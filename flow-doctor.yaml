@@ -8,6 +8,9 @@ notify:
     smtp_host: smtp.gmail.com
     smtp_port: 587
     smtp_password: ${GMAIL_APP_PASSWORD}
+  - type: s3
+    bucket: alpha-engine-research
+    subsystem: predictor
 store:
   type: sqlite
   path: /tmp/flow_doctor.db
