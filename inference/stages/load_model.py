@@ -75,7 +75,8 @@ def _load_meta_models(ctx: PipelineContext) -> None:
     # run_inference.py. Tier 1 regime rewrite is on the roadmap; when it
     # ships it will re-introduce a loader block here with its own path.
 
-    # Research calibrator
+    # Research calibrator (bucket lookup — canonical source for
+    # research_calibrator_prob META_FEATURE).
     try:
         from model.research_calibrator import ResearchCalibrator
         path = _dl(f"{prefix}research_calibrator.json", "meta_research_cal.json")
@@ -83,6 +84,31 @@ def _load_meta_models(ctx: PipelineContext) -> None:
         log.info("Loaded research calibrator")
     except Exception as e:
         log.warning("Research calibrator not available: %s", e)
+
+    # Audit Phase 3 PR 3/5 (2026-05-07): ResearchGBMScorer ships alongside
+    # the bucket-lookup in observe-only mode. The LGB exists in S3 (since
+    # PR #95 wired the training-side persistence) but its output rides
+    # alongside the bucket-lookup as a parallel diagnostic. The
+    # bucket-lookup remains the canonical source for the
+    # research_calibrator_prob META_FEATURE the meta-Ridge consumes;
+    # the LGB output is captured in each prediction dict as
+    # `research_gbm_prob` for observation. Cutover happens in PR 4.
+    #
+    # Loader is tolerant of the LGB being absent (early days post-PR-#95
+    # before the first Sat training cycle has produced research_gbm.pkl,
+    # or any cycle where prod_research_gbm was None due to insufficient
+    # data). Inference doesn't fail — it just writes None for
+    # research_gbm_prob and the bucket-lookup remains the only source.
+    try:
+        from model.research_gbm import ResearchGBMScorer
+        path = _dl(f"{prefix}research_gbm.pkl", "research_gbm.pkl")
+        ctx.meta_models["research_gbm"] = ResearchGBMScorer.load(path)
+        log.info("Loaded ResearchGBMScorer (Phase 3 observe-only)")
+    except Exception as e:
+        # Fully expected to fail in the early observation period or
+        # whenever the training-side persistence was skipped. Down-grade
+        # to debug-level so it doesn't pollute Lambda logs.
+        log.debug("ResearchGBMScorer not available (observe-only OK): %s", e)
 
     # Meta-model (ridge stacker)
     try:
