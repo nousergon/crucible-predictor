@@ -1204,6 +1204,76 @@ def run_meta_training(
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
     log.info("Peak IC horizon: %s (Spearman=%+.4f)", _peak[0], _peak[1]["spearman"])
 
+    # ── Step 7c: ResearchGBMScorer fit (audit Phase 3 PR 2/5, observe-only) ─
+    # Fits the new LightGBM-based research scorer alongside the existing
+    # bucket-lookup ResearchCalibrator (prod_calibrator from Step 5b).
+    # Both run in parallel until the cutover PR — manifest carries metrics
+    # for both so we can validate the LGB matches or beats the bucket-lookup
+    # before swapping it in.
+    #
+    # Training shape: same OOS rows the meta-Ridge consumes (each row has
+    # all 9 RESEARCH_GBM_FEATURES + multi-horizon labels from Track B).
+    # Label is binary beat-SPY-at-10d (`actual_fwd_10d > 0`) — same target
+    # the bucket-lookup is graded on. Walk-forward isolation: rows are
+    # date-sorted, and we split 80/20 temporally for early-stopping
+    # validation. (The bucket-lookup uses a per-fold calibrator; the LGB's
+    # walk-forward isolation tightens in PR 4 cutover when it becomes
+    # load-bearing.)
+    from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
+
+    prod_research_gbm: ResearchGBMScorer | None = None
+    research_gbm_metrics: dict | None = None
+    try:
+        # Build feature matrix + 10d binary label from oos_meta_rows.
+        # Filter to rows with finite 10d label (some rows at the tail of
+        # history have NaN actual_fwd_10d because forward window extends
+        # past the data range).
+        finite_mask = np.array([
+            np.isfinite(r.get("actual_fwd_10d", float("nan")))
+            for r in oos_meta_rows
+        ])
+        n_finite = int(finite_mask.sum())
+        if n_finite >= 100:
+            X_research = np.array([
+                [r.get(f, 0.0) or 0.0 for f in RESEARCH_GBM_FEATURES]
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ], dtype=np.float32)
+            y_research = np.array([
+                1.0 if r.get("actual_fwd_10d", 0.0) > 0 else 0.0
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ], dtype=np.float32)
+            # Date-sorted split: oos_meta_rows are accumulated in fold
+            # order which is date-ascending, so a positional 80/20 split
+            # is temporal by construction. Verify with the row dates.
+            split_idx = int(n_finite * 0.8)
+            prod_research_gbm = ResearchGBMScorer(
+                n_estimators=500, early_stopping_rounds=30,
+            )
+            prod_research_gbm.fit(
+                X_research[:split_idx], y_research[:split_idx],
+                X_research[split_idx:], y_research[split_idx:],
+            )
+            research_gbm_metrics = prod_research_gbm.metrics()
+            log.info(
+                "ResearchGBMScorer fit on %d rows (val_ic=%.4f, best_iter=%d) — "
+                "observe-only alongside bucket-lookup ResearchCalibrator",
+                n_finite, prod_research_gbm._val_ic,
+                prod_research_gbm._best_iteration,
+            )
+        else:
+            log.info(
+                "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
+                "skipped this cycle. Bucket-lookup ResearchCalibrator unchanged.",
+                n_finite,
+            )
+    except Exception as e:
+        # Non-blocking: failure here logs a warning but doesn't fail the
+        # whole training run. The bucket-lookup remains the live path
+        # until PR 4 cutover.
+        log.warning(
+            "ResearchGBMScorer fit failed (non-blocking, observe-only): %s", e,
+        )
+
     # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
     #
@@ -1470,6 +1540,14 @@ def run_meta_training(
                 "meta_model": (meta_model, "meta_model.pkl"),
                 "isotonic_calibrator": (calibrator, "isotonic_calibrator.pkl"),
             }
+            # Audit Phase 3 PR 2/5: ResearchGBMScorer ships ALONGSIDE the
+            # bucket-lookup in observe-only mode. Both get persisted with
+            # their .meta.json sidecars; inference doesn't read the LGB
+            # yet (PR 3 wires that). When prod_research_gbm is None
+            # (insufficient data this cycle, or fit failed), the LGB key
+            # is omitted — bucket-lookup remains the canonical path.
+            if prod_research_gbm is not None:
+                models["research_gbm"] = (prod_research_gbm, "research_gbm.pkl")
             # Dated archive is always written (records what training produced
             # regardless of gate decision). Live path is only overwritten when
             # the promotion gate passes — otherwise live weights stay at the
@@ -1528,6 +1606,19 @@ def run_meta_training(
                         "ece_after": round(calibrator._ece_after or 0.0, 6),
                         "n_samples": calibrator._n_samples,
                     },
+                    # Audit Phase 3 PR 2/5 (2026-05-07): ResearchGBMScorer
+                    # ships alongside the bucket-lookup in observe-only mode.
+                    # Persisted in the manifest for parity comparison —
+                    # inference doesn't consume it yet (PR 3 wires that).
+                    # When None, the LGB wasn't fit this cycle (insufficient
+                    # data or fit failed); bucket-lookup remains canonical.
+                    **(
+                        {"research_gbm": {
+                            "key": f"{prefix}research_gbm.pkl",
+                            **(research_gbm_metrics or {}),
+                        }}
+                        if prod_research_gbm is not None else {}
+                    ),
                 },
                 "walk_forward": {
                     "momentum_median_ic": round(mom_median_ic, 6),
