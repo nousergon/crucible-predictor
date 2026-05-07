@@ -207,6 +207,13 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # regime_model removed from ctx.meta_models lookup 2026-04-16 — Tier 0
     # classifier no longer loaded by load_model.py.
     research_cal = ctx.meta_models.get("research_calibrator")
+    # Audit Phase 3 PR 3/5 (2026-05-07): ResearchGBMScorer rides alongside
+    # the bucket-lookup in observe-only mode. None when the LGB hasn't
+    # been trained yet (early observation cycle) or when training-side
+    # persistence was skipped. Bucket-lookup remains canonical for
+    # research_calibrator_prob META_FEATURE; the LGB output is captured
+    # per-prediction for parity comparison.
+    research_gbm = ctx.meta_models.get("research_gbm")
     meta_model = ctx.meta_models.get("meta")
 
     if mom_scorer is None and vol_scorer is None and meta_model is None:
@@ -396,6 +403,26 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             **macro_row_for_meta,  # raw macro features
         }
 
+        # Audit Phase 3 PR 3/5 (2026-05-07): ResearchGBMScorer parallel
+        # path. The LGB consumes the same 9 RESEARCH_GBM_FEATURES already
+        # built into meta_features; its output is captured per-ticker for
+        # observation alongside the bucket-lookup's output. The LGB
+        # output does NOT feed the meta-Ridge yet — the bucket-lookup's
+        # research_calibrator_prob remains the canonical META_FEATURE
+        # the Ridge sees. Cutover is PR 4. None when the LGB isn't
+        # loaded (early observation cycle, or training-side persistence
+        # was skipped this Saturday); the field rides as null in the
+        # output JSON for parity-comparison observability.
+        research_gbm_prob: float | None = None
+        if research_gbm is not None and getattr(research_gbm, "fitted", False):
+            try:
+                research_gbm_prob = float(research_gbm.predict_from_dict(meta_features))
+            except Exception as e:
+                # Non-blocking — log per-ticker and continue with bucket-lookup
+                # as the canonical path. Should be exceedingly rare given
+                # predict_from_dict is defensive on missing keys.
+                log.debug("ResearchGBMScorer.predict_from_dict failed for %s: %s", ticker, e)
+
         # NaN-aware sanitization at the ridge boundary. Ridge is NaN-poison;
         # data layer ships partial-NaN features for short-history tickers
         # (2026-04-21 evening graceful-degrade policy). Impute neutral and
@@ -463,6 +490,14 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "combined_rank": None,
             # Meta-model detail (new fields, additive)
             "research_calibrator_prob": round(research_cal_prob, 4),
+            # Audit Phase 3 PR 3/5: ResearchGBMScorer parallel output.
+            # Rides alongside research_calibrator_prob in observe-only
+            # mode; not consumed by the Ridge yet. None when the LGB
+            # isn't loaded or the prediction failed for this ticker.
+            # Dashboards + email may surface for parity comparison.
+            "research_gbm_prob": (
+                round(research_gbm_prob, 4) if research_gbm_prob is not None else None
+            ),
             "momentum_confirmation": round(momentum_score, 6),
             "expected_move": round(expected_move, 6),
             # regime_bull/regime_bear removed from per-ticker output 2026-04-16
