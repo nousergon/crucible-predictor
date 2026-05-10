@@ -57,6 +57,11 @@ from pathlib import Path
 
 import numpy as np
 
+from labeling.triple_barrier import (
+    TRIPLE_BARRIER_SENTINEL,
+    triple_barrier_class_labels,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -84,62 +89,12 @@ REGIME_V2_FEATURES: list[str] = [
 REGIME_CLASSES: list[str] = ["bear", "neutral", "bull"]
 
 
-def make_triple_barrier_labels(
-    spy_log_returns: np.ndarray,
-    forward_window: int = 21,
-    up_barrier_pct: float = 0.05,
-    down_barrier_pct: float = 0.05,
-) -> np.ndarray:
-    """Generate 3-class triple-barrier labels from SPY log-return series.
-
-    For each row, looks forward ``forward_window`` rows; classifies by
-    which barrier hits first:
-
-      - 2 (bull)   : up barrier hit first, OR window-end cumulative
-                     return > up_barrier_pct / 2
-      - 0 (bear)   : down barrier hit first, OR window-end cumulative
-                     return < -down_barrier_pct / 2
-      - 1 (neutral): neither barrier hit, window-end cumulative return
-                     in [-half, +half]
-
-    Returns int array (length matching input). Tail rows where the
-    forward window extends past data end get label = -1 (sentinel for
-    "no label available" — caller filters these out before fit).
-
-    Args:
-        spy_log_returns: (n,) log-return series for SPY
-        forward_window: trading days forward to check
-        up_barrier_pct: cumulative log-return threshold for bull hit
-        down_barrier_pct: cumulative log-return threshold for bear hit
-    """
-    n = len(spy_log_returns)
-    labels = np.full(n, -1, dtype=np.int8)
-    for i in range(n - forward_window):
-        cum = 0.0
-        bull_hit = False
-        bear_hit = False
-        for j in range(forward_window):
-            cum += spy_log_returns[i + 1 + j]
-            if cum >= up_barrier_pct:
-                bull_hit = True
-                break
-            if cum <= -down_barrier_pct:
-                bear_hit = True
-                break
-        if bull_hit:
-            labels[i] = 2  # bull
-        elif bear_hit:
-            labels[i] = 0  # bear
-        else:
-            # Neither barrier hit during window — classify by window-end
-            # cumulative return relative to half-band.
-            if cum > up_barrier_pct / 2:
-                labels[i] = 2  # bull (drifted up)
-            elif cum < -down_barrier_pct / 2:
-                labels[i] = 0  # bear (drifted down)
-            else:
-                labels[i] = 1  # neutral
-    return labels
+# Backward-compatible alias — original name preserved so existing
+# meta_trainer + tests continue to import from this module. Implementation
+# now lives in ``labeling/triple_barrier.py`` (regime-agnostic generic);
+# the class encoding (2=bull / 1=neutral / 0=bear) maps onto the generic
+# (2=up / 1=neutral / 0=down) by convention.
+make_triple_barrier_labels = triple_barrier_class_labels
 
 
 def _default_params() -> dict:
