@@ -117,6 +117,9 @@ class RegimePredictor:
         tnx_series: pd.Series | None = None,
         irx_series: pd.Series | None = None,
         all_close_prices: dict[str, pd.Series] | None = None,
+        two_series: pd.Series | None = None,
+        hyoas_series: pd.Series | None = None,
+        baa10y_series: pd.Series | None = None,
     ) -> pd.DataFrame:
         """
         Build regime feature matrix from macro time series.
@@ -172,6 +175,49 @@ class RegimePredictor:
             df["yield_curve_slope"] = (tnx_aligned - irx_aligned) / 10.0
         else:
             df["yield_curve_slope"] = 0.0
+
+        # Stage 2c-full additions (2026-05-10 — regime-conditioning rebuild):
+        # 10Y-2Y curve slope (recession-canonical) + HY OAS + BAA10Y
+        # credit-regime indicators. Each compute path falls back to a
+        # neutral default when the upstream parquet is missing so the
+        # build doesn't fail during data-availability transitions.
+
+        # yield_curve_10y_2y: recession-focused canonical curve. Distinct
+        # from yield_curve_slope (10Y-3M cyclical curve). Inverted (negative
+        # values) historically precedes recessions by 6-18 months.
+        if tnx_series is not None and two_series is not None:
+            tnx_for_2y = tnx_series.reindex(df.index, method="ffill")
+            two_aligned = two_series.reindex(df.index, method="ffill")
+            df["yield_curve_10y_2y"] = (tnx_for_2y - two_aligned) / 10.0
+        else:
+            df["yield_curve_10y_2y"] = 0.0
+
+        # hy_oas_level: ICE BofA US HY Index OAS. License-gated to 2023+
+        # on FRED — pre-2023 rows fall back to neutral. Forward-going,
+        # the level captures HY-specific stress regimes that BAA10Y
+        # (BBB-rated) misses.
+        if hyoas_series is not None:
+            hyoas_aligned = hyoas_series.reindex(df.index, method="ffill")
+            df["hy_oas_level"] = hyoas_aligned
+            # 21d change captures regime shifts (credit widening) that
+            # the level alone smooths. Used by institutional credit dashboards.
+            df["hy_oas_change_21d"] = hyoas_aligned - hyoas_aligned.shift(21)
+        else:
+            df["hy_oas_level"] = 0.0
+            df["hy_oas_change_21d"] = 0.0
+
+        # baa10y_level: Moody's BAA Corporate - 10Y Treasury spread. Full
+        # 40y FRED history (1986+); the credit-regime signal HYOAS can't
+        # provide across the full predictor training corpus. BBB-rated
+        # spread vs HY's below-BBB; both belong in the institutional
+        # credit feature set.
+        if baa10y_series is not None:
+            baa_aligned = baa10y_series.reindex(df.index, method="ffill")
+            df["baa10y_level"] = baa_aligned
+            df["baa10y_change_21d"] = baa_aligned - baa_aligned.shift(21)
+        else:
+            df["baa10y_level"] = 0.0
+            df["baa10y_change_21d"] = 0.0
 
         # Market breadth: % of stocks above 50-day MA AND % above 200-day MA
         # (Stage 2c-partial 2026-05-10). 50d captures cyclical breadth; 200d

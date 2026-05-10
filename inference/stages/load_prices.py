@@ -34,7 +34,15 @@ _ARCTIC_OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 # universe library with full OHLCV; daily_append writes them to the macro
 # library with Close only. The reader tries universe first, falls back to
 # macro, so both writers are supported.
-_ARCTIC_MACRO_STEMS = ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]
+_ARCTIC_MACRO_STEMS = [
+    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    # Stage 2c-full additions (regime-conditioning rebuild 2026-05-10):
+    # FRED-only macros for the expanded credit + 10Y-2Y curve macros.
+    # Backfilled to S3 via collectors/fred_history.py; daily updates via
+    # daily_closes._FRED_INDEX_MAP. Predictor reads them as Close-only
+    # macro series — same shape as TNX/IRX/VIX.
+    "TWO", "HYOAS", "BAA10Y",
+]
 _ARCTIC_SECTOR_ETFS = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
                        "XLP", "XLRE", "XLU", "XLV", "XLY"]
 
