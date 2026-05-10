@@ -185,6 +185,18 @@ ADAPTIVE_WINDOW = _label_cfg.get("adaptive_window", 63)
 ADAPTIVE_UP_PCT = _label_cfg.get("adaptive_up_pct", 65)
 ADAPTIVE_DOWN_PCT = _label_cfg.get("adaptive_down_pct", 35)
 
+# ── Triple-barrier alpha labels (Stage 3, parallel-observe) ─────────────────
+# LdP Ch. 3.4 — vol-scaled barriers. PR 1 of the Stage 3 arc ships the label
+# generator + config knobs only; PR 2 wires parallel L1 training; PR 5 flips
+# `enforce_cutover` to consume triple-barrier labels as the canonical L1
+# alpha target. Plan: alpha-engine-docs/private/triple-barrier-260510.md.
+_tb_cfg = _cfg.get("triple_barrier", {})
+TRIPLE_BARRIER_FORWARD_WINDOW = _tb_cfg.get("forward_window", 21)
+TRIPLE_BARRIER_VOL_WINDOW = _tb_cfg.get("vol_window", 20)
+TRIPLE_BARRIER_VOL_MULTIPLIER = _tb_cfg.get("vol_multiplier", 2.0)
+TRIPLE_BARRIER_MIN_PERIODS = _tb_cfg.get("min_periods", 10)
+TRIPLE_BARRIER_ENFORCE_CUTOVER = _tb_cfg.get("enforce_cutover", False)
+
 # ── GBM tuned hyperparameters ────────────────────────────────────────────────
 _gbm_cfg = _cfg["gbm"]
 GBM_N_ESTIMATORS = _gbm_cfg["n_estimators"]

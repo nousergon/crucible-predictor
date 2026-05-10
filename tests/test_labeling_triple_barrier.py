@@ -171,6 +171,88 @@ class TestTripleBarrierAlphaLabels:
         assert np.allclose(finite, 0.10)
 
 
+# ── Per-row (ndarray) barrier tests — Stage 3 vol-scaling support ──────
+
+
+class TestTripleBarrierAlphaPerRowBarriers:
+    """LdP Ch. 3.4 vol-scaled barriers — per-row barrier widths broadcast
+    via ndarray. PR 1 of the Stage 3 arc adds this signature widening.
+    """
+
+    def test_scalar_and_array_barriers_agree_when_uniform(self):
+        # Scalar 0.05 vs ndarray of 0.05 should produce identical labels.
+        log_returns = np.full(60, 0.005)
+        scalar_labels = triple_barrier_alpha_labels(
+            log_returns,
+            forward_window=21,
+            up_barrier_pct=0.05,
+            down_barrier_pct=0.05,
+        )
+        array_labels = triple_barrier_alpha_labels(
+            log_returns,
+            forward_window=21,
+            up_barrier_pct=np.full(60, 0.05),
+            down_barrier_pct=np.full(60, 0.05),
+        )
+        # Use array_equal w/ NaN-equal semantics
+        assert np.array_equal(scalar_labels, array_labels, equal_nan=True)
+
+    def test_per_row_barriers_apply_row_wise(self):
+        # Two distinct regimes encoded into the barrier array:
+        # rows 0-29: tight barrier 0.02 (steep cap)
+        # rows 30-59: wide barrier 0.20 (effectively no barrier hit at this scale)
+        # Underlying returns are 0.005/day → 21-day cum = 0.105.
+        # Tight regime: 4 days × 0.005 = 0.02 → caps at 0.02.
+        # Wide regime: 21 days × 0.005 = 0.105 < 0.20 → time-out at 0.105.
+        log_returns = np.full(60, 0.005)
+        up_arr = np.concatenate([np.full(30, 0.02), np.full(30, 0.20)])
+        down_arr = np.concatenate([np.full(30, 0.02), np.full(30, 0.20)])
+        labels = triple_barrier_alpha_labels(
+            log_returns,
+            forward_window=21,
+            up_barrier_pct=up_arr,
+            down_barrier_pct=down_arr,
+        )
+        # Rows 0-29 cap at 0.02
+        assert np.allclose(labels[:30], 0.02)
+        # Rows 30-38 time out at 0.105 (last 21 rows are NaN tail; 39-59 → tail)
+        time_out_region = labels[30:60 - 21]
+        assert np.allclose(time_out_region, 0.105, atol=1e-9)
+
+    def test_nan_barrier_at_row_yields_nan_label(self):
+        # Insufficient vol history → NaN barrier → NaN label at that row.
+        log_returns = np.full(60, 0.005)
+        up_arr = np.full(60, 0.05)
+        up_arr[:10] = np.nan  # simulate front-of-history vol gap
+        down_arr = np.full(60, 0.05)
+        down_arr[:10] = np.nan
+        labels = triple_barrier_alpha_labels(
+            log_returns,
+            forward_window=21,
+            up_barrier_pct=up_arr,
+            down_barrier_pct=down_arr,
+        )
+        # Rows 0-9 NaN due to NaN barrier
+        assert np.isnan(labels[:10]).all()
+        # Rows 10-38 finite (39-59 are tail NaN)
+        assert (~np.isnan(labels[10:60 - 21])).all()
+
+    def test_mismatched_barrier_length_raises(self):
+        # Per-row arrays must match log_returns length — broadcast_to raises.
+        log_returns = np.full(60, 0.005)
+        bad_up = np.full(50, 0.05)  # wrong length
+        try:
+            triple_barrier_alpha_labels(
+                log_returns,
+                forward_window=21,
+                up_barrier_pct=bad_up,
+                down_barrier_pct=0.05,
+            )
+        except ValueError:
+            return
+        raise AssertionError("expected ValueError on length mismatch")
+
+
 # ── Cross-flavor sanity ────────────────────────────────────────────────
 
 

@@ -32,6 +32,19 @@ labeling:
   adaptive_up_pct: 65              # percentile for UP threshold (top 35% → UP)
   adaptive_down_pct: 35            # percentile for DOWN threshold (bottom 35% → DOWN)
 
+# ── Triple-barrier alpha labels (Stage 3, parallel-observe) ────────────────
+# LdP Ch. 3.4 — path-dependent labels with per-row vol-scaled barriers
+# (barrier = vol_multiplier × σ_t, where σ_t is EWMA std of sector-neutral
+# residual log-returns). PR 1 ships the label generator only; PR 2 wires
+# parallel L1 training; PR 5 flips `enforce_cutover` after ≥3 Sat-SF firings
+# of the variant_cutover_gate show ≥15% relative IC lift.
+triple_barrier:
+  forward_window: 21               # time-out barrier in trading days
+  vol_window: 20                   # EWMA span for σ_t (~1 trading month)
+  vol_multiplier: 2.0              # barrier width as multiple of σ_t (LdP-standard ≈ 2-sigma)
+  min_periods: 10                  # min EWMA observations before σ_t is non-NaN
+  enforce_cutover: false           # PR 5 flips this to swap canonical L1 alpha target
+
 # ── GBM hyperparameters ──────────────────────────────────────────────────────
 # Values below are LightGBM library defaults (publicly documented — see
 # https://lightgbm.readthedocs.io/), NOT production-tuned values. Real
