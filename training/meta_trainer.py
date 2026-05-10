@@ -740,124 +740,6 @@ def run_meta_training(
 
     log.info("Regime data: %d dates with features+labels", len(common_dates))
 
-    # ── Step 4b: Tier-1 RegimePredictorV2 fit (audit Phase 4 PR 2/6) ────────
-    # Observe-only build of the new regime classifier. Same parallel-
-    # observation pattern as Phase 3's ResearchGBMScorer (#95) — fits
-    # alongside the inference path's existing regime handling, persists
-    # gate metrics to S3 + manifest, but is NOT consumed by inference yet.
-    # Cutover is Phase 4 PR 5 after the gate (oos_accuracy ≥ 0.50,
-    # bear_recall ≥ 0.40, per-class floor 0.15) has cleared on validation.
-    #
-    # Three failures of the retired Tier-0 the V2 design addresses:
-    #  (1) triple-barrier labels (López de Prado) instead of point-in-time
-    #  (2) 3-class LightGBM softmax instead of multinomial logistic
-    #  (3) honest gate metrics persisted to manifest for trend monitoring
-    from model.regime_predictor_v2 import (
-        RegimePredictorV2, REGIME_V2_FEATURES, make_triple_barrier_labels,
-    )
-
-    prod_regime_v2: RegimePredictorV2 | None = None
-    regime_v2_metrics: dict | None = None
-    try:
-        # Build V2's 9 features per date. Existing regime_features_df has
-        # the 6 macro features under their unprefixed names (spy_20d_return,
-        # vix_level, etc.); V2's META-spec'd names use ``macro_`` prefix.
-        # Compute the 3 additional SPY-momentum features inline from
-        # spy_series's close prices.
-        if spy_series is not None and len(spy_series) >= 130:
-            # Daily log returns from SPY close-price series — used both
-            # for the feature derivation and the triple-barrier labels.
-            spy_close = spy_series.astype(float)
-            spy_log_ret_daily = np.log(spy_close / spy_close.shift(1))
-            spy_log_ret_daily = spy_log_ret_daily.fillna(0.0)
-
-            # SPY-momentum features at 5d / 60d / 120d horizons.
-            # Cumulative log return over the trailing window:
-            spy_5d = spy_log_ret_daily.rolling(5).sum()
-            spy_60d = spy_log_ret_daily.rolling(60).sum()
-            spy_120d = spy_log_ret_daily.rolling(120).sum()
-
-            # Build the V2 feature matrix: align with the existing
-            # regime_features_df dates (which already has the 6 macro
-            # features). Each row gets all 9 V2 features.
-            common_idx = regime_features_df.index.intersection(spy_5d.index)
-            common_idx = common_idx.intersection(spy_60d.index).intersection(spy_120d.index)
-            if len(common_idx) >= 200:
-                v2_macro_block = regime_features_df.loc[
-                    common_idx, RegimePredictor.FEATURE_NAMES
-                ].to_numpy(dtype=np.float32)
-                # Map regime_features_df columns to V2's macro_*-prefixed names.
-                # Order in REGIME_V2_FEATURES[:6] matches FEATURE_NAMES order.
-                v2_spy_block = np.column_stack([
-                    spy_5d.loc[common_idx].to_numpy(dtype=np.float32),
-                    spy_60d.loc[common_idx].to_numpy(dtype=np.float32),
-                    spy_120d.loc[common_idx].to_numpy(dtype=np.float32),
-                ])
-                v2_X = np.concatenate([v2_macro_block, v2_spy_block], axis=1)
-
-                # Triple-barrier labels for the same date index.
-                spy_log_ret_aligned = spy_log_ret_daily.reindex(
-                    common_idx, method="ffill"
-                ).to_numpy()
-                v2_labels_full = make_triple_barrier_labels(
-                    spy_log_ret_aligned, forward_window=21,
-                    up_barrier_pct=0.05, down_barrier_pct=0.05,
-                )
-                # Filter sentinel (-1) tail rows
-                label_mask = v2_labels_full != -1
-                v2_X_finite = v2_X[label_mask]
-                v2_y_finite = v2_labels_full[label_mask].astype(np.int32)
-
-                if len(v2_X_finite) >= 200:
-                    # Temporal 80/20 split (common_idx is date-sorted ascending).
-                    split = int(len(v2_X_finite) * 0.8)
-                    prod_regime_v2 = RegimePredictorV2(
-                        n_estimators=500, early_stopping_rounds=30,
-                    )
-                    prod_regime_v2.fit(
-                        v2_X_finite[:split], v2_y_finite[:split],
-                        v2_X_finite[split:], v2_y_finite[split:],
-                    )
-                    regime_v2_metrics = prod_regime_v2.metrics()
-                    gate_passed, gate_reason = prod_regime_v2.passes_promotion_gate()
-                    log.info(
-                        "RegimePredictorV2 fit on %d rows (oos_acc=%s, macro_f1=%s, "
-                        "bear_recall=%s, gate=%s) — observe-only Phase 4 PR 2/6",
-                        len(v2_X_finite),
-                        f"{prod_regime_v2._oos_accuracy:.4f}"
-                        if prod_regime_v2._oos_accuracy is not None else "n/a",
-                        f"{prod_regime_v2._macro_f1:.4f}"
-                        if prod_regime_v2._macro_f1 is not None else "n/a",
-                        f"{prod_regime_v2._per_class_recall.get('bear', 'n/a'):.4f}"
-                        if prod_regime_v2._per_class_recall else "n/a",
-                        "PASS" if gate_passed else f"FAIL ({gate_reason})",
-                    )
-                else:
-                    log.info(
-                        "RegimePredictorV2: only %d labeled rows (need >=200) — "
-                        "skipped this cycle.",
-                        len(v2_X_finite),
-                    )
-            else:
-                log.info(
-                    "RegimePredictorV2: only %d common dates (need >=200) — "
-                    "skipped this cycle.",
-                    len(common_idx),
-                )
-        else:
-            log.info(
-                "RegimePredictorV2: spy_series too short (%d days, need >=130) — "
-                "skipped this cycle.",
-                len(spy_series) if spy_series is not None else 0,
-            )
-    except Exception as e:
-        # Non-blocking. The Tier-0 path remains retired regardless;
-        # this PR ships observe-only. Failure here logs a warning but
-        # does not fail the training run.
-        log.warning(
-            "RegimePredictorV2 fit failed (non-blocking, observe-only): %s", e,
-        )
-
     # ── Step 5: Load research calibrator data from S3 ────────────────────────
     research_scores = np.array([])
     research_beat_spy = np.array([])
@@ -1368,8 +1250,8 @@ def run_meta_training(
     )
 
     # Filter oos_meta_rows to canonical-finite rows so downstream consumers
-    # (horizon battery, row_regimes, regime_conditioned_meta, isotonic
-    # calibrator) align naturally with meta_X / meta_y / Ridge predictions.
+    # (horizon battery, row_regimes, isotonic calibrator) align naturally
+    # with meta_X / meta_y / Ridge predictions.
     # Pre-cutover the Ridge fit on the full row set; post-cutover the fit
     # is on the canonical-finite subset and every downstream operation
     # against Ridge outputs must use the same subset.
@@ -1572,42 +1454,6 @@ def run_meta_training(
     _peak = max(horizon_ics.items(),
                 key=lambda kv: abs(kv[1]["spearman"]) if np.isfinite(kv[1]["spearman"]) else -1)
     log.info("Peak IC horizon: %s (Spearman=%+.4f)", _peak[0], _peak[1]["spearman"])
-
-    # ── Step 7d: RegimeConditionedMeta fit (audit Phase 4 PR 3/6, observe-only) ─
-    # Three Ridges (one per regime) + an unconditioned fallback. Fits on
-    # the same OOS rows + their regime labels (already attached by Track B
-    # 3/N's _classify_regime). Persisted alongside the single Ridge in
-    # observe-only mode; inference doesn't read it yet (PR 4 wires that).
-    # Cutover is PR 5 after the gate (regime-conditioned ensemble IC must
-    # exceed single-Ridge IC by ≥ 15% relative across validation period)
-    # has cleared.
-    from model.regime_conditioned_meta import RegimeConditionedMeta
-
-    prod_regime_conditioned_meta: RegimeConditionedMeta | None = None
-    regime_conditioned_meta_metrics: dict | None = None
-    try:
-        if len(oos_meta_rows) >= 600:  # need ~200 per regime worst case
-            prod_regime_conditioned_meta = RegimeConditionedMeta(
-                alpha=1.0, min_per_regime_rows=200,
-            ).fit(meta_X, meta_y, row_regimes, feature_names=META_FEATURES)
-            regime_conditioned_meta_metrics = prod_regime_conditioned_meta.metrics()
-            log.info(
-                "RegimeConditionedMeta fit: dedicated_ridges=%s, fallback_val_ic=%s — "
-                "observe-only Phase 4 PR 3/6",
-                regime_conditioned_meta_metrics["regimes_with_dedicated_ridge"],
-                f"{prod_regime_conditioned_meta._fallback_ridge._val_ic:.4f}"
-                if prod_regime_conditioned_meta._fallback_ridge is not None else "n/a",
-            )
-        else:
-            log.info(
-                "RegimeConditionedMeta: only %d OOS rows (need >=600 for 3-regime fit) — "
-                "skipped this cycle.",
-                len(oos_meta_rows),
-            )
-    except Exception as e:
-        log.warning(
-            "RegimeConditionedMeta fit failed (non-blocking, observe-only): %s", e,
-        )
 
     # ── Step 7b: Fit isotonic calibrator on meta OOS predictions ─────────────
     # ROADMAP P1: collapse FLAT, use calibrated P(UP) as confidence.
@@ -1873,23 +1719,6 @@ def run_meta_training(
             # is omitted — bucket-lookup remains the canonical path.
             if prod_research_gbm is not None:
                 models["research_gbm"] = (prod_research_gbm, "research_gbm.pkl")
-            # Audit Phase 4 PR 2/6: RegimePredictorV2 ships in observe-only
-            # mode. Inference doesn't load it yet (PR 4 wires that). Cutover
-            # is PR 5 after the gate (oos_accuracy ≥ 0.50, bear_recall ≥
-            # 0.40, per-class floor 0.15) has cleared on validation. The
-            # retired Tier-0's regime_predictor.pkl in S3 is left in place;
-            # it's already untouched by inference (load_model.py:97 stopped
-            # loading it 2026-04-16).
-            if prod_regime_v2 is not None:
-                models["regime_predictor_v2"] = (prod_regime_v2, "regime_predictor_v2.pkl")
-            # Audit Phase 4 PR 3/6: RegimeConditionedMeta (3 Ridges + fallback)
-            # ships in observe-only mode. Inference doesn't load it yet
-            # (PR 4 wires that). The single-Ridge meta_model.pkl above
-            # remains the canonical alpha source.
-            if prod_regime_conditioned_meta is not None:
-                models["regime_conditioned_meta"] = (
-                    prod_regime_conditioned_meta, "regime_conditioned_meta.pkl",
-                )
             # Audit Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
             # retired from the upload set. The single meta_model.pkl above
             # is now trained on canonical labels — no separate canonical
@@ -1988,28 +1817,6 @@ def run_meta_training(
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}
-                    ),
-                    # Audit Phase 4 PR 2/6 (2026-05-07): RegimePredictorV2
-                    # observe-only metrics. Carries the honest gate
-                    # outputs (oos_accuracy, per_class_recall, macro_f1)
-                    # so the cutover decision in PR 5 is data-driven.
-                    # When None, V2 wasn't fit this cycle.
-                    **(
-                        {"regime_predictor_v2": {
-                            "key": f"{prefix}regime_predictor_v2.pkl",
-                            **(regime_v2_metrics or {}),
-                        }}
-                        if prod_regime_v2 is not None else {}
-                    ),
-                    # Audit Phase 4 PR 3/6 (2026-05-07): RegimeConditionedMeta
-                    # observe-only metrics. Carries per-regime val_ic +
-                    # sample counts so PR 5's cutover decision is data-driven.
-                    **(
-                        {"regime_conditioned_meta": {
-                            "key": f"{prefix}regime_conditioned_meta.pkl",
-                            **(regime_conditioned_meta_metrics or {}),
-                        }}
-                        if prod_regime_conditioned_meta is not None else {}
                     ),
                     # Track A PR 5/6 cutover (2026-05-09): canonical_meta_model
                     # observe-only entry retired. The meta_model entry above
