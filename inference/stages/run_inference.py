@@ -255,6 +255,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         vix3m_s = ctx.macro.get("VIX3M") if ctx.macro else None
         tnx_s = ctx.macro.get("TNX") if ctx.macro else None
         irx_s = ctx.macro.get("IRX") if ctx.macro else None
+        # Stage 2c-full additions (regime-conditioning rebuild 2026-05-10)
+        two_s = ctx.macro.get("TWO") if ctx.macro else None
+        hyoas_s = ctx.macro.get("HYOAS") if ctx.macro else None
+        baa10y_s = ctx.macro.get("BAA10Y") if ctx.macro else None
 
         if spy_s is not None and len(spy_s) >= 20:
             _close_prices = {}
@@ -263,6 +267,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                     _close_prices[_tk] = _df["Close"].astype(float)
             regime_features_df = _RPFeatureBuilder().build_features(
                 spy_s, vix_s, vix3m_s, tnx_s, irx_s, _close_prices,
+                two_series=two_s,
+                hyoas_series=hyoas_s,
+                baa10y_series=baa10y_s,
             )
             if not regime_features_df.empty:
                 latest_regime = regime_features_df.iloc[-1]

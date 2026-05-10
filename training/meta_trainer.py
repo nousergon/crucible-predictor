@@ -446,6 +446,14 @@ def run_meta_training(
     vix3m_series = _load_close("VIX3M.parquet")
     tnx_series = _load_close("TNX.parquet")
     irx_series = _load_close("IRX.parquet")
+    # Stage 2c-full (regime-conditioning rebuild): FRED-only macros
+    # backfilled to predictor/price_cache via collectors/fred_history.py.
+    # _load_close returns None when the parquet is absent so the predictor
+    # still trains during data-availability transitions; build_features()
+    # falls back to neutral defaults for those macro features.
+    two_series = _load_close("TWO.parquet")
+    hyoas_series = _load_close("HYOAS.parquet")
+    baa10y_series = _load_close("BAA10Y.parquet")
     gld_series = _load_close("GLD.parquet")
     uso_series = _load_close("USO.parquet")
 
@@ -765,6 +773,9 @@ def run_meta_training(
     regime_features_df = regime_predictor.build_features(
         spy_series, vix_series, vix3m_series, tnx_series, irx_series,
         all_close_prices,
+        two_series=two_series,
+        hyoas_series=hyoas_series,
+        baa10y_series=baa10y_series,
     )
     regime_labels = regime_predictor.build_labels(spy_series)
 

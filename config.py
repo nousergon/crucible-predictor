@@ -372,6 +372,20 @@ MACRO_NORM_FEATURES = [
     # yield_curve_10y_2y, hy_oas_level, hy_oas_change_21d.
     "vix_vix3m_ratio",
     "market_breadth_200d",
+    # Stage 2c-full additions (2026-05-10):
+    # - yield_curve_10y_2y: recession-canonical curve, distinct from
+    #   yield_curve_slope (10Y-3M cyclical). Inverted values precede
+    #   recessions historically.
+    # - hy_oas_level / hy_oas_change_21d: HY-specific credit stress
+    #   regime. License-gated to 2023+ on FRED (forward signal).
+    # - baa10y_level / baa10y_change_21d: BBB-rated corporate spread,
+    #   full 40y FRED history. Provides credit-regime signal across
+    #   the full predictor training corpus.
+    "yield_curve_10y_2y",
+    "hy_oas_level",
+    "hy_oas_change_21d",
+    "baa10y_level",
+    "baa10y_change_21d",
 ]
 # Rolling window for time-series z-score. 252 trading days = 1 year, the
 # institutional default for macro normalization (captures one full regime
