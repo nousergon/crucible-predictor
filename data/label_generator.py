@@ -32,6 +32,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from labeling.triple_barrier import triple_barrier_alpha_labels
+
 
 def compute_labels(
     df: pd.DataFrame,
@@ -206,6 +208,103 @@ def compute_multi_horizon_labels(
     max_h = max(horizons)
     df = df.dropna(subset=[f"forward_return_{max_h}d"])
 
+    return df
+
+
+def compute_triple_barrier_alpha_labels(
+    df: pd.DataFrame,
+    benchmark_returns: pd.Series | None = None,
+    forward_window: int = 21,
+    vol_window: int = 20,
+    vol_multiplier: float = 2.0,
+    min_periods: int = 10,
+    column_name: str = "triple_barrier_alpha_21d",
+) -> pd.DataFrame:
+    """Append vol-scaled triple-barrier alpha labels to a featured DataFrame.
+
+    Per LdP *Advances in Financial Machine Learning* Ch. 3.4: for each row,
+    walk forward ``forward_window`` trading days using sector-neutral
+    residual log-returns and label by which barrier the path touches first
+    (profit-take, stop-loss, or time-out). Barriers are scaled to recent
+    realized vol (``barrier = vol_multiplier × σ_t``) so the label adapts
+    to each ticker's vol regime continuously instead of using static
+    constants that produce asymmetrically degenerate labels across
+    high-vol vs low-vol names.
+
+    Sector-neutral residual log-returns are computed per-step:
+    ``residual_t = log(close_t / close_{t-1}) - log(bench_t / bench_{t-1})``
+    σ_t is the EWMA std of the residual log-return series with span
+    ``vol_window``. Rows with insufficient EWMA history (< ``min_periods``)
+    receive NaN labels and are NOT dropped — caller is responsible for
+    handling NaN rows downstream (typical pattern: filter at training
+    array assembly).
+
+    The returned label is the realized residual log-return at first touch
+    (capped at the touched barrier) or window-end residual log-return
+    (uncapped) for time-out rows. Tail rows past data end are NaN.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain ``Close`` column with DatetimeIndex.
+    benchmark_returns : pd.Series or None
+        Benchmark Close prices (e.g. sector ETF for sector-neutral alpha,
+        SPY for market-relative alpha). When None, labels are based on
+        absolute log-returns instead of residuals.
+    forward_window : int
+        Time-out barrier in trading days. Default 21 (matches the
+        post-2026-05-09 horizon migration).
+    vol_window : int
+        EWMA span for vol estimate. Default 20 (≈ 1 trading month).
+    vol_multiplier : float
+        Barrier width as multiple of σ_t. Default 2.0 (≈ 2-sigma barriers,
+        LdP-standard).
+    min_periods : int
+        Minimum EWMA-window observations before σ_t is non-NaN. Below
+        this, label is NaN. Default 10.
+    column_name : str
+        Output column name. Default ``triple_barrier_alpha_21d``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Input DataFrame with ``column_name`` column appended. NaN at
+        front-of-history (insufficient vol history) and tail (past
+        data end). Rows are NOT dropped — use this column alongside
+        the legacy ``forward_return_5d`` from ``compute_labels``.
+    """
+    if df.empty:
+        df = df.copy()
+        df[column_name] = pd.Series(dtype=float)
+        return df
+
+    df = df.copy()
+    close = df["Close"].astype(float)
+    stock_log_ret = np.log(close / close.shift(1))
+
+    if benchmark_returns is not None:
+        bench_aligned = benchmark_returns.reindex(df.index, method="ffill").astype(float)
+        bench_log_ret = np.log(bench_aligned / bench_aligned.shift(1))
+        residual_log_ret = stock_log_ret - bench_log_ret
+    else:
+        residual_log_ret = stock_log_ret
+
+    # First row is NaN by construction (shift(1)) — replace with 0.0 for
+    # the cum-walk array (label at front-of-history will be NaN anyway
+    # via the vol-history gate below).
+    log_ret_arr = residual_log_ret.fillna(0.0).to_numpy(dtype=np.float64)
+
+    sigma = residual_log_ret.ewm(span=vol_window, min_periods=min_periods).std()
+    sigma_arr = sigma.to_numpy(dtype=np.float64)
+    barrier_arr = vol_multiplier * sigma_arr  # NaN where sigma is NaN
+
+    labels = triple_barrier_alpha_labels(
+        log_ret_arr,
+        forward_window=forward_window,
+        up_barrier_pct=barrier_arr,
+        down_barrier_pct=barrier_arr,
+    )
+    df[column_name] = labels
     return df
 
 

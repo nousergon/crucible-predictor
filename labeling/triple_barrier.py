@@ -88,8 +88,8 @@ def triple_barrier_class_labels(
 def triple_barrier_alpha_labels(
     log_returns: np.ndarray,
     forward_window: int = 21,
-    up_barrier_pct: float = 0.05,
-    down_barrier_pct: float = 0.05,
+    up_barrier_pct: float | np.ndarray = 0.05,
+    down_barrier_pct: float | np.ndarray = 0.05,
 ) -> np.ndarray:
     """Generate continuous triple-barrier alpha labels.
 
@@ -107,33 +107,45 @@ def triple_barrier_alpha_labels(
     the realized return is the barrier value, not the post-touch path.
     Time-out rows return uncapped because no exit triggered.
 
-    For Stage 3 of the regime-conditioning rebuild, callers pass
-    regime-vol-scaled barrier widths (e.g., barriers as multiples of
-    realized vol) so the label adapts to vol regime continuously.
+    For Stage 3 of the regime-conditioning rebuild, callers pass per-row
+    vol-scaled barrier widths (LdP Ch. 3.4): ``barrier = k × σ_t`` where
+    ``σ_t`` is a trailing-window vol estimate. Barriers may be scalar
+    (uniform across all rows, original Stage 0a behavior) or an ndarray
+    of length ``n`` (per-row). NaN barriers at any row produce a NaN
+    label at that row, propagating the underlying vol-estimate gap.
 
     Args:
         log_returns: (n,) log-return series
         forward_window: time-out barrier in trading days
-        up_barrier_pct: profit-take barrier (cumulative log return)
+        up_barrier_pct: profit-take barrier (cumulative log return).
+            Scalar broadcasts across all rows; ndarray of length n
+            applies row-wise. NaN at row i → label[i] = NaN.
         down_barrier_pct: stop-loss barrier as positive number; the
-            function negates internally
+            function negates internally. Scalar or ndarray as above.
 
     Returns:
-        (n,) float64 array — realized return label per row, NaN for tail.
+        (n,) float64 array — realized return label per row, NaN for tail
+        and for rows where either barrier is NaN.
     """
     n = len(log_returns)
+    up_arr = np.broadcast_to(np.asarray(up_barrier_pct, dtype=np.float64), (n,))
+    down_arr = np.broadcast_to(np.asarray(down_barrier_pct, dtype=np.float64), (n,))
     labels = np.full(n, np.nan, dtype=np.float64)
     for i in range(n - forward_window):
+        up_i = up_arr[i]
+        down_i = down_arr[i]
+        if np.isnan(up_i) or np.isnan(down_i):
+            continue  # NaN barrier → NaN label (already initialized)
         cum = 0.0
         hit = False
         for j in range(forward_window):
             cum += log_returns[i + 1 + j]
-            if cum >= up_barrier_pct:
-                labels[i] = up_barrier_pct
+            if cum >= up_i:
+                labels[i] = up_i
                 hit = True
                 break
-            if cum <= -down_barrier_pct:
-                labels[i] = -down_barrier_pct
+            if cum <= -down_i:
+                labels[i] = -down_i
                 hit = True
                 break
         if not hit:
