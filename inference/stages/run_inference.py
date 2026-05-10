@@ -216,14 +216,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # rows in oos_meta_rows). When both are loaded, GBM wins.
     research_cal = ctx.meta_models.get("research_calibrator")
     research_gbm = ctx.meta_models.get("research_gbm")
-    # Audit Phase 4 PR 4/6 (2026-05-07): RegimePredictorV2 +
-    # RegimeConditionedMeta ride alongside the single-Ridge meta-model
-    # in observe-only mode. Predicted regime + regime-conditioned alpha
-    # are captured per-ticker for parity comparison with the single-Ridge
-    # canonical alpha. Cutover is PR 5 after the gate (regime-conditioned
-    # IC > single-Ridge IC by ≥ 15% relative) clears on validation.
-    regime_predictor_v2 = ctx.meta_models.get("regime_predictor_v2")
-    regime_conditioned_meta = ctx.meta_models.get("regime_conditioned_meta")
     # Track A PR 5/6 cutover (2026-05-09): meta_model is now trained on
     # canonical alpha labels (log-domain risk-matched vs vol-cohort EW
     # basket); predicted_alpha IS the canonical alpha. No separate
@@ -454,48 +446,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             **macro_row_for_meta,  # raw macro features
         }
 
-        # Audit Phase 4 PR 4/6 (2026-05-07): regime-conditioned alpha
-        # parallel path. RegimePredictorV2 predicts the current regime
-        # (using macro features + SPY-momentum already in meta_features
-        # plus the row-level macro_* fields); RegimeConditionedMeta
-        # routes to the per-regime Ridge (or fallback) and produces an
-        # alternative alpha. Both predicted_regime and
-        # regime_conditioned_alpha ride alongside the single-Ridge alpha
-        # in the prediction dict. None values when the regime detector
-        # or the per-regime stack isn't loaded (early observation period,
-        # or training-side persistence was skipped this Saturday).
-        predicted_regime: str | None = None
-        regime_conditioned_alpha: float | None = None
-        if (
-            regime_predictor_v2 is not None
-            and getattr(regime_predictor_v2, "fitted", False)
-        ):
-            try:
-                predicted_regime = regime_predictor_v2.predict_class_from_dict(
-                    meta_features
-                )
-            except Exception as e:
-                log.debug(
-                    "RegimePredictorV2.predict_class_from_dict failed for %s: %s",
-                    ticker, e,
-                )
-        if (
-            predicted_regime is not None
-            and regime_conditioned_meta is not None
-            and getattr(regime_conditioned_meta, "fitted", False)
-        ):
-            try:
-                regime_conditioned_alpha = float(
-                    regime_conditioned_meta.predict_single_for_regime(
-                        meta_features, predicted_regime,
-                    )
-                )
-            except Exception as e:
-                log.debug(
-                    "RegimeConditionedMeta.predict_single_for_regime failed for %s: %s",
-                    ticker, e,
-                )
-
         # Track A PR 5/6 cutover (2026-05-09): canonical_predicted_alpha
         # parallel-output retired. predicted_alpha IS the canonical alpha
         # (meta_model is now trained on canonical labels).
@@ -523,32 +473,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 + 0.3 * (research_cal_prob - 0.5) * 0.1
                 + 0.2 * expected_move * np.sign(momentum_score)
             )
-
-        # Audit Phase 4 PR 5 cutover: when the operator has confirmed the
-        # cutover gate passes (offline ``analysis.regime_cutover_gate`` →
-        # flip ``regime_conditioned_inference_enabled`` in predictor.yaml),
-        # swap ``alpha`` to the regime-conditioned ensemble value. Falls
-        # back per-ticker to the single-Ridge ``alpha`` whenever the
-        # regime stack didn't produce a value for that ticker (regime
-        # classifier not loaded, prediction failed, or per-regime Ridge
-        # missing for the predicted regime). ``predicted_alpha_source``
-        # surfaces in the result dict so the operator can audit the
-        # source of each row's prediction post-cutover.
-        #
-        # Safe-by-construction: when the flag is False (default), this
-        # block is a no-op and inference behaves exactly as the pre-cutover
-        # single-Ridge production path. When the flag is True but the
-        # regime stack hasn't been promoted yet (e.g. RegimePredictorV2
-        # hasn't cleared its own gate this cycle), each ticker's
-        # regime_conditioned_alpha is None → fallback to single-Ridge
-        # alpha → again no observable behaviour change.
-        predicted_alpha_source = "single_ridge"
-        if (
-            getattr(cfg, "REGIME_CONDITIONED_INFERENCE_ENABLED", False)
-            and regime_conditioned_alpha is not None
-        ):
-            alpha = regime_conditioned_alpha
-            predicted_alpha_source = "regime_conditioned"
 
         # The manual research-signal adjustment that lived here pre-2026-04-28
         # was a workaround for the meta-trainer hardcoding research features
@@ -599,28 +523,6 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # cutover — it now equals research_calibrator_prob whenever the
             # GBM is loaded, and dashboards key off `research_calibrator_prob`.
             "research_calibrator_prob": round(research_cal_prob, 4),
-            # Audit Phase 4 PR 4/6: regime-conditioned parallel path.
-            # predicted_regime is the V2 detector's class label (or None
-            # when V2 isn't loaded). regime_conditioned_alpha is the
-            # per-regime Ridge stack's alpha for that regime (or None
-            # when the stack isn't loaded). Both ride alongside the
-            # single-Ridge canonical predicted_alpha in observe-only
-            # mode. Cutover is PR 5 after the gate (regime-conditioned
-            # IC > single-Ridge IC by ≥ 15% relative) clears.
-            "predicted_regime": predicted_regime,
-            "regime_conditioned_alpha": (
-                round(regime_conditioned_alpha, 6)
-                if regime_conditioned_alpha is not None else None
-            ),
-            # Audit Phase 4 PR 5 cutover: which ridge produced
-            # ``predicted_alpha`` for this row. ``"single_ridge"`` when
-            # the flag is off OR the regime stack didn't produce a value
-            # for this ticker; ``"regime_conditioned"`` when the cutover
-            # is active AND the per-regime Ridge produced a value.
-            # Distinct from ``predicted_regime`` (always populated when
-            # the V2 detector loaded; describes the ROUTING decision,
-            # not whether routing was used in production).
-            "predicted_alpha_source": predicted_alpha_source,
             # canonical_predicted_alpha parallel output retired with the
             # Track A PR 5/6 cutover (2026-05-09). predicted_alpha IS the
             # canonical alpha now (meta_model trained on canonical labels).

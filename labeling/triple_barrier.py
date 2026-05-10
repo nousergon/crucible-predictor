@@ -3,8 +3,8 @@
 Two label flavors share the same path-walking core:
 
 - ``triple_barrier_class_labels`` — 3-class direction labels (up / neutral
-  / down). Used by RegimePredictorV2 for SPY-based regime classification
-  and by future per-ticker direction classifiers.
+  / down). Reusable for SPY-based regime classification or per-ticker
+  direction classifiers under any future continuous-conditioning rebuild.
 
 - ``triple_barrier_alpha_labels`` — continuous alpha target: the realized
   cumulative log-return at first-touch (capped at the touched barrier)
