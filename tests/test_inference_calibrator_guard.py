@@ -80,11 +80,12 @@ def test_rescaling_runs_without_calibrator():
         f"Fallback rescaling expected p_up≈0.5 at alpha=0, got {bbb['p_up']}"
     )
 
-    # With max_abs=0.008 and META_ALPHA_CLIP floor=0.02, meta_clip=0.02.
-    # AAA at alpha=0.008 → p_up = 0.5 + 0.008/(2*0.02) = 0.70.
+    # With max_abs=0.008 and META_ALPHA_CLIP floor=0.05 (post 2026-05-10 21d
+    # log-domain bump), meta_clip=0.05. AAA at alpha=0.008 →
+    # p_up = 0.5 + 0.008/(2*0.05) = 0.58.
     aaa = next(p for p in ctx.predictions if p["ticker"] == "AAA")
-    assert abs(aaa["p_up"] - 0.70) < 1e-4, (
-        f"Fallback rescaling with floor clip expected p_up≈0.70 for alpha=0.008, got {aaa['p_up']}"
+    assert abs(aaa["p_up"] - 0.58) < 1e-4, (
+        f"Fallback rescaling with floor clip expected p_up≈0.58 for alpha=0.008, got {aaa['p_up']}"
     )
     assert aaa["predicted_direction"] == "UP"
 
@@ -177,9 +178,11 @@ def test_variance_fallback_engages_on_collapse(caplog):
         f"Variance fallback engaged but batch p_up still has {len(p_ups)} "
         f"unique value(s) — linear heuristic didn't fire. p_ups={p_ups}"
     )
-    # Linear heuristic uses META_ALPHA_CLIP=0.02 floor; with alphas spanning
-    # [-0.013, +0.013] meta_clip=0.02 → p_up ≈ 0.5 + a/0.04. Min/max should
-    # span ~[0.175, 0.825].
+    # Linear heuristic uses META_ALPHA_CLIP=0.05 floor (post 2026-05-10 21d
+    # log-domain bump); with alphas spanning [-0.013, +0.013] the actual
+    # max_abs=0.013 is below the floor, so meta_clip=0.05 → p_up ≈ 0.5 +
+    # a/0.10. Min/max land near [0.37, 0.63] — variance is recovered, just
+    # at the floor's smaller boost than the pre-bump 0.02 produced.
     assert min(p_ups) < 0.4 and max(p_ups) > 0.6, (
         f"Linear fallback should produce p_up spanning [<0.4, >0.6], got "
         f"[{min(p_ups):.4f}, {max(p_ups):.4f}]"
