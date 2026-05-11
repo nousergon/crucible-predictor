@@ -40,6 +40,34 @@ def _safe_get_numeric(latest: pd.Series, key: str, default: float) -> float:
         return float(default)
 
 
+def compute_momentum_veto(
+    latest, threshold: float,
+) -> tuple[float | None, bool]:
+    """Return ``(momentum_20d, momentum_veto)`` for a precomputed feature row.
+
+    Extracts the 20-day raw return from the row (``momentum_20d`` feature,
+    set by ``alpha-engine-data/features/feature_engineer.py`` as
+    ``close/close.shift(20) - 1``). Veto fires when the return is below
+    ``threshold`` (typically -0.05 = -5%).
+
+    Missing / non-finite ``momentum_20d`` returns ``(None, False)`` —
+    fail-safe under-veto direction matching the gbm_veto path's
+    missing-field behavior.
+
+    Refactored out of run() per 2026-05-11 PR moving momentum_gate from
+    executor to predictor; keeps the veto rule independently testable
+    without spinning up the full inference pipeline.
+    """
+    raw = latest.get("momentum_20d") if hasattr(latest, "get") else None
+    try:
+        m20 = float(raw)
+        if not np.isfinite(m20):
+            return None, False
+    except (TypeError, ValueError):
+        return None, False
+    return m20, m20 < threshold
+
+
 def _emit_nan_feature_tickers_metric(count: int) -> None:
     """Emit ``AlphaEngine/Predictor/nan_feature_tickers_count`` gauge.
 
@@ -478,6 +506,16 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # inputs degrade to neutral defaults inside predict_dict.
         momentum_score = _momentum_scorer_predict_dict(latest)
 
+        # Per-ticker momentum veto. Picks up the raw 20-day return from
+        # the precomputed feature row and flags falling-knife candidates.
+        # Migrated from executor's inline ``momentum_gate`` (2026-05-11)
+        # so signal-side rules live with the predictor and the executor
+        # can focus on risk-rule enforcement (sector / position / drawdown
+        # caps).
+        momentum_20d, momentum_veto = compute_momentum_veto(
+            latest, threshold=cfg.MOMENTUM_VETO_THRESHOLD,
+        )
+
         # Layer 1B: Volatility model. LightGBM handles NaN natively; if
         # predict raises that's a real load/inference fault we want loud,
         # not a per-ticker silent zero.
@@ -688,6 +726,17 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # Track A PR 5/6 cutover (2026-05-09). predicted_alpha IS the
             # canonical alpha now (meta_model trained on canonical labels).
             "momentum_confirmation": round(momentum_score, 6),
+            # Raw 20-day return + the boolean veto signal derived from
+            # cfg.MOMENTUM_VETO_THRESHOLD. The executor reads
+            # ``momentum_veto`` and treats it as a hard skip in
+            # deciders._plan_entries (replaces the prior executor-side
+            # inline momentum_gate). ``momentum_20d`` is included for
+            # observability + backtester attribution; the veto flag is
+            # the executor-facing decision.
+            "momentum_20d": (
+                round(momentum_20d, 6) if momentum_20d is not None else None
+            ),
+            "momentum_veto": momentum_veto,
             "expected_move": round(expected_move, 6),
             # Stage 1c parallel-observation field: macro-augmented vol
             # GBM prediction. Rides alongside ``expected_move`` for offline

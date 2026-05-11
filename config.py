@@ -230,6 +230,16 @@ _gates_cfg = _cfg["gates"]
 MIN_HIT_RATE = _gates_cfg["min_hit_rate"]
 MIN_IC = _gates_cfg["min_ic"]
 MIN_CONFIDENCE = _gates_cfg["min_confidence"]
+# Momentum veto threshold for the per-ticker ``momentum_veto`` flag on
+# predictions.json. A ticker whose 20-day raw return is below this
+# threshold gets ``momentum_veto=True``, signaling the executor to skip
+# the ENTER (falling-knife guard). Moved from executor's inline
+# momentum_gate (2026-05-11 refactor) to consolidate signal-side rules
+# on the predictor side and free the executor to focus on risk rules.
+# Default -0.05 (-5% over 20 days) matches the prior executor default.
+# ``.get(..., -0.05)`` fallback lets this ship before predictor.yaml is
+# updated in alpha-engine-config.
+MOMENTUM_VETO_THRESHOLD = _gates_cfg.get("momentum_veto_threshold", -0.05)
 
 # ── Training split (by time, no lookahead) ───────────────────────────────────
 _split_cfg = _cfg["split"]
