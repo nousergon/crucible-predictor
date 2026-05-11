@@ -144,6 +144,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --subnet-id "$SUBNET_ID" \
   --iam-instance-profile Name="$IAM_PROFILE" \
   --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+  --instance-initiated-shutdown-behavior terminate \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":30,"VolumeType":"gp3"}}]' \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=alpha-engine-gbm-train-$(date +%Y%m%d)}]" \
   --region "$AWS_REGION" \
