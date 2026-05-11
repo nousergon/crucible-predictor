@@ -17,6 +17,7 @@ import pandas as pd
 import config as cfg
 from inference.pipeline import PipelineContext, PipelineAbort
 from model.momentum_scorer import predict_dict as _momentum_scorer_predict_dict
+from model.stance_classifier import classify_stance
 
 log = logging.getLogger(__name__)
 
@@ -516,6 +517,22 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             latest, threshold=cfg.MOMENTUM_VETO_THRESHOLD,
         )
 
+        # Per-ticker stance classifier — emits BOTH continuous loadings
+        # (institutional factor-model pattern) AND the dominant stance
+        # label (simple-consumer routing). 4-element closed taxonomy:
+        # momentum / value / quality / catalyst. Stance is DERIVED from
+        # per-ticker features here, not declared by the sector-team
+        # agents. Origin: 2026-05-11 stance taxonomy arc, mid-arc pivot
+        # to predictor-emitted stance + continuous loadings per
+        # alpha-engine-docs/private/stance-taxonomy-arc-260511.md.
+        #
+        # Simple consumers (executor v1, dashboards) read ``stance``
+        # and route by single label. Nuanced consumers (backtester
+        # per-loading attribution, future weighted-gate executor v2,
+        # future ML stance classifier) read ``stance_loadings`` and
+        # weight gates / sizing / attribution by each loading.
+        stance, stance_loadings, catalyst_date = classify_stance(latest)
+
         # Layer 1B: Volatility model. LightGBM handles NaN natively; if
         # predict raises that's a real load/inference fault we want loud,
         # not a per-ticker silent zero.
@@ -737,6 +754,31 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 round(momentum_20d, 6) if momentum_20d is not None else None
             ),
             "momentum_veto": momentum_veto,
+            # Per-ticker stance from the heuristic classifier
+            # (model/stance_classifier.py).
+            #
+            # ``stance`` (StanceLiteral) — discrete dominant label,
+            # ``argmax(stance_loadings)``. Simple consumers (executor
+            # v1, dashboards) route by this single label.
+            #
+            # ``stance_loadings`` (StanceLoadings shape) — continuous
+            # 4-element softmax probability distribution. Nuanced
+            # consumers (backtester per-loading attribution, future
+            # weighted-gate executor v2, future ML stance classifier)
+            # read this and weight gates / sizing proportionally.
+            #
+            # Both fields ride on every prediction; storage cost is
+            # trivial and the dual emission lets us bridge to ML v2
+            # (which naturally emits calibrated softmax) without a
+            # schema migration.
+            #
+            # ``catalyst_date`` populated only when the feature row
+            # provides ``next_earnings_date``; the executor's catalyst
+            # gate computes the hard-exit date from this field + 3
+            # trading days.
+            "stance": stance,
+            "stance_loadings": stance_loadings,
+            "catalyst_date": catalyst_date,
             "expected_move": round(expected_move, 6),
             # Stage 1c parallel-observation field: macro-augmented vol
             # GBM prediction. Rides alongside ``expected_move`` for offline
