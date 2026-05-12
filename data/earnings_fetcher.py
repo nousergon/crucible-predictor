@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +31,7 @@ _RATE_LIMIT_DELAY = 0.25  # 4 req/sec to stay under 5/sec limit
 
 
 def _fmp_get(endpoint: str, params: Optional[dict] = None, base: str = _FMP_BASE) -> dict | list:
-    api_key = os.environ.get("FMP_API_KEY", "")
+    api_key = get_secret("FMP_API_KEY", required=False, default="")
     if not api_key:
         raise RuntimeError("FMP_API_KEY environment variable not set.")
     url = f"{base}/{endpoint}"

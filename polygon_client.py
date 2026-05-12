@@ -23,13 +23,14 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections import deque
 from datetime import date, datetime, timedelta
 
 import pandas as pd
 import requests
+
+from alpha_engine_lib.secrets import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class PolygonClient:
     """Rate-limited polygon.io REST client with dividend adjustment."""
 
     def __init__(self, api_key: str | None = None, calls_per_min: int = 5):
-        self._api_key = api_key or os.environ.get("POLYGON_API_KEY", "")
+        self._api_key = api_key or get_secret("POLYGON_API_KEY", required=False, default="")
         if not self._api_key:
             raise ValueError("POLYGON_API_KEY not set")
         self._calls_per_min = calls_per_min
