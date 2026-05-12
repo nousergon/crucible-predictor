@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from alpha_engine_lib.secrets import get_secret
+
 import config as cfg
 from inference.pipeline import PipelineContext
 from inference.s3_io import _s3_put_json
@@ -776,7 +778,7 @@ def send_predictor_email(
 
     # Morning briefing HTML archival removed — no consumers read it (email delivers the content).
 
-    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
 
     if app_password:
         import smtplib

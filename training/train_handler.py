@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import smtplib
 import tempfile
 import time
@@ -56,6 +55,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
 
+from alpha_engine_lib.secrets import get_secret
 from ssm_secrets import load_secrets
 
 load_secrets()
@@ -606,7 +606,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             + f"{feat_health_plain}\n"
         )
 
-    app_password = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
+    app_password = (get_secret("GMAIL_APP_PASSWORD", required=False, default="") or "").strip()
 
     if app_password:
         msg = MIMEMultipart("alternative")
