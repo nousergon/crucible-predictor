@@ -80,12 +80,30 @@ class TestPlattCalibrator:
 
         result = cal.calibrate_prediction(0.05)
         assert result["predicted_direction"] == "UP"
-        assert 0.5 < result["prediction_confidence"] <= 1.0
+        # New semantics: confidence = |p_up - 0.5| * 2 ∈ [0, 1].
+        assert 0.0 <= result["prediction_confidence"] <= 1.0
         assert result["p_up"] + result["p_down"] == pytest.approx(1.0, abs=0.01)
+        # Confidence is the distance from coin-flip, doubled.
+        assert result["prediction_confidence"] == pytest.approx(
+            abs(result["p_up"] - 0.5) * 2.0, abs=1e-3,
+        )
 
         result_neg = cal.calibrate_prediction(-0.05)
         assert result_neg["predicted_direction"] == "DOWN"
-        assert result_neg["prediction_confidence"] > 0.5
+        assert result_neg["prediction_confidence"] >= 0.0
+        assert result_neg["prediction_confidence"] == pytest.approx(
+            abs(result_neg["p_up"] - 0.5) * 2.0, abs=1e-3,
+        )
+
+    def test_calibrate_prediction_confidence_at_coin_flip(self):
+        """Coin-flip p_up=0.5 should yield zero confidence (post-2026-05-12)."""
+        from model.calibrator import PlattCalibrator
+
+        cal = PlattCalibrator(method="platt")
+        # Unfitted → linear fallback: p_up = 0.5 + 0/(2*0.15) = 0.5
+        result = cal.calibrate_prediction(0.0, label_clip=0.15)
+        assert result["p_up"] == pytest.approx(0.5, abs=1e-6)
+        assert result["prediction_confidence"] == pytest.approx(0.0, abs=1e-6)
 
     def test_calibrate_prediction_linear_fallback(self):
         """Unfitted calibrator should use linear fallback."""
@@ -98,6 +116,8 @@ class TestPlattCalibrator:
         # Linear: p_up = 0.5 + 0.075 / 0.30 = 0.75
         assert result["p_up"] == pytest.approx(0.75, abs=0.01)
         assert result["predicted_direction"] == "UP"
+        # Confidence = |0.75 - 0.5| * 2 = 0.5
+        assert result["prediction_confidence"] == pytest.approx(0.5, abs=0.02)
 
     def test_save_load_roundtrip(self, synthetic_data):
         from model.calibrator import PlattCalibrator

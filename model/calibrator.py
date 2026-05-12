@@ -125,6 +125,13 @@ class PlattCalibrator:
         Calibrate a single prediction. Returns p_up, p_down, direction, confidence.
 
         Falls back to linear calibration if not fitted.
+
+        Confidence semantics: ``|p_up - 0.5| * 2`` — distance from coin-flip on
+        [0, 1]. At p_up=0.5 the model has no opinion → confidence=0.0; at
+        p_up=1.0 or 0.0 the model is certain → confidence=1.0. Pre-2026-05-12
+        this was ``max(p_up, p_down)`` (range [0.5, 1.0]), which treated a
+        coin-flip prediction as "0.5 confident" — load-bearing on the
+        DOWN-veto inversion at the 75%+ band (ROADMAP L1594).
         """
         alpha = float(np.clip(raw_alpha, -label_clip, label_clip))
 
@@ -135,12 +142,8 @@ class PlattCalibrator:
             p_up = float(np.clip(0.5 + alpha / (2.0 * label_clip), 0.0, 1.0))
 
         p_down = 1.0 - p_up
-        if alpha >= 0:
-            direction = "UP"
-            confidence = p_up
-        else:
-            direction = "DOWN"
-            confidence = p_down
+        direction = "UP" if p_up >= 0.5 else "DOWN"
+        confidence = abs(p_up - 0.5) * 2.0
 
         return {
             "p_up": round(p_up, 4),

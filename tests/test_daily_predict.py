@@ -24,13 +24,14 @@ class TestBuildPredictorEmail:
 
     def _make_predictions(self, n: int = 5) -> list[dict]:
         """Create synthetic prediction dicts."""
-        directions = ["UP", "FLAT", "DOWN"]
+        # Binary direction post-2026-05-12 (ROADMAP L1615).
+        directions = ["UP", "DOWN"]
         preds = []
         for i in range(n):
             preds.append({
                 "ticker": f"TICK{i}",
                 "predicted_alpha": 0.05 - i * 0.025,
-                "predicted_direction": directions[i % 3],
+                "predicted_direction": directions[i % 2],
                 "prediction_confidence": 0.7 + i * 0.05,
                 "combined_rank": float(i + 1),
                 "watchlist_source": "tracked" if i % 2 == 0 else "buy_candidate",
@@ -253,48 +254,48 @@ class TestGetVetoThreshold:
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_bear_regime_lowers_threshold(self, mock_load):
-        """Bear regime should lower the threshold by 0.10."""
+        """Bear regime should lower the threshold by 0.20 (new convention)."""
         from inference.daily_predict import get_veto_threshold
 
-        mock_load.return_value = {"veto_confidence": 0.65}
+        mock_load.return_value = {"veto_confidence": 0.30}
         result = get_veto_threshold("test-bucket", "bear")
-        assert result == pytest.approx(0.55)
+        assert result == pytest.approx(0.10)
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_bullish_regime_raises_threshold(self, mock_load):
-        """Bullish regime should raise the threshold by 0.05."""
+        """Bullish regime should raise the threshold by 0.10 (new convention)."""
         from inference.daily_predict import get_veto_threshold
 
-        mock_load.return_value = {"veto_confidence": 0.65}
+        mock_load.return_value = {"veto_confidence": 0.30}
         result = get_veto_threshold("test-bucket", "bullish")
-        assert result == pytest.approx(0.70)
+        assert result == pytest.approx(0.40)
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_caution_regime(self, mock_load):
-        """Caution regime should lower threshold by 0.05."""
+        """Caution regime should lower threshold by 0.10 (new convention)."""
         from inference.daily_predict import get_veto_threshold
 
-        mock_load.return_value = {"veto_confidence": 0.65}
+        mock_load.return_value = {"veto_confidence": 0.30}
         result = get_veto_threshold("test-bucket", "caution")
-        assert result == pytest.approx(0.60)
+        assert result == pytest.approx(0.20)
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_threshold_clamped_floor(self, mock_load):
-        """Threshold should not go below 0.40 even with bear adjustment."""
+        """Threshold should not go below 0.0 even with bear adjustment."""
         from inference.daily_predict import get_veto_threshold
 
-        mock_load.return_value = {"veto_confidence": 0.42}
+        mock_load.return_value = {"veto_confidence": 0.10}
         result = get_veto_threshold("test-bucket", "bear")
-        assert result == 0.40
+        assert result == 0.0
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_threshold_clamped_ceiling(self, mock_load):
-        """Threshold should not exceed 0.90 even with bullish adjustment."""
+        """Threshold should not exceed 0.80 even with bullish adjustment."""
         from inference.daily_predict import get_veto_threshold
 
-        mock_load.return_value = {"veto_confidence": 0.88}
+        mock_load.return_value = {"veto_confidence": 0.75}
         result = get_veto_threshold("test-bucket", "bullish")
-        assert result == 0.90
+        assert result == 0.80
 
     @patch("inference.stages.write_output._load_predictor_params_from_s3")
     def test_empty_regime_string(self, mock_load):

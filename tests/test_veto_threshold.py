@@ -18,30 +18,31 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("bucket", "neutral")
         assert result == pytest.approx(0.65)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_bear_regime_lowers(self, _mock):
+        # Post-2026-05-12 confidence semantics: |p_up - 0.5| * 2 ∈ [0, 1].
         result = get_veto_threshold("bucket", "bear")
-        assert result == pytest.approx(0.55)
+        assert result == pytest.approx(0.10)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_caution_regime(self, _mock):
         result = get_veto_threshold("bucket", "caution")
-        assert result == pytest.approx(0.60)
+        assert result == pytest.approx(0.20)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_bull_regime_raises(self, _mock):
         result = get_veto_threshold("bucket", "bull")
-        assert result == pytest.approx(0.70)
+        assert result == pytest.approx(0.40)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_bullish_alias(self, _mock):
         result = get_veto_threshold("bucket", "bullish")
-        assert result == pytest.approx(0.70)
+        assert result == pytest.approx(0.40)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_bearish_alias(self, _mock):
         result = get_veto_threshold("bucket", "bearish")
-        assert result == pytest.approx(0.55)
+        assert result == pytest.approx(0.10)
 
     @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
     def test_unknown_regime_no_adjustment(self, _mock):
@@ -53,20 +54,20 @@ class TestGetVetoThreshold:
         result = get_veto_threshold("bucket", "")
         assert result == pytest.approx(0.65)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.45})
-    def test_bear_clamped_at_040(self, _mock):
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.10})
+    def test_bear_clamped_at_zero(self, _mock):
         result = get_veto_threshold("bucket", "bear")
-        assert result == pytest.approx(0.40)
+        assert result == pytest.approx(0.0)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.88})
-    def test_bull_clamped_at_090(self, _mock):
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.75})
+    def test_bull_clamped_at_080(self, _mock):
         result = get_veto_threshold("bucket", "bull")
-        assert result == pytest.approx(0.90)
+        assert result == pytest.approx(0.80)
 
     @patch.object(wo, "_load_predictor_params_from_s3", return_value=None)
     def test_no_s3_uses_config_default(self, _mock):
         result = get_veto_threshold("bucket", "neutral")
-        assert 0.40 <= result <= 0.90
+        assert 0.0 <= result <= 0.80
 
 
 class TestLoadPredictorParams:
