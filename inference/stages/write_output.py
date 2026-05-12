@@ -82,11 +82,16 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
     to protect capital. In bull regimes, the threshold is raised (more permissive)
     to avoid missing opportunities.
 
+    Confidence semantics post-2026-05-12: ``|p_up - 0.5| * 2`` (ROADMAP L1615).
+    A threshold of 0.30 corresponds to the prior 0.65 winner-probability gate
+    via the linear map ``new = (old - 0.5) * 2``. Regime adjustments doubled
+    to preserve the same relative pull on the new [0, 1] axis.
+
     Regime adjustments (applied to the base threshold from S3 or config):
-      bear:    -0.10  (e.g., 0.65 → 0.55 — veto more aggressively)
-      caution: -0.05  (e.g., 0.65 → 0.60)
+      bear:    -0.20  (e.g., 0.30 → 0.10 — veto more aggressively)
+      caution: -0.10  (e.g., 0.30 → 0.20)
       neutral:  0.00  (no adjustment)
-      bullish: +0.05  (e.g., 0.65 → 0.70 — allow more entries)
+      bullish: +0.10  (e.g., 0.30 → 0.40 — allow more entries)
     """
     params = _load_predictor_params_from_s3(s3_bucket)
     if params and "veto_confidence" in params:
@@ -97,15 +102,15 @@ def get_veto_threshold(s3_bucket: str, market_regime: str = "") -> float:
     # Regime-adaptive adjustment
     regime = market_regime.lower().strip() if market_regime else ""
     regime_adjustments = {
-        "bear": -0.10,
-        "bearish": -0.10,
-        "caution": -0.05,
+        "bear": -0.20,
+        "bearish": -0.20,
+        "caution": -0.10,
         "neutral": 0.0,
-        "bull": 0.05,
-        "bullish": 0.05,
+        "bull": 0.10,
+        "bullish": 0.10,
     }
     adjustment = regime_adjustments.get(regime, 0.0)
-    adjusted = max(0.40, min(0.90, base + adjustment))
+    adjusted = max(0.0, min(0.80, base + adjustment))
 
     if adjustment != 0.0:
         log.info(

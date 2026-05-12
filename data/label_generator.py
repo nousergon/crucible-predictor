@@ -2,14 +2,16 @@
 data/label_generator.py — Forward-return label computation.
 
 Given a DataFrame of OHLCV + computed features, this module computes the
-5-trading-day forward return for each row and bins it into three classes:
+forward return for each row and bins it into two classes:
 
-    UP   — forward_return > up_threshold   → label 2
-    FLAT — forward_return in [down, up]    → label 1
-    DOWN — forward_return < down_threshold → label 0
+    UP   — forward_return >= 0 → label 1
+    DOWN — forward_return < 0  → label 0
 
-The integer mapping (DOWN=0, FLAT=1, UP=2) matches CLASS_LABELS in config.py
-and the model output neuron indices.
+The 3-class UP/FLAT/DOWN taxonomy was retired 2026-05-12 (ROADMAP L1615) —
+the meta-model trains on continuous forward returns and the calibrator
+fits on sign(meta_y) as a pure binary target. The 3-band labels here had
+zero production consumers (meta_trainer regresses on continuous y_fwd
+directly) but were still being emitted and reported via label_distribution.
 
 When benchmark_returns (a benchmark Close series) is provided, the label is
 based on the relative return vs the benchmark rather than the absolute return:
@@ -57,44 +59,34 @@ def compute_labels(
     forward_days : int
         Number of trading days ahead to compute the forward return.
         Default is 5 (one calendar week).
-    up_threshold : float
-        Minimum return to classify as UP. Default +1% (0.01).
-        Ignored when adaptive_thresholds=True.
-    down_threshold : float
-        Maximum return to classify as DOWN. Default -1% (-0.01).
-        Ignored when adaptive_thresholds=True.
+    up_threshold, down_threshold, adaptive_thresholds, adaptive_window,
+    adaptive_up_pct, adaptive_down_pct : retained for backward compatibility
+        with callers; ignored under the binary UP/DOWN taxonomy. Direction
+        is determined by sign(forward_return) regardless of threshold values.
     benchmark_returns : pd.Series or None
         Benchmark Close prices with a DatetimeIndex. When provided, labels are
         based on stock return minus benchmark return (relative alpha), rather
-        than the absolute return. The forward_return_5d column stores the
-        relative return value for IC computation.
+        than the absolute return.
 
         Pass SPY Close for market-relative alpha (original behaviour).
         Pass a sector ETF Close (e.g. XLK for Information Technology) for
-        sector-neutral (idiosyncratic) alpha — recommended when sector_map.json
-        is available, as it removes sector-level noise from the training target.
-    adaptive_thresholds : bool
-        When True, UP/DOWN thresholds are computed per-row as rolling percentiles
-        of forward returns, adapting to the current volatility regime. This avoids
-        the problem of fixed ±1% being too easy in high-vol and too hard in low-vol.
-    adaptive_window : int
-        Rolling window (trading days) for computing adaptive percentiles.
-        Default 63 (~3 months).
-    adaptive_up_pct : float
-        Percentile for UP threshold (e.g. 65 = top 35% of returns → UP).
-    adaptive_down_pct : float
-        Percentile for DOWN threshold (e.g. 35 = bottom 35% of returns → DOWN).
+        sector-neutral (idiosyncratic) alpha.
 
     Returns
     -------
     pd.DataFrame
         Input DataFrame with three new columns appended:
-        - forward_return_5d  (float) : absolute or relative 5-day forward return
-        - direction          (str)   : "UP", "FLAT", or "DOWN"
-        - direction_int      (int)   : 2, 1, or 0 respectively
+        - forward_return_5d  (float) : absolute or relative forward return
+        - direction          (str)   : "UP" or "DOWN" (binary, post-2026-05-12)
+        - direction_int      (int)   : 1 or 0 respectively
         Rows where forward_return_5d is NaN (last forward_days rows) are
         dropped, since they have no label.
     """
+    # Adaptive-threshold knobs retained in the signature so existing callers
+    # keep type-checking, but they no longer influence binary labels.
+    del up_threshold, down_threshold
+    del adaptive_thresholds, adaptive_window, adaptive_up_pct, adaptive_down_pct
+
     if df.empty:
         df = df.copy()
         df["forward_return_5d"] = pd.Series(dtype=float)
@@ -122,37 +114,10 @@ def compute_labels(
     # Drop rows where the forward return is undefined (end of series)
     df = df.dropna(subset=["forward_return_5d"])
 
-    if adaptive_thresholds and len(df) >= adaptive_window:
-        # Volatility-adaptive thresholds: rolling percentiles of forward returns.
-        # In low-vol periods, thresholds tighten; in high-vol, they widen.
-        rolling_up = df["forward_return_5d"].rolling(
-            window=adaptive_window, min_periods=adaptive_window // 2
-        ).quantile(adaptive_up_pct / 100.0)
-        rolling_down = df["forward_return_5d"].rolling(
-            window=adaptive_window, min_periods=adaptive_window // 2
-        ).quantile(adaptive_down_pct / 100.0)
-
-        # Fall back to fixed thresholds where rolling data is insufficient
-        rolling_up = rolling_up.fillna(up_threshold)
-        rolling_down = rolling_down.fillna(down_threshold)
-
-        conditions = [
-            df["forward_return_5d"] > rolling_up,
-            df["forward_return_5d"] < rolling_down,
-        ]
-    else:
-        # Fixed thresholds (original behavior)
-        conditions = [
-            df["forward_return_5d"] > up_threshold,
-            df["forward_return_5d"] < down_threshold,
-        ]
-
-    choices_str = ["UP", "DOWN"]
-    df["direction"] = np.select(conditions, choices_str, default="FLAT")
-
-    # Integer labels: DOWN=0, FLAT=1, UP=2 (matches CLASS_LABELS order in config)
-    label_map = {"DOWN": 0, "FLAT": 1, "UP": 2}
-    df["direction_int"] = df["direction"].map(label_map).astype(int)
+    # Binary sign label — UP if forward_return >= 0 else DOWN.
+    is_up = df["forward_return_5d"] >= 0
+    df["direction"] = np.where(is_up, "UP", "DOWN")
+    df["direction_int"] = is_up.astype(int)
 
     return df
 
@@ -315,14 +280,14 @@ def label_distribution(df: pd.DataFrame) -> dict[str, float]:
 
     Returns
     -------
-    dict with keys "UP", "FLAT", "DOWN" and float proportion values.
+    dict with keys "UP" and "DOWN" and float proportion values
+    (post-2026-05-12 binary taxonomy).
     """
     if "direction" not in df.columns or df.empty:
-        return {"UP": 0.0, "FLAT": 0.0, "DOWN": 0.0}
+        return {"UP": 0.0, "DOWN": 0.0}
 
     counts = df["direction"].value_counts(normalize=True)
     return {
         "UP": float(counts.get("UP", 0.0)),
-        "FLAT": float(counts.get("FLAT", 0.0)),
         "DOWN": float(counts.get("DOWN", 0.0)),
     }

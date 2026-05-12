@@ -119,8 +119,9 @@ def check_prediction_drift(s3, bucket: str, date_str: str) -> list[str]:
         alerts.append("Today's predictions are empty")
         return alerts
 
-    # Direction clustering (single day)
-    directions = [p.get("predicted_direction", "FLAT") for p in today]
+    # Direction clustering (single day). Filter None — missing
+    # predicted_direction shouldn't count as its own cluster.
+    directions = [d for d in (p.get("predicted_direction") for p in today) if d]
     if directions:
         from collections import Counter
         counts = Counter(directions)
@@ -135,9 +136,9 @@ def check_prediction_drift(s3, bucket: str, date_str: str) -> list[str]:
     if len(recent_preds) >= CONSECUTIVE_DAYS_THRESHOLD:
         consecutive_clustered = 0
         for day_data in recent_preds[:CONSECUTIVE_DAYS_THRESHOLD]:
-            day_dirs = [p.get("predicted_direction", "FLAT") for p in day_data["predictions"]]
+            day_dirs = [d for d in (p.get("predicted_direction") for p in day_data["predictions"]) if d]
             if day_dirs:
-                day_counts = {}
+                day_counts: dict[str, int] = {}
                 for d in day_dirs:
                     day_counts[d] = day_counts.get(d, 0) + 1
                 day_dominant_pct = max(day_counts.values()) / len(day_dirs)

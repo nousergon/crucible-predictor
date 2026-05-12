@@ -704,7 +704,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 log.debug("meta_alpha_tb predict failed for %s: %s", ticker, _e)
                 meta_alpha_tb = None
 
-        # Calibrated confidence
+        # Calibrated confidence. Confidence semantics: |p_up - 0.5| * 2 — see
+        # model/calibrator.calibrate_prediction docstring for the rationale
+        # (DOWN-veto inversion at 75%+ band, ROADMAP L1594).
         _cal = getattr(ctx, "calibrator", None)
         if _cal is not None and _cal.is_fitted:
             _cal_result = _cal.calibrate_prediction(alpha, label_clip=max_r)
@@ -714,13 +716,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             confidence = _cal_result["prediction_confidence"]
         else:
             p_up = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
-            p_down = float(np.clip(0.5 - alpha / (2.0 * max_r), 0.0, 1.0))
-            if alpha >= 0:
-                predicted_direction = "UP"
-                confidence = p_up
-            else:
-                predicted_direction = "DOWN"
-                confidence = p_down
+            p_down = 1.0 - p_up
+            predicted_direction = "UP" if p_up >= 0.5 else "DOWN"
+            confidence = abs(p_up - 0.5) * 2.0
 
         result = {
             "ticker": ticker,

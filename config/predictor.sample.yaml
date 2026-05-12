@@ -98,7 +98,10 @@ gbm:
 gates:
   min_hit_rate: 0.52               # min directional accuracy to deploy
   min_ic: 0.02                     # min Pearson IC to promote model
-  min_confidence: 0.60             # min confidence for veto gate
+  # min confidence for veto gate. Confidence semantics post-2026-05-12:
+  # |p_up - 0.5| * 2 ∈ [0, 1] (ROADMAP L1615). Prior 0.60 winner-probability
+  # gate maps to 0.20 under the new convention via new = (old - 0.5) * 2.
+  min_confidence: 0.20
 
 # ── Training split ────────────────────────────────────────────────────────────
 split:

@@ -130,7 +130,6 @@ FEATURES = [
     "current_ratio",             # Current ratio / 3, normalized
 ]
 N_FEATURES = 53
-N_CLASSES = 3  # UP, FLAT, DOWN
 
 # Macro features — identical across all tickers on a given day, cannot predict
 # cross-sectional alpha.  Excluded from GBM training/inference but kept in
@@ -151,9 +150,6 @@ _FUNDAMENTAL_EXCLUDE = {
 
 GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES and f not in _FUNDAMENTAL_EXCLUDE]
 N_GBM_FEATURES = len(GBM_FEATURES)  # 38 (31 technical + 7 alternative)
-
-# Class labels — index matches model output neuron order
-CLASS_LABELS = ["DOWN", "FLAT", "UP"]  # index 0, 1, 2
 
 # ── Model architecture hyperparameters ───────────────────────────────────────
 _model_cfg = _cfg["model"]

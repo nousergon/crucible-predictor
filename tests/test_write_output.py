@@ -71,15 +71,16 @@ class TestGetVetoThresholdExtended:
         wo._predictor_params_cache = None
         wo._predictor_params_loaded = False
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_case_insensitive_regime(self, _mock):
+        # Post-2026-05-12: bear adjustment is -0.20 in new confidence units.
         result = get_veto_threshold("bucket", "  BEAR  ")
-        assert result == pytest.approx(0.55)
+        assert result == pytest.approx(0.10)
 
-    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.65})
+    @patch.object(wo, "_load_predictor_params_from_s3", return_value={"veto_confidence": 0.30})
     def test_none_regime(self, _mock):
         result = get_veto_threshold("bucket", None)
-        assert result == pytest.approx(0.65)
+        assert result == pytest.approx(0.30)
 
 
 class TestMergePredictions:
@@ -231,19 +232,21 @@ class TestCoverageGuard:
 class TestGbmVetoConfidenceFloor:
     """Pin the confidence floor on gbm_veto computation.
 
-    With ``p_flat=0`` hardcoded in run_inference.py:676 (binary UP/DOWN
-    output), every prediction is forced to one extreme even when the
-    underlying alpha estimate is near zero. Without a confidence floor,
-    low-confidence DOWN predictions (which a 3-class model would have
-    left in FLAT mass) fire ``gbm_veto`` and over-block research's ENTER
-    candidates. 2026-05-11 incident: 15 of 30 vetos with mean DOWN
-    confidence 0.749; 8 of 28 research ENTERs blocked by predictor.
+    The binary UP/DOWN output forces every prediction to one extreme even
+    when the underlying alpha estimate is near zero. Without a confidence
+    floor, low-confidence DOWN predictions (near coin-flip on the calibrator)
+    fire ``gbm_veto`` and over-block research's ENTER candidates. 2026-05-11
+    incident: 15 of 30 vetos with mean DOWN confidence ~0.75; 8 of 28
+    research ENTERs blocked by predictor.
 
     The fix gates ``gbm_veto`` on ``prediction_confidence >= veto_thresh``
     in addition to the existing ``alpha < 0`` and ``cr > n_preds/2``
     criteria. ``veto_thresh`` is the regime-adjusted value from
     ``get_veto_threshold`` (sourced from ``config/predictor_params.json``'s
     ``veto_confidence`` with ``cfg.MIN_CONFIDENCE`` fallback).
+
+    Confidence semantics post-2026-05-12: ``|p_up - 0.5| * 2`` ∈ [0, 1]
+    (ROADMAP L1615). Threshold values below are in the new convention.
     """
 
     def _ctx(self, predictions, signals_data=None):
@@ -258,22 +261,22 @@ class TestGbmVetoConfidenceFloor:
         )
         return ctx
 
-    @patch.object(wo, "get_veto_threshold", return_value=0.70)
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
     @patch.object(wo, "_load_gbm_meta", return_value={})
     def test_low_confidence_down_does_not_veto(self, _m1, _m2):
         """A DOWN prediction below the regime-adjusted confidence floor
-        must NOT trigger ``gbm_veto`` — that prediction is binary noise
-        the 3-class model would have parked in FLAT."""
+        must NOT trigger ``gbm_veto`` — near coin-flip is binary noise."""
         # Two DOWN preds both in bottom half; one above floor, one below.
+        # Confidence in post-2026-05-12 semantics: |p_up - 0.5| * 2.
         preds = [
             {"ticker": "A", "predicted_alpha": 0.05, "combined_rank": 1,
-             "predicted_direction": "UP", "prediction_confidence": 0.90},
-            {"ticker": "B", "predicted_alpha": 0.03, "combined_rank": 2,
              "predicted_direction": "UP", "prediction_confidence": 0.80},
+            {"ticker": "B", "predicted_alpha": 0.03, "combined_rank": 2,
+             "predicted_direction": "UP", "prediction_confidence": 0.60},
             {"ticker": "C", "predicted_alpha": -0.02, "combined_rank": 3,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.60},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.20},
             {"ticker": "D", "predicted_alpha": -0.08, "combined_rank": 4,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.95},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.90},
         ]
         ctx = self._ctx(preds)
         wo.run(ctx)
@@ -281,18 +284,18 @@ class TestGbmVetoConfidenceFloor:
         # A, B: UP (alpha>0) → no veto regardless of confidence
         assert veto_by_ticker["A"] is False
         assert veto_by_ticker["B"] is False
-        # C: DOWN + bottom half + conf 0.60 < threshold 0.70 → NO veto (the fix)
+        # C: DOWN + bottom half + conf 0.20 < threshold 0.40 → NO veto (the fix)
         assert veto_by_ticker["C"] is False, (
-            "DOWN at conf=0.60 below threshold=0.70 must NOT fire gbm_veto — "
-            "that's the binary-noise case the 3-class FLAT mass used to absorb"
+            "DOWN at conf=0.20 below threshold=0.40 must NOT fire gbm_veto — "
+            "near coin-flip is binary noise, not a high-conviction bearish call"
         )
-        # D: DOWN + bottom half + conf 0.95 >= 0.70 → veto fires
+        # D: DOWN + bottom half + conf 0.90 >= 0.40 → veto fires
         assert veto_by_ticker["D"] is True, (
-            "DOWN at conf=0.95 above threshold=0.70 must fire gbm_veto — "
+            "DOWN at conf=0.90 above threshold=0.40 must fire gbm_veto — "
             "this is the high-conviction bearish signal we still want to block on"
         )
 
-    @patch.object(wo, "get_veto_threshold", return_value=0.70)
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
     @patch.object(wo, "_load_gbm_meta", return_value={})
     def test_top_half_rank_never_vetoes(self, _m1, _m2):
         """The cross-sectional rank gate still applies — top-half ranks
@@ -302,13 +305,13 @@ class TestGbmVetoConfidenceFloor:
         preds = [
             # DOWN, top half (rank 1 of 4), high conf → still no veto
             {"ticker": "X", "predicted_alpha": -0.01, "combined_rank": 1,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.95},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.90},
             {"ticker": "Y", "predicted_alpha": 0.05, "combined_rank": 2,
-             "predicted_direction": "UP", "prediction_confidence": 0.90},
+             "predicted_direction": "UP", "prediction_confidence": 0.80},
             {"ticker": "Z", "predicted_alpha": -0.05, "combined_rank": 3,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.95},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.90},
             {"ticker": "W", "predicted_alpha": -0.06, "combined_rank": 4,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.95},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.90},
         ]
         ctx = self._ctx(preds)
         wo.run(ctx)
@@ -317,7 +320,7 @@ class TestGbmVetoConfidenceFloor:
         assert veto_by_ticker["Z"] is True   # bottom half, high conf, DOWN
         assert veto_by_ticker["W"] is True
 
-    @patch.object(wo, "get_veto_threshold", return_value=0.70)
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
     @patch.object(wo, "_load_gbm_meta", return_value={})
     def test_missing_confidence_field_does_not_veto(self, _m1, _m2):
         """If ``prediction_confidence`` is absent (defensive — never
@@ -332,24 +335,24 @@ class TestGbmVetoConfidenceFloor:
         wo.run(ctx)
         assert ctx.predictions[0]["gbm_veto"] is False
 
-    @patch.object(wo, "get_veto_threshold", return_value=0.55)
+    @patch.object(wo, "get_veto_threshold", return_value=0.10)
     @patch.object(wo, "_load_gbm_meta", return_value={})
     def test_threshold_is_regime_adapted_via_get_veto_threshold(self, _m1, _m2):
         """The threshold flows from ``get_veto_threshold(market_regime=…)``
         which applies the bull/bear adjustments. Pin that the per-ticker
         veto uses the regime-adjusted value, not a hardcoded constant."""
         preds = [
-            # DOWN at conf=0.60 — would NOT veto at threshold 0.70 (bull),
-            # but WOULD veto at threshold 0.55 (caution, this test's regime).
+            # DOWN at conf=0.20 — would NOT veto at threshold 0.40 (bull),
+            # but WOULD veto at threshold 0.10 (caution, this test's regime).
             {"ticker": "A", "predicted_alpha": 0.05, "combined_rank": 1,
-             "predicted_direction": "UP", "prediction_confidence": 0.90},
+             "predicted_direction": "UP", "prediction_confidence": 0.80},
             {"ticker": "B", "predicted_alpha": -0.02, "combined_rank": 2,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.60},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.20},
         ]
         ctx = self._ctx(preds)
         wo.run(ctx)
         assert ctx.predictions[1]["gbm_veto"] is True, (
-            "At threshold 0.55, conf=0.60 should fire the veto"
+            "At threshold 0.10, conf=0.20 should fire the veto"
         )
 
 
