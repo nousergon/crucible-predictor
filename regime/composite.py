@@ -125,3 +125,80 @@ def compute_composite_intensity(
         "per_feature_z": per_feature_z,
         "features_used": features_used,
     }
+
+
+def compute_intensity_z_series(
+    feature_panel: pd.DataFrame,
+    weights: Mapping[str, float] | None = None,
+    rolling_window_weeks: int | None = 260,
+) -> pd.Series:
+    """Vectorized compute of intensity_z per row of a date-indexed
+    feature panel — Stage D L2 META_FEATURES integration.
+
+    For each row in ``feature_panel``, computes the composite z-score
+    using that row as ``current`` and all prior rows (within the
+    rolling window) as ``history``. The output is **inverted** to match
+    the substrate Lambda's downstream convention (positive = risk-on,
+    negative = risk-off) so the META_FEATURE value is consistent with
+    what the substrate.json artifact's ``composite.intensity_z`` field
+    carries. This is the same inversion that
+    ``regime/substrate.py:build_regime_substrate`` performs.
+
+    Used at both training time (meta_trainer.py extends
+    regime_features_df with this column) and inference time
+    (run_inference.py same path) so the L2 Ridge sees a consistent
+    intensity_z value with the same orientation regardless of code
+    path. Predictor's inference Lambda does NOT yet read substrate
+    artifacts directly — Stage D recomputes intensity_z in-process
+    from the same macro inputs the substrate Lambda uses. When the
+    substrate Lambda's artifact becomes the authoritative source at
+    inference time (follow-up PR), the values will match by
+    construction.
+
+    The first ``min(rolling_window_weeks // 4, 4)`` rows in the panel
+    have insufficient history for a meaningful z-score — the helper
+    returns 0.0 for those rows (neutral feature value) rather than a
+    noisy estimate from a tiny historical window. The Ridge L2 sees
+    0.0 for those early rows; this matches the "missing-feature →
+    0.0 fallback" convention in meta_trainer.py + run_inference.py.
+
+    Args:
+        feature_panel: Date-indexed DataFrame with columns matching
+            the composite weight keys (vix_level, hy_oas_bps,
+            yield_curve_slope, spy_20d_return, market_breadth,
+            vix_term_slope). Missing columns are silently skipped at
+            the row-level composite computation.
+        weights: Per-feature weight dict; defaults to ``DEFAULT_WEIGHTS``.
+        rolling_window_weeks: Lookback window for z-score normalization.
+
+    Returns:
+        pd.Series indexed by ``feature_panel.index`` with values in
+        roughly ``[-3, +3]`` (z-units, positive = risk-on).
+    """
+    if feature_panel.empty:
+        return pd.Series(dtype="float64")
+
+    # Minimum history before computing a meaningful z-score. With fewer
+    # than 4 rows of history the rolling z-score is dominated by sample-
+    # size noise; default to 0.0 (neutral) for those early rows.
+    min_history = 4
+
+    out: dict = {}
+    for i, (idx, row) in enumerate(feature_panel.iterrows()):
+        if i < min_history:
+            out[idx] = 0.0
+            continue
+        # History = all rows strictly before this one (no look-ahead).
+        history = feature_panel.iloc[:i]
+        result = compute_composite_intensity(
+            current=row.to_dict(),
+            history=history,
+            weights=weights,
+            rolling_window_weeks=rolling_window_weeks,
+        )
+        # Invert sign to match substrate.json convention
+        # (positive = risk-on). The raw composite returns stress
+        # orientation (positive = risk-off).
+        out[idx] = -result["intensity_z"]
+
+    return pd.Series(out, name="intensity_z")

@@ -1198,8 +1198,23 @@ def run_meta_training(
             if test_date in regime_features_df.index:
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
                     macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
+                # Stage D: regime-derived features (currently just
+                # intensity_z). Same date-indexed lookup pattern; missing
+                # columns default to 0.0 so older code paths that
+                # haven't repopulated regime_features_df via
+                # RegimePredictor.build_features (which now adds
+                # intensity_z) degrade gracefully.
+                from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
+                for src_name, meta_name in REGIME_DERIVED_FEATURE_META_MAP.items():
+                    if src_name in regime_features_df.columns:
+                        macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
+                    else:
+                        macro_row[meta_name] = 0.0
             else:
                 for meta_name in MACRO_FEATURE_META_MAP.values():
+                    macro_row[meta_name] = 0.0
+                from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
+                for meta_name in REGIME_DERIVED_FEATURE_META_MAP.values():
                     macro_row[meta_name] = 0.0
 
             # Lookup the most-recent-prior weekly signals snapshot for this
