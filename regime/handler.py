@@ -98,18 +98,44 @@ def produce_regime_substrate(
     lookback_weeks: int = 520,
     hmm_feature_columns: tuple[str, ...] = DEFAULT_HMM_FEATURE_COLUMNS,
     write: bool = True,
+    as_of: "pd.Timestamp | None" = None,
+    run_id: str | None = None,
+    calendar_date: str | None = None,
+    trading_day: str | None = None,
+    write_latest: bool = True,
 ) -> dict[str, Any]:
     """Run the substrate pipeline end-to-end.
 
     Returns the substrate payload dict. When ``write=True``, also
     publishes to S3 and includes ``artifact_key`` + ``latest_key`` in
     the return value alongside the payload.
+
+    Backfill parameters (use defaults for live Saturday SF invocation):
+
+    - ``as_of``         truncate the feature history to this timestamp,
+                        reproducing the substrate as it would have been
+                        written on that date. Used by the historical
+                        backfill script (scripts/backfill_regime_substrate.py)
+                        to populate the dashboard's history window with
+                        ~10y of weekly artifacts.
+    - ``run_id``        override the canonical YYMMDDHHMM run_id with a
+                        caller-supplied string. Backfill encodes the
+                        historical Saturday's date into the run_id so
+                        artifacts sort chronologically alongside live
+                        weekly runs.
+    - ``calendar_date`` / ``trading_day``  override the dual-tracked
+                        dates so the artifact payload reflects the
+                        historical run rather than today's clock.
+    - ``write_latest``  when False, skip the latest.json sidecar update.
+                        Backfill must NEVER touch latest.json — that
+                        pointer reflects live state.
     """
     history = fetch_macro_feature_history(
         s3_client=s3_client,
         bucket=bucket,
         prefix=price_cache_prefix,
         lookback_weeks=lookback_weeks,
+        as_of=as_of,
     )
     if history.empty:
         raise RuntimeError(
@@ -138,6 +164,9 @@ def produce_regime_substrate(
         feature_history=hmm_input,  # only the cols HMM saw at fit time
         current_features=current,
         hmm=hmm,
+        run_id=run_id,
+        calendar_date=calendar_date,
+        trading_day=trading_day,
         fit_window_start=str(hmm_input.index.min().date()),
         fit_window_end=str(hmm_input.index.max().date()),
     )
@@ -147,6 +176,7 @@ def produce_regime_substrate(
 
     keys = write_regime_substrate(
         payload, s3_client=s3_client, bucket=bucket, prefix=regime_prefix,
+        write_latest=write_latest,
     )
     return {"payload": payload, "wrote": True, **keys}
 

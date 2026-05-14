@@ -305,15 +305,22 @@ def write_regime_substrate(
     s3_client: Any,
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
+    write_latest: bool = True,
 ) -> dict[str, str]:
     """Publish substrate payload to S3 in canonical eval_artifacts shape.
 
     Writes:
 
-    - ``{prefix}/{run_id}.json`` — forensic dated artifact
-    - ``{prefix}/latest.json``    — operator-UX sidecar pointer
+    - ``{prefix}/{run_id}.json`` — forensic dated artifact (always)
+    - ``{prefix}/latest.json``    — operator-UX sidecar pointer (when
+                                    ``write_latest=True``, the default)
 
-    Returns dict with ``artifact_key`` and ``latest_key``.
+    Pass ``write_latest=False`` for backfill — the live ``latest.json``
+    pointer must reflect the current week's substrate, never an older
+    backfilled run.
+
+    Returns dict with ``artifact_key`` and (when written)
+    ``latest_key``.
     """
     from alpha_engine_lib.eval_artifacts import (
         eval_artifact_key,
@@ -322,7 +329,6 @@ def write_regime_substrate(
 
     run_id = payload["run_id"]
     artifact_key = eval_artifact_key(prefix, run_id)  # default basename → {run_id}.json
-    latest_key = eval_latest_key(prefix)
 
     body = json.dumps(payload, default=str).encode("utf-8")
     s3_client.put_object(
@@ -332,29 +338,39 @@ def write_regime_substrate(
         ContentType="application/json",
     )
 
-    sidecar = {
-        "run_id": run_id,
-        "artifact_key": artifact_key,
-        "calendar_date": payload["calendar_date"],
-        "trading_day": payload["trading_day"],
-        "schema_version": payload["schema_version"],
-        "hmm_argmax": payload["hmm"]["argmax"],
-        "composite_intensity_z": payload["composite"]["intensity_z"],
-        "regime_change_signal": payload["bocpd"]["change_signal"],
-        "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    }
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=latest_key,
-        Body=json.dumps(sidecar).encode("utf-8"),
-        ContentType="application/json",
-    )
+    result = {"artifact_key": artifact_key}
 
-    logger.info(
-        "[regime_substrate] wrote run_id=%s → s3://%s/%s (latest=%s)",
-        run_id, bucket, artifact_key, latest_key,
-    )
-    return {"artifact_key": artifact_key, "latest_key": latest_key}
+    if write_latest:
+        latest_key = eval_latest_key(prefix)
+        sidecar = {
+            "run_id": run_id,
+            "artifact_key": artifact_key,
+            "calendar_date": payload["calendar_date"],
+            "trading_day": payload["trading_day"],
+            "schema_version": payload["schema_version"],
+            "hmm_argmax": payload["hmm"]["argmax"],
+            "composite_intensity_z": payload["composite"]["intensity_z"],
+            "regime_change_signal": payload["bocpd"]["change_signal"],
+            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        s3_client.put_object(
+            Bucket=bucket,
+            Key=latest_key,
+            Body=json.dumps(sidecar).encode("utf-8"),
+            ContentType="application/json",
+        )
+        result["latest_key"] = latest_key
+        logger.info(
+            "[regime_substrate] wrote run_id=%s → s3://%s/%s (latest=%s)",
+            run_id, bucket, artifact_key, latest_key,
+        )
+    else:
+        logger.info(
+            "[regime_substrate] wrote run_id=%s → s3://%s/%s (latest skipped — backfill)",
+            run_id, bucket, artifact_key,
+        )
+
+    return result
 
 
 def read_regime_substrate(
