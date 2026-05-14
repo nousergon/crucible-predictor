@@ -32,6 +32,13 @@ LAMBDA_FUNCTION="alpha-engine-predictor-inference"
 # Skipped gracefully if the function does not yet exist (one-time create
 # is a manual operator step — see setup-regime-lambda.sh).
 REGIME_LAMBDA_FUNCTION="alpha-engine-predictor-regime-substrate"
+# Third Lambda sharing the same image: the T1 retrospective HMM smoothing
+# eval (regime-v3-260514.md §5.3.3). CMD override at creation time points
+# at regime.retrospective_eval_handler.lambda_handler. Saturday SF
+# RegimeRetrospectiveEval state (alpha-engine-config) invokes this
+# function. Skipped gracefully if not yet created — one-time operator
+# step via setup-regime-retrospective-eval-lambda.sh.
+REGIME_EVAL_LAMBDA_FUNCTION="alpha-engine-predictor-regime-retrospective-eval"
 IMAGE_TAG="latest"
 DRY_RUN=false
 
@@ -363,6 +370,95 @@ if aws lambda get-function \
 else
   echo "  NOT FOUND — skipping. Create the function once via:"
   echo "    bash infrastructure/setup-regime-lambda.sh"
+  echo "  Subsequent deploys will update it automatically."
+fi
+
+echo ""
+
+# ── Step 10: Update the regime retrospective eval Lambda image ────────────────
+#
+# Same shared-image pattern as Step 9 — third Lambda function backed by the
+# same ECR image with regime.retrospective_eval_handler.lambda_handler as
+# the CMD override. Skip gracefully if not yet created.
+echo "==> Checking for regime retrospective eval Lambda: ${REGIME_EVAL_LAMBDA_FUNCTION}"
+if aws lambda get-function \
+     --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+     --region "${AWS_REGION}" \
+     --query "Configuration.FunctionName" \
+     --output text >/dev/null 2>&1; then
+  echo "  Found — updating..."
+
+  aws lambda update-function-code \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --image-uri "${ECR_IMAGE}" \
+    --region "${AWS_REGION}" \
+    --output json \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); print('  FunctionArn:', d.get('FunctionArn','?')); print('  LastModified:', d.get('LastModified','?'))"
+
+  if [ -n "${LAMBDA_ENV_JSON:-}" ]; then
+    aws lambda wait function-updated --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" --region "${AWS_REGION}" 2>/dev/null || sleep 5
+    aws lambda update-function-configuration \
+      --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+      --environment "$LAMBDA_ENV_JSON" \
+      --region "${AWS_REGION}" > /dev/null
+  fi
+
+  aws lambda wait function-updated \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --region "${AWS_REGION}"
+
+  REGIME_EVAL_VERSION=$(aws lambda publish-version \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --query "Version" --output text \
+    --region "${AWS_REGION}")
+  echo "  Published regime-eval version: ${REGIME_EVAL_VERSION}"
+
+  echo "==> Running regime-eval canary against :${REGIME_EVAL_VERSION} (action=dry_run)..."
+  REGIME_EVAL_CANARY_OUT=$(mktemp)
+  REGIME_EVAL_CANARY_META=$(aws lambda invoke \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION}" \
+    --payload '{"action": "dry_run"}' \
+    --cli-binary-format raw-in-base64-out \
+    --cli-read-timeout 600 \
+    --region "${AWS_REGION}" \
+    "$REGIME_EVAL_CANARY_OUT")
+
+  REGIME_EVAL_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_EVAL_CANARY_META" 2>/dev/null || echo "")
+  REGIME_EVAL_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
+  REGIME_EVAL_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
+  rm -f "$REGIME_EVAL_CANARY_OUT"
+
+  if [ -n "$REGIME_EVAL_FUNC_ERR" ] || [ "$REGIME_EVAL_STATUS" != "200" ]; then
+    echo ""
+    echo "ERROR: Regime-eval canary failed — refusing to promote :${REGIME_EVAL_VERSION} to live."
+    echo "       FunctionError : ${REGIME_EVAL_FUNC_ERR:-<none>}"
+    echo "       statusCode    : ${REGIME_EVAL_STATUS}"
+    echo "       payload       : ${REGIME_EVAL_ERR_MSG:-<empty>}"
+    echo "       Inference + substrate Lambdas were already promoted; rollback regime-eval separately if needed."
+    exit 1
+  fi
+  echo "  Regime-eval canary passed (status=$REGIME_EVAL_STATUS)"
+
+  aws lambda update-alias \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --name live \
+    --function-version "${REGIME_EVAL_VERSION}" \
+    --region "${AWS_REGION}" 2>/dev/null || \
+  aws lambda create-alias \
+    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
+    --name live \
+    --function-version "${REGIME_EVAL_VERSION}" \
+    --region "${AWS_REGION}"
+
+  echo ""
+  echo "==> Deploy complete (regime-eval Lambda)"
+  echo "    Function : ${REGIME_EVAL_LAMBDA_FUNCTION}"
+  echo "    Version  : ${REGIME_EVAL_VERSION}"
+  echo "    Alias    : live → ${REGIME_EVAL_VERSION}"
+  echo "    Image    : ${ECR_IMAGE}"
+else
+  echo "  NOT FOUND — skipping. Create the function once via:"
+  echo "    bash infrastructure/setup-regime-retrospective-eval-lambda.sh"
   echo "  Subsequent deploys will update it automatically."
 fi
 

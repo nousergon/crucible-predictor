@@ -24,7 +24,8 @@
       ],
       "Resource": [
         "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-inference:*",
-        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-substrate:*"
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-substrate:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-retrospective-eval:*"
       ]
     },
     {

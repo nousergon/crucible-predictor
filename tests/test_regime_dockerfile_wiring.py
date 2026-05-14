@@ -88,3 +88,57 @@ def test_iam_role_grants_logs_to_regime_lambda_log_group() -> None:
     assert any(
         "alpha-engine-predictor-regime-substrate" in r for r in resources
     ), "IAM role's CloudWatchLogs statement must grant access to the regime Lambda's log group"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# T1 retrospective eval Lambda — third shared-image Lambda (regime-v3
+# §5.3.3). Same contracts as the substrate Lambda above, applied to the
+# new function name.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_deploy_sh_references_regime_eval_lambda_function() -> None:
+    """``deploy.sh`` must reference the T1 retrospective eval Lambda
+    function name so Step 10's update path runs on every deploy."""
+    deploy = (REPO_ROOT / "infrastructure" / "deploy.sh").read_text()
+    assert "REGIME_EVAL_LAMBDA_FUNCTION" in deploy
+    assert "alpha-engine-predictor-regime-retrospective-eval" in deploy
+
+
+def test_deploy_sh_has_step_10_update_block() -> None:
+    """Step 10 update block must exist + call ``update-function-code``
+    against ``REGIME_EVAL_LAMBDA_FUNCTION``."""
+    deploy = (REPO_ROOT / "infrastructure" / "deploy.sh").read_text()
+    assert "Step 10:" in deploy
+    assert '--function-name "${REGIME_EVAL_LAMBDA_FUNCTION}"' in deploy
+
+
+def test_setup_regime_eval_lambda_script_exists_and_executable() -> None:
+    """The one-time setup script for the T1 eval Lambda. Mirrors the
+    substrate setup contract."""
+    setup = REPO_ROOT / "infrastructure" / "setup-regime-retrospective-eval-lambda.sh"
+    assert setup.exists(), "setup-regime-retrospective-eval-lambda.sh missing"
+    content = setup.read_text()
+    # Must reference the right CMD override
+    assert "regime.retrospective_eval_handler.lambda_handler" in content
+    # Must create the function with the image-config Command override
+    assert "create-function" in content
+    assert "image-config" in content
+
+
+def test_iam_role_grants_logs_to_regime_eval_lambda_log_group() -> None:
+    """The shared IAM role's CloudWatchLogs statement must also include
+    the T1 retrospective eval Lambda's log group."""
+    import json
+    role_file = REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-predictor-role.json"
+    policy = json.loads(role_file.read_text())
+    logs_statement = next(s for s in policy["Statement"] if s["Sid"] == "CloudWatchLogs")
+    resources = logs_statement["Resource"]
+    if isinstance(resources, str):
+        resources = [resources]
+    assert any(
+        "alpha-engine-predictor-regime-retrospective-eval" in r for r in resources
+    ), (
+        "IAM role's CloudWatchLogs statement must grant access to the "
+        "T1 retrospective eval Lambda's log group"
+    )
