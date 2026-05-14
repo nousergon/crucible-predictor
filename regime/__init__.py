@@ -34,7 +34,7 @@ architecture; v1/v2 were discrete classifiers killed by accuracy gates.
 Reference: ``alpha-engine-docs/private/regime-v3-260514.md``.
 """
 
-from .composite import compute_composite_intensity
+from .composite import compute_composite_intensity, compute_intensity_z_series
 from .hmm import HMMRegimeClassifier, REGIME_STATES
 from .bocpd import BOCPDDetector
 from .substrate import (
@@ -46,6 +46,7 @@ from .substrate import (
 
 __all__ = [
     "compute_composite_intensity",
+    "compute_intensity_z_series",
     "HMMRegimeClassifier",
     "REGIME_STATES",
     "BOCPDDetector",

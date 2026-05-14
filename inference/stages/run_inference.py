@@ -230,7 +230,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # after PR #5 removed the per-ticker inline compute fallback. Features now
     # come exclusively from ArcticDB via _load_precomputed_features_from_arcticdb.
     # Training still imports it — only inference was migrated.
-    from model.meta_model import META_FEATURES, MACRO_FEATURE_META_MAP
+    from model.meta_model import META_FEATURES, MACRO_FEATURE_META_MAP, REGIME_DERIVED_FEATURE_META_MAP
 
     # Momentum L1 component is the deterministic baseline at
     # model/momentum_scorer.py — no scorer to look up. The
@@ -280,6 +280,11 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # note and roadmap). The 6 macro features below feed the meta ridge
     # directly; no classifier in the loop.
     macro_row_for_meta: dict[str, float] = {name: 0.0 for name in MACRO_FEATURE_META_MAP.values()}
+    # Stage D: regime-derived features (intensity_z) — initialize at
+    # 0.0 (neutral) and populated below from latest_regime when
+    # regime_features_df is built successfully.
+    for _name in REGIME_DERIVED_FEATURE_META_MAP.values():
+        macro_row_for_meta[_name] = 0.0
     # Stage 1c (regime-conditioning rebuild): keep regime_features_df at
     # function scope so the macro-aug volatility GBM can apply
     # time-series z-score against the same history.
@@ -310,6 +315,12 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             if not regime_features_df.empty:
                 latest_regime = regime_features_df.iloc[-1]
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
+                    macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
+                # Stage D: composite intensity_z (added to
+                # regime_features_df by RegimePredictor.build_features
+                # via regime/composite.py). Single market-wide value;
+                # consumed by the L2 Ridge via META_FEATURES[regime_intensity_z].
+                for src_name, meta_name in REGIME_DERIVED_FEATURE_META_MAP.items():
                     macro_row_for_meta[meta_name] = float(latest_regime.get(src_name, 0.0))
                 log.info(
                     "Macro features: spy_20d_ret=%.3f spy_20d_vol=%.3f vix_lvl=%.2f "

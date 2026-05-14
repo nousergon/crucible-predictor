@@ -50,6 +50,17 @@ META_FEATURES = [
     "macro_vix_term_slope",       # (VIX - VIX3M) / 20
     "macro_yield_curve_slope",    # (TNX - IRX) / 10
     "macro_market_breadth",       # % of universe above 50d MA
+    # Stage D (regime-v3 2026-05-14): AQR-style risk-on/risk-off
+    # composite intensity z-score computed by ``regime.composite``.
+    # Positive = risk-on, negative = risk-off (matches the substrate
+    # Lambda's downstream convention). Single market-wide value per
+    # date; all tickers on a given date share this column. Computed
+    # in-process from the 6 macros above via z-score-weighted-sum,
+    # then inverted to risk-on orientation. Equivalent to what the
+    # substrate Lambda writes to substrate.json composite.intensity_z;
+    # consistency by construction since both paths read the same
+    # macro inputs through ``regime.composite``.
+    "regime_intensity_z",
 ]
 
 # Raw macro feature names — used by trainer/inference to look up values from
@@ -66,6 +77,15 @@ MACRO_FEATURE_NAMES = [
 # Prefix avoids a collision if a downstream consumer ever adds its own
 # `vix_level` ticker-local feature.
 MACRO_FEATURE_META_MAP = {k: f"macro_{k}" for k in MACRO_FEATURE_NAMES}
+
+# Stage D — derived composite features (Stage 4 of regime-conditioning-260510
+# composes with the new substrate-driven regime-v3 plan). Source column on
+# ``regime_features_df`` → meta-feature name on the L2 row. Distinct map
+# from MACRO_FEATURE_META_MAP because these are derived, not raw, and the
+# absence of a ``regime_`` prefix on the raw macros above would collide.
+REGIME_DERIVED_FEATURE_META_MAP = {
+    "intensity_z": "regime_intensity_z",
+}
 
 
 class MetaModel:

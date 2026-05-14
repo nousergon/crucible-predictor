@@ -272,7 +272,26 @@ class RegimePredictor:
             df["market_breadth"] = 0.5  # neutral default
             df["market_breadth_200d"] = 0.5
 
-        return df.dropna()
+        df = df.dropna()
+
+        # Stage D (regime-v3 2026-05-14): AQR-style risk-on/risk-off
+        # composite z-score derived from the 6 raw macros above. Single
+        # market-wide value per date; consumed by the L2 Ridge via
+        # META_FEATURES["regime_intensity_z"]. Computed in-process
+        # (same algorithm as the substrate Lambda) so training +
+        # inference see consistent values without an S3 substrate
+        # dependency at this stage.
+        try:
+            from regime.composite import compute_intensity_z_series
+            df["intensity_z"] = compute_intensity_z_series(df)
+        except Exception as e:
+            log.warning(
+                "regime intensity_z computation failed (%s); defaulting column to 0.0",
+                type(e).__name__,
+            )
+            df["intensity_z"] = 0.0
+
+        return df
 
     def build_labels(self, spy_series: pd.Series) -> pd.Series:
         """
