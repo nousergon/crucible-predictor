@@ -1,101 +1,85 @@
 #!/usr/bin/env bash
 # infrastructure/spot_train.sh — Run GBM retraining on a spot EC2 instance.
 #
-# Launches a c5.xlarge spot instance, syncs code, runs training via the
+# Launches a c5.large spot instance, syncs code, runs training via the
 # same train_handler.main() pipeline that Lambda uses (S3 price cache
 # download → refresh → train → promote → slim cache → email).
 #
+# Communication is via `aws ssm send-command` (IAM-authenticated, CloudTrail-
+# audited) — NOT SSH/SCP. Config is staged through S3; secrets are read on
+# the spot via alpha_engine_lib.secrets.get_secret() (SSM Parameter Store),
+# so there is no `.env` SCP and no `~/.ssh/alpha-engine-key.pem` dependency
+# in the workflow. (PR 2 of the spot-train-260512 SSH/SCP→SSM migration;
+# canonical plan: alpha-engine-docs/private/spot-train-260512.md.)
+#
 # Usage:
-#   ./infrastructure/spot_train.sh                  # smoke test (dry_run), then prompt for full train
-#   ./infrastructure/spot_train.sh --full-only       # skip smoke test, run full training directly
-#   ./infrastructure/spot_train.sh --smoke-only      # run smoke test only, then terminate
-#   ./infrastructure/spot_train.sh --instance-type c5.2xlarge  # override instance type
+#   ./infrastructure/spot_train.sh                  # smoke (dry_run) then full
+#   ./infrastructure/spot_train.sh --full-only       # full training only (Saturday SF)
+#   ./infrastructure/spot_train.sh --smoke-only      # smoke only, then terminate
+#   ./infrastructure/spot_train.sh --instance-type c5.2xlarge  # override type
 #
 # Prerequisites:
-#   - AWS CLI configured (uses alpha-engine-executor-profile for S3/email access)
-#   - SSH key at ~/.ssh/alpha-engine-key.pem
-#   - Code committed and pushed to origin (the instance clones from GitHub)
-#   - .env file with EMAIL_SENDER, EMAIL_RECIPIENTS, GMAIL_APP_PASSWORD
-#   - config/predictor.yaml (gitignored — SCP'd to EC2 by this script)
+#   - AWS CLI configured (alpha-engine-executor-profile — S3 + SSM + email).
+#     The instance profile carries AmazonSSMManagedInstanceCore so the spot
+#     registers with SSM; this script polls SSM for readiness (no port 22).
+#   - Code committed + pushed to origin/$BRANCH (the spot clones HTTPS).
+#   - config/predictor.yaml present locally (gitignored — staged to S3).
 #
 # The script will:
-#   1. Request a spot instance (c5.xlarge, ~$0.06/hr)
-#   2. Wait for SSH to become available
-#   3. Clone the repo and install dependencies
-#   4. Copy config/predictor.yaml and .env from local machine → EC2
-#   5. Run smoke test (dry_run=True) to verify config + code
-#   6. Prompt to continue with full training (dry_run=False)
-#   7. Terminate the spot instance
+#   1. Request a spot instance (c5.large, ~$0.03/hr)
+#   2. Wait for the SSM agent to register (no SSH)
+#   3. Stage config/predictor.yaml to S3; spot bootstraps + fetches it
+#   4. Run smoke (dry_run=True), then full training (dry_run=False)
+#   5. Terminate the spot instance + clean the S3 staging prefix
+#
+# Rollback: `git revert` this commit restores the SSH/SCP script. Port 22
+# ingress on the SG is intentionally left in place until the migration's
+# PR 3 (SG cleanup), so emergency `ssh`/`aws ssm start-session` remains
+# available during the validation window.
 
 set -euo pipefail
 
-# ── Ensure HOME is set (SSM RunCommand does not set it) ──────────────────────
+# SSM RunCommand executes as root with a minimal env — set HOME/cache dirs
+# explicitly wherever the workload runs (done per-step below too).
 export HOME="${HOME:-/home/ec2-user}"
 
-# ── Load .env ────────────────────────────────────────────────────────────────
-# Master .env lives in alpha-engine-data; fall back to ~/.alpha-engine.env
-# (Step Functions SSM), then local .env
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-ENV_FILE="$(dirname "$REPO_ROOT")/alpha-engine-data/.env"
-if [ ! -f "$ENV_FILE" ]; then
-  ENV_FILE="$HOME/.alpha-engine.env"
-fi
-if [ ! -f "$ENV_FILE" ]; then
-  ENV_FILE="$REPO_ROOT/.env"
-fi
-if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  set +a
-  echo "Loaded .env from $ENV_FILE"
-else
-  echo "WARNING: No .env file found"
-  echo "         Copy alpha-engine-data/.env.example to .env and fill in values."
-  echo ""
-fi
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
 # c5.large = 2 vCPU / 4 GB RAM. Right-sized 2026-04-28: meta-trainer
-# steady-state is ~1–1.5 GB (~540 MB ticker DataFrames + ~200-400 MB
-# numpy arrays + LightGBM DMatrix overhead). c5.xlarge was inherited from
-# the v2-era CatBoost + multi-horizon stack (deleted in PR #54). Override
-# via ``--instance-type`` if a future feature pushes peak memory past
-# ~3 GB; if a run OOMs at this size, bump back to c5.xlarge and add a
-# RSS check to the training preflight.
+# steady-state is ~1–1.5 GB. Override via ``--instance-type`` if a future
+# feature pushes peak memory past ~3 GB.
 INSTANCE_TYPE="c5.large"
-AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12)
+AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12, SSM agent preinstalled)
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
-# include pip install + smoke + full run. 90 min with headroom. Bump
-# (don't silently rely on the orphan reaper) if a legitimate run needs more.
+# include pip install + smoke + full run. 90 min with headroom.
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# KEY_NAME is still passed to run-instances so emergency SSH stays possible
+# during the validation window (the SG's port 22 ingress is dropped only in
+# the migration's PR 3, after this PR validates against a Saturday SF).
 KEY_NAME="alpha-engine-key"
-KEY_FILE="$HOME/.ssh/alpha-engine-key.pem"
 SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 SUBNET_ID="subnet-e07166ec"
 IAM_PROFILE="alpha-engine-executor-profile"
-REPO_URL="git@github.com:cipher813/alpha-engine-predictor.git"
+REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
 
 # Parse flags
 MODE="both"  # both | full-only | smoke-only
-for arg in "$@"; do
-  case "$arg" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --full-only) MODE="full-only" ;;
     --smoke-only) MODE="smoke-only" ;;
-    --instance-type)
-      shift
-      INSTANCE_TYPE="$1"
-      ;;
+    --instance-type) shift; INSTANCE_TYPE="$1" ;;
   esac
+  shift
 done
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  GBM Spot Training — $(date +%Y-%m-%d)"
+echo "  GBM Spot Training — $(date +%Y-%m-%d)  (SSM transport)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Instance type : $INSTANCE_TYPE"
 echo "  AMI           : $AMI_ID"
@@ -103,39 +87,26 @@ echo "  Region        : $AWS_REGION"
 echo "  Branch        : $BRANCH"
 echo "  Mode          : $MODE"
 echo "  S3 bucket     : $S3_BUCKET"
-echo "  Email sender  : ${EMAIL_SENDER:-<not set>}"
 echo ""
 
 # ── Preflight checks ──────────────────────────────────────────────────────────
-if [ ! -f "$KEY_FILE" ]; then
-  echo "ERROR: SSH key not found at $KEY_FILE"
-  exit 1
-fi
-
 if [ ! -f "$REPO_ROOT/config/predictor.yaml" ]; then
   echo "ERROR: config/predictor.yaml not found — copy from predictor.sample.yaml"
   exit 1
 fi
 
-# Check for uncommitted changes
+# Uncommitted-changes check — WARN only (non-interactive: this runs under the
+# Saturday Step Function with no TTY). The spot clones origin/$BRANCH, so
+# uncommitted local changes simply won't be included.
 cd "$REPO_ROOT"
-if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/train_handler.py model/ data/ README.md; then
-  echo "WARNING: You have uncommitted changes in key files."
-  echo "         The spot instance clones from origin/$BRANCH."
-  echo "         Commit and push first, or changes won't be included."
+if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/train_handler.py model/ data/ README.md 2>/dev/null; then
+  echo "WARNING: uncommitted changes in key files — the spot clones origin/$BRANCH,"
+  echo "         so those changes will NOT be included. Commit + push first if intended."
   echo ""
-  read -p "Continue anyway? (y/N) " -n 1 -r
-  echo
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted. Commit and push first:"
-    echo "  git add -A && git commit -m 'GBM signal strength + monitoring' && git push"
-    exit 1
-  fi
 fi
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
 echo "==> Requesting spot instance ($INSTANCE_TYPE)..."
-
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id "$AMI_ID" \
   --instance-type "$INSTANCE_TYPE" \
@@ -150,169 +121,166 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --region "$AWS_REGION" \
   --query 'Instances[0].InstanceId' \
   --output text)
-
 echo "  Instance ID: $INSTANCE_ID"
 
-# Cleanup function — always terminate the instance
+RUN_ID="$(date +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
+S3_STAGING_PREFIX="tmp/spot_train/${RUN_ID}"
+S3_STAGING="s3://${S3_BUCKET}/${S3_STAGING_PREFIX}"
+
+# Cleanup — always terminate the instance + remove the S3 staging prefix.
+# (S3 lifecycle on tmp/ is the belt-and-suspenders if the trap never fires.)
 cleanup() {
   echo ""
   echo "==> Terminating spot instance $INSTANCE_ID..."
   aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-  echo "  Instance terminated."
+  aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
+  echo "  Instance terminated; S3 staging cleaned."
 }
 trap cleanup EXIT
 
-# Wait for instance to be running
 echo "==> Waiting for instance to enter running state..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$AWS_REGION"
 
-# Get public IP
-PUBLIC_IP=$(aws ec2 describe-instances \
-  --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].PublicIpAddress' \
-  --output text \
-  --region "$AWS_REGION")
+# Stage config/predictor.yaml to S3 (spot fetches via its IAM role).
+echo "==> Staging config/predictor.yaml → ${S3_STAGING}/predictor.yaml"
+aws s3 cp "$REPO_ROOT/config/predictor.yaml" "${S3_STAGING}/predictor.yaml" --region "$AWS_REGION" --quiet
 
-if [ "$PUBLIC_IP" = "None" ] || [ -z "$PUBLIC_IP" ]; then
-  echo "ERROR: Instance has no public IP. Check subnet/VPC configuration."
-  exit 1
-fi
-
-echo "  Public IP: $PUBLIC_IP"
-
-# ── Wait for SSH ──────────────────────────────────────────────────────────────
-echo "==> Waiting for SSH to become available..."
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
-
-for i in $(seq 1 30); do
-  if ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "echo ok" 2>/dev/null; then
-    echo "  SSH ready."
+# ── Wait for the SSM agent to register ────────────────────────────────────────
+# Replaces the old SSH-readiness poll. AL2023 ships the SSM agent; with the
+# instance profile's AmazonSSMManagedInstanceCore it registers within ~1 min.
+echo "==> Waiting for SSM agent to come Online..."
+for i in $(seq 1 36); do  # 36 × 5s = 180s budget
+  ping=$(aws ssm describe-instance-information \
+    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+    --query 'InstanceInformationList[0].PingStatus' \
+    --output text --region "$AWS_REGION" 2>/dev/null || true)
+  if [ "$ping" = "Online" ]; then
+    echo "  SSM agent Online."
     break
   fi
-  if [ "$i" -eq 30 ]; then
-    echo "ERROR: SSH not available after 150s"
+  if [ "$i" -eq 36 ]; then
+    echo "ERROR: SSM agent not Online after 180s (instance $INSTANCE_ID)"
     exit 1
   fi
   sleep 5
 done
 
-# Helper: run command on EC2
-run_remote() {
-  ssh $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" "$@"
+# ── SSM command primitive ─────────────────────────────────────────────────────
+# run_ssm "<description>" "<bash script>" [timeout_seconds]
+#
+# Ships the script body via AWS-RunShellScript (base64-wrapped so embedded
+# Python/heredoc quoting is transport-safe), captures full stdout/stderr to
+# S3 (past SSM's 24KB response cap), and streams the StandardOutputContent
+# delta to the dispatcher while polling. Returns non-zero on any non-Success
+# terminal status. jq-free (python3 + `aws --query` only) so it runs on the
+# Saturday-SF dispatcher (ae-dashboard) without extra deps.
+run_ssm() {
+  local description="$1" script="$2" timeout_s="${3:-3600}"
+  local b64 pfile cmd_id status out last=0 err
+
+  b64=$(printf '%s' "$script" | base64 | tr -d '\n')
+  pfile=$(mktemp)
+  REMOTE_CMD="echo $b64 | base64 -d | bash" python3 - "$pfile" <<'PYJSON'
+import json, os, sys
+json.dump({"commands": [os.environ["REMOTE_CMD"]]}, open(sys.argv[1], "w"))
+PYJSON
+
+  cmd_id=$(aws ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name AWS-RunShellScript \
+    --comment "predictor-training: $description" \
+    --timeout-seconds "$timeout_s" \
+    --parameters "file://$pfile" \
+    --output-s3-bucket-name "$S3_BUCKET" \
+    --output-s3-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
+    --region "$AWS_REGION" \
+    --query 'Command.CommandId' --output text) || { rm -f "$pfile"; return 1; }
+  rm -f "$pfile"
+
+  echo "    [ssm $description] command-id=$cmd_id"
+  while :; do
+    sleep 5
+    status=$(aws ssm get-command-invocation --command-id "$cmd_id" \
+      --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
+      --query 'Status' --output text 2>/dev/null || echo "Pending")
+    out=$(aws ssm get-command-invocation --command-id "$cmd_id" \
+      --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
+      --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
+    if [ "${#out}" -gt "$last" ]; then
+      printf '%s' "${out:$last}"
+      last=${#out}
+    elif [ "${#out}" -lt "$last" ]; then
+      # 24KB cap rotated the buffer — full log is in S3.
+      echo "    [ssm $description] (stdout exceeded 24KB cap — full log: ${S3_STAGING}/ssm-output/)"
+      last=${#out}
+    fi
+    case "$status" in
+      Success) echo ""; return 0 ;;
+      Pending|InProgress|Delayed) : ;;
+      *)
+        err=$(aws ssm get-command-invocation --command-id "$cmd_id" \
+          --instance-id "$INSTANCE_ID" --region "$AWS_REGION" \
+          --query 'StandardErrorContent' --output text 2>/dev/null || echo "")
+        echo ""
+        echo "ERROR: SSM step '$description' terminal status=$status"
+        [ -n "$err" ] && { echo "--- stderr (24KB cap; full: ${S3_STAGING}/ssm-output/) ---"; printf '%s\n' "$err"; }
+        return 1 ;;
+    esac
+  done
 }
 
-# ── Spot-side watchdog ──────────────────────────────────────────────────────
-# Dispatcher-side `trap cleanup EXIT` only fires when THIS bash script exits
-# cleanly. If the dispatcher SSM command is cancelled, the dispatcher EC2
-# is stopped mid-run, or the shell gets SIGKILLed, the trap never runs and
-# the spot orphans until manually terminated — hit 3 times in April 2026
-# (~$20 orphan each; a GBM-training c5.xlarge orphan is the most expensive).
-# Transient systemd timer on the spot fires shutdown -h now after
-# MAX_RUNTIME_SECONDS regardless of dispatcher state.
-echo "==> Installing spot-side watchdog (${MAX_RUNTIME_SECONDS}s = $((MAX_RUNTIME_SECONDS / 60)) min)..."
-run_remote "sudo systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now"
+# ── Bootstrap (watchdog + deps + clone + staged config) ───────────────────────
+echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
+run_ssm "bootstrap" "$(cat <<BOOTSTRAP
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
 
-# ── Bootstrap environment on EC2 ──────────────────────────────────────────────
-echo "==> Bootstrapping EC2 environment..."
-run_remote bash -s <<'BOOTSTRAP'
-set -euo pipefail
+# Spot-side hard-timeout watchdog. The dispatcher-side 'trap cleanup EXIT'
+# only fires if THIS script exits; if the dispatcher is killed/cancelled the
+# spot would orphan. systemd-run shuts the box down after MAX_RUNTIME_SECONDS
+# regardless of dispatcher state.
+systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
+  --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
 
-# Amazon Linux 2023: install Python 3.12, git, gcc, and pip
-sudo dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-  sudo dnf install -y -q python3 python3-pip python3-devel git gcc
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+  dnf install -y -q python3 python3-pip python3-devel git gcc
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+echo "Using: \$(\$PY --version)"
 
-# Determine python binary
-if command -v python3.12 &>/dev/null; then
-  PYTHON=python3.12
-elif command -v python3 &>/dev/null; then
-  PYTHON=python3
-else
-  echo "ERROR: No python3 found"
-  exit 1
-fi
-
-echo "Using: $($PYTHON --version)"
-
-# Set up SSH for GitHub
-mkdir -p ~/.ssh
-ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+git clone --depth 1 --branch ${BRANCH} ${REPO_URL} /home/ec2-user/predictor
+aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/predictor/config/predictor.yaml --region ${AWS_REGION}
+echo "Bootstrap complete: repo cloned, predictor.yaml staged from S3."
 BOOTSTRAP
+)" 600
 
-echo "==> Cloning repository (branch: $BRANCH)..."
-# Try SSH clone first (via agent forwarding), fall back to HTTPS
-ssh -A $SSH_OPTS -i "$KEY_FILE" ec2-user@"$PUBLIC_IP" \
-  "git clone --depth 1 --branch $BRANCH $REPO_URL /home/ec2-user/predictor" 2>/dev/null || {
-  echo "  SSH clone failed — trying HTTPS..."
-  HTTPS_URL="https://github.com/cipher813/alpha-engine-predictor.git"
-  run_remote "git clone --depth 1 --branch $BRANCH $HTTPS_URL /home/ec2-user/predictor"
-}
-
-# ── Copy local config + .env to EC2 ──────────────────────────────────────────
-# .env carries non-secret runtime config (EMAIL_*, S3_BUCKET, etc.) consumed
-# by the training workload. alpha-engine-lib was flipped public 2026-05-03,
-# so the spot installs it directly from git+https with no auth — earlier
-# versions of this script fetched a PAT from SSM /alpha-engine/lib-token.
-echo "==> Uploading config/predictor.yaml and .env..."
-scp $SSH_OPTS -i "$KEY_FILE" \
-  "$REPO_ROOT/config/predictor.yaml" \
-  ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/config/predictor.yaml
-
-if [ -f "$ENV_FILE" ]; then
-  scp $SSH_OPTS -i "$KEY_FILE" \
-    "$ENV_FILE" \
-    ec2-user@"$PUBLIC_IP":/home/ec2-user/predictor/.env
-else
-  echo "ERROR: .env not found at $ENV_FILE"
-  exit 1
-fi
-
+# ── Dependencies ──────────────────────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
-run_remote bash -s <<'DEPS'
-set -euo pipefail
+run_ssm "deps" "$(cat <<'DEPS'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
 cd /home/ec2-user/predictor
-
-if command -v python3.12 &>/dev/null; then
-  PIP="python3.12 -m pip"
-else
-  PIP="python3 -m pip"
-fi
-
+command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
-
-# Source .env for non-secret runtime vars.
-set -a
-source /home/ec2-user/predictor/.env
-set +a
-
-# alpha-engine-lib is public; pip resolves the git+https URL in
-# requirements.txt without auth. Filter out private packages (flow-doctor)
-# that aren't on PyPI.
+# alpha-engine-lib is public (git+https in requirements.txt, no auth).
+# flow-doctor is private + not on PyPI — filtered out (same as legacy).
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
-$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|catboost|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
+$PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
 DEPS
+)" 900
 
-# ── Build env export command for remote shells ────────────────────────────────
-# Source .env on the remote side so all training/email code sees the vars
-ENV_SOURCE='set -a; [ -f /home/ec2-user/predictor/.env ] && source /home/ec2-user/predictor/.env; set +a; export XDG_CACHE_HOME=/tmp;'
-
-# ── Determine python binary on remote ─────────────────────────────────────────
-REMOTE_PYTHON=$(run_remote "command -v python3.12 || command -v python3")
-
-# ── Smoke test ────────────────────────────────────────────────────────────────
+# ── Smoke test (dry_run=True) ─────────────────────────────────────────────────
 if [ "$MODE" != "full-only" ]; then
   echo ""
   echo "═══════════════════════════════════════════════════════════════"
   echo "  SMOKE TEST (dry_run=True)"
   echo "═══════════════════════════════════════════════════════════════"
-  echo ""
-
-  run_remote bash -s <<SMOKE
-set -euo pipefail
+  run_ssm "smoke" "$(cat <<'SMOKE'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
 cd /home/ec2-user/predictor
-${ENV_SOURCE}
-
-$REMOTE_PYTHON -c "
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+$PY - <<'PYEOF'
 import sys, os
 sys.path.insert(0, '.')
 os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
@@ -332,19 +300,19 @@ is_meta = 'meta' in str(v).lower()
 
 if is_meta:
     print(f'  Architecture:   v3.0 Meta-Model')
-    print(f'  Meta-Model IC:  {result.get(\"meta_model_ic\", result.get(\"test_ic\", \"n/a\"))}')
-    print(f'  Momentum IC:    {result.get(\"momentum_test_ic\", \"n/a\")}')
-    print(f'  Volatility IC:  {result.get(\"volatility_test_ic\", \"n/a\")}')
-    print(f'  Regime Acc:     {(result.get(\"regime_accuracy\", 0) * 100):.1f}%')
+    print(f'  Meta-Model IC:  {result.get("meta_model_ic", result.get("test_ic", "n/a"))}')
+    print(f'  Momentum IC:    {result.get("momentum_test_ic", "n/a")}')
+    print(f'  Volatility IC:  {result.get("volatility_test_ic", "n/a")}')
+    print(f'  Regime Acc:     {(result.get("regime_accuracy", 0) * 100):.1f}%')
     rc = result.get('research_calibrator_metrics', {})
     if rc:
-        print(f'  Research Cal:   {rc.get(\"n_samples\", 0)} samples, overall hit={rc.get(\"overall_hit_rate\", \"n/a\")}')
+        print(f'  Research Cal:   {rc.get("n_samples", 0)} samples, overall hit={rc.get("overall_hit_rate", "n/a")}')
         for bucket, info in rc.get('buckets', {}).items():
             if info.get('n', 0) > 0:
-                print(f'    Score {bucket}: hit_rate={info[\"hit_rate\"]:.1%} (n={info[\"n\"]})')
+                print(f'    Score {bucket}: hit_rate={info["hit_rate"]:.1%} (n={info["n"]})')
     wf = result.get('walk_forward', {})
-    print(f'  WF Momentum:    median_IC={wf.get(\"momentum_median_ic\", \"n/a\")}')
-    print(f'  WF Volatility:  median_IC={wf.get(\"volatility_median_ic\", \"n/a\")}')
+    print(f'  WF Momentum:    median_IC={wf.get("momentum_median_ic", "n/a")}')
+    print(f'  WF Volatility:  median_IC={wf.get("volatility_median_ic", "n/a")}')
     wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL'
     print(f'  WF Status:      {wf_status}')
     coefs = result.get('meta_coefficients', {})
@@ -353,24 +321,24 @@ if is_meta:
         for name, val in sorted(coefs.items(), key=lambda x: -abs(x[1])):
             if name != 'intercept' and abs(val) > 0.0001:
                 print(f'    {name:<30} {val:+.4f}')
-        print(f'    {\"intercept\":<30} {coefs.get(\"intercept\", 0):+.4f}')
+        print(f'    {"intercept":<30} {coefs.get("intercept", 0):+.4f}')
     if wf.get('folds'):
         print(f'  Per-fold ICs (momentum / volatility):')
         for f in wf['folds']:
-            print(f'    Fold {f[\"fold\"]:>2}: mom={f[\"mom_ic\"]:+.4f}  vol={f[\"vol_ic\"]:+.4f}  [{f[\"test_start\"]} → {f[\"test_end\"]}]')
+            print(f'    Fold {f["fold"]:>2}: mom={f["mom_ic"]:+.4f}  vol={f["vol_ic"]:+.4f}  [{f["test_start"]} -> {f["test_end"]}]')
 else:
     print(f'  Architecture:   v2.0 Single/Ensemble GBM')
-    print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
-    print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
-    print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
-    print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+    print(f'  Test IC:        {result.get("test_ic", "n/a")}')
+    print(f'  MSE IC:         {result.get("mse_ic", "n/a")}')
+    print(f'  Rank IC:        {result.get("rank_ic", "n/a")}')
+    print(f'  Ensemble IC:    {result.get("ensemble_ic", "n/a")}')
     if result.get('catboost_enabled'):
-        print(f'  CatBoost IC:    {result.get(\"catboost_ic\", \"n/a\")}')
-        print(f'  LGB-Cat Blend:  {result.get(\"lgb_cat_blend_ic\", \"n/a\")}  weights={result.get(\"blend_weights\", \"n/a\")}')
-    print(f'  IC IR:          {result.get(\"ic_ir\", \"n/a\")}')
+        print(f'  CatBoost IC:    {result.get("catboost_ic", "n/a")}')
+        print(f'  LGB-Cat Blend:  {result.get("lgb_cat_blend_ic", "n/a")}  weights={result.get("blend_weights", "n/a")}')
+    print(f'  IC IR:          {result.get("ic_ir", "n/a")}')
     wf = result.get('walk_forward', {})
     wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
-    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get("median_ic", "n/a")})')
     fics = result.get('feature_ics', {})
     if fics:
         sorted_fics = sorted(fics.items(), key=lambda x: abs(x[1]), reverse=True)
@@ -378,45 +346,33 @@ else:
         for name, ic in sorted_fics[:5]:
             print(f'    {name:<22} {ic:+.4f}')
 
-print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
-print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
+print(f'  Promoted:       {result.get("promoted", "n/a")}')
+print(f'  Elapsed:        {result.get("elapsed_s", "n/a")}s')
 noise = result.get('noise_candidates', [])
 if noise:
     print(f'  Noise features: {noise}')
 print('=' * 60)
-"
+PYEOF
 SMOKE
-
-  echo ""
+)" 1800
   echo "Smoke test complete."
-
   if [ "$MODE" = "smoke-only" ]; then
     echo "==> Smoke-only mode — skipping full training."
     exit 0
   fi
-
-  echo ""
-  read -p "Proceed with full training (writes to S3, sends email)? (y/N) " -n 1 -r
-  echo
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Aborted. Instance will be terminated."
-    exit 0
-  fi
 fi
 
-# ── Full training ─────────────────────────────────────────────────────────────
+# ── Full training (dry_run=False) ─────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
-echo ""
-
-run_remote bash -s <<TRAIN
-set -euo pipefail
+run_ssm "full-training" "$(cat <<'TRAIN'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
 cd /home/ec2-user/predictor
-${ENV_SOURCE}
-
-$REMOTE_PYTHON -c "
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+$PY - <<'PYEOF'
 import sys, os
 sys.path.insert(0, '.')
 os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
@@ -436,16 +392,16 @@ is_meta = 'meta' in str(v).lower()
 
 if is_meta:
     print(f'  Architecture:   v3.0 Meta-Model')
-    print(f'  Meta-Model IC:  {result.get(\"meta_model_ic\", result.get(\"test_ic\", \"n/a\"))}')
-    print(f'  Momentum IC:    {result.get(\"momentum_test_ic\", \"n/a\")}')
-    print(f'  Volatility IC:  {result.get(\"volatility_test_ic\", \"n/a\")}')
-    print(f'  Regime Acc:     {(result.get(\"regime_accuracy\", 0) * 100):.1f}%')
+    print(f'  Meta-Model IC:  {result.get("meta_model_ic", result.get("test_ic", "n/a"))}')
+    print(f'  Momentum IC:    {result.get("momentum_test_ic", "n/a")}')
+    print(f'  Volatility IC:  {result.get("volatility_test_ic", "n/a")}')
+    print(f'  Regime Acc:     {(result.get("regime_accuracy", 0) * 100):.1f}%')
     rc = result.get('research_calibrator_metrics', {})
     if rc:
-        print(f'  Research Cal:   {rc.get(\"n_samples\", 0)} samples, overall hit={rc.get(\"overall_hit_rate\", \"n/a\")}')
+        print(f'  Research Cal:   {rc.get("n_samples", 0)} samples, overall hit={rc.get("overall_hit_rate", "n/a")}')
     wf = result.get('walk_forward', {})
-    print(f'  WF Momentum:    median_IC={wf.get(\"momentum_median_ic\", \"n/a\")}')
-    print(f'  WF Volatility:  median_IC={wf.get(\"volatility_median_ic\", \"n/a\")}')
+    print(f'  WF Momentum:    median_IC={wf.get("momentum_median_ic", "n/a")}')
+    print(f'  WF Volatility:  median_IC={wf.get("volatility_median_ic", "n/a")}')
     coefs = result.get('meta_coefficients', {})
     if coefs:
         print(f'  Meta-model coefficients:')
@@ -454,28 +410,29 @@ if is_meta:
                 print(f'    {name:<30} {val:+.4f}')
 else:
     print(f'  Architecture:   v2.0 Single/Ensemble GBM')
-    print(f'  Test IC:        {result.get(\"test_ic\", \"n/a\")}')
-    print(f'  MSE IC:         {result.get(\"mse_ic\", \"n/a\")}')
-    print(f'  Rank IC:        {result.get(\"rank_ic\", \"n/a\")}')
-    print(f'  Ensemble IC:    {result.get(\"ensemble_ic\", \"n/a\")}')
+    print(f'  Test IC:        {result.get("test_ic", "n/a")}')
+    print(f'  MSE IC:         {result.get("mse_ic", "n/a")}')
+    print(f'  Rank IC:        {result.get("rank_ic", "n/a")}')
+    print(f'  Ensemble IC:    {result.get("ensemble_ic", "n/a")}')
     wf = result.get('walk_forward', {})
     wf_status = 'PASS' if wf.get('passes_wf') else 'FAIL/skipped'
-    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get(\"median_ic\", \"n/a\")})')
+    print(f'  Walk-forward:   {wf_status}  (median_IC={wf.get("median_ic", "n/a")})')
 
-print(f'  Promoted:       {result.get(\"promoted\", \"n/a\")}')
-print(f'  Promoted mode:  {result.get(\"promoted_mode\", \"n/a\")}')
-print(f'  Elapsed:        {result.get(\"elapsed_s\", \"n/a\")}s')
-print(f'  Slim cache:     {result.get(\"slim_cache_tickers\", \"n/a\")} tickers')
+print(f'  Promoted:       {result.get("promoted", "n/a")}')
+print(f'  Promoted mode:  {result.get("promoted_mode", "n/a")}')
+print(f'  Elapsed:        {result.get("elapsed_s", "n/a")}s')
+print(f'  Slim cache:     {result.get("slim_cache_tickers", "n/a")} tickers')
 print('=' * 60)
-"
+PYEOF
 TRAIN
+)" "${MAX_RUNTIME_SECONDS}"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Training complete. Instance will be terminated."
 echo "═══════════════════════════════════════════════════════════════"
 
-# Emit CloudWatch heartbeat on successful completion
+# CloudWatch heartbeat on successful completion (unchanged).
 aws cloudwatch put-metric-data \
   --namespace "AlphaEngine" \
   --metric-name "Heartbeat" \
