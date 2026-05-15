@@ -7,14 +7,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-@pytest.fixture(autouse=True)
-def _reset_init_flag():
-    """Reset the module-level _init_done so each test starts fresh."""
-    import inference.handler as h
-    h._init_done = False
-    yield
-
-
 @pytest.fixture
 def stubbed_preflight(monkeypatch):
     """Replace PredictorPreflight with a no-op so tests don't hit S3."""
@@ -24,15 +16,6 @@ def stubbed_preflight(monkeypatch):
     fake_module = MagicMock(PredictorPreflight=pf)
     monkeypatch.setitem(sys.modules, "inference.preflight", fake_module)
     return pf
-
-
-@pytest.fixture
-def stub_load_secrets(monkeypatch):
-    """Make load_secrets a cheap no-op."""
-    fake_ssm = MagicMock()
-    fake_ssm.load_secrets = MagicMock(return_value=0)
-    monkeypatch.setitem(sys.modules, "ssm_secrets", fake_ssm)
-    return fake_ssm
 
 
 def _fake_context(function_name="local", arn=""):
@@ -45,7 +28,7 @@ def _fake_context(function_name="local", arn=""):
 # ── action="train" (deprecated) ─────────────────────────────────────────────
 
 
-def test_handler_train_returns_400_deprecated(stub_load_secrets, stubbed_preflight):
+def test_handler_train_returns_400_deprecated(stubbed_preflight):
     import inference.handler as h
     result = h.handler({"action": "train"}, _fake_context())
     assert result["statusCode"] == 400
@@ -55,7 +38,7 @@ def test_handler_train_returns_400_deprecated(stub_load_secrets, stubbed_preflig
 # ── action="check_coverage" ─────────────────────────────────────────────────
 
 
-def test_handler_check_coverage_returns_delta(stub_load_secrets, stubbed_preflight, monkeypatch):
+def test_handler_check_coverage_returns_delta(stubbed_preflight, monkeypatch):
     fake_delta = {
         "n_buy_candidates": 25,
         "n_predictions": 20,
@@ -77,7 +60,7 @@ def test_handler_check_coverage_returns_delta(stub_load_secrets, stubbed_preflig
 
 
 def test_handler_check_deploy_drift_uses_run_for_drift_gate(
-    stub_load_secrets, stubbed_preflight, monkeypatch,
+    stubbed_preflight, monkeypatch,
 ):
     fake_drift = MagicMock()
     fake_drift.check_deploy_drift = MagicMock(return_value={
@@ -103,7 +86,7 @@ def test_handler_check_deploy_drift_uses_run_for_drift_gate(
 
 
 def test_handler_check_deploy_drift_falls_back_to_env_account(
-    stub_load_secrets, stubbed_preflight, monkeypatch,
+    stubbed_preflight, monkeypatch,
 ):
     monkeypatch.setenv("AWS_ACCOUNT_ID", "999999999999")
     fake_drift = MagicMock()
@@ -127,7 +110,7 @@ def test_handler_check_deploy_drift_falls_back_to_env_account(
 
 
 def test_handler_predict_default_path_invokes_main(
-    stub_load_secrets, stubbed_preflight, monkeypatch,
+    stubbed_preflight, monkeypatch,
 ):
     fake_daily = MagicMock()
     fake_daily.main = MagicMock()
@@ -149,7 +132,7 @@ def test_handler_predict_default_path_invokes_main(
 
 
 def test_handler_predict_supplemental_tickers_split_csv(
-    stub_load_secrets, stubbed_preflight, monkeypatch,
+    stubbed_preflight, monkeypatch,
 ):
     fake_daily = MagicMock()
     fake_daily.main = MagicMock()
@@ -169,7 +152,7 @@ def test_handler_predict_supplemental_tickers_split_csv(
 
 
 def test_handler_predict_supplemental_tickers_list(
-    stub_load_secrets, stubbed_preflight, monkeypatch,
+    stubbed_preflight, monkeypatch,
 ):
     fake_daily = MagicMock()
     fake_daily.main = MagicMock()
@@ -183,18 +166,3 @@ def test_handler_predict_supplemental_tickers_list(
     assert call_kwargs["dry_run"] is True
 
 
-# ── _ensure_init ────────────────────────────────────────────────────────────
-
-
-def test_ensure_init_is_idempotent(stub_load_secrets, stubbed_preflight, monkeypatch):
-    """load_secrets() must run on first invocation and skip subsequent ones."""
-    fake_daily = MagicMock()
-    fake_daily.main = MagicMock()
-    monkeypatch.setitem(sys.modules, "inference.daily_predict", fake_daily)
-
-    import inference.handler as h
-    h.handler({}, _fake_context())
-    h.handler({}, _fake_context())
-
-    # _ensure_init is called twice but load_secrets only once
-    assert stub_load_secrets.load_secrets.call_count == 1
