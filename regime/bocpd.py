@@ -43,13 +43,20 @@ import numpy as np
 #
 # DAILY_HAZARD = 1/500 ≈ a regime change every ~500 trading days (~2y),
 # matching the historical mean regime length (NBER cycles / VIX-regime
-# stretches). DAILY_MIN_RUNLENGTH_FOR_CHANGE = 10 ≈ two trading weeks,
-# the daily analog of the weekly detector's 4-week window. Both are
-# starting points; F1's backfill recalibrates them against retrospective
-# smoothed-HMM bear stretches before any executor consumes the signal.
+# stretches).
+#
+# RECALIBRATED 2026-05-15 (F1 backfill, the stated F1 deliverable):
+# swept hazard ∈ {1/250,1/500,1/750,1/1000} × min_rl ∈ {5,10,15} over
+# the 9.8y daily intensity_z reconstruction vs SPY drawdown stretches.
+# hazard=1/500 (unchanged) + min_rl=5 dominated: lowest whipsaw
+# (0.71 toggles/yr, 29.3d mean dwell, 0% sub-clear episodes), positive
+# lead (+0.7d), lowest FPR (0.29). min_rl=10 was the pre-backfill
+# starting guess (≈2 trading weeks); the evidence favors a tighter
+# 5-day (≈1 week) change window. Report:
+# alpha-engine-config/private-docs/EXPERIMENTS.md.
 WEEKLY_HAZARD: float = 1.0 / 100.0
 DAILY_HAZARD: float = 1.0 / 500.0
-DAILY_MIN_RUNLENGTH_FOR_CHANGE: int = 10
+DAILY_MIN_RUNLENGTH_FOR_CHANGE: int = 5
 # A daily detector should track ~2y of run-length grid before tail
 # collapse (vs the weekly detector's 520 ≈ 10y). 504 ≈ 2 trading years.
 DAILY_MAX_RUNLENGTH_HORIZON: int = 504
