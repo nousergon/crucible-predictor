@@ -229,11 +229,20 @@ PYJSON
   done
 }
 
+# Each run_ssm step is a fresh SSM shell with a minimal env. The
+# .env-deprecation arc deleted the sourced .env, so AWS_REGION/
+# AWS_DEFAULT_REGION (which boto3 + training/preflight.py's
+# check_env_vars("AWS_REGION") require) are no longer set unless each
+# step's export line sets them. Same #247 regression as alpha-engine-data's
+# spot scripts; spot_train.sh is a sibling repo the original arc missed.
+# System is single-region us-east-1 (matches this file's own
+# ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
+# PredictorTraining preflight failure.
 # ── Bootstrap (watchdog + deps + clone + staged config) ───────────────────────
 echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
 run_ssm "bootstrap" "$(cat <<BOOTSTRAP
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 
 # Spot-side hard-timeout watchdog. The dispatcher-side 'trap cleanup EXIT'
 # only fires if THIS script exits; if the dispatcher is killed/cancelled the
@@ -257,7 +266,7 @@ BOOTSTRAP
 echo "==> Installing Python dependencies..."
 run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
@@ -277,7 +286,7 @@ if [ "$MODE" != "full-only" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "smoke" "$(cat <<'SMOKE'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -369,7 +378,7 @@ echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
 run_ssm "full-training" "$(cat <<'TRAIN'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
