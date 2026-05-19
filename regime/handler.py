@@ -160,6 +160,38 @@ def produce_regime_substrate(
 
     current = current_features_from_history(history)
 
+    # ── Drawdown regime leg — weekly forensic block (additive) ───────────
+    # regime-drawdown-hysteresis-260518.md §4.1. Reproducible from the
+    # price cache (replayed through the hysteresis), mirroring the HMM
+    # refit-from-history discipline. Best-effort: a failure here writes
+    # the substrate WITHOUT the drawdown key (S3-contract-safe, ADD-only)
+    # — the brief/macro-agent fall back to the HMM-only path. The excess
+    # leg is live-only (point-in-time eod_pnl is not reproducible for an
+    # ``as_of`` historical backfill).
+    drawdown_block = None
+    try:
+        from regime.drawdown import block_from_history, read_eod_pnl_nav
+        from regime.features import _read_parquet_close
+
+        spy_close = _read_parquet_close(
+            "SPY", s3_client=s3_client, bucket=bucket,
+            prefix=price_cache_prefix,
+        )
+        if as_of is not None and len(spy_close):
+            spy_close = spy_close[spy_close.index <= as_of]
+        nav_hist = (
+            read_eod_pnl_nav(s3_client, bucket=bucket)
+            if as_of is None else None
+        )
+        drawdown_block = block_from_history(spy_close, nav_history=nav_hist)
+    except Exception as _dd_err:  # noqa: BLE001 — additive, never block
+        logger.warning(
+            "[regime_substrate] drawdown block assembly failed (%s) — "
+            "substrate written without it (additive, S3-contract-safe).",
+            _dd_err,
+        )
+        drawdown_block = None
+
     payload = build_regime_substrate(
         feature_history=hmm_input,  # only the cols HMM saw at fit time
         current_features=current,
@@ -169,6 +201,7 @@ def produce_regime_substrate(
         trading_day=trading_day,
         fit_window_start=str(hmm_input.index.min().date()),
         fit_window_end=str(hmm_input.index.max().date()),
+        drawdown_block=drawdown_block,
     )
 
     if not write:

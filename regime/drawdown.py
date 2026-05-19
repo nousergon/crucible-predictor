@@ -547,3 +547,73 @@ def seed_state(
         nav_peak=nav_peak,
         observations_seen=0,
     )
+
+
+# ── Forensic batch view (weekly substrate block) ─────────────────────────
+
+def block_from_history(
+    spy_close: "pd.Series",
+    *,
+    nav_history: "pd.Series | None" = None,
+    tunables: DrawdownTunables | None = None,
+) -> dict[str, Any] | None:
+    """Hysteresis-correct *current* drawdown state, replayed from price
+    history — the forensic weekly-substrate view.
+
+    The weekly substrate block must be reproducible from the price cache
+    alone (same philosophy as the HMM refitting from history each week),
+    so this **replays the full SPY series through ``step()``** to get
+    the hysteresis-correct current tier (NOT ``seed_state``'s
+    conservative cold-start shortcut). The excess (book-vs-market) leg
+    is a **point-in-time** read of the latest NAV-vs-SPY gap — the NAV
+    series is executor-produced + short, so its hysteresis history is
+    not reproducible here; a point-in-time forensic read is the honest
+    surface.
+
+    Returns the same ``spy``/``excess`` sub-block shape as the daily
+    artifact (so the substrate ``drawdown`` key is uniform weekly vs
+    daily), or ``None`` when there is no SPY history (caller omits the
+    block — S3-contract-safe, additive).
+    """
+    t = tunables or DrawdownTunables()
+    s = spy_close.dropna()
+    if s.empty:
+        return None
+    st: DrawdownState | None = None
+    for i, px in enumerate(s.to_list()):
+        st, _ = step(
+            st, spy_close=float(px), trading_day=str(i),
+            calendar_date=str(i), run_id="hist", tunables=t,
+        )
+    assert st is not None  # s is non-empty ⇒ at least one step ran
+    spy_dd = (
+        float(s.iloc[-1]) / st.spy_peak - 1.0 if st.spy_peak else 0.0
+    )
+    spy_block = {
+        "tier": st.spy_tier,
+        "drawdown": float(spy_dd),
+        "peak": None if st.spy_peak is None else float(st.spy_peak),
+        "regime_contribution": spy_tier_to_regime(st.spy_tier),
+    }
+    excess_block: dict[str, Any] = {
+        "available": False, "tier": "risk_on",
+        "nav_drawdown": None, "excess_depth": None,
+        "regime_contribution": None,
+    }
+    if nav_history is not None:
+        nv = nav_history.dropna()
+        if len(nv) >= 2:
+            nav_peak = float(nv.cummax().iloc[-1])
+            nav_dd = (
+                float(nv.iloc[-1]) / nav_peak - 1.0 if nav_peak else 0.0
+            )
+            excess_mag = max(spy_dd - nav_dd, 0.0)
+            ex_tier = _advance_excess_tier("risk_on", excess_mag, t)
+            excess_block = {
+                "available": True,
+                "tier": ex_tier,
+                "nav_drawdown": float(nav_dd),
+                "excess_depth": float(excess_mag),
+                "regime_contribution": excess_tier_to_regime(ex_tier),
+            }
+    return {"spy": spy_block, "excess": excess_block}
