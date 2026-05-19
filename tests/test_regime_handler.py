@@ -161,3 +161,43 @@ def test_default_hmm_features_include_pin_feature() -> None:
     """spy_20d_return must be in DEFAULT_HMM_FEATURE_COLUMNS — otherwise
     every default-invocation Lambda call would fail the pin check."""
     assert "spy_20d_return" in DEFAULT_HMM_FEATURE_COLUMNS
+
+
+def test_produce_assembles_weekly_drawdown_block() -> None:
+    """The weekly handler now fills the additive drawdown block (PR:
+    weekly-handler wiring) so the substrate the macro agent reads
+    carries `drawdown` + the composed `effective_regime`."""
+    s3 = _FakeS3()
+    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    result = produce_regime_substrate(
+        s3_client=s3, bucket="test-bucket", write=False,
+    )
+    payload = result["payload"]
+    assert "drawdown" in payload
+    assert payload["drawdown"]["spy"]["tier"] in {
+        "risk_on", "caution", "risk_off",
+    }
+    # No eod_pnl.csv seeded ⇒ excess leg gracefully unavailable.
+    assert payload["drawdown"]["excess"]["available"] is False
+    eff = payload["effective_regime"]["effective_regime"]
+    assert eff in {"bull", "neutral", "caution", "bear"}
+
+
+def test_produce_substrate_survives_drawdown_block_failure(monkeypatch) -> None:
+    """A drawdown-assembly failure must NOT block the substrate — the
+    key is simply omitted (additive, S3-contract-safe)."""
+    import regime.drawdown as dd
+
+    s3 = _FakeS3()
+    _seed_two_regime_price_cache(s3, "test-bucket", DEFAULT_PRICE_CACHE_PREFIX)
+    monkeypatch.setattr(
+        dd, "block_from_history",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    result = produce_regime_substrate(
+        s3_client=s3, bucket="test-bucket", write=False,
+    )
+    payload = result["payload"]
+    assert "drawdown" not in payload          # omitted, not crashed
+    assert "effective_regime" not in payload
+    assert payload["hmm"]["argmax"] in {"bear", "neutral", "bull"}

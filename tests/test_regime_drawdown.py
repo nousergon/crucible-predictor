@@ -26,6 +26,7 @@ from regime.drawdown import (
     DrawdownState,
     DrawdownTunables,
     bear_stretches,
+    block_from_history,
     compose_effective_regime,
     dump_state,
     load_state,
@@ -385,6 +386,44 @@ def test_stage_drawdown_graceful_when_spy_missing(monkeypatch) -> None:
     stg.run(ctx)  # must not raise
 
     assert ctx.drawdown_effective_regime is None
+
+
+# ── block_from_history (forensic weekly view) ────────────────────────────
+
+def test_block_from_history_hysteresis_correct_replay() -> None:
+    # Rally to 120, fall to 102 (-15%), recover to 117 (-2.5%). A
+    # hysteresis-correct replay latches risk_off at -10% and only
+    # releases via the exit bands — at -2.5% it is back to risk_on
+    # (unlike seed_state's point-in-time, this honours the path).
+    idx = pd.date_range("2020-01-01", periods=8, freq="W")
+    spy = pd.Series([100, 110, 120, 108, 102, 108, 114, 117], index=idx)
+    blk = block_from_history(spy)
+    assert blk["spy"]["peak"] == 120.0
+    assert blk["spy"]["tier"] == "risk_on"          # recovered past exit band
+    assert blk["spy"]["drawdown"] == pytest.approx(117 / 120 - 1.0)
+    assert blk["excess"]["available"] is False
+
+
+def test_block_from_history_still_in_drawdown() -> None:
+    idx = pd.date_range("2020-01-01", periods=4, freq="W")
+    spy = pd.Series([100, 120, 110, 104], index=idx)  # -13% from 120
+    blk = block_from_history(spy)
+    assert blk["spy"]["tier"] == "risk_off"
+    assert blk["spy"]["regime_contribution"] == "bear"
+
+
+def test_block_from_history_excess_point_in_time() -> None:
+    idx = pd.date_range("2020-01-01", periods=4, freq="W")
+    spy = pd.Series([100, 100, 100, 100], index=idx)   # SPY flat at peak
+    nav = pd.Series([100, 100, 100, 93], index=idx)    # book -7% ⇒ excess 7%
+    blk = block_from_history(spy, nav_history=nav)
+    assert blk["excess"]["available"] is True
+    assert blk["excess"]["tier"] == "alpha_bleed"
+    assert blk["excess"]["regime_contribution"] == "bear"
+
+
+def test_block_from_history_empty_returns_none() -> None:
+    assert block_from_history(pd.Series(dtype=float)) is None
 
 
 # ── additive substrate hook ──────────────────────────────────────────────
