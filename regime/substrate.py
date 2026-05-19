@@ -139,6 +139,7 @@ def build_regime_substrate(
     fit_window_start: str | None = None,
     fit_window_end: str | None = None,
     hmm_weights_s3_key: str | None = None,
+    drawdown_block: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the regime substrate payload.
 
@@ -279,6 +280,27 @@ def build_regime_substrate(
             "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
     }
+
+    # ─ Drawdown regime leg (additive, optional — S3-contract-safe) ────
+    # The block is assembled by the caller (handler/stage) which has S3
+    # access to the SPY price cache + eod_pnl; substrate.py stays pure.
+    # When absent (None), the key is omitted entirely → zero change for
+    # existing consumers / the macro brief's HMM-only path.
+    if drawdown_block is not None:
+        from .drawdown import compose_effective_regime
+
+        payload["drawdown"] = dict(drawdown_block)
+        spy_leg = drawdown_block.get("spy") or {}
+        excess_leg = drawdown_block.get("excess") or {}
+        payload["effective_regime"] = compose_effective_regime(
+            hmm_argmax=hmm_argmax,
+            spy_tier=spy_leg.get("tier"),
+            excess_tier=(
+                excess_leg.get("tier")
+                if excess_leg.get("available") else None
+            ),
+        )
+
     return payload
 
 
@@ -353,6 +375,13 @@ def write_regime_substrate(
             "regime_change_signal": payload["bocpd"]["change_signal"],
             "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
+        # Additive: surface the composed effective regime when the
+        # drawdown leg is present (consumers reading latest.json get the
+        # composed value without resolving the full artifact).
+        if "effective_regime" in payload:
+            sidecar["effective_regime"] = payload["effective_regime"][
+                "effective_regime"
+            ]
         s3_client.put_object(
             Bucket=bucket,
             Key=latest_key,

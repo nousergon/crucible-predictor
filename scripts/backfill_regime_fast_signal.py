@@ -201,25 +201,22 @@ def _bear_stretches(s3, bucket: str) -> list[tuple[pd.Timestamp, pd.Timestamp]] 
             _read_parquet_close,
         )
 
+        from regime.drawdown import bear_stretches as _shared_bear_stretches
+
         spy = _read_parquet_close(
             "SPY", s3_client=s3, bucket=bucket, prefix=DEFAULT_PRICE_CACHE_PREFIX,
         ).dropna()
         if spy.empty:
             log.warning("SPY parquet empty — drawdown reference unavailable.")
             return None
-        peak = spy.cummax()
-        dd = spy / peak - 1.0  # ≤ 0
-        stretches: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-        in_bear = False
-        start: pd.Timestamp | None = None
-        for ts, d in dd.items():
-            if not in_bear and d <= -BEAR_DD_ENTER:
-                in_bear, start = True, ts
-            elif in_bear and d >= -BEAR_DD_EXIT:
-                stretches.append((start, ts))
-                in_bear = False
-        if in_bear and start is not None:
-            stretches.append((start, dd.index[-1]))
+        # Single source of truth: the production drawdown leg and this
+        # eval reference are now the SAME code (regime.drawdown). Keeping
+        # the BEAR_DD_ENTER/EXIT constants here as the explicit reference
+        # thresholds; raising them re-opens the F1 calibration (plan §3
+        # single-source-of-truth invariant).
+        stretches = _shared_bear_stretches(
+            spy, enter=BEAR_DD_ENTER, exit=BEAR_DD_EXIT,
+        )
         log.info(
             "drawdown bear reference: %d stretches (enter -%.0f%%, exit -%.0f%%)",
             len(stretches), BEAR_DD_ENTER * 100, BEAR_DD_EXIT * 100,
