@@ -84,3 +84,74 @@ class TestLoadPredictorParams:
         wo._predictor_params_cache = {"veto_confidence": 0.70}
         result = _load_predictor_params_from_s3("bucket")
         assert result == {"veto_confidence": 0.70}
+
+
+class TestDrawdownVetoClamp:
+    """PR 3: drawdown effective-regime veto clamp (gated default-off,
+    most-protective composition with the forced-bear clamp)."""
+
+    # base=0.30, cap=0.20 ⇒ bear_floor=0.10, caution_floor=0.20.
+    _OFF = {"veto_confidence": 0.30}
+    _ON = {"veto_confidence": 0.30, "drawdown_regime_enabled": True}
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_flag_off_is_observe_only_no_behavior_change(self, m):
+        m.return_value = self._OFF
+        # dd=bear but flag off ⇒ threshold unchanged (0.30); counterfactual
+        # only logged.
+        assert get_veto_threshold(
+            "b", drawdown_effective_regime="bear"
+        ) == pytest.approx(0.30)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_flag_on_bear_clamps_to_bear_floor(self, m):
+        m.return_value = self._ON
+        assert get_veto_threshold(
+            "b", drawdown_effective_regime="bear"
+        ) == pytest.approx(0.10)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_flag_on_caution_clamps_to_milder_floor(self, m):
+        m.return_value = self._ON
+        assert get_veto_threshold(
+            "b", drawdown_effective_regime="caution"
+        ) == pytest.approx(0.20)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_flag_on_benign_regimes_no_clamp(self, m):
+        m.return_value = self._ON
+        for r in ("bull", "neutral", None, ""):
+            assert get_veto_threshold(
+                "b", drawdown_effective_regime=r
+            ) == pytest.approx(0.30)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_most_protective_min_with_existing_threshold(self, m):
+        # bull market_regime would raise threshold to 0.40, but dd=bear
+        # clamp wins (min ⇒ 0.10).
+        m.return_value = self._ON
+        assert get_veto_threshold(
+            "b", market_regime="bull", drawdown_effective_regime="bear"
+        ) == pytest.approx(0.10)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_composition_with_forced_bear_is_most_protective(self, m):
+        # forced_bear (enabled) → bear_floor 0.10; dd=caution → 0.20.
+        # Most-protective = min = 0.10.
+        m.return_value = {
+            "veto_confidence": 0.30,
+            "drawdown_regime_enabled": True,
+            "regime_forced_bear_enabled": True,
+        }
+        assert get_veto_threshold(
+            "b", forced_bear=True, drawdown_effective_regime="caution"
+        ) == pytest.approx(0.10)
+
+    @patch.object(wo, "_load_predictor_params_from_s3")
+    def test_both_flags_off_default_path_unchanged(self, m):
+        # Regression: the accumulation refactor must not change the
+        # all-off path (forced_bear False, no dd) — plain base.
+        m.return_value = {"veto_confidence": 0.30}
+        assert get_veto_threshold("b", market_regime="neutral") == pytest.approx(
+            0.30
+        )

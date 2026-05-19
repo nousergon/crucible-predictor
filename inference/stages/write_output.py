@@ -116,6 +116,7 @@ def get_veto_threshold(
     market_regime: str = "",
     regime_intensity_z: float | None = None,
     forced_bear: bool = False,
+    drawdown_effective_regime: str | None = None,
 ) -> float:
     """
     Return the active veto confidence threshold, adjusted by market regime.
@@ -159,6 +160,20 @@ def get_veto_threshold(
       Default ``regime_forced_bear_enabled=False``: the clamp is dormant
       but, when ``forced_bear=True``, the counterfactual is logged
       (parallel-observe) so the F2 gate has data during the gated window.
+
+    Drawdown-regime clamp (regime-drawdown-hysteresis-260518.md, PR 3):
+      When ``drawdown_regime_enabled=True`` in S3 predictor_params AND
+      the composed daily drawdown effective regime
+      (``ctx.drawdown_effective_regime``, stamped by the daily stage)
+      is protective, the threshold is clamped — ``bear`` → the same
+      bear floor as forced-bear (``base - cap``), ``caution`` → a milder
+      floor (``base - cap/2``), mirroring the discrete −0.20/−0.10
+      relationship. Composed most-protective with the forced-bear clamp
+      and the Wire-4/discrete result: all clamps accumulate via ``min``
+      (lower threshold = more aggressive veto); none is half-honored.
+
+      Default ``drawdown_regime_enabled=False``: dormant; the
+      counterfactual is logged (parallel-observe) for the promotion gate.
     """
     params = _load_predictor_params_from_s3(s3_bucket)
     if params and "veto_confidence" in params:
@@ -204,30 +219,51 @@ def get_veto_threshold(
                 base, adjustment, regime, threshold,
             )
 
-    # ── F2 forced-bear max-protection clamp ──────────────────────────────
+    # ── Max-protection clamps (forced-bear + drawdown) ───────────────────
+    # Both accumulate via min() so the most-protective wins and neither
+    # is half-honored. Each is independently gated default-OFF; flag-off
+    # logs the counterfactual (parallel-observe) without changing
+    # behavior. With both flags off (the only live state today) the
+    # return value is exactly ``threshold`` — unchanged.
+    effective = threshold
+
     if forced_bear:
         bear_floor = max(0.0, min(0.80, base - cap))
         clamped = min(threshold, bear_floor)  # lower = more aggressive veto
-        clamp_enabled = bool(
-            params and params.get("regime_forced_bear_enabled", False)
-        )
-        if clamp_enabled:
-            if clamped < threshold:
+        if bool(params and params.get("regime_forced_bear_enabled", False)):
+            if clamped < effective:
                 log.warning(
                     "Veto threshold FORCED-BEAR clamp: %.3f → %.3f "
                     "(bear_floor=base-cap=%.2f-%.2f)",
-                    threshold, clamped, base, cap,
+                    effective, clamped, base, cap,
                 )
-            return clamped
-        # Parallel-observe: flag off, behavior unchanged, log the
-        # counterfactual so the F2 gate can measure the would-be effect.
-        log.info(
-            "regime_forced_bear OBSERVE (flag off): forced_bear=True, "
-            "veto would clamp %.3f → %.3f (bear_floor=%.3f)",
-            threshold, clamped, bear_floor,
-        )
+            effective = min(effective, clamped)
+        else:
+            log.info(
+                "regime_forced_bear OBSERVE (flag off): forced_bear=True, "
+                "veto would clamp %.3f → %.3f (bear_floor=%.3f)",
+                threshold, clamped, bear_floor,
+            )
 
-    return threshold
+    dd = (drawdown_effective_regime or "").lower().strip()
+    if dd in ("bear", "caution"):
+        dd_floor = max(0.0, min(0.80, base - (cap if dd == "bear" else cap / 2.0)))
+        dd_clamped = min(threshold, dd_floor)
+        if bool(params and params.get("drawdown_regime_enabled", False)):
+            if dd_clamped < effective:
+                log.warning(
+                    "Veto threshold DRAWDOWN clamp (%s): %.3f → %.3f "
+                    "(dd_floor=%.3f)", dd, effective, dd_clamped, dd_floor,
+                )
+            effective = min(effective, dd_clamped)
+        else:
+            log.info(
+                "drawdown_regime OBSERVE (flag off): effective_regime=%s, "
+                "veto would clamp %.3f → %.3f (dd_floor=%.3f)",
+                dd, threshold, dd_clamped, dd_floor,
+            )
+
+    return effective
 
 
 # ── Output writing (migrated from daily_predict.py) ──────────────────────────
@@ -1037,6 +1073,9 @@ def run(ctx: PipelineContext) -> None:
         market_regime=market_regime,
         regime_intensity_z=getattr(ctx, "regime_intensity_z", None),
         forced_bear=getattr(ctx, "regime_forced_bear", False),
+        drawdown_effective_regime=getattr(
+            ctx, "drawdown_effective_regime", None
+        ),
     )
 
     # Veto fires only when the model is BOTH bearish AND confident.
