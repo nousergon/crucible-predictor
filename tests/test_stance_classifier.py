@@ -289,3 +289,151 @@ class TestStanceVocabularyContract:
         assert MOMENTUM_SCALE > 0
         assert VALUE_SCALE > 0
         assert 0 < CATALYST_PEAK_DAYS < 30
+
+
+# ── Pillar-aware classify_stance (Phase 5 of attractiveness-pillars-260520) ──
+
+
+def _pillar_assessment(quality=70, value=50, momentum=50, growth=50,
+                       stewardship=50, defensiveness=50, catalyst=0):
+    """Build a pillar_assessment-shape dict matching the Phase 5 contract."""
+    return {
+        "quality": {"score": quality},
+        "value": {"score": value},
+        "momentum": {"score": momentum},
+        "growth": {"score": growth},
+        "stewardship": {"score": stewardship},
+        "defensiveness": {"score": defensiveness},
+        "catalyst_horizon_modulation": catalyst,
+    }
+
+
+class TestPillarAwareStanceClassifier:
+    """Phase 5: pillar-aware classify_stance routes via the institutional
+    6-pillar → 4-stance mapping when pillar_assessment is present."""
+
+    def test_high_momentum_pillar_dominates(self):
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=40, value=40, momentum=90,
+                                growth=40, stewardship=40,
+                                defensiveness=40, catalyst=0)
+        # Features irrelevant — pillar path takes over
+        stance, loadings, _ = classify_stance({}, pillar_assessment=pa)
+        assert stance == "momentum"
+        # Loadings sum to 1.0 within sum-to-one tolerance (lib validator
+        # tolerates ±1e-3 — we round to 6 decimals so should be ~exact)
+        assert abs(sum(loadings.values()) - 1.0) < 1e-3
+
+    def test_high_value_pillar_dominates(self):
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=40, value=90, momentum=40,
+                                growth=40, stewardship=40,
+                                defensiveness=40, catalyst=0)
+        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        assert stance == "value"
+
+    def test_quality_cluster_dominates_when_compounder_profile(self):
+        """quality_loading is mean(quality + growth + stewardship +
+        defensiveness) — a name with strong scores in all four (the
+        compounder/defensive cluster) should route to quality stance,
+        even when no single pillar is the highest individually."""
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=80, value=40, momentum=40,
+                                growth=80, stewardship=80,
+                                defensiveness=80, catalyst=0)
+        stance, loadings, _ = classify_stance({}, pillar_assessment=pa)
+        assert stance == "quality"
+        # Quality should be the largest loading by a meaningful margin
+        # because mean(80, 80, 80, 80) = 80 vs momentum_pillar = 40
+        # → quality_loading raw = 80/50 = 1.6 vs momentum/value = 0.8.
+        # After softmax with temperature 3, dominant ~60%+.
+        assert loadings["quality"] > 0.5
+
+    def test_high_catalyst_modulation_dominates(self):
+        """catalyst_horizon_modulation=+20 (max) → catalyst stance
+        dominates even when pillar scores are middling."""
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=50, value=50, momentum=50,
+                                growth=50, stewardship=50,
+                                defensiveness=50, catalyst=20)
+        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        assert stance == "catalyst"
+
+    def test_negative_catalyst_modulation_does_not_route_to_catalyst(self):
+        """catalyst_horizon_modulation < 0 represents near-term RISK,
+        not catalyst opportunity. Rescale clamps negative to 0 →
+        catalyst stance loading is ~uniform with others (doesn't
+        dominate)."""
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=80, value=50, momentum=50,
+                                growth=80, stewardship=80,
+                                defensiveness=80, catalyst=-15)
+        stance, _, _ = classify_stance({}, pillar_assessment=pa)
+        assert stance != "catalyst"
+
+    def test_pillar_path_falls_back_to_heuristic_when_pillars_empty(self):
+        """pillar_assessment={} → classifier falls back to feature heuristic."""
+        from model.stance_classifier import classify_stance
+
+        features = {"momentum_20d": 0.10, "realized_vol_20d": 0.30,
+                    "debt_to_equity": 0.5, "eps_ttm": 2.0}
+        stance_a, loadings_a, _ = classify_stance(features, pillar_assessment={})
+        stance_b, loadings_b, _ = classify_stance(features, pillar_assessment=None)
+        # Empty dict and None should both fall back to feature heuristic
+        # → same loadings
+        assert stance_a == stance_b
+        for k in loadings_a:
+            assert abs(loadings_a[k] - loadings_b[k]) < 1e-6
+
+    def test_pillar_path_falls_back_when_no_scores_extractable(self):
+        """pillar_assessment dict present but no pillar entries readable
+        → graceful degrade to feature heuristic."""
+        from model.stance_classifier import classify_stance
+
+        pa = {"catalyst_horizon_modulation": 5}  # no pillars
+        features = {"momentum_20d": 0.10, "realized_vol_20d": 0.30,
+                    "debt_to_equity": 0.5, "eps_ttm": 2.0}
+        stance_a, loadings_a, _ = classify_stance(features, pillar_assessment=pa)
+        stance_b, loadings_b, _ = classify_stance(features)
+        assert stance_a == stance_b
+        for k in loadings_a:
+            assert abs(loadings_a[k] - loadings_b[k]) < 1e-6
+
+    def test_pillar_path_preserves_catalyst_date_from_features(self):
+        """Pillar-derived stance shouldn't drop the catalyst_date —
+        executor's hard-exit gate needs it regardless of stance source."""
+        from model.stance_classifier import classify_stance
+
+        pa = _pillar_assessment(quality=90)
+        features = {"next_earnings_date": "2026-06-15"}
+        _, _, cd = classify_stance(features, pillar_assessment=pa)
+        assert cd == "2026-06-15"
+
+    def test_pillar_path_loadings_sum_to_one_across_full_input_space(self):
+        """Σ loadings == 1.0 must hold for any pillar input combination."""
+        from model.stance_classifier import classify_stance
+        import itertools
+
+        score_grid = (0, 25, 50, 75, 100)
+        # Sample a sparse grid to keep test fast; cartesian product of 6
+        # pillars × 5 values × catalyst ∈ {-20, 0, 20} = 46875 → take
+        # a quick stride. Goal is shape coverage, not exhaustiveness.
+        for q, v, m, g, st, df, cat in [
+            (0, 0, 0, 0, 0, 0, 0),       # all min
+            (100, 100, 100, 100, 100, 100, 0),  # all max
+            (50, 50, 50, 50, 50, 50, 0),  # all mid
+            (90, 30, 60, 90, 10, 80, 15),  # mixed realistic
+            (10, 90, 10, 10, 90, 10, -10),  # value-heavy with neg catalyst
+        ]:
+            pa = _pillar_assessment(q, v, m, g, st, df, cat)
+            _, loadings, _ = classify_stance({}, pillar_assessment=pa)
+            assert abs(sum(loadings.values()) - 1.0) < 1e-3, (
+                f"Σ != 1.0 for pillar input "
+                f"q={q} v={v} m={m} g={g} st={st} df={df} cat={cat}: "
+                f"loadings={loadings}"
+            )

@@ -173,8 +173,89 @@ def _raw_scores(features: Any) -> dict[str, float]:
     }
 
 
+def _pillar_raw_scores(pillar_assessment: dict) -> dict[str, float] | None:
+    """Compute per-stance raw scores from a research-emitted
+    ``QualitativePillarAssessment`` dict (Phase 5 of
+    attractiveness-pillars-260520 arc, 2026-05-21).
+
+    Mapping:
+      * ``momentum_loading ← momentum_pillar.score`` (1:1 — institutional
+        factor-model 1:1 momentum mapping per Jegadeesh-Titman / Carhart)
+      * ``value_loading ← value_pillar.score`` (1:1 — Fama-French HML /
+        Greenblatt)
+      * ``quality_loading ← mean(quality + growth + stewardship +
+        defensiveness pillar scores)`` (the compounder/defensive cluster
+        — preserves the 4-element ``StanceLiteral`` vocab so downstream
+        executor stance-conditional gates see no shape change; Buffett/
+        Munger "wonderful business" intuition + AQR QMJ + Frazzini-
+        Pedersen Betting Against Beta all collapse into this cluster)
+      * ``catalyst_loading ← max(0, catalyst_horizon_modulation) × 5``
+        (rescale [-20, +20] → [0, 100]; negative modulations zero out —
+        they represent near-term risk, not catalyst opportunity, and
+        don't route to catalyst-stance executor gates)
+
+    Returns ``None`` when the pillar_assessment has no per-pillar
+    scores readable (caller falls back to the feature-based heuristic).
+
+    Raw scores are on a 0-100 scale (mirroring the pillar score scale).
+    The caller normalizes via softmax with the same temperature as the
+    heuristic path (SOFTMAX_TEMPERATURE_INVERSE) — so the two paths
+    produce comparable loading shapes (dominant ~50-65%) even though
+    inputs differ.
+    """
+    if not pillar_assessment:
+        return None
+
+    def _score(pillar_name: str) -> float | None:
+        sub = pillar_assessment.get(pillar_name)
+        if isinstance(sub, dict):
+            return _safe_float(sub.get("score"))
+        if sub is not None:
+            return _safe_float(getattr(sub, "score", None))
+        return None
+
+    momentum = _score("momentum")
+    value = _score("value")
+    quality_cluster_scores = [
+        s for s in (_score("quality"), _score("growth"),
+                    _score("stewardship"), _score("defensiveness"))
+        if s is not None
+    ]
+
+    catalyst_mod = _safe_float(pillar_assessment.get("catalyst_horizon_modulation"))
+    if catalyst_mod is None:
+        catalyst_mod = 0.0
+
+    if momentum is None and value is None and not quality_cluster_scores:
+        return None
+
+    # Normalize raw scores to roughly [0, 2] before softmax so the
+    # temperature * 3.0 scaling produces dominant-stance ~50-65%
+    # loadings — matches the heuristic path's loading shape so
+    # consumers see comparable distributions across the two paths.
+    # Pillar scores are 0-100; divide by 50 to land in [0, 2].
+    def _norm(v: float | None) -> float:
+        return (v or 0.0) / 50.0
+
+    quality_mean = (
+        sum(quality_cluster_scores) / len(quality_cluster_scores)
+        if quality_cluster_scores else 0.0
+    )
+
+    catalyst_raw = max(0.0, catalyst_mod) * 5.0 / 50.0  # [0, 2]
+
+    return {
+        "momentum": _norm(momentum),
+        "value": _norm(value),
+        "quality": _norm(quality_mean),
+        "catalyst": catalyst_raw,
+    }
+
+
 def classify_stance(
     features: Any,
+    *,
+    pillar_assessment: dict | None = None,
 ) -> tuple[StanceLiteral, dict[str, float], str | None]:
     """Return ``(dominant_stance, loadings_dict, catalyst_date_or_None)``.
 
@@ -192,10 +273,29 @@ def classify_stance(
     executor's catalyst gate computes the hard-exit date from
     ``days_to_earnings`` directly in that case.
 
+    Two code paths (Phase 5 of attractiveness-pillars-260520 arc,
+    2026-05-21):
+      * ``pillar_assessment`` present + non-empty → derive raw stance
+        scores from the 6 pillar scores + catalyst_horizon_modulation
+        (institutional pillar-decomposed routing — see
+        ``_pillar_raw_scores`` for the mapping).
+      * ``pillar_assessment`` absent OR empty → fall back to the
+        feature-based heuristic (``_raw_scores``). This is the path
+        held-position recompute hits + the pre-Phase-4 history hits.
+
+    Both paths apply the same softmax temperature so loadings shapes
+    are comparable across the cutover. The pillar path's acceptance
+    criterion is that, post-first-Saturday-SF, the derived stance
+    distribution stays within 2σ of the prior-4-week heuristic-stance
+    distribution.
+
     Pure function — no I/O, no state. Takes a dict / pandas Series /
     anything with ``.get()``.
     """
-    raw = _raw_scores(features)
+    raw = _pillar_raw_scores(pillar_assessment) if pillar_assessment else None
+    if raw is None:
+        raw = _raw_scores(features)
+
     # Apply temperature sharpening to amplify the dominant stance
     # without going all the way to one-hot. T < 1 (we use 1/T = 3.0)
     # makes the dominant stance ~50-65% of mass while preserving the
