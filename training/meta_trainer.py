@@ -30,6 +30,32 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
+def _log_rss(label: str) -> int:
+    """Log current process RSS in MB and return the integer MB value.
+
+    Used at major training-stage boundaries to surface memory pressure
+    cycle-over-cycle. The 2026-05-24 redrive's predictor SIGKILL (likely
+    OOM during the third sequential volatility GBM fit) was diagnostically
+    invisible because the trainer had no per-stage RSS instrumentation;
+    closing that gap is the institutional pre-requisite to refactoring
+    memory usage with measured before/after numbers per
+    [[feedback_sota_institutional_default_no_shortcuts]].
+
+    Returns the RSS in MB so callers can track running max.
+
+    Soft-fails to a no-op if ``psutil`` import or syscall raises — never
+    blocks training.
+    """
+    try:
+        import psutil  # type: ignore[import]
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        log.info("RSS %s: %.0f MB", label, rss_mb)
+        return int(rss_mb)
+    except Exception as exc:  # pragma: no cover — defensive
+        log.debug("RSS profiling unavailable (%s)", exc)
+        return 0
+
+
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 
 # Horizons for the post-training Spearman IC diagnostic. Training still
@@ -2054,6 +2080,7 @@ def run_meta_training(
     log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
     # Volatility production model
+    peak_rss_mb = _log_rss("before prod_vol (plain) fit")
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
                          early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS)
     prod_vol.fit(X_vol[:n_train], np.abs(y_fwd[:n_train]),
@@ -2062,6 +2089,7 @@ def run_meta_training(
     vol_test_preds = prod_vol.predict(X_vol[val_end:])
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after prod_vol (plain) fit"))
 
     # ── Step 8a: Parallel macro-augmented volatility GBM (Stage 1b observe-only) ──
     # Per regime-conditioning rebuild plan: train a parallel volatility
@@ -2081,11 +2109,15 @@ def run_meta_training(
     # against the plain variant only — adding the aug variant to the gate
     # would require coupling the gate to the cutover decision, which we
     # explicitly defer.
-    X_vol_aug = np.concatenate([X_vol, X_macro_zscored], axis=1)
+    # Float32 augmented feature matrices — LightGBM trains natively on
+    # float32 and the augmented variants are the largest in-RAM matrices
+    # in this stage. Halves memory vs the default float64.
+    X_vol_aug = np.concatenate([X_vol, X_macro_zscored], axis=1).astype(np.float32, copy=False)
     VOL_AUG_FEATURES = list(cfg.VOLATILITY_FEATURES) + list(cfg.MACRO_NORM_FEATURES)
     prod_vol_macro_aug: GBMScorer | None = None
     vol_macro_aug_test_ic: float | None = None
     try:
+        peak_rss_mb = max(peak_rss_mb, _log_rss("before prod_vol_macro_aug fit"))
         prod_vol_macro_aug = GBMScorer(
             params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
             early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
@@ -2120,6 +2152,16 @@ def run_meta_training(
         )
         prod_vol_macro_aug = None
         vol_macro_aug_test_ic = None
+    # Release the augmented feature matrix before the next variant's
+    # concat allocates another large matrix. Together with the
+    # Booster's `free_dataset()` (called inside GBMScorer.fit() post-
+    # 2026-05-24), this caps peak RSS during the 3-variant volatility
+    # training instead of letting it accumulate to OOM.
+    import gc
+    peak_rss_mb = max(peak_rss_mb, _log_rss("before X_vol_aug del"))
+    del X_vol_aug
+    gc.collect()
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after X_vol_aug del + gc"))
 
     # ── Step 8a-2: Parallel risk-augmented volatility GBM (Stage 2b observe-only) ──
     # Per regime-conditioning rebuild plan: train a parallel volatility
@@ -2133,11 +2175,12 @@ def run_meta_training(
     # observe-only (Stage 2b inference path adds expected_move_risk_aug
     # parallel field). Cutover (Stage 2d) happens after the
     # variant_cutover_gate fires (≥15% relative IC lift over plain).
-    X_vol_risk_aug = np.concatenate([X_vol, X_risk], axis=1)
+    X_vol_risk_aug = np.concatenate([X_vol, X_risk], axis=1).astype(np.float32, copy=False)
     VOL_RISK_AUG_FEATURES = list(cfg.VOLATILITY_FEATURES) + list(cfg.RISK_AUG_FEATURES)
     prod_vol_risk_aug: GBMScorer | None = None
     vol_risk_aug_test_ic: float | None = None
     try:
+        peak_rss_mb = max(peak_rss_mb, _log_rss("before prod_vol_risk_aug fit"))
         prod_vol_risk_aug = GBMScorer(
             params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
             early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS,
@@ -2172,6 +2215,12 @@ def run_meta_training(
         )
         prod_vol_risk_aug = None
         vol_risk_aug_test_ic = None
+    # Same eager-release pattern as the macro-aug variant — drop the
+    # large augmented feature matrix before downstream stages allocate.
+    peak_rss_mb = max(peak_rss_mb, _log_rss("before X_vol_risk_aug del"))
+    del X_vol_risk_aug
+    gc.collect()
+    peak_rss_mb = max(peak_rss_mb, _log_rss("after X_vol_risk_aug del + gc"))
 
     # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
     # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
@@ -2510,10 +2559,18 @@ def run_meta_training(
                         name, bucket, dated_key,
                     )
 
+            # Final RSS snapshot — captured AFTER all L1 fits + meta-Ridge
+            # but before manifest write, so it reflects the high-water mark
+            # of training. Surfaced in the manifest so cycle-over-cycle
+            # drift (creeping memory pressure from new features / variants)
+            # is observable BEFORE it OOMs the spot.
+            peak_rss_mb = max(peak_rss_mb, _log_rss("end of training (pre-manifest-write)"))
+            log.info("Peak training RSS: %d MB", peak_rss_mb)
             # Write manifest
             manifest = {
                 "date": date_str,
                 "version": "v3.0-meta",
+                "peak_rss_mb": peak_rss_mb,
                 # Horizon-of-record + label-domain top-level metadata (added
                 # 2026-05-09 post Track A PR 5/6 cutover) so downstream
                 # consumers — dashboard, backtester analytics, evaluator —
