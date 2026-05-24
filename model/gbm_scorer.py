@@ -254,6 +254,20 @@ class GBMScorer:
         val_preds = self._booster.predict(X_val, num_iteration=self._best_iteration)
         self._val_ic = float(np.corrcoef(val_preds, y_val)[0, 1])
 
+        # Release training-data references retained by the Booster so the
+        # caller's RSS doesn't carry the 1.5M-row × N-feature train+val
+        # matrices forward to the NEXT GBM fit. LightGBM's `free_dataset()`
+        # nulls the internal `_train_set` / `_valid_sets` references; tree
+        # weights + `predict()` capability are unaffected. Closes the
+        # 2026-05-24 OOM class where 3 sequential volatility GBM fits
+        # accumulated train-data references until the 3rd fit OOMed.
+        try:
+            self._booster.free_dataset()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning(
+                "GBMScorer: free_dataset() failed (non-fatal): %s", exc,
+            )
+
         log.info(
             "GBMScorer training complete: best_iteration=%d  val_IC=%.4f",
             self._best_iteration, self._val_ic,
