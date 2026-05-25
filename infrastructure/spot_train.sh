@@ -58,12 +58,22 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 BRANCH="${BRANCH:-main}"
-# Capacity-resilient instance-type fallback set (2026-05-22 incident:
-# spot launches in single-AZ subnet-e07166ec/us-east-1f hit
-# InsufficientInstanceCapacity). All 2 vCPU / 4-8 GB RAM — equivalent
-# for the meta-trainer (steady-state ~1-1.5 GB). Order = preference;
-# the lib CLI tries each in turn until one launches.
-INSTANCE_TYPES="${INSTANCE_TYPES:-c5.large,m5.large,c6i.large,c5a.large}"
+# Capacity-resilient instance-type fallback set. 2026-05-26 reorder:
+# m5.large (8 GB) is first — the c5.large default (4 GB RAM) hit OOM
+# during the 2026-05-24 11:02 PT Saturday-SF recovery on
+# volatility-with-macros training (Stage 1b parallel observe-only;
+# `train=1503471 val=322172 n_features=19`). SSM script line 56
+# (the `$PY - <<PYEOF` invocation) was Killed by the kernel OOM
+# reaper; bash propagated SIGKILL (exit 137), SSM saw non-Success,
+# SF cascaded to BranchBFailed. Closes ROADMAP (f) forensic dive.
+# Order = preference; the lib CLI tries each in turn until one
+# launches. m5.large is ~$0.10/hr vs c5.large ~$0.085/hr — a few
+# pennies per Saturday SF buys the headroom that prevents OOM
+# class incidents. Original 2026-05-22 capacity-incident framing
+# preserved: spot launches in single-AZ subnet-e07166ec/us-east-1f
+# hit InsufficientInstanceCapacity; all 4 types in this list are
+# 2 vCPU and capacity-rotate cleanly.
+INSTANCE_TYPES="${INSTANCE_TYPES:-m5.large,c5.large,c6i.large,c5a.large}"
 INSTANCE_TYPE=""  # backward-compat: --instance-type X collapses INSTANCE_TYPES to single value
 AMI_ID="ami-0c421724a94bba6d6"  # Amazon Linux 2023 x86_64 (Python 3.12, SSM agent preinstalled)
 # Spot-side watchdog budget: meta-trainer typically completes 40-70 min;
