@@ -93,6 +93,38 @@ def test_run_ssm_uses_lib_dispatcher():
     )
 
 
+def test_run_ssm_passes_diagnostics_flags():
+    """L394 cascade — ``run_ssm`` MUST pass both ``--diagnostics-bucket``
+    and ``--diagnostics-prefix`` so terminal non-Success in any spot
+    SSM step writes a JSON failure record to
+    ``s3://${S3_BUCKET}/_spot_diagnostics/ae-predictor/{date}.json`` per
+    the lib v0.39.0 contract. Both flags must be present — lib's partial-
+    config guard makes a missing flag a silent no-op."""
+    text = _SCRIPT.read_text()
+    m = re.search(r"^run_ssm\(\)\s*\{.*?^\}", text, re.MULTILINE | re.DOTALL)
+    assert m, "no run_ssm() helper found in spot_train.sh"
+    body = m.group(0)
+    assert "--diagnostics-bucket" in body, (
+        "spot_train.sh run_ssm() does not pass --diagnostics-bucket to "
+        "the lib CLI. L394 cascade requires both --diagnostics-bucket "
+        "and --diagnostics-prefix together; without --diagnostics-bucket "
+        "the lib's partial-config guard makes the diagnostics-write a "
+        "silent no-op even on terminal non-Success."
+    )
+    assert "--diagnostics-prefix" in body, (
+        "spot_train.sh run_ssm() does not pass --diagnostics-prefix to "
+        "the lib CLI."
+    )
+    # Per-repo subprefix discriminates cascade A (ae-data) + cascade B
+    # (ae-backtester) sibling writes — lib's {date}.json key shape would
+    # otherwise clobber within a shared prefix.
+    assert "_spot_diagnostics/ae-predictor" in body, (
+        "spot_train.sh --diagnostics-prefix must scope to "
+        "_spot_diagnostics/ae-predictor so ae-data + ae-backtester "
+        "cascade siblings write to disjoint S3 namespaces."
+    )
+
+
 def test_no_inline_aws_ssm_send_command():
     """The script MUST NOT call ``aws ssm send-command`` directly in a
     non-comment line. That's the pre-lift pattern L342 explicitly

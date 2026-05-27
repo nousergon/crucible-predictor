@@ -214,6 +214,15 @@ done
 # reads it verbatim (no command-substitution scanning) — matching the
 # pattern alpha-engine-data PR 2 (#330) and alpha-engine-backtester
 # PR 3 (#251) adopted for their migrations.
+# L394 cascade: --diagnostics-bucket + --diagnostics-prefix activate the
+# lib v0.39.0 chokepoint that writes a JSON failure record (status +
+# command_id + 4KB stdout/stderr tails + instance_id) to
+# s3://${S3_BUCKET}/_spot_diagnostics/ae-predictor/{YYYY-MM-DD}.json on
+# terminal non-Success. Best-effort write inside the lib — S3 failure
+# swallowed; inner SSM exit always preserved. Substrate is failure-only
+# (no-op on Success). Per-repo subprefix discriminates cascade A
+# (ae-data) + cascade B (ae-backtester) sibling writes — lib's
+# {date}.json key shape would otherwise clobber within a shared prefix.
 run_ssm() {
   local description="$1" script="$2" timeout_s="${3:-3600}"
   printf '%s' "$script" | "$LIB_PYTHON" -m alpha_engine_lib.ssm_dispatcher run \
@@ -223,6 +232,8 @@ run_ssm() {
     --output-bucket "$S3_BUCKET" \
     --output-key-prefix "${S3_STAGING_PREFIX}/ssm-output" \
     --region "$AWS_REGION" \
+    --diagnostics-bucket "$S3_BUCKET" \
+    --diagnostics-prefix "_spot_diagnostics/ae-predictor" \
     --script-stdin
 }
 
