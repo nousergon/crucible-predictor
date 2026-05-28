@@ -500,8 +500,8 @@ def main():
     """CLI entry point for offline gate evaluation."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "--bucket", default=cfg.RESEARCH_BUCKET,
-        help=f"S3 bucket. Default: {cfg.RESEARCH_BUCKET}",
+        "--bucket", default=cfg.S3_BUCKET,
+        help=f"S3 bucket. Default: {cfg.S3_BUCKET}",
     )
     parser.add_argument(
         "--baseline", required=True,

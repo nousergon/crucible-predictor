@@ -263,8 +263,8 @@ def main():
         help="OOS rows date (YYYY-MM-DD). Default: latest.",
     )
     parser.add_argument(
-        "--bucket", default=cfg.RESEARCH_BUCKET,
-        help=f"S3 bucket. Default: {cfg.RESEARCH_BUCKET}",
+        "--bucket", default=cfg.S3_BUCKET,
+        help=f"S3 bucket. Default: {cfg.S3_BUCKET}",
     )
     parser.add_argument(
         "--bootstrap-iter", type=int, default=1000,

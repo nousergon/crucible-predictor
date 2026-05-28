@@ -223,7 +223,7 @@ def run_gate(
     ``DATE_CONVENTIONS.md``.
 
     Args:
-        bucket: S3 bucket. Defaults to ``cfg.RESEARCH_BUCKET``.
+        bucket: S3 bucket. Defaults to ``cfg.S3_BUCKET``.
         n_days: trailing prediction-history window. Default 42.
         horizon_days: forward-realized window. Default 21 (matches
             ``cfg.FORWARD_DAYS``).
@@ -248,7 +248,7 @@ def run_gate(
         ``window_days``, ``horizon_days``, ``n_pairs_loaded``,
         ``n_realized_filled``, ``s3_key`` (when ``write_to_s3=True``).
     """
-    bucket = bucket or cfg.RESEARCH_BUCKET
+    bucket = bucket or cfg.S3_BUCKET
     dual = now_dual()
     if run_id is None:
         run_id = new_eval_run_id()
@@ -344,7 +344,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--bucket", default=None,
-        help=f"S3 bucket. Default: cfg.RESEARCH_BUCKET ({cfg.RESEARCH_BUCKET}).",
+        help=f"S3 bucket. Default: cfg.S3_BUCKET ({cfg.S3_BUCKET}).",
     )
     parser.add_argument(
         "--window", type=int, default=DEFAULT_WINDOW_DAYS,
