@@ -1688,8 +1688,13 @@ def run_meta_training(
     # ONLY: it is reported in the manifest, NOT used to gate promotion. L4469
     # W1.4 flips the gate from the in-sample _val_ic to this number after 2-3
     # Saturday observe firings. See training/leakfree_meta_ic.py.
+    leakfree_meta_ic = {"status": "not_run"}
+    cpcv_meta_ic = {"status": "not_run"}
     try:
-        from training.leakfree_meta_ic import leakfree_meta_oos_ic
+        from training.leakfree_meta_ic import (
+            cpcv_meta_oos_ic,
+            leakfree_meta_oos_ic,
+        )
         _meta_dates = [
             r.get("date")
             for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
@@ -1720,10 +1725,37 @@ def run_meta_training(
             leakfree_meta_ic.get("n_folds"), leakfree_meta_ic.get("n"),
             leakfree_meta_ic.get("n_dates"), meta_model._val_ic,
         )
+
+        # W1.2 (L4469, OBSERVE): combinatorial purged CV — a DISTRIBUTION of
+        # leak-free cross-sectional OOS ICs (the single-path WF above tests one
+        # easily-overfit path). The distribution is the input to W1.3's
+        # Deflated-Sharpe / PBO promotion gate. OBSERVE ONLY.
+        cpcv_meta_ic = cpcv_meta_oos_ic(
+            meta_X, meta_y, _meta_dates,
+            fit_predict_fn=_meta_fit_predict,
+            forward_days=cfg.FORWARD_DAYS,
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            n_groups=getattr(cfg, "WF_CPCV_N_GROUPS", 6),
+            k_test=getattr(cfg, "WF_CPCV_K_TEST", 2),
+        )
+        log.info(
+            "W1.2 CPCV meta OOS IC (OBSERVE, NOT gated): mean=%s std=%s "
+            "[p05=%s p50=%s p95=%s] frac_pos=%s over %s combos / %s paths "
+            "(N=%s,k=%s). Distribution feeds the W1.3 DSR/PBO gate.",
+            cpcv_meta_ic.get("mean_ic"), cpcv_meta_ic.get("std_ic"),
+            cpcv_meta_ic.get("p05_ic"), cpcv_meta_ic.get("p50_ic"),
+            cpcv_meta_ic.get("p95_ic"), cpcv_meta_ic.get("frac_positive"),
+            cpcv_meta_ic.get("n_combos"), cpcv_meta_ic.get("n_backtest_paths"),
+            cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
+        )
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning(
-            "W1.1a leak-free meta OOS IC failed (OBSERVE, non-fatal): %s", _e)
-        leakfree_meta_ic = {"status": "error", "error": str(_e)}
+            "W1.1a/W1.2 leak-free meta OOS IC failed (OBSERVE, non-fatal): %s",
+            _e)
+        if leakfree_meta_ic.get("status") == "not_run":
+            leakfree_meta_ic = {"status": "error", "error": str(_e)}
+        if cpcv_meta_ic.get("status") == "not_run":
+            cpcv_meta_ic = {"status": "error", "error": str(_e)}
 
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
@@ -3169,6 +3201,11 @@ def run_meta_training(
         # gate from the in-sample _val_ic to this after observe firings.
         # Additive per S3 contract safety.
         "meta_model_oos_ic_leakfree": leakfree_meta_ic,
+        # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
+        # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
+        # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
+        # NOT gated. Additive per S3 contract safety.
+        "meta_model_oos_ic_cpcv": cpcv_meta_ic,
         "meta_coefficients": meta_model._coefficients,
         "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
