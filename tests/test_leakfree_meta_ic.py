@@ -11,6 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from training.leakfree_meta_ic import (
+    cpcv_meta_oos_ic,
     cross_sectional_rank_ic,
     expanding_wf_folds,
     leakfree_meta_oos_ic,
@@ -172,3 +173,52 @@ def test_insufficient_data_returns_status_not_crash():
         forward_days=21, n_folds=5, min_test=21,
     )
     assert out["status"] in ("insufficient_folds", "ok")
+
+
+# ── cpcv_meta_oos_ic (W1.2 — combinatorial purged CV) ─────────────────────
+
+
+def test_cpcv_enumerates_all_combinations():
+    X, y, dates = _make_panel(n_dates=240, n_names=15, signal=0.5, seed=10)
+    out = cpcv_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_groups=6, k_test=2,
+    )
+    assert out["status"] == "ok"
+    # C(6, 2) = 15 combinations, all should be valid on a 240-date panel
+    assert out["n_combos"] == 15
+    # LdP path count φ = (k/N)·C(N,k) = (2/6)·15 = 5
+    assert out["n_backtest_paths"] == 5
+    assert len(out["ics"]) == 15
+
+
+def test_cpcv_recovers_signal_distribution_positive():
+    X, y, dates = _make_panel(n_dates=240, n_names=15, signal=0.6, seed=11)
+    out = cpcv_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_groups=6, k_test=2,
+    )
+    assert out["status"] == "ok"
+    assert out["mean_ic"] > 0.2
+    assert out["frac_positive"] > 0.8
+    assert out["std_ic"] >= 0.0
+    assert out["min_ic"] <= out["p50_ic"] <= out["max_ic"]
+
+
+def test_cpcv_no_signal_centered_near_zero():
+    X, y, dates = _make_panel(n_dates=240, n_names=15, signal=0.0, seed=12)
+    out = cpcv_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_groups=6, k_test=2,
+    )
+    assert out["status"] == "ok"
+    assert abs(out["mean_ic"]) < 0.1
+
+
+def test_cpcv_insufficient_groups_status():
+    X, y, dates = _make_panel(n_dates=20, n_names=5, signal=0.5, seed=13)
+    out = cpcv_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_groups=2, k_test=2,  # need >= k_test+1 groups
+    )
+    assert out["status"] in ("insufficient_groups", "no_valid_combos", "ok")

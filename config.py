@@ -293,6 +293,14 @@ WF_PURGE_DAYS = _wf_cfg.get("purge_days", 5)
 # and the future CPCV path. Default 0 = current behavior; W1.4 raises it to
 # ~ceil(0.01·T) alongside the CPCV cutover.
 WF_EMBARGO_DAYS = _wf_cfg.get("embargo_days", 0)
+# W1.2 (ROADMAP L4469): combinatorial purged CV (López de Prado Ch. 12). The
+# meta rows' unique dates split into WF_CPCV_N_GROUPS contiguous groups; every
+# combination of WF_CPCV_K_TEST test groups yields one purged+embargoed OOS fit
+# → a DISTRIBUTION of cross-sectional ICs (vs the single-path WF). C(N,k)
+# combinations: (6,2)=15 fits/run (trivial). OBSERVE diagnostic only; the
+# distribution feeds the W1.3 DSR/PBO promotion gate.
+WF_CPCV_N_GROUPS = _wf_cfg.get("cpcv_n_groups", 6)
+WF_CPCV_K_TEST = _wf_cfg.get("cpcv_k_test", 2)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 
