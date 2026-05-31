@@ -1690,6 +1690,7 @@ def run_meta_training(
     # Saturday observe firings. See training/leakfree_meta_ic.py.
     leakfree_meta_ic = {"status": "not_run"}
     cpcv_meta_ic = {"status": "not_run"}
+    promotion_stats = {"status": "not_run"}
     try:
         from training.leakfree_meta_ic import (
             cpcv_meta_oos_ic,
@@ -1748,14 +1749,51 @@ def run_meta_training(
             cpcv_meta_ic.get("n_combos"), cpcv_meta_ic.get("n_backtest_paths"),
             cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
         )
+
+        # W1.3 (L4469, OBSERVE): Deflated Sharpe Ratio on the leak-free
+        # per-date IC series. PSR(0) is the trial-count-independent
+        # significance; DSR deflates for the trial count (anti-false-discovery
+        # — ~20 backtests manufacture a spurious 5%-significant strategy). NOT
+        # gated. PBO/CSCV deferred to W1.3b (needs a config grid; the predictor
+        # promotes one config per run today). See training/deflated_sharpe.py.
+        from training.deflated_sharpe import deflated_sharpe_ratio
+        _ic_series = (
+            leakfree_meta_ic.get("ic_series", [])
+            if isinstance(leakfree_meta_ic, dict) else []
+        )
+        # n_trials: the CPCV combination count is a conservative within-run
+        # trial proxy until cumulative cross-week trial-count tracking lands
+        # (W1.3b). max(.,WF_DSR_N_TRIALS) so a degenerate CPCV doesn't zero the
+        # deflation.
+        _n_trials = max(
+            int(cpcv_meta_ic.get("n_combos", 1) or 1),
+            int(getattr(cfg, "WF_DSR_N_TRIALS", 10)),
+        )
+        promotion_stats = deflated_sharpe_ratio(
+            _ic_series, n_trials=_n_trials,
+            threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+        )
+        log.info(
+            "W1.3 Deflated Sharpe (OBSERVE, NOT gated): IC-IR=%s skew=%s "
+            "kurt=%s | PSR(0)=%s DSR=%s (n_trials=%s SR*_maxnull=%s) → "
+            "would_promote=%s @thr=%s. W1.4 will gate on DSR.",
+            promotion_stats.get("ic_ir"), promotion_stats.get("skew"),
+            promotion_stats.get("kurtosis"), promotion_stats.get("psr_vs_zero"),
+            promotion_stats.get("dsr"), promotion_stats.get("n_trials"),
+            promotion_stats.get("sr_benchmark_maxnull"),
+            promotion_stats.get("would_promote"),
+            promotion_stats.get("threshold"),
+        )
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning(
-            "W1.1a/W1.2 leak-free meta OOS IC failed (OBSERVE, non-fatal): %s",
-            _e)
+            "W1.1a/W1.2/W1.3 leak-free meta OOS IC failed (OBSERVE, "
+            "non-fatal): %s", _e)
         if leakfree_meta_ic.get("status") == "not_run":
             leakfree_meta_ic = {"status": "error", "error": str(_e)}
         if cpcv_meta_ic.get("status") == "not_run":
             cpcv_meta_ic = {"status": "error", "error": str(_e)}
+        if promotion_stats.get("status") == "not_run":
+            promotion_stats = {"status": "error", "error": str(_e)}
 
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
@@ -3206,6 +3244,11 @@ def run_meta_training(
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
         # NOT gated. Additive per S3 contract safety.
         "meta_model_oos_ic_cpcv": cpcv_meta_ic,
+        # W1.3 (L4469, OBSERVE): Deflated Sharpe Ratio battery on the leak-free
+        # IC series — IC-IR, PSR(0) (trial-count-independent significance), and
+        # the trial-deflated DSR + a would_promote flag. NOT gated (W1.4 flips
+        # the gate to require dsr >= threshold). Additive per S3 contract safety.
+        "meta_model_promotion_stats": promotion_stats,
         "meta_coefficients": meta_model._coefficients,
         "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
