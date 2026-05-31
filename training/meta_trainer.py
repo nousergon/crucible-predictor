@@ -1750,13 +1750,21 @@ def run_meta_training(
             cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
         )
 
-        # W1.3 (L4469, OBSERVE): Deflated Sharpe Ratio on the leak-free
-        # per-date IC series. PSR(0) is the trial-count-independent
-        # significance; DSR deflates for the trial count (anti-false-discovery
-        # — ~20 backtests manufacture a spurious 5%-significant strategy). NOT
-        # gated. PBO/CSCV deferred to W1.3b (needs a config grid; the predictor
-        # promotes one config per run today). See training/deflated_sharpe.py.
-        from training.deflated_sharpe import deflated_sharpe_ratio
+        # W1.3 (L4469, OBSERVE): TWO lenses on the leak-free per-date IC series.
+        # (1) DOWNSIDE-AWARE PERFORMANCE — Sortino-of-IC + CVaR-of-IC, matching
+        #     the house skilled-risk basket (Sortino + CVaR + maxDD; Sharpe is
+        #     RETIRED to legacy, anchor-gates-on-skilled-risk-not-sharpe). This
+        #     is the headline "is the skill good + downside-robust" lens.
+        # (2) OVERFIT-SIGNIFICANCE — PSR/Deflated-Sharpe (Bailey-LdP): is the IC
+        #     genuinely non-zero vs multiple-testing false discovery? PSR is
+        #     itself in the basket. IC-IR here is symmetric BY DESIGN (a
+        #     significance test, not the performance metric).
+        # NOT gated. W1.4 composes BOTH (real AND downside-robust). PBO/CSCV
+        # deferred to W1.3b (needs a config grid). See training/deflated_sharpe.
+        from training.deflated_sharpe import (
+            deflated_sharpe_ratio,
+            downside_ic_stats,
+        )
         _ic_series = (
             leakfree_meta_ic.get("ic_series", [])
             if isinstance(leakfree_meta_ic, dict) else []
@@ -1769,20 +1777,34 @@ def run_meta_training(
             int(cpcv_meta_ic.get("n_combos", 1) or 1),
             int(getattr(cfg, "WF_DSR_N_TRIALS", 10)),
         )
-        promotion_stats = deflated_sharpe_ratio(
+        _downside = downside_ic_stats(
+            _ic_series,
+            sortino_threshold=float(getattr(cfg, "WF_SORTINO_IC_THRESHOLD", 0.0)),
+        )
+        _overfit = deflated_sharpe_ratio(
             _ic_series, n_trials=_n_trials,
             threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
         )
+        # Headline = the downside-aware performance lens; DSR/PSR is the
+        # significance leg. Structured so W1.4 can gate on both legs.
+        promotion_stats = {
+            "status": _overfit.get("status"),
+            "downside": _downside,
+            "overfit": _overfit,
+        }
         log.info(
-            "W1.3 Deflated Sharpe (OBSERVE, NOT gated): IC-IR=%s skew=%s "
-            "kurt=%s | PSR(0)=%s DSR=%s (n_trials=%s SR*_maxnull=%s) → "
-            "would_promote=%s @thr=%s. W1.4 will gate on DSR.",
-            promotion_stats.get("ic_ir"), promotion_stats.get("skew"),
-            promotion_stats.get("kurtosis"), promotion_stats.get("psr_vs_zero"),
-            promotion_stats.get("dsr"), promotion_stats.get("n_trials"),
-            promotion_stats.get("sr_benchmark_maxnull"),
-            promotion_stats.get("would_promote"),
-            promotion_stats.get("threshold"),
+            "W1.3 promotion battery (OBSERVE, NOT gated) — DOWNSIDE "
+            "(skilled-risk basket): Sortino-of-IC=%s CVaR%s%%-of-IC=%s "
+            "frac_neg_IC=%s worst=%s | OVERFIT (significance): PSR(0)=%s DSR=%s "
+            "(n_trials=%s) | passes_downside=%s passes_overfit=%s. W1.4 gates "
+            "on BOTH; Sortino/CVaR are the house metrics, IC-IR is symmetric "
+            "significance only.",
+            _downside.get("sortino_of_ic"), _downside.get("cvar_pct"),
+            _downside.get("cvar_of_ic"), _downside.get("frac_negative_ic"),
+            _downside.get("worst_ic"), _overfit.get("psr_vs_zero"),
+            _overfit.get("dsr"), _overfit.get("n_trials"),
+            _downside.get("passes_downside_gate"),
+            _overfit.get("passes_overfit_gate"),
         )
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning(
@@ -3244,10 +3266,13 @@ def run_meta_training(
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
         # NOT gated. Additive per S3 contract safety.
         "meta_model_oos_ic_cpcv": cpcv_meta_ic,
-        # W1.3 (L4469, OBSERVE): Deflated Sharpe Ratio battery on the leak-free
-        # IC series — IC-IR, PSR(0) (trial-count-independent significance), and
-        # the trial-deflated DSR + a would_promote flag. NOT gated (W1.4 flips
-        # the gate to require dsr >= threshold). Additive per S3 contract safety.
+        # W1.3 (L4469, OBSERVE): two-lens promotion battery on the leak-free IC
+        # series. `downside` = the house skilled-risk lens (Sortino-of-IC +
+        # CVaR-of-IC + frac_negative_ic — Sortino/CVaR/maxDD basket, Sharpe is
+        # legacy); `overfit` = the significance lens (PSR/Deflated-Sharpe,
+        # Bailey-LdP; IC-IR symmetric by design for significance). NOT gated —
+        # W1.4 composes both (downside-robust AND real). Additive per S3
+        # contract safety.
         "meta_model_promotion_stats": promotion_stats,
         "meta_coefficients": meta_model._coefficients,
         "meta_importance": meta_model._importance,

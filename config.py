@@ -309,6 +309,13 @@ WF_CPCV_K_TEST = _wf_cfg.get("cpcv_k_test", 2)
 # W1.4 makes it gating. OBSERVE only today (reported, not gating).
 WF_DSR_N_TRIALS = _wf_cfg.get("dsr_n_trials", 10)
 WF_DSR_THRESHOLD = _wf_cfg.get("dsr_threshold", 0.95)
+# W1.3 (ROADMAP L4469): downside-aware IC performance lens — Sortino-of-IC
+# threshold (skilled-risk basket: Sortino + CVaR + maxDD, anchor-gates-on-
+# skilled-risk-not-sharpe). The predictor judges skill on DOWNSIDE risk, not
+# symmetric volatility; Sortino-of-IC = mean(IC)/downside-deviation(IC). OBSERVE
+# only today; W1.4 sets the real gating bar (composed with the DSR significance
+# leg). 0.0 = informational placeholder.
+WF_SORTINO_IC_THRESHOLD = _wf_cfg.get("sortino_ic_threshold", 0.0)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 

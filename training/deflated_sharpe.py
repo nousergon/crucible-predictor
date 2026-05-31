@@ -1,24 +1,33 @@
-"""Deflated Sharpe Ratio + Probabilistic Sharpe Ratio — ROADMAP L4469 W1.3.
+"""Predictor-skill promotion battery — ROADMAP L4469 W1.3 (OBSERVE).
 
-Bailey & López de Prado (2012/2014). The predictor's per-date cross-sectional
-IC series is treated as the "returns": the IC information ratio
-``IC-IR = mean(IC) / std(IC)`` is the Sharpe analog. The **Probabilistic Sharpe
-Ratio** PSR(SR*) is the probability the TRUE IC-IR exceeds a benchmark SR* given
-sample length, skewness and kurtosis. The **Deflated Sharpe Ratio** sets SR* to
-the EXPECTED MAXIMUM IC-IR under the null (true skill = 0) across ``n_trials``
-independent trials — so a strategy cherry-picked from many trials must clear a
-HIGHER bar. This is the anti-false-discovery deflation: ~20 repeated backtests
-manufacture a spurious 5%-significant strategy (López de Prado), and our weekly
-retrain + design-choice search is exactly that kind of multiple testing.
+TWO DISTINCT LENSES on the predictor's per-date cross-sectional IC series (one
+IC per date = did the model rank stocks correctly that day):
 
-OBSERVE ONLY in W1.3 — computed and reported, NOT used to gate promotion. W1.4
-flips the gate to require ``dsr >= threshold``.
+1. **Overfit-significance lens** (``deflated_sharpe_ratio``) — Bailey & López de
+   Prado. Is the IC genuinely non-zero, or a false discovery from multiple
+   testing? The IC information ratio ``IC-IR = mean(IC)/std(IC)`` is the Sharpe
+   analog; the **Probabilistic Sharpe Ratio** PSR(SR*) is the probability the
+   TRUE IC-IR exceeds SR*; the **Deflated Sharpe Ratio** sets SR* to the
+   EXPECTED MAXIMUM IC-IR under the null across ``n_trials`` (~20 backtests
+   manufacture a spurious 5%-significant strategy). This is a SIGNIFICANCE test,
+   not a performance metric — and PSR is itself part of the house skilled-risk
+   basket, so it is on-framework. IC-IR is intentionally symmetric here because
+   significance testing needs the full dispersion.
 
-PBO via CSCV is deliberately DEFERRED to W1.3b: the Probability of Backtest
-Overfitting measures overfitting of model *selection* and needs a grid of
-candidate configs to select among. The predictor promotes ONE config per run
-today, so PBO is degenerate; it becomes meaningful once W2/W4 introduce L1 /
-architecture variants. Shipping a degenerate PBO now would be a bandaid.
+2. **Downside-aware performance lens** (``downside_ic_stats``) — the house
+   metric framework (``anchor-gates-on-skilled-risk-not-sharpe``; the
+   evaluator-revamp stack is **Sortino + CVaR + max DD**, with Sharpe RETIRED to
+   legacy) judges on DOWNSIDE risk, not symmetric volatility. Applied to the IC
+   series: **Sortino-of-IC** = mean(IC) / downside-deviation(IC), **CVaR-of-IC**
+   = mean of the worst k% daily ICs (the bad-ranking-day tail), and the fraction
+   of negative-IC days. This is the PERFORMANCE lens that matches the basket —
+   the symmetric IC-IR above is a secondary/significance stat, not the headline.
+
+W1.4 will gate on BOTH legs (real AND downside-robust); any evaluation of the
+signal as RETURNS (W3 turnover-adjusted net alpha, W5 decile spreads) uses
+Sortino + CVaR + max DD, never Sharpe. OBSERVE ONLY in W1.3 — reported, not
+gating. PBO via CSCV is DEFERRED to W1.3b (it measures model-*selection*
+overfitting and needs a config grid; degenerate with one config per run today).
 """
 from __future__ import annotations
 
@@ -30,6 +39,75 @@ from scipy.stats import norm
 from scipy.stats import skew as _skew
 
 _EULER_MASCHERONI = 0.5772156649015329
+
+
+def downside_ic_stats(
+    ic_series,
+    *,
+    target: float = 0.0,
+    cvar_pct: float = 5.0,
+    sortino_threshold: float = 0.0,
+) -> dict:
+    """Downside-aware IC performance lens (skilled-risk basket: Sortino + CVaR).
+
+    Matches the house framework (``anchor-gates-on-skilled-risk-not-sharpe``)
+    which judges on DOWNSIDE risk rather than symmetric volatility, applied to
+    the predictor's per-date IC series:
+
+    - ``sortino_of_ic`` = mean(IC) / downside_deviation(IC, target) — penalizes
+      only bad-ranking days (IC < target), not upside IC dispersion.
+    - ``cvar_of_ic`` = mean of the worst ``cvar_pct``% daily ICs — the expected
+      IC on our worst ranking days (Expected Shortfall; CVaR is the basket's
+      tail measure).
+    - ``frac_negative_ic`` / ``worst_ic`` — how often / how badly we rank wrong.
+
+    This is the PERFORMANCE lens; ``deflated_sharpe_ratio`` is the separate
+    OVERFIT-significance lens. ``passes_downside_gate`` (observe) flags
+    ``sortino_of_ic >= sortino_threshold``; W1.4 sets the real thresholds.
+    """
+    ic = np.asarray([x for x in np.asarray(ic_series, dtype=float)
+                     if np.isfinite(x)], dtype=float)
+    n = int(ic.size)
+    if n < 5:
+        return {"status": "insufficient", "n": n,
+                "sortino_of_ic": None, "cvar_of_ic": float("nan"),
+                "passes_downside_gate": False}
+    mean_ic = float(ic.mean())
+    downside = ic[ic < target] - target
+    n_down = int(downside.size)
+    dd = float(math.sqrt(float(np.mean(downside ** 2)))) if n_down > 0 else 0.0
+    # No bad-ranking days → Sortino is "infinitely good"; report None +
+    # n_downside_days=0 rather than inf (JSON-safe) so the consumer reads it as
+    # a clean upside-only series, not a missing value.
+    sortino = (mean_ic / dd) if dd > 1e-12 else None
+    k = max(1, int(math.ceil(cvar_pct / 100.0 * n)))
+    worst_k = np.sort(ic)[:k]
+    cvar = float(worst_k.mean())
+    frac_neg = float((ic < 0).mean())
+
+    def _r(v, p=6):
+        if v is None:
+            return None
+        return round(float(v), p) if np.isfinite(v) else float("nan")
+
+    passes = bool(
+        (sortino is not None and sortino >= sortino_threshold)
+        or (sortino is None and mean_ic > 0)
+    )
+    return {
+        "status": "ok",
+        "n": n,
+        "n_downside_days": n_down,
+        "mean_ic": _r(mean_ic),
+        "downside_deviation": _r(dd),
+        "sortino_of_ic": _r(sortino),
+        "cvar_pct": cvar_pct,
+        "cvar_of_ic": _r(cvar),
+        "frac_negative_ic": _r(frac_neg, 4),
+        "worst_ic": _r(float(ic.min())),
+        "sortino_threshold": sortino_threshold,
+        "passes_downside_gate": passes,
+    }
 
 
 def probabilistic_sharpe_ratio(
@@ -77,7 +155,10 @@ def deflated_sharpe_ratio(
     supplied it falls back to ``1/sqrt(n)`` (the single-path sampling std — a
     conservative deflation). Returns observe stats incl. ``psr_vs_zero``
     (trial-count-independent significance), ``dsr`` (deflated), and a
-    ``would_promote`` flag at ``threshold``.
+    ``passes_overfit_gate`` flag at ``threshold``. NOTE: this is the
+    SIGNIFICANCE leg only (is the IC real?), NOT a promotion decision — W1.4
+    composes it with the downside-aware performance lens (``downside_ic_stats``:
+    Sortino-of-IC + CVaR) per the house skilled-risk basket.
     """
     ic = np.asarray([x for x in np.asarray(ic_series, dtype=float)
                      if np.isfinite(x)], dtype=float)
@@ -86,7 +167,7 @@ def deflated_sharpe_ratio(
         return {
             "status": "insufficient", "n": n,
             "ic_ir": float("nan"), "psr_vs_zero": float("nan"),
-            "dsr": float("nan"), "would_promote": False,
+            "dsr": float("nan"), "passes_overfit_gate": False,
         }
     sr = float(ic.mean() / ic.std(ddof=1))
     sk = float(_skew(ic))
@@ -113,5 +194,5 @@ def deflated_sharpe_ratio(
         "psr_vs_zero": _r(psr0),
         "dsr": _r(dsr),
         "threshold": threshold,
-        "would_promote": bool(np.isfinite(dsr) and dsr >= threshold),
+        "passes_overfit_gate": bool(np.isfinite(dsr) and dsr >= threshold),
     }
