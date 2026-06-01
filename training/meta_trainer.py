@@ -459,7 +459,6 @@ from model.research_features import (
 from model import momentum_scorer
 from model import residual_momentum_scorer
 from model.residual_momentum_scorer import RESIDUAL_MOMENTUM_FEATURES
-from data.residual_momentum_features import compute_residual_momentum_features
 
 
 def build_train_meta_features(resid_mom_enabled: bool) -> list[str]:
@@ -873,25 +872,14 @@ def run_meta_training(
         vol_chunks.append(
             labeled[cfg.VOLATILITY_FEATURES].to_numpy(dtype=np.float32)
         )
-        # W2 (L4469): residual-momentum features. Computed on the FULL raw_df
-        # close index (backward-only, point-in-time) then reindexed to the
-        # tail-dropped labeled.index so it aligns row-for-row with mom/vol.
-        # Benchmark = sector ETF if present else SPY (matches the label
-        # convention). Always emitted (the column is harmless extra data); the
-        # observe gate controls only META_FEATURES inclusion downstream.
-        resid_mom_df = compute_residual_momentum_features(
-            raw_df["Close"].astype(float),
-            benchmark_close=(sector_etf_s if sector_etf_s is not None else spy_series),
-            spy_close=spy_series,
-            beta_window=cfg.RESID_MOM_BETA_WINDOW,
-            mom_window=cfg.RESID_MOM_WINDOW,
-            skip_window=cfg.RESID_MOM_SKIP_DAYS,
-            vol_window=cfg.RESID_MOM_VOL_WINDOW,
-            mom_change_window=cfg.RESID_MOM_CHANGE_WINDOW,
-        )
+        # W2 (L4469): residual-momentum features — READ from the feature store
+        # (alpha-engine-data computes them; the data module owns features). Like
+        # risk_chunks below, ``reindex`` returns NaN for any column absent from
+        # the parquet (older feature_engineer outputs pre-rematerialization lack
+        # them) — the deterministic scorer + rank-norm neutralize NaN downstream.
         resid_mom_chunks.append(
-            resid_mom_df.reindex(labeled.index)[RESIDUAL_MOMENTUM_FEATURES]
-            .to_numpy(dtype=np.float32)
+            labeled.reindex(columns=RESIDUAL_MOMENTUM_FEATURES)
+                   .to_numpy(dtype=np.float32)
         )
         # Stage 2b: per-ticker risk features. ``reindex`` returns NaN
         # for any column missing from the parquet — older feature_engineer
@@ -936,7 +924,7 @@ def run_meta_training(
         # next iteration's allocations bounded by one DF's worth of
         # peak memory rather than the cumulative sum across 900 tickers
         # (the 2026-04-28 OOM root cause).
-        del labeled, raw_df, close_for_horizon, bench_for_horizon, resid_mom_df
+        del labeled, raw_df, close_for_horizon, bench_for_horizon
 
     log.info(
         "Feature read complete: %d accepted / %d candidates  "

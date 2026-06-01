@@ -163,20 +163,16 @@ walk_forward:
   wf_early_stopping: 20          # faster early stopping for fold validation
 
 # ── Residual / idiosyncratic-momentum L1 (W2, L4469, OBSERVE-mode) ────────────
-# Revives the dead raw-momentum L1 (WF median IC ≈ -0.001) with residual
-# momentum + vol scaling (Blitz/Hanauer) + a price-trend decomposition.
-# enabled=false ⇒ trained + measured by the leak-free machinery + emitted to
-# manifest.json, but NOT added to META_FEATURES / the live ensemble (inference
-# path byte-identical). Flip true only after 2-3 observe firings confirm a
-# positive purged-CV IC (composes with W1.4). The standalone leak-free read is
-# emitted regardless of this flag.
+# Reads residual-momentum features from the data-module feature store
+# (residual_momentum_ratio / mom_12_1_pct / sector_mom_pct — computed in
+# alpha-engine-data feature_engineer.py, NOT the predictor). enabled=false ⇒
+# trained + measured by the leak-free machinery + emitted to manifest.json, but
+# NOT added to META_FEATURES / the live ensemble (inference path byte-identical).
+# Flip true only after 2-3 observe firings confirm a positive purged-CV IC
+# (composes with W1.4). The standalone leak-free read is emitted regardless of
+# this flag. Feature windows live in the data module's `_FC`, not here.
 residual_momentum:
   enabled: false                 # the observe gate — NOT auto-promoted
-  beta_window: 60                # trailing window for the point-in-time market beta
-  window: 252                    # total momentum lookback (~12 months)
-  skip_days: 21                  # most-recent days skipped (12-1 skip-month convention)
-  vol_window: 20                 # residual-return volatility window (vol scaling)
-  change_window: 21              # momentum-change (acceleration) window
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:

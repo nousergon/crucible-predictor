@@ -25,8 +25,9 @@ def _synthetic_X(n: int = 200, seed: int = 0) -> np.ndarray:
 
 class TestContract:
     def test_feature_list_is_canonical(self):
+        # These are FEATURE-STORE column names (computed in alpha-engine-data).
         assert RESIDUAL_MOMENTUM_FEATURES == [
-            "resid_mom_vol_scaled", "mom_12_1", "mom_1m", "mom_change", "sector_mom",
+            "residual_momentum_ratio", "mom_12_1_pct", "sector_mom_pct",
         ]
 
     def test_predict_array_shape(self):
@@ -40,7 +41,7 @@ class TestContract:
         # not a crash. Score must still be finite and equal the blend of present
         # columns.
         X = _synthetic_X(50)
-        names = ["resid_mom_vol_scaled", "mom_12_1", "mom_1m", "mom_change"]  # drop sector_mom
+        names = ["residual_momentum_ratio", "mom_12_1_pct"]  # drop sector_mom_pct
         out = rms.predict_array(X[:, : len(names)], names)
         assert out.shape == (50,)
         assert np.all(np.isfinite(out))
@@ -79,13 +80,15 @@ class TestDictParity:
     def test_predict_dict_none_and_missing_degrade(self):
         # Missing keys + None both → neutral; with all neutral the score is 0.
         assert abs(rms.predict_dict({})) < 1e-12
-        assert abs(rms.predict_dict({"resid_mom_vol_scaled": None})) < 1e-12
+        assert abs(rms.predict_dict({"residual_momentum_ratio": None})) < 1e-12
 
     def test_known_weighting_sign(self):
-        # mom_1m carries a NEGATIVE weight (short-term reversal): a positive
-        # mom_1m alone must lower the score.
+        # All three sub-signals carry POSITIVE weights (momentum); each lifts
+        # the score, and the residual headline dominates.
         base = rms.predict_dict({})
-        pos_1m = rms.predict_dict({"mom_1m": 1.0})
-        pos_resid = rms.predict_dict({"resid_mom_vol_scaled": 1.0})
-        assert pos_1m < base
-        assert pos_resid > base
+        assert rms.predict_dict({"residual_momentum_ratio": 1.0}) > base
+        assert rms.predict_dict({"mom_12_1_pct": 1.0}) > base
+        assert rms.predict_dict({"sector_mom_pct": 1.0}) > base
+        # Headline residual term dominates the raw decomposition terms.
+        assert (rms.predict_dict({"residual_momentum_ratio": 1.0})
+                > rms.predict_dict({"mom_12_1_pct": 1.0}))
