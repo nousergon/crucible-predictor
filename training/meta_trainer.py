@@ -769,6 +769,13 @@ def run_meta_training(
     # to the same tail-dropped labeled.index as mom_chunks. OBSERVE-mode: gated
     # out of META_FEATURES unless cfg.RESIDUAL_MOMENTUM_ENABLED.
     resid_mom_chunks: list[np.ndarray] = []
+    # W2.3 (L4469): factor_momentum_ratio is a cross-sectional-time-series
+    # feature OWNED by the data module (factor_momentum.materialize_factor_
+    # momentum) — it can't be computed predictor-locally per ticker, so we READ
+    # it from the ArcticDB-sourced ``labeled`` frame. NaN-filled when the column
+    # isn't materialized yet (pre-backfill / daily-gap) → neutral downstream.
+    # Carried for the standalone + add-one-in observe reads; NOT a META_FEATURE.
+    factor_mom_chunks: list[np.ndarray] = []
 
     for path in all_parquets:
         ticker = path.stem
@@ -893,6 +900,14 @@ def run_meta_training(
             resid_mom_df.reindex(labeled.index)[RESIDUAL_MOMENTUM_FEATURES]
             .to_numpy(dtype=np.float32)
         )
+        # W2.3 (L4469): read factor_momentum_ratio straight from the ArcticDB
+        # frame (it's a data-module feature). Absent (pre-backfill / daily-gap)
+        # → NaN, which the observe reads drop per-date / impute to neutral.
+        factor_mom_chunks.append(
+            labeled["factor_momentum_ratio"].to_numpy(dtype=np.float32)
+            if "factor_momentum_ratio" in labeled.columns
+            else np.full(n_rows, np.nan, dtype=np.float32)
+        )
         # Stage 2b: per-ticker risk features. ``reindex`` returns NaN
         # for any column missing from the parquet — older feature_engineer
         # outputs (pre-#202) lack these columns, but LightGBM handles
@@ -985,13 +1000,14 @@ def run_meta_training(
     y_fwd_tb_unsorted = np.concatenate(fwd_tb_chunks)
     y_fwd_tb_touch_unsorted = np.concatenate(fwd_tb_touch_chunks)
     X_resid_mom_unsorted = np.concatenate(resid_mom_chunks, axis=0)  # W2
+    factor_mom_unsorted = np.concatenate(factor_mom_chunks)  # W2.3 (1-D)
 
     # Free the chunk lists — referenced data has been copied into the
     # contiguous arrays above. Without this `del` the chunks linger
     # through walk-forward and double the RSS we just reduced.
     del date_chunks, ticker_chunks, mom_chunks, vol_chunks, risk_chunks
     del fwd_chunks, fwd_horizons_chunks, fwd_tb_chunks, fwd_tb_touch_chunks
-    del resid_mom_chunks
+    del resid_mom_chunks, factor_mom_chunks
 
     # Stable sort by date so ties keep ticker-order deterministic for
     # snapshot tests + reproducibility.
@@ -1030,11 +1046,12 @@ def run_meta_training(
     # applies only to the continuous alpha labels).
     y_fwd_tb_touch = y_fwd_tb_touch_unsorted[sort_idx]
     X_resid_mom = X_resid_mom_unsorted[sort_idx]  # W2
+    factor_mom_raw = factor_mom_unsorted[sort_idx]  # W2.3 (1-D, row-aligned)
 
     del date_unsorted, ticker_unsorted
     del X_mom_unsorted, X_vol_unsorted, X_risk_unsorted
     del y_fwd_unsorted, y_fwd_horizons_unsorted, y_fwd_tb_unsorted
-    del y_fwd_tb_touch_unsorted, X_resid_mom_unsorted
+    del y_fwd_tb_touch_unsorted, X_resid_mom_unsorted, factor_mom_unsorted
 
     # Winsorize
     if cfg.LABEL_CLIP:
@@ -1479,6 +1496,10 @@ def run_meta_training(
                     # observe gate (cfg.RESIDUAL_MOMENTUM_ENABLED) selects it
                     # into TRAIN_META_FEATURES below.
                     "residual_momentum_score": float(resid_mom_preds[local_idx]),
+                    # W2.3 (L4469): raw factor_momentum_ratio carried for the
+                    # standalone + add-one-in observe reads. NOT a META_FEATURE
+                    # (absent from TRAIN_META_FEATURES → never enters meta_X).
+                    "factor_momentum_ratio": float(factor_mom_raw[idx]),
                     **research_features,
                     "actual_fwd": float(y_fwd[idx]),
                     # Stage 3 PR 2: parallel triple-barrier alpha label
@@ -1775,6 +1796,7 @@ def run_meta_training(
     leakfree_meta_ic = {"status": "not_run"}
     cpcv_meta_ic = {"status": "not_run"}
     promotion_stats = {"status": "not_run"}
+    _lf_oos_preds = _lf_oos_true = _lf_oos_dates = None  # W5 capture (below)
     try:
         from training.leakfree_meta_ic import (
             cpcv_meta_oos_ic,
@@ -1797,7 +1819,14 @@ def run_meta_training(
             embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
             bootstrap_fn=lambda p, y, d: _bootstrap_ic_ci_by_date(
                 p, y, d, n_iter=1000, ci=0.95, seed=4469),
+            return_preds=True,
         )
+        # W5 (L4469): capture the stacked leak-free OOS preds for the decile-
+        # spread read (no refit) and POP them so the manifest dict stays
+        # JSON-serializable. None until the block below runs.
+        _lf_oos_preds = leakfree_meta_ic.pop("_oos_preds", None)
+        _lf_oos_true = leakfree_meta_ic.pop("_oos_true", None)
+        _lf_oos_dates = leakfree_meta_ic.pop("_oos_dates", None)
         log.info(
             "W1.1a leak-free meta OOS IC (OBSERVE, NOT gated): xsec=%s "
             "pooled=%s [%s, %s] over %s folds / %s rows / %s dates — vs "
@@ -2155,6 +2184,258 @@ def run_meta_training(
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning("W4.1 nonlinear-L2 shadow failed (OBSERVE, non-fatal): %s", _e)
         meta_oos_ic_leakfree_nonlinear = {"status": "error", "error": str(_e)}
+
+    # ── W2.3 + observe trio (L4469, OBSERVE) ─────────────────────────────────
+    # Four more leak-free reads, all reusing the W1 machinery, all gating
+    # NOTHING. Each is self-contained (own dates / fit_predict) so one failing
+    # read can't take the others down. The canonical 21d target is unchanged.
+
+    # (B) W2.3 factor_momentum_ratio — a SEPARATELY-CONSTRUCTED candidate factor
+    # (the data module owns its construction). Measured the institutional way:
+    # standalone univariate cross-sectional rank IC (does it rank names at all?)
+    # + the marginal add-one-in leak-free meta ΔIC (does it add IC beyond the
+    # existing stack?). Deliberately NOT folded into the residual-momentum
+    # deterministic blend — that would need an invented weight and would
+    # contaminate the W2.1/2.2 signal mid-soak; a constructed factor is promoted
+    # via the L2 weighter, after observe firings, not a hand-set constant.
+    factor_momentum_leakfree: dict = {"status": "not_run"}
+    meta_oos_ic_leakfree_with_factor_momentum: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import (
+            cross_sectional_ic_series as _fm_ics,
+            leakfree_meta_oos_ic as _fm_lf,
+        )
+        from training.deflated_sharpe import (
+            deflated_sharpe_ratio as _fm_dsr,
+            downside_ic_stats as _fm_dstats,
+        )
+        _fm_col = np.array([
+            r.get("factor_momentum_ratio", float("nan")) for r in oos_meta_rows
+        ])[canonical_finite_mask]
+        _fm_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _fm_finite = int(np.isfinite(_fm_col).sum())
+        if _fm_finite < 50:
+            # Loud, not silent: the column isn't materialized yet (the W2.3
+            # backfill hasn't run, or this is a daily-gap firing).
+            factor_momentum_leakfree = {
+                "status": "not_materialized",
+                "n_finite": _fm_finite,
+                "note": "factor_momentum_ratio absent/sparse in ArcticDB — run "
+                        "the data-module W2.3 backfill before this firing.",
+            }
+            log.warning(
+                "W2.3 factor-momentum observe: only %d finite factor_momentum_"
+                "ratio rows — column not materialized; read skipped (OBSERVE).",
+                _fm_finite,
+            )
+        else:
+            _fm_series = _fm_ics(_fm_col, meta_y, _fm_dates)
+            _fm_xsec = float(np.mean(_fm_series)) if _fm_series else float("nan")
+            _fm_down = _fm_dstats(
+                _fm_series,
+                sortino_threshold=float(getattr(cfg, "WF_SORTINO_IC_THRESHOLD", 0.0)),
+            )
+            _fm_over = _fm_dsr(
+                _fm_series,
+                n_trials=int(getattr(cfg, "WF_DSR_N_TRIALS", 10)),
+                threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+            )
+            factor_momentum_leakfree = {
+                "status": "ok" if _fm_series else "insufficient_dates",
+                "xsec_ic": round(_fm_xsec, 6) if _fm_series else None,
+                "n": _fm_finite,
+                "n_dates": len(_fm_series),
+                "ic_series": [round(float(x), 6) for x in _fm_series],
+                "downside": _fm_down,
+                "overfit": _fm_over,
+                "forward_days": cfg.FORWARD_DAYS,
+                "embargo_days": int(getattr(cfg, "WF_EMBARGO_DAYS", 0)),
+            }
+            # Add-one-in marginal read: append factor_momentum_ratio to meta_X
+            # (NaN→0 neutral, matching the scorer posture) and run the SAME
+            # purged+embargoed WF; delta vs the headline meta_model_oos_ic_
+            # leakfree is its marginal contribution (complement to the W4 LOO).
+            _fm_aug_names = list(TRAIN_META_FEATURES) + ["factor_momentum_ratio"]
+            _fm_X_aug = np.column_stack([
+                meta_X, np.where(np.isfinite(_fm_col), _fm_col, 0.0),
+            ])
+
+            def _fm_fit_predict(_Xtr, _ytr, _Xte, _names=_fm_aug_names):
+                _m = MetaModel(alpha=1.0)
+                _m.fit(_Xtr, _ytr, feature_names=_names)
+                return _m.predict(_Xte).ravel()
+
+            meta_oos_ic_leakfree_with_factor_momentum = _fm_lf(
+                _fm_X_aug, meta_y, _fm_dates,
+                fit_predict_fn=_fm_fit_predict,
+                forward_days=cfg.FORWARD_DAYS,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+            _fm_base = leakfree_meta_ic.get("xsec_ic") if isinstance(leakfree_meta_ic, dict) else None
+            _fm_aug_ic = meta_oos_ic_leakfree_with_factor_momentum.get("xsec_ic")
+            if isinstance(_fm_base, (int, float)) and isinstance(_fm_aug_ic, (int, float)):
+                meta_oos_ic_leakfree_with_factor_momentum["delta_vs_base"] = round(
+                    float(_fm_aug_ic) - float(_fm_base), 6)
+            log.info(
+                "W2.3 factor-momentum observe (NOT gated): standalone xsec_ic=%s "
+                "over %s dates | add-one-in meta xsec=%s Δ=%s vs base. "
+                "Institutional candidate-factor read; promotion via the L2 only "
+                "after observe firings clear the bar.",
+                factor_momentum_leakfree.get("xsec_ic"),
+                factor_momentum_leakfree.get("n_dates"),
+                meta_oos_ic_leakfree_with_factor_momentum.get("xsec_ic"),
+                meta_oos_ic_leakfree_with_factor_momentum.get("delta_vs_base"),
+            )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W2.3 factor-momentum observe read failed (OBSERVE, non-fatal): %s", _e)
+        factor_momentum_leakfree = {"status": "error", "error": str(_e)}
+
+    # (W5) decile-spread monotonicity of the leak-free meta preds — NO refit,
+    # reuses the headline leak-free OOS preds captured at the W1.1a call.
+    meta_decile_spread_leakfree: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import decile_spread_monotonicity
+        if _lf_oos_preds is not None and len(_lf_oos_preds) >= 100:
+            meta_decile_spread_leakfree = decile_spread_monotonicity(
+                _lf_oos_preds, _lf_oos_true, _lf_oos_dates,
+            )
+        else:
+            meta_decile_spread_leakfree = {
+                "status": "no_leakfree_preds",
+                "n": 0 if _lf_oos_preds is None else int(len(_lf_oos_preds)),
+            }
+        log.info(
+            "W5 leak-free decile-spread monotonicity (OBSERVE, NOT gated): "
+            "top-minus-bottom=%s rank_spearman=%s monotone_frac=%s over %s "
+            "dates. A monotone-increasing decile profile = calibrated "
+            "cross-sectional skill.",
+            meta_decile_spread_leakfree.get("top_minus_bottom"),
+            meta_decile_spread_leakfree.get("rank_spearman"),
+            meta_decile_spread_leakfree.get("monotone_step_fraction"),
+            meta_decile_spread_leakfree.get("n_dates"),
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W5 decile-spread read failed (OBSERVE, non-fatal): %s", _e)
+        meta_decile_spread_leakfree = {"status": "error", "error": str(_e)}
+
+    # (W4) generalized per-L1 leave-one-out leak-free meta IC — drop EACH meta
+    # feature in turn and recompute; per-feature ΔIC vs the full read is the
+    # W4.2 pruning input ("which L1s carry leak-free IC"). Generalizes the
+    # W4-watch drop-expected_move read above to the whole stack.
+    meta_oos_ic_leakfree_per_l1_dropout: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import leakfree_meta_oos_ic as _loo_lf
+
+        _loo_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _loo_base = leakfree_meta_ic.get("xsec_ic") if isinstance(leakfree_meta_ic, dict) else None
+
+        def _loo_fit_predict(_Xtr, _ytr, _Xte, _names):
+            _m = MetaModel(alpha=1.0)
+            _m.fit(_Xtr, _ytr, feature_names=_names)
+            return _m.predict(_Xte).ravel()
+
+        _loo_per: dict = {}
+        for _drop_j, _drop_name in enumerate(TRAIN_META_FEATURES):
+            _keep = [f for f in TRAIN_META_FEATURES if f != _drop_name]
+            _keep_idx = [i for i in range(len(TRAIN_META_FEATURES)) if i != _drop_j]
+            _loo_res = _loo_lf(
+                meta_X[:, _keep_idx], meta_y, _loo_dates,
+                fit_predict_fn=lambda a, b, c, _n=_keep: _loo_fit_predict(a, b, c, _n),
+                forward_days=cfg.FORWARD_DAYS,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+            _drop_ic = _loo_res.get("xsec_ic")
+            _loo_per[_drop_name] = {
+                "xsec_ic_without": _drop_ic,
+                "delta_vs_full": (
+                    round(float(_loo_base) - float(_drop_ic), 6)
+                    if isinstance(_loo_base, (int, float)) and isinstance(_drop_ic, (int, float))
+                    else None
+                ),
+                "n_dates": _loo_res.get("n_dates"),
+            }
+        meta_oos_ic_leakfree_per_l1_dropout = {
+            "status": "ok",
+            "full_xsec_ic": _loo_base,
+            "per_feature": _loo_per,
+        }
+        # The most load-bearing feature is the one whose removal drops IC most.
+        _loo_ranked = sorted(
+            ((k, v["delta_vs_full"]) for k, v in _loo_per.items()
+             if isinstance(v.get("delta_vs_full"), (int, float))),
+            key=lambda kv: kv[1], reverse=True,
+        )
+        log.info(
+            "W4 per-L1 leave-one-out leak-free meta IC (OBSERVE, NOT gated): "
+            "full=%s | most load-bearing (largest IC drop when removed)=%s. "
+            "W4.2 pruning input — features with ~0 or negative delta carry no "
+            "leak-free meta IC.",
+            _loo_base, _loo_ranked[:3],
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4 per-L1 LOO read failed (OBSERVE, non-fatal): %s", _e)
+        meta_oos_ic_leakfree_per_l1_dropout = {"status": "error", "error": str(_e)}
+
+    # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
+    # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
+    # linear curve_leakfree (W3.2)? Reuses leakfree_horizon_ic_curve with the
+    # GBM fit_predict (W4.1). OBSERVE; the canonical 21d target is unchanged.
+    horizon_ics_leakfree_nonlinear: dict = {"status": "not_run"}
+    try:
+        from training.leakfree_meta_ic import (
+            gbm_blender_fit_predict as _nlh_gbm,
+            leakfree_horizon_ic_curve as _nlh_curve,
+        )
+
+        _nlh_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _nlh_labels = {
+            _h: np.array([
+                r.get(f"actual_fwd_{_h}d", float("nan"))
+                for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+            ])
+            for _h in _DIAGNOSTIC_HORIZONS
+        }
+        _nlh_raw = _nlh_curve(
+            meta_X, _nlh_labels, _nlh_dates,
+            fit_predict_fn=_nlh_gbm(),
+            embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+        )
+        horizon_ics_leakfree_nonlinear = {
+            _k: {
+                "status": _v.get("status"),
+                "xsec_ic": _v.get("xsec_ic"),
+                "pooled_ic": _v.get("pooled_ic"),
+                "n": _v.get("n"),
+                "n_dates": _v.get("n_dates"),
+                "n_folds": _v.get("n_folds"),
+                "forward_days": _v.get("forward_days"),
+            }
+            for _k, _v in _nlh_raw.items()
+        }
+        _nlh_finite = {
+            k: v["xsec_ic"] for k, v in horizon_ics_leakfree_nonlinear.items()
+            if isinstance(v.get("xsec_ic"), (int, float)) and np.isfinite(v["xsec_ic"])
+        }
+        _nlh_peak = max(_nlh_finite, key=_nlh_finite.get) if _nlh_finite else None
+        log.info(
+            "W3.2×W4.1 nonlinear-blender leak-free horizon curve (OBSERVE, NOT "
+            "gated): %s | nonlinear peak=%s vs linear-curve peak. Does a "
+            "nonlinear meta change the optimal horizon? Net-of-cost (W3.4) still "
+            "settles any cutover.",
+            {k: round(float(v), 4) for k, v in _nlh_finite.items()}, _nlh_peak,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W3.2×W4.1 nonlinear horizon curve failed (OBSERVE, non-fatal): %s", _e)
+        horizon_ics_leakfree_nonlinear = {"status": "error", "error": str(_e)}
 
     # Parity diagnostic: canonical Ridge predictions vs legacy labels
     # (cross-target). Useful for monitoring whether the cutover degrades
@@ -3666,6 +3947,22 @@ def run_meta_training(
         # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC — vs the linear
         # meta_model_oos_ic_leakfree on the SAME folds. Additive per S3 contract.
         "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
+        # W2.3 (L4469, OBSERVE): factor_momentum_ratio candidate-factor reads —
+        # standalone univariate cross-sectional rank IC (+ downside/DSR legs)
+        # and the add-one-in marginal leak-free meta ΔIC. NOT folded into the
+        # residual-momentum blend; promotion via the L2 only after observe
+        # firings. `status:not_materialized` until the data-module W2.3 backfill
+        # runs. Additive per S3 contract.
+        "factor_momentum_leakfree_oos_ic": factor_momentum_leakfree,
+        "meta_oos_ic_leakfree_with_factor_momentum": meta_oos_ic_leakfree_with_factor_momentum,
+        # W5 (L4469, OBSERVE): decile-spread monotonicity of the leak-free meta
+        # preds (no refit). Monotone-increasing decile profile = calibrated
+        # cross-sectional skill. Additive per S3 contract.
+        "meta_decile_spread_leakfree": meta_decile_spread_leakfree,
+        # W4 (L4469, OBSERVE): generalized per-L1 leave-one-out leak-free meta
+        # IC — per-feature ΔIC vs the full read is the W4.2 pruning input
+        # (which L1s carry leak-free IC). Additive per S3 contract.
+        "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
@@ -3757,6 +4054,12 @@ def run_meta_training(
             # gated; the canonical 21d target is unchanged. Additive per S3
             # contract. Net-of-cost judgment is W3.4 (deferred).
             "curve_leakfree": horizon_ics_leakfree,
+            # W3.2×W4.1 (L4469, OBSERVE): the leak-free per-horizon IC curve
+            # under the NONLINEAR (LightGBM) blender — does a nonlinear meta
+            # move the optimal horizon vs the linear curve_leakfree above? NOT
+            # gated; canonical 21d target unchanged. Net-of-cost (W3.4) settles
+            # any cutover. Additive per S3 contract.
+            "curve_leakfree_nonlinear": horizon_ics_leakfree_nonlinear,
             # Audit Track A PR 2/6 (2026-05-07): canonical-label IC
             # diagnostic. Persisted regardless of pass/fail for cross-cycle
             # trend monitoring. The audit's PR 5 cutover decision will
