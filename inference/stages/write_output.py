@@ -423,12 +423,30 @@ def write_predictions(
         if p.get("prediction_confidence", 0) >= threshold
     )
 
+    # Single gate-result block, carried in BOTH metrics.json (forensic trail)
+    # AND predictions.json (so the executor's hold-book safeguard can read the
+    # gate atomically with the batch it describes — the consumer-cutover for the
+    # 2026-06-01 hold-book decision). Additive field; no predictor behavior
+    # change here — the executor decides whether to act on it.
+    gate_block = {
+        "passed": inference_gate_result.passed,
+        "failed_check": inference_gate_result.failed_check,
+        "reason": inference_gate_result.reason,
+        "metrics": inference_gate_result.metrics,
+        "blocking": inference_gate_blocking,
+        "would_have_blocked_if_blocking": not inference_gate_result.passed,
+    }
+
     output = {
         "date": date_str,
         "model_version": metrics.get("model_version", "unknown"),
         "model_hit_rate_30d": metrics.get("hit_rate_30d_rolling", None),
         "n_predictions": len(predictions),
         "n_high_confidence": n_high_confidence,
+        # Executor reads this for the hold-book safeguard (2026-06-01): a
+        # strongly-biased batch (passed=False) must not drive an optimizer
+        # rotation — the executor holds the current book instead.
+        "output_distribution_gate": gate_block,
         "predictions": predictions,
     }
 
@@ -443,14 +461,7 @@ def write_predictions(
         # failed_check + the four measured invariants (n_unique_p_up,
         # saturation_rate, stdev_p_up, direction_skew) regardless of
         # whether the gate was in blocking mode this run.
-        "output_distribution_gate": {
-            "passed": inference_gate_result.passed,
-            "failed_check": inference_gate_result.failed_check,
-            "reason": inference_gate_result.reason,
-            "metrics": inference_gate_result.metrics,
-            "blocking": inference_gate_blocking,
-            "would_have_blocked_if_blocking": not inference_gate_result.passed,
-        },
+        "output_distribution_gate": gate_block,
     }
 
     predictions_json = json.dumps(output, indent=2)
