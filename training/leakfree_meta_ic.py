@@ -127,6 +127,7 @@ def leakfree_meta_oos_ic(
     n_folds: int = 5,
     min_test: int = 21,
     bootstrap_fn: Callable | None = None,
+    return_preds: bool = False,
 ) -> dict:
     """Second-level walk-forward OOS meta IC (OBSERVE).
 
@@ -136,6 +137,13 @@ def leakfree_meta_oos_ic(
 
     Returns a dict with ``xsec_ic`` (cross-sectional rank IC — the headline),
     ``pooled_ic`` (+ bootstrap CI), fold/sample counts, and a ``status``.
+
+    ``return_preds`` (W5, L4469): when True, also attach the stacked leak-free
+    OOS predictions / labels / dates under ``_oos_preds`` / ``_oos_true`` /
+    ``_oos_dates`` so a caller can run a downstream read (e.g. decile-spread
+    monotonicity) on the SAME preds WITHOUT a second walk-forward refit. These
+    are numpy arrays (NOT JSON-serializable) — the caller must ``pop`` them
+    before the dict reaches the manifest.
     """
     meta_X = np.asarray(meta_X, dtype=float)
     meta_y = np.asarray(meta_y, dtype=float)
@@ -165,7 +173,7 @@ def leakfree_meta_oos_ic(
         n_used_folds += 1
 
     if n_used_folds == 0 or len(oos_pred) < 10:
-        return {
+        out = {
             "status": "insufficient_folds",
             "n_folds": n_used_folds,
             "n": len(oos_pred),
@@ -174,6 +182,11 @@ def leakfree_meta_oos_ic(
             "forward_days": forward_days,
             "embargo_days": embargo_days,
         }
+        if return_preds:
+            out["_oos_preds"] = np.asarray(oos_pred, dtype=float)
+            out["_oos_true"] = np.asarray(oos_true, dtype=float)
+            out["_oos_dates"] = np.asarray(oos_date)
+        return out
 
     op = np.asarray(oos_pred, dtype=float)
     ot = np.asarray(oos_true, dtype=float)
@@ -199,7 +212,7 @@ def leakfree_meta_oos_ic(
     def _r(v):
         return round(float(v), 6) if np.isfinite(v) else float("nan")
 
-    return {
+    out = {
         "status": "ok",
         "n_folds": n_used_folds,
         "n": int(fin.sum()),
@@ -214,6 +227,11 @@ def leakfree_meta_oos_ic(
         "forward_days": forward_days,
         "embargo_days": embargo_days,
     }
+    if return_preds:
+        out["_oos_preds"] = op
+        out["_oos_true"] = ot
+        out["_oos_dates"] = od
+    return out
 
 
 def _contiguous_groups(n: int, n_groups: int) -> list[tuple[int, int]]:
@@ -410,6 +428,70 @@ def per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names) -> dict:
             "n_dates": len(series),
         }
     return out
+
+
+def decile_spread_monotonicity(
+    preds, y, dates, *, n_bins: int = 10, min_names: int = 10,
+) -> dict:
+    """W5 (L4469, OBSERVE): cross-sectional decile-spread monotonicity of the
+    leak-free meta predictions — the canonical sorted-portfolio diagnostic.
+
+    NO REFIT: operates on the stacked leak-free OOS preds already produced by
+    ``leakfree_meta_oos_ic(..., return_preds=True)``. Per date, rank names into
+    ``n_bins`` prediction bins (deciles); accumulate realized alpha per bin
+    across all dates; then report the top-minus-bottom spread, the Spearman of
+    bin-rank vs mean realized alpha, and the fraction of monotone-increasing
+    bin steps. A skilled, well-calibrated meta shows a monotone-increasing
+    decile profile (top decile earns the most alpha). Gates nothing.
+
+    Returns ``{status, n_bins, n_dates, decile_means, top_minus_bottom,
+    rank_spearman, monotone_step_fraction}``.
+    """
+    preds = np.asarray(preds, dtype=float)
+    y = np.asarray(y, dtype=float)
+    dates = np.asarray(dates)
+    bin_sums = np.zeros(n_bins)
+    bin_cnts = np.zeros(n_bins)
+    n_dates_used = 0
+    for d in np.unique(dates):
+        m = (dates == d) & np.isfinite(preds) & np.isfinite(y)
+        if m.sum() < max(min_names, n_bins):
+            continue
+        p = preds[m]
+        yy = y[m]
+        if np.std(p) < 1e-12:
+            continue
+        # 0-based rank (ties broken by position) → equal-population bins.
+        ranks = np.argsort(np.argsort(p))
+        bins = np.minimum(ranks * n_bins // len(p), n_bins - 1)
+        for b in range(n_bins):
+            sel = bins == b
+            if sel.any():
+                bin_sums[b] += yy[sel].sum()
+                bin_cnts[b] += int(sel.sum())
+        n_dates_used += 1
+
+    if n_dates_used == 0 or (bin_cnts == 0).any():
+        return {"status": "insufficient", "n_bins": n_bins, "n_dates": n_dates_used}
+
+    decile_means = bin_sums / bin_cnts
+    spread = float(decile_means[-1] - decile_means[0])
+    sp = spearmanr(np.arange(n_bins), decile_means).correlation
+    steps = np.diff(decile_means)
+    mono_frac = float((steps > 0).mean()) if steps.size else float("nan")
+
+    def _r(v):
+        return round(float(v), 6) if np.isfinite(v) else None
+
+    return {
+        "status": "ok",
+        "n_bins": n_bins,
+        "n_dates": n_dates_used,
+        "decile_means": [round(float(x), 6) for x in decile_means],
+        "top_minus_bottom": _r(spread),
+        "rank_spearman": _r(sp),
+        "monotone_step_fraction": _r(mono_frac),
+    }
 
 
 def gbm_blender_fit_predict(**lgb_params) -> Callable:

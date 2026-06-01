@@ -13,6 +13,7 @@ import numpy as np
 from training.leakfree_meta_ic import (
     cpcv_meta_oos_ic,
     cross_sectional_rank_ic,
+    decile_spread_monotonicity,
     expanding_wf_folds,
     leakfree_meta_oos_ic,
 )
@@ -222,3 +223,69 @@ def test_cpcv_insufficient_groups_status():
         forward_days=5, n_groups=2, k_test=2,  # need >= k_test+1 groups
     )
     assert out["status"] in ("insufficient_groups", "no_valid_combos", "ok")
+
+
+# ── return_preds (W5 capture) ─────────────────────────────────────────────
+
+
+def test_return_preds_attaches_aligned_oos_arrays():
+    """W5 needs the stacked leak-free OOS preds WITHOUT a second refit. With
+    return_preds=True the dict carries _oos_preds/_oos_true/_oos_dates, all
+    the same length, and the headline xsec_ic is unchanged by the flag."""
+    X, y, dates = _make_panel(signal=0.6, seed=20)
+    base = leakfree_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_folds=4, min_test=10,
+    )
+    out = leakfree_meta_oos_ic(
+        X, y, dates, fit_predict_fn=_ridge_fit_predict,
+        forward_days=5, n_folds=4, min_test=10, return_preds=True,
+    )
+    assert "_oos_preds" in out and "_oos_true" in out and "_oos_dates" in out
+    n = len(out["_oos_preds"])
+    assert n == len(out["_oos_true"]) == len(out["_oos_dates"]) > 0
+    assert out["xsec_ic"] == base["xsec_ic"]  # flag doesn't change the read
+    # Default (no flag) must NOT leak numpy arrays into the manifest dict.
+    assert "_oos_preds" not in base
+
+
+# ── decile_spread_monotonicity (W5) ───────────────────────────────────────
+
+
+def _decile_panel(n_dates=120, n_names=40, signal=0.0, seed=0):
+    rng = np.random.default_rng(seed)
+    preds, ys, dates = [], [], []
+    for di in range(n_dates):
+        p = rng.standard_normal(n_names)
+        y = signal * p + rng.standard_normal(n_names)
+        preds.extend(p.tolist())
+        ys.extend(y.tolist())
+        dates.extend([di] * n_names)
+    return np.array(preds), np.array(ys), np.array(dates)
+
+
+def test_decile_spread_monotone_for_genuine_signal():
+    preds, y, dates = _decile_panel(signal=0.8, seed=30)
+    out = decile_spread_monotonicity(preds, y, dates, n_bins=10)
+    assert out["status"] == "ok"
+    assert out["n_bins"] == 10
+    assert len(out["decile_means"]) == 10
+    # Top decile earns more than bottom; profile rises with the decile rank.
+    assert out["top_minus_bottom"] > 0
+    assert out["rank_spearman"] > 0.7
+    assert out["monotone_step_fraction"] > 0.6
+
+
+def test_decile_spread_flat_for_noise():
+    preds, y, dates = _decile_panel(signal=0.0, seed=31)
+    out = decile_spread_monotonicity(preds, y, dates, n_bins=10)
+    assert out["status"] == "ok"
+    # No signal → no reliable monotone spread.
+    assert abs(out["top_minus_bottom"]) < 0.3
+
+
+def test_decile_spread_insufficient_when_too_few_names():
+    # Fewer names per date than bins → every date skipped → insufficient.
+    preds, y, dates = _decile_panel(n_dates=20, n_names=5, signal=0.5, seed=32)
+    out = decile_spread_monotonicity(preds, y, dates, n_bins=10, min_names=10)
+    assert out["status"] == "insufficient"
