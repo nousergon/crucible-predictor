@@ -22,6 +22,7 @@ Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** 
 |---|---|
 | Layer-2 Ridge meta-learner (META_FEATURES list of 12) | [`model/meta_model.py`](model/meta_model.py) |
 | Layer-1 LightGBM wrapper (momentum + volatility) | [`model/gbm_scorer.py`](model/gbm_scorer.py) |
+| Layer-1 residual/idiosyncratic momentum (W2, OBSERVE-mode, gated off) | [`model/residual_momentum_scorer.py`](model/residual_momentum_scorer.py) · [`data/residual_momentum_features.py`](data/residual_momentum_features.py) |
 | Layer-1 research-score calibrator (lookup → GBM v1 on roadmap) | [`model/research_calibrator.py`](model/research_calibrator.py) |
 | Per-component subsample-IC validator (promotion gate) | [`model/subsample_validator.py`](model/subsample_validator.py) |
 | Calibration helpers | [`model/calibrator.py`](model/calibrator.py) |
