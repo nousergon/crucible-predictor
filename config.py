@@ -347,6 +347,24 @@ OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING = _wf_cfg.get(
 WF_N_ESTIMATORS = _wf_cfg.get("wf_n_estimators", None)  # None → use GBM_N_ESTIMATORS
 WF_EARLY_STOPPING = _wf_cfg.get("wf_early_stopping", None)  # None → use GBM_EARLY_STOPPING_ROUNDS
 
+# ── Residual / idiosyncratic-momentum L1 (W2, ROADMAP L4469) ────────────────
+# OBSERVE-mode component reviving the dead raw-momentum L1 (WF median IC
+# ≈ -0.001) with residual/idiosyncratic momentum + vol scaling (Blitz/Hanauer)
+# plus a price-trend decomposition. ``enabled`` is the gate: when False
+# (default) the L1 is trained + measured by the leak-free machinery + emitted
+# to manifest.json, but its ``residual_momentum_score`` column is NOT added to
+# META_FEATURES — the live ensemble + inference path are byte-identical. Flip
+# to True (off-cycle / Saturday) only AFTER 2-3 observe firings confirm a
+# positive purged-CV IC (composes with W1.4). ``.get`` with defaults so the
+# code ships before alpha-engine-config's predictor.yaml carries the section.
+_resid_mom_cfg = _cfg.get("residual_momentum", {})
+RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
+RESID_MOM_BETA_WINDOW = _resid_mom_cfg.get("beta_window", 60)
+RESID_MOM_WINDOW = _resid_mom_cfg.get("window", 252)
+RESID_MOM_SKIP_DAYS = _resid_mom_cfg.get("skip_days", 21)
+RESID_MOM_VOL_WINDOW = _resid_mom_cfg.get("vol_window", 20)
+RESID_MOM_CHANGE_WINDOW = _resid_mom_cfg.get("change_window", 21)
+
 # Regime classifier promotion gate. 3-class balanced-random baseline is 0.333;
 # 0.40 requires the model to clear random by a meaningful margin on walk-forward
 # OOS. Macro-F1 guards against a degenerate majority-class classifier that scores
