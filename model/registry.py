@@ -30,6 +30,10 @@ from datetime import datetime, timezone
 DEFAULT_SOURCE_PREFIX = "predictor/weights/meta/"
 DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
 
+# The lifecycle stages a registered version can carry. `snapshot_to_registry`
+# records one into the lineage; the CLI validates `--stage` against this set.
+VALID_STAGES = ("champion", "challenger", "archived")
+
 # Files that MUST be present for a snapshot to be a valid, reproducible bundle.
 # feature_list = the feature contract; manifest = lineage/metrics. Without them
 # the version is not independently runnable, so we refuse to register it.
@@ -287,12 +291,20 @@ def promote_to_champion(
 def _cli() -> None:
     """Model registry CLI — snapshot / promote / list (L4469).
 
-    Snapshot (backfill):
-        python -m model.registry --bucket B --model-version V --date YYYY-MM-DD [--source-prefix P]
+    Snapshot (backfill) — register a model as a challenger (challenger-first):
+        python -m model.registry --bucket B --model-version V --date YYYY-MM-DD \
+            --stage challenger [--source-prefix P]
     Promote a challenger to the live champion (operator step):
         python -m model.registry --bucket B --promote VERSION_ID
     List registered versions:
         python -m model.registry --bucket B --list [--stage challenger]
+
+    `--stage` does double duty: it FILTERS the listing under `--list`, and it
+    SETS the recorded lifecycle stage when snapshotting. Without it the snapshot
+    records stage=None (the legacy default) — pass `--stage challenger` so a
+    manually-backfilled model is shadow-runnable (the shadow runner enumerates
+    `stage="challenger"`). Use `--promote` (not `--stage champion`) to make a
+    version live — promotion copies the bundle + demotes the prior champion.
     """
     import argparse
 
@@ -307,7 +319,9 @@ def _cli() -> None:
     p.add_argument("--promote", default=None, metavar="VERSION_ID",
                    help="Promote this registered version to the live champion.")
     p.add_argument("--list", action="store_true", help="List registered versions.")
-    p.add_argument("--stage", default=None, help="Filter --list by stage.")
+    p.add_argument("--stage", default=None, choices=VALID_STAGES,
+                   help="Filter --list by stage; OR set the recorded stage when "
+                        "snapshotting (challenger-first: use 'challenger').")
     args = p.parse_args()
     s3 = boto3.client("s3")
 
@@ -330,8 +344,9 @@ def _cli() -> None:
         s3, args.bucket,
         model_version=args.model_version, date=args.date,
         source_prefix=args.source_prefix, code_sha=args.code_sha,
+        stage=args.stage,
     )
-    print(f"registry snapshot: predictor/registry/{vid}/")
+    print(f"registry snapshot: predictor/registry/{vid}/ (stage={args.stage or 'None'})")
 
 
 if __name__ == "__main__":
