@@ -8,7 +8,7 @@ champion/challenger ``stage`` and promotes-in-place (L4469 capture-gap fix).
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -108,6 +108,34 @@ def test_stage_recorded_in_lineage():
                          stage="challenger")
     body = s3.put_object.call_args_list[-1].kwargs["Body"]
     assert json.loads(body)["stage"] == "challenger"
+
+
+def test_cli_threads_stage_into_snapshot():
+    # L4469 #3: `--stage challenger` must reach snapshot_to_registry so a
+    # manually-backfilled model is shadow-runnable (the prior CLI dropped it,
+    # recording stage=None and leaving the model invisible to the shadow runner
+    # which enumerates stage="challenger").
+    import model.registry as reg
+    with patch.object(reg, "snapshot_to_registry", return_value="v-x") as snap, \
+            patch("boto3.client", return_value=MagicMock()), \
+            patch("sys.argv", [
+                "registry", "--bucket", "bkt",
+                "--model-version", "meta-v3.0-8models", "--date", "2026-06-02",
+                "--stage", "challenger",
+            ]):
+        reg._cli()
+    assert snap.call_args.kwargs["stage"] == "challenger"
+
+
+def test_cli_rejects_invalid_stage():
+    import model.registry as reg
+    with patch("boto3.client", return_value=MagicMock()), \
+            patch("sys.argv", [
+                "registry", "--bucket", "bkt", "--model-version", "v",
+                "--date", "2026-06-02", "--stage", "bogus",
+            ]):
+        with pytest.raises(SystemExit):  # argparse choices= rejects it
+            reg._cli()
 
 
 def test_promote_in_place_patches_stage_when_bundle_exists():
