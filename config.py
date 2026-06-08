@@ -444,6 +444,22 @@ MODEL_VERSION_LABEL = _cfg.get("model_version_label", "v3.0-meta")
 # is separate + always-on; this budget is the challenger zoo on top of it.
 MODEL_ZOO_WEEKLY_BUDGET = int(_cfg.get("model_zoo_weekly_budget", 3))
 
+# L4544: model-zoo IMMEDIATE selection — after the weekly rotation trains the
+# challenger variants, the selection step ranks them by leak-free CPCV mean IC
+# (gated by downside-Sortino + DSR) and picks a winner that beats the live
+# champion by MODEL_ZOO_PROMOTE_MARGIN. OBSERVE-FIRST: with auto-promote-winner
+# False (default), the step writes a leaderboard + recommended promotion to S3
+# but does NOT promote; flip True (yaml or env) after a soak to activate
+# auto-promote of the winning challenger (the executor turnover governor caps the
+# resulting book move). Horizon variants (forward_days != champion) are never
+# promote-eligible — observe-only. Env-overridable so the cutover flip needs no
+# redeploy.
+MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
+    "MODEL_ZOO_AUTO_PROMOTE_WINNER", _cfg.get("model_zoo_auto_promote_winner", False)
+)
+# CPCV mean-IC margin a challenger must beat the champion by to be selected.
+MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
+
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the
 # shadow runner re-scores the SAME prices/universe with each registered

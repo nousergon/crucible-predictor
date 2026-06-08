@@ -9,6 +9,8 @@ single failure.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 
@@ -189,3 +191,136 @@ def test_train_weekly_rotation_continues_past_failure():
     )
     assert results["h60"]["status"] == "error"
     assert results["resid"]["status"] == "ok"
+
+
+# ── L4544: rotation isolation (G1 challenger-first + G2 contract restore) ─────
+
+
+class _FakeS3:
+    """Minimal S3 stub: get_object reads from ``objects``, put_object records to
+    ``puts``. Missing keys raise (mimicking a NoSuchKey the code catches)."""
+
+    def __init__(self, objects=None):
+        self.objects = dict(objects or {})
+        self.puts = {}
+
+    def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
+        if Key not in self.objects:
+            raise KeyError(Key)
+        body = json.dumps(self.objects[Key]).encode()
+        return {"Body": io.BytesIO(body), "ContentType": "application/json"}
+
+    def put_object(self, Bucket, Key, Body, ContentType="application/json"):  # noqa: N803
+        self.puts[Key] = Body
+
+
+def _mk_manifest(forward_days, cpcv_ic, gate_pass):
+    return {
+        "forward_days": forward_days,
+        "meta_model_oos_ic_cpcv": (
+            {"mean_ic": cpcv_ic} if cpcv_ic is not None else {"status": "error"}
+        ),
+        "meta_model_promotion_stats": {
+            "downside": {"passes_downside_gate": gate_pass},
+            "overfit": {"passes_overfit_gate": gate_pass},
+        },
+    }
+
+
+def test_rotation_forces_challenger_first_and_restores(monkeypatch):
+    # G1: every spec trains with auto-promote forced OFF, restored after.
+    monkeypatch.setattr(cfg, "TRAINING_AUTO_PROMOTE_ENABLED", True, raising=False)
+    seen = []
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        seen.append(cfg.TRAINING_AUTO_PROMOTE_ENABLED)
+        return {"status": "ok"}
+
+    mz.train_weekly_rotation(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train, registered_versions=[],
+    )
+    assert seen and all(v is False for v in seen)          # forced off during each train
+    assert cfg.TRAINING_AUTO_PROMOTE_ENABLED is True       # restored after the rotation
+
+
+def test_snapshot_and_restore_live_contract_roundtrip():
+    # G2: the live champion contract is captured then restored byte-for-byte.
+    champ_manifest = {"version": "champ", "forward_days": 21}
+    feat = {"features": ["a", "b"]}
+    s3 = _FakeS3({cfg.META_MANIFEST_KEY: champ_manifest, cfg.META_FEATURE_LIST_KEY: feat})
+    saved = mz._snapshot_live_contract(s3, "bkt")
+    assert set(saved) == {cfg.META_MANIFEST_KEY, cfg.META_FEATURE_LIST_KEY}
+    mz._restore_live_contract(s3, "bkt", saved)
+    assert json.loads(s3.puts[cfg.META_MANIFEST_KEY]) == champ_manifest
+    assert json.loads(s3.puts[cfg.META_FEATURE_LIST_KEY]) == feat
+
+
+# ── L4544: immediate CPCV selection ──────────────────────────────────────────
+
+
+def test_select_winner_horizon_gate_and_margin(monkeypatch):
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),          # champion baseline
+        "predictor/registry/resid-v/manifest.json": _mk_manifest(21, 0.15, True),  # winner
+        "predictor/registry/h60-v/manifest.json": _mk_manifest(60, 0.30, True),    # wrong horizon
+        "predictor/registry/bad-v/manifest.json": _mk_manifest(21, 0.20, False),   # gate fail
+        "predictor/registry/low-v/manifest.json": _mk_manifest(21, 0.105, True),   # below champ+margin
+    })
+    trained = [
+        {"spec_id": "resid", "version_id": "resid-v", "model_version": "spec-resid"},
+        {"spec_id": "h60", "version_id": "h60-v", "model_version": "spec-60d"},
+        {"spec_id": "bad", "version_id": "bad-v", "model_version": "spec-bad"},
+        {"spec_id": "low", "version_id": "low-v", "model_version": "spec-low"},
+    ]
+    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
+    assert board["winner_version_id"] == "resid-v"          # highest gated 21d CPCV > champ+margin
+    reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
+    assert reasons["h60"] == "non_canonical_horizon"        # observe-only, never eligible
+    assert reasons["bad"] == "gate_failed"
+    assert reasons["low"] == "below_champion_plus_margin"
+    assert reasons["resid"] == "eligible"
+
+
+def _run_select_fixture(monkeypatch, *, auto_promote):
+    import model.registry as reg
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _FakeS3({
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
+        cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
+        "predictor/registry/resid-v/manifest.json": _mk_manifest(21, 0.20, True),
+        "predictor/registry/h60-v/manifest.json": _mk_manifest(60, 0.30, True),
+    })
+    monkeypatch.setattr(reg, "list_versions", lambda s3c, b, stage=None: [
+        {"version_id": "resid-v", "model_version": "spec-resid", "date": "2026-06-13"},
+        {"version_id": "h60-v", "model_version": "spec-60d", "date": "2026-06-13"},
+    ])
+    promotes = []
+    monkeypatch.setattr(reg, "promote_to_champion",
+                        lambda s3c, b, vid, **k: promotes.append(vid))
+
+    def _fake_train(bucket, *, date_str=None, dry_run=False):
+        return {"status": "ok"}
+
+    board = mz.run_rotation_and_select(
+        "bkt", budget=5, specs=_SPECS, train_fn=_fake_train,
+        registered_versions=[], s3=s3, auto_promote_winner=auto_promote,
+    )
+    return board, promotes, s3
+
+
+def test_run_rotation_observe_recommends_but_never_promotes(monkeypatch):
+    board, promotes, s3 = _run_select_fixture(monkeypatch, auto_promote=False)
+    assert board["mode"] == "observe"
+    assert board["winner_version_id"] == "resid-v"          # 21d challenger beats champion
+    assert board["promoted"] is None                        # observe → not executed
+    assert promotes == []                                   # promote_to_champion never called
+    assert any(k.startswith(mz._LEADERBOARD_PREFIX) for k in s3.puts)  # leaderboard written
+
+
+def test_run_rotation_cutover_promotes_winner(monkeypatch):
+    board, promotes, _ = _run_select_fixture(monkeypatch, auto_promote=True)
+    assert board["mode"] == "cutover"
+    assert board["winner_version_id"] == "resid-v"
+    assert board["promoted"] == "resid-v"                   # cutover → executed
+    assert promotes == ["resid-v"]                          # promoted exactly the winner

@@ -97,12 +97,15 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
 
 # Parse flags
-MODE="both"  # both | full-only | smoke-only | preflight-only
+MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly
 while [ $# -gt 0 ]; do
   case "$1" in
     --full-only) MODE="full-only" ;;
     --smoke-only) MODE="smoke-only" ;;
     --preflight-only) MODE="preflight-only" ;;
+    # L4544: train the weekly model-zoo rotation + immediate CPCV selection
+    # (challenger-first; champion retrain is the separate --full-only run).
+    --model-zoo-weekly) MODE="model-zoo-weekly" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
   esac
   shift
@@ -342,8 +345,9 @@ log = logging.getLogger('preflight-only')
 log.info('[1/3] Importing training package...')
 import alpha_engine_lib  # lib-pin presence (version asserted by requirements.txt pin)
 from training import train_handler  # noqa: F401  (import-only; main() NOT called)
+from training import model_zoo  # noqa: F401  (L4544 rotation path; import-only)
 from training.preflight import TrainingPreflight
-log.info('       OK — alpha_engine_lib + training.train_handler import clean')
+log.info('       OK — alpha_engine_lib + training.train_handler + model_zoo import clean')
 
 # 2. Reuse the EXISTING training preflight (env vars + S3 bucket
 #    *reachability*; check_s3_bucket is a read/head, no object write).
@@ -392,7 +396,8 @@ PREFLIGHT
 fi
 
 # ── Smoke test (dry_run=True) ─────────────────────────────────────────────────
-if [ "$MODE" != "full-only" ]; then
+# model-zoo-weekly skips the champion smoke (it trains its own challenger variants).
+if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ]; then
   echo ""
   echo "═══════════════════════════════════════════════════════════════"
   echo "  SMOKE TEST (dry_run=True)"
@@ -482,6 +487,67 @@ SMOKE
     echo "==> Smoke-only mode — skipping full training."
     exit 0
   fi
+fi
+
+# ── Model-zoo weekly rotation + immediate CPCV selection (L4544) ──────────────
+# Trains the N stalest challenger specs, ranks them by leak-free CPCV, writes a
+# leaderboard, and (only if MODEL_ZOO_AUTO_PROMOTE_WINNER) promotes the winner.
+# Challenger-first + live-contract-restore are enforced inside model_zoo, so this
+# never disturbs the live champion. Runs INSTEAD OF the champion retrain (that's
+# the separate --full-only state); exits 0 when done.
+if [ "$MODE" = "model-zoo-weekly" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  MODEL-ZOO WEEKLY ROTATION + SELECT (observe-first by default)"
+  echo "═══════════════════════════════════════════════════════════════"
+  run_ssm "model-zoo-weekly" "$(cat <<'ZOO'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+cd /home/ec2-user/predictor
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+$PY - <<'PYEOF'
+import os, sys
+sys.path.insert(0, '.')
+os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
+bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
+
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
+
+import config as cfg
+from training.model_zoo import run_rotation_and_select
+budget = int(os.environ.get('MODEL_ZOO_WEEKLY_BUDGET', getattr(cfg, 'MODEL_ZOO_WEEKLY_BUDGET', 3)))
+board = run_rotation_and_select(bucket, budget=budget)
+
+print()
+print('=' * 60)
+print('  MODEL-ZOO ROTATION + SELECT')
+print('=' * 60)
+print(f'  Mode:           {board.get("mode")}')
+champ = board.get('champion', {})
+print(f'  Champion CPCV:  {champ.get("cpcv_mean_ic")} (fwd={champ.get("forward_days")})')
+for c in board.get('candidates', []):
+    print(f'    {c.get("spec_id"):<18} cpcv={c.get("cpcv_mean_ic")} fwd={c.get("forward_days")} '
+          f'gate={c.get("passes_gate")} eligible={c.get("eligible")} ({c.get("reason")})')
+print(f'  Winner:         {board.get("winner_version_id")}')
+print(f'  Promoted:       {board.get("promoted")}')
+print('=' * 60)
+PYEOF
+ZOO
+)" "${MAX_RUNTIME_SECONDS}"
+
+  aws cloudwatch put-metric-data \
+    --namespace "AlphaEngine" \
+    --metric-name "Heartbeat" \
+    --dimensions "Process=predictor-model-zoo" \
+    --value 1 --unit "Count" \
+    --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+    && echo "Heartbeat emitted: predictor-model-zoo" \
+    || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+
+  echo ""
+  echo "==> Model-zoo rotation complete. Instance will be terminated."
+  exit 0
 fi
 
 # ── Full training (dry_run=False) ─────────────────────────────────────────────
