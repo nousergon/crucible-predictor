@@ -374,7 +374,14 @@ def send_training_email(result: dict, date_str: str) -> bool:
 
     promoted     = result.get("promoted", False)
     promoted_mode = result.get("promoted_mode")
+    # `passes_ic` is now the QUALITY verdict (all gates passed), decoupled from
+    # the promotion decision (L4540). Challenger-first: a run can pass every gate
+    # and NOT promote because auto-promote is off — that is a registered
+    # challenger, NOT a failure. `auto_promote_enabled` defaults True for legacy
+    # archive runs (pre-challenger-first, where promoted == gate_passed).
     passes_ic    = result.get("passes_ic_gate", False)
+    auto_promote = result.get("auto_promote_enabled", True)
+    challenger_registered = bool(passes_ic and not promoted and not auto_promote)
     val_ic       = result.get("val_ic", 0.0)
     test_ic      = result.get("test_ic", 0.0)
     mse_ic       = result.get("mse_ic", test_ic)
@@ -459,6 +466,8 @@ def send_training_email(result: dict, date_str: str) -> bool:
     promo_label = (
         f"Promoted → weights/meta/ ✓" if promoted and is_meta
         else f"Promoted → gbm_latest ({promoted_mode}) ✓" if promoted
+        else "Registered challenger (gates passed; auto-promote off) ◆"
+        if challenger_registered
         else f"NOT promoted ({_build_failure_reason()}) ✗"
     )
     status_str  = "PASS" if passes_ic else "FAIL"
@@ -488,10 +497,15 @@ def send_training_email(result: dict, date_str: str) -> bool:
             _subj_ic_text = f"Meta IC {test_ic:+.4f} (in-sample)"
     else:
         _subj_ic_text = f"IC {test_ic:.4f}"
+    _subj_promo = (
+        f"Promoted ({promoted_mode})" if promoted
+        else "Registered challenger" if challenger_registered
+        else "Not promoted"
+    )
     subject = (
         f"Alpha Engine Training | {date_str} | "
         f"{_subj_ic_text} {status_str} | "
-        f"{'Promoted (' + promoted_mode + ')' if promoted else 'Not promoted'}"
+        f"{_subj_promo}"
     )
 
     # Feature importance bar chart (top 5)
@@ -887,7 +901,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
                 f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
                 if cat_enabled and cat_ic_val is not None else ""
             ) +
-            f"\nPromoted:           {promoted_mode if promoted else 'none'}"
+            f"\nPromoted:           {promoted_mode if promoted else ('challenger' if challenger_registered else 'none')}"
             f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
             f"\nPromotion:          {promo_label}\n"
             f"{wf_plain}"

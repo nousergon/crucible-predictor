@@ -4310,7 +4310,16 @@ def run_meta_training(
         "test_ic": round(meta_model._val_ic, 6),
         "mse_ic": round(mom_test_ic, 6),
         "val_ic": round(meta_model._val_ic, 6),
-        "passes_ic_gate": promoted,
+        # `passes_ic_gate` is the QUALITY verdict (all promotion gates passed),
+        # NOT the promotion decision — under challenger-first a run can pass every
+        # gate and deliberately NOT promote (auto_promote off). Previously this
+        # was `promoted`, so a gate-passing challenger-first run was mislabeled
+        # "FAIL" in the training email (L4540, recurrence of L1668). The email
+        # reads `gate_passed` / `auto_promote_enabled` to distinguish a registered
+        # challenger from a true gate failure.
+        "passes_ic_gate": gate_passed,
+        "gate_passed": gate_passed,
+        "auto_promote_enabled": auto_promote_enabled,
         "ic_ir": 0.0,
         "feature_importance_top10": [],
         "feature_ics": {},
