@@ -264,7 +264,7 @@ run_ssm() {
 echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
 run_ssm "bootstrap" "$(cat <<BOOTSTRAP
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 
 # Spot-side hard-timeout watchdog. The dispatcher-side 'trap cleanup EXIT'
 # only fires if THIS script exits; if the dispatcher is killed/cancelled the
@@ -288,7 +288,7 @@ BOOTSTRAP
 echo "==> Installing Python dependencies..."
 run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
@@ -326,7 +326,7 @@ if [ "$MODE" = "preflight-only" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "preflight-only" "$(cat <<'PREFLIGHT'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -404,7 +404,7 @@ if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "smoke" "$(cat <<'SMOKE'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -502,7 +502,7 @@ if [ "$MODE" = "model-zoo-weekly" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   run_ssm "model-zoo-weekly" "$(cat <<'ZOO'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'
@@ -557,7 +557,7 @@ echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
 run_ssm "full-training" "$(cat <<'TRAIN'
 set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 $PY - <<'PYEOF'

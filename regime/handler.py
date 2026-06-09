@@ -65,6 +65,7 @@ from regime.features import (
     current_features_from_history,
     fetch_macro_feature_history,
 )
+from alpha_engine_lib.logging import monitor_handler
 from regime.hmm import HMMRegimeClassifier
 from regime.substrate import (
     DEFAULT_S3_BUCKET,
@@ -214,6 +215,7 @@ def produce_regime_substrate(
     return {"payload": payload, "wrote": True, **keys}
 
 
+@monitor_handler
 def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     """AWS Lambda entry point.
 

@@ -65,7 +65,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # GMAIL_APP_PASSWORD, all populated by Lambda's `--environment` block
 # BEFORE the Python interpreter starts. Other secrets are pulled lazily
 # from SSM via alpha_engine_lib.secrets.get_secret() (per-process cached).
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, monitor_handler
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -83,6 +83,7 @@ setup_logging(
 log = logging.getLogger(__name__)
 
 
+@monitor_handler
 def handler(event: dict, context) -> dict:
     """
     AWS Lambda entry point.

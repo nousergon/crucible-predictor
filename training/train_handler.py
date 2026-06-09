@@ -71,7 +71,7 @@ from alpha_engine_lib.secrets import get_secret
 #
 # exclude_patterns starts empty by deliberate convention; add patterns
 # only after observing real ERROR-level noise during training runs.
-from alpha_engine_lib.logging import setup_logging
+from alpha_engine_lib.logging import setup_logging, guard_entrypoint
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(
     Path(__file__).resolve().parent.parent / "flow-doctor-training.yaml"
@@ -924,6 +924,26 @@ def send_training_email(result: dict, date_str: str) -> bool:
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 def main(
+    bucket: str,
+    date_str: Optional[str] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Top-level training entrypoint.
+
+    Thin wrapper around :func:`_main_impl` that runs the body inside
+    ``guard_entrypoint()`` so an uncaught ``raise`` from the spot-train
+    run is reported to flow-doctor (email) and re-raised. ``guard_entrypoint``
+    no-ops when flow-doctor is inactive (dev / CI / pytest), so this is
+    safe everywhere; it activates only on the deployed spot (where
+    ``ALPHA_ENGINE_DEPLOYED=1`` is exported by ``infrastructure/spot_train.sh``).
+    The spot driver calls ``train_handler.main()`` directly, so wrapping
+    here is the true top-level entrypoint.
+    """
+    with guard_entrypoint():
+        return _main_impl(bucket, date_str=date_str, dry_run=dry_run)
+
+
+def _main_impl(
     bucket: str,
     date_str: Optional[str] = None,
     dry_run: bool = False,

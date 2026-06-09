@@ -66,6 +66,7 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from alpha_engine_lib.logging import monitor_handler
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     fetch_macro_feature_history,
@@ -424,6 +425,7 @@ def _write_t1_eval_artifact(
     return {"artifact_key": artifact_key, "latest_key": latest_key}
 
 
+@monitor_handler
 def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     """AWS Lambda entry point.
 
