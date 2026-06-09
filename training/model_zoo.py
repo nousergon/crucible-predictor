@@ -53,6 +53,11 @@ _ALLOWED_OVERRIDES = {
     "MOMENTUM_L1_IN_META",
     "XSEC_DEMEAN_ALPHA_ENABLED",
     "MODEL_VERSION_LABEL",
+    # L4565 SOTA directional-combine levers. Read via cfg.X at fit time in
+    # meta_trainer (build_train_meta_features + the meta_model.fit standardize
+    # arg). Default-preserving so the champion is byte-identical when unset.
+    "EXPECTED_MOVE_IN_META",
+    "META_STANDARDIZE_ENABLED",
 }
 
 _SENTINEL = object()

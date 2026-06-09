@@ -384,6 +384,22 @@ RESIDUAL_MOMENTUM_ENABLED = _resid_mom_cfg.get("enabled", False)
 _meta_stack_cfg = _cfg.get("meta_stack", {})
 MOMENTUM_L1_IN_META = _meta_stack_cfg.get("momentum_l1_in_meta", True)
 
+# ── L4565 SOTA directional-combine levers (model-zoo gated, observe-first) ──
+# EXPECTED_MOVE_IN_META: keep the volatility L1's ``expected_move`` in the L2
+# directional meta-vector. Default True ⇒ byte-identical to today. The
+# ``sota-directional-combine`` zoo spec flips it False — ``expected_move`` is a
+# directionless MAGNITUDE (E[|move|]); fed as a positive additive directional
+# term it makes the highest-vol name (COIN: ~6σ) the #1 alpha pick (L4549b root
+# cause). With it off the vol L1 still trains + emits the field for sizing /
+# confidence / the barrier model — it just stops driving DIRECTIONAL alpha.
+EXPECTED_MOVE_IN_META = _meta_stack_cfg.get("expected_move_in_meta", True)
+# META_STANDARDIZE_ENABLED: standardize (z-score) + winsorize the DIRECTIONAL
+# meta-features before the Ridge (Asness-Moskowitz-Pedersen signal-level
+# combine + outlier guard). Default False ⇒ raw features, byte-identical. The
+# scaler is fit at training time and persisted with the model so inference
+# applies the identical transform. ``.get`` defaults so code ships before yaml.
+META_STANDARDIZE_ENABLED = _meta_stack_cfg.get("meta_standardize_enabled", False)
+
 # ── Cross-sectional level-neutralization of predicted_alpha (L4487) ─────────
 # The meta-L2's macro features are common-mode across the daily cross-section,
 # so an adverse-macro day shifts the ENTIRE predicted-alpha vector negative →
