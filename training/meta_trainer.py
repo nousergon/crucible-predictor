@@ -464,29 +464,37 @@ from data.residual_momentum_features import compute_residual_momentum_features
 
 
 def build_train_meta_features(
-    resid_mom_enabled: bool, momentum_l1_in_meta: bool = True
+    resid_mom_enabled: bool,
+    momentum_l1_in_meta: bool = True,
+    expected_move_in_meta: bool = True,
 ) -> list[str]:
-    """W2/W4.2 (L4469) observe gates: the L2 training-time meta-feature list.
+    """W2/W4.2 (L4469) + L4565 observe gates: the L2 training-time feature list.
 
-    Starts from ``META_FEATURES`` and applies two independent, flag-gated
-    deltas, NEVER mutating the ``META_FEATURES`` module constant (inference
-    imports it, and the persisted ``meta_model._feature_names`` must stay
-    byte-identical to today when BOTH gates are at their defaults so the live
-    prediction path is unchanged):
+    Starts from ``META_FEATURES`` and applies independent, flag-gated deltas,
+    NEVER mutating the ``META_FEATURES`` module constant (inference imports it,
+    and the persisted ``meta_model._feature_names`` must stay byte-identical to
+    today when ALL gates are at their defaults so the live prediction path is
+    unchanged):
 
     - ``resid_mom_enabled`` (W2) appends ``residual_momentum_score``.
     - ``momentum_l1_in_meta`` (W4.2) — when False, drops the dead raw-momentum
       ``momentum_score`` column from the meta vector (the L1 still trains and
       still emits ``momentum_score`` for the executor veto; this only removes it
       from the L2 input). Together (resid on + momentum off) this is the SWAP.
+    - ``expected_move_in_meta`` (L4565) — when False, drops the volatility L1's
+      ``expected_move`` column from the DIRECTIONAL meta vector. The vol L1 still
+      trains + emits expected_move for sizing/confidence/the barrier model; this
+      only removes it as a positive additive DIRECTIONAL alpha term (the L4549b
+      COIN root cause — a directionless magnitude driving rank-1 alpha).
 
-    Promotion of either delta = flip its flag (default-on for momentum so today
-    is byte-identical; default-off for residual-momentum, both observe-gated).
+    Promotion of any delta = flip its flag (defaults preserve today byte-for-byte;
+    all observe-gated, exercised by the model-zoo specs).
     """
     from model.meta_model import META_FEATURES
     feats = [
         f for f in META_FEATURES
-        if momentum_l1_in_meta or f != "momentum_score"
+        if (momentum_l1_in_meta or f != "momentum_score")
+        and (expected_move_in_meta or f != "expected_move")
     ]
     if resid_mom_enabled:
         feats.append("residual_momentum_score")
@@ -1817,13 +1825,20 @@ def run_meta_training(
     # 2-3 observe firings (the model-zoo `residual-momentum` spec sets both).
     _resid_mom_enabled = bool(getattr(cfg, "RESIDUAL_MOMENTUM_ENABLED", False))
     _momentum_l1_in_meta = bool(getattr(cfg, "MOMENTUM_L1_IN_META", True))
+    _expected_move_in_meta = bool(getattr(cfg, "EXPECTED_MOVE_IN_META", True))
+    # L4565: directional standardize+winsorize toggle, threaded into EVERY
+    # MetaModel.fit below (the champion fit AND the leak-free/CPCV/horizon/
+    # nonlinear refits) so the observed ICs reflect the model that will serve.
+    _meta_standardize = bool(getattr(cfg, "META_STANDARDIZE_ENABLED", False))
     TRAIN_META_FEATURES = build_train_meta_features(
-        _resid_mom_enabled, _momentum_l1_in_meta
+        _resid_mom_enabled, _momentum_l1_in_meta, _expected_move_in_meta
     )
     log.info(
         "Training meta-model on %d OOS rows... "
-        "(residual_momentum L1 in stack: %s; raw momentum_score in meta: %s)",
+        "(residual_momentum L1 in stack: %s; raw momentum_score in meta: %s; "
+        "expected_move in meta: %s; directional standardize+winsor: %s)",
         len(oos_meta_rows), _resid_mom_enabled, _momentum_l1_in_meta,
+        _expected_move_in_meta, _meta_standardize,
     )
     meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
@@ -1843,7 +1858,10 @@ def run_meta_training(
     meta_X = meta_X_all[canonical_finite_mask]
     meta_y = canonical_y_full[canonical_finite_mask]
     meta_model = MetaModel(alpha=1.0)
-    meta_model.fit(meta_X, meta_y, feature_names=TRAIN_META_FEATURES)
+    meta_model.fit(
+        meta_X, meta_y, feature_names=TRAIN_META_FEATURES,
+        standardize_directional=_meta_standardize,
+    )
     log.info(
         "Meta-Ridge fit on canonical labels: n_canonical=%d / n_total=%d "
         "(val_ic_canonical=%.4f)",
@@ -1879,7 +1897,8 @@ def run_meta_training(
 
         def _meta_fit_predict(_Xtr, _ytr, _Xte):
             _m = MetaModel(alpha=1.0)
-            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES)
+            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES,
+                   standardize_directional=_meta_standardize)
             return _m.predict(_Xte).ravel()
 
         leakfree_meta_ic = leakfree_meta_oos_ic(
@@ -2095,7 +2114,8 @@ def run_meta_training(
 
         def _h_fit_predict(_Xtr, _ytr, _Xte):
             _m = MetaModel(alpha=1.0)
-            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES)
+            _m.fit(_Xtr, _ytr, feature_names=TRAIN_META_FEATURES,
+                   standardize_directional=_meta_standardize)
             return _m.predict(_Xte).ravel()
 
         _h_dates = [
@@ -2179,7 +2199,8 @@ def run_meta_training(
 
         def _d_fit_predict(_Xtr, _ytr, _Xte, _names=TRAIN_META_FEATURES):
             _m = MetaModel(alpha=1.0)
-            _m.fit(_Xtr, _ytr, feature_names=_names)
+            _m.fit(_Xtr, _ytr, feature_names=_names,
+                   standardize_directional=_meta_standardize)
             return _m.predict(_Xte).ravel()
 
         # (A) per-input standalone alpha-IC
@@ -2391,7 +2412,8 @@ def run_meta_training(
 
             def _fm_fit_predict(_Xtr, _ytr, _Xte, _names=_fm_aug_names):
                 _m = MetaModel(alpha=1.0)
-                _m.fit(_Xtr, _ytr, feature_names=_names)
+                _m.fit(_Xtr, _ytr, feature_names=_names,
+                       standardize_directional=_meta_standardize)
                 return _m.predict(_Xte).ravel()
 
             meta_oos_ic_leakfree_with_factor_momentum = _fm_lf(
@@ -2463,7 +2485,8 @@ def run_meta_training(
 
         def _loo_fit_predict(_Xtr, _ytr, _Xte, _names):
             _m = MetaModel(alpha=1.0)
-            _m.fit(_Xtr, _ytr, feature_names=_names)
+            _m.fit(_Xtr, _ytr, feature_names=_names,
+                   standardize_directional=_meta_standardize)
             return _m.predict(_Xte).ravel()
 
         _loo_per: dict = {}
@@ -2636,6 +2659,7 @@ def run_meta_training(
             tb_X, tb_y,
             feature_names=META_FEATURES,
             sample_weight=tb_sample_weights,
+            standardize_directional=_meta_standardize,
         )
         log.info(
             "Triple-barrier Meta-Ridge fit (Stage 3 PR 2 observe-only): "

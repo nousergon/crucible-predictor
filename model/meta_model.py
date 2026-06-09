@@ -76,6 +76,30 @@ META_FEATURES = [
     "regime_intensity_z",
 ]
 
+# Directional meta-features eligible for the L4565 standardize+winsorize
+# transform (the SOTA signal-level combine). These are the TICKER-VARYING
+# directional signals: standardizing them puts every signal on a comparable
+# scale before the Ridge combines them, and winsorizing caps any single
+# feature's contribution so a far-outlier value cannot dominate the stack
+# (the COIN failure mode — a ~6σ ``expected_move`` driving rank-1 alpha).
+#
+# DELIBERATELY EXCLUDED:
+#   - ``expected_move`` — a directionless MAGNITUDE (E[|move|]); L4565 removes
+#     it from the directional meta-vector entirely (EXPECTED_MOVE_IN_META), so
+#     it never reaches the Ridge as a directional term regardless of this list.
+#   - the 6 ``macro_*`` features + ``regime_intensity_z`` — market-wide, a
+#     single shared value per date with ZERO cross-sectional variance; they are
+#     the regime baseline and are left raw (standardizing a constant column
+#     would divide by ~0).
+META_DIRECTIONAL_FEATURES = [
+    "research_calibrator_prob",
+    "momentum_score",
+    "research_composite_score",
+    "research_conviction",
+    "sector_macro_modifier",
+    "residual_momentum_score",  # present only when RESIDUAL_MOMENTUM_ENABLED
+]
+
 # Raw macro feature names — used by trainer/inference to look up values from
 # regime_features_df / latest_regime and to keep source-of-truth in one place.
 MACRO_FEATURE_NAMES = [
@@ -130,6 +154,14 @@ class MetaModel:
         # Without this, any META_FEATURES addition would break all inferences
         # against the previously-trained model.
         self._feature_names: list[str] = []
+        # L4565 directional standardize+winsorize scaler. None → no transform
+        # (byte-identical legacy behaviour). When set, a dict:
+        #   {"directional": [feat,...], "mean": {feat: μ}, "std": {feat: σ},
+        #    "winsor": float}
+        # The transform is LOAD-BEARING (it conditions the fitted coefficients),
+        # so it travels inside the pickle alongside the estimator + feature
+        # order — never reconstructable from the sidecar alone.
+        self._scaler: dict | None = None
         # Importance reports (Phase 4). Ridge coefficients alone are not
         # comparable across features that live on different scales, so we also
         # persist standardized coefficients (coef × std(feature) / std(y)) and
@@ -144,6 +176,8 @@ class MetaModel:
         y: np.ndarray,
         feature_names: list[str] | None = None,
         sample_weight: np.ndarray | None = None,
+        standardize_directional: bool = False,
+        winsor: float = 3.0,
     ) -> "MetaModel":
         """
         Fit ridge regression on Layer 1 OOS outputs.
@@ -158,6 +192,16 @@ class MetaModel:
             apply LdP Ch. 4.4 average-uniqueness weights, downweighting rows
             whose forward windows overlap heavily with neighbors. Sklearn
             Ridge accepts unnormalized weights and rescales internally.
+        standardize_directional : bool (L4565)
+            When True, fit a per-feature standardizer (mean/std) on the
+            DIRECTIONAL columns (``META_DIRECTIONAL_FEATURES`` ∩ feature_names),
+            winsorize the standardized values to ±``winsor``, and fit the Ridge
+            on the transformed matrix. The fitted scaler is persisted with the
+            model so inference applies the identical transform. Macro / regime
+            columns are left raw. SOTA signal-level combine + outlier guard.
+        winsor : float
+            Winsorization bound in standard deviations for the directional
+            transform (default ±3σ). Ignored when standardize_directional=False.
         """
         from sklearn.linear_model import BayesianRidge
 
@@ -177,6 +221,19 @@ class MetaModel:
             log.warning("MetaModel: only %d valid samples (need 20+) — skipping fit", len(y))
             return self
 
+        # Feature names must be known BEFORE building the directional scaler
+        # (the scaler keys on names). Defaults to the leading META_FEATURES.
+        names = feature_names or META_FEATURES[:X.shape[1]]
+        self._feature_names = list(names)
+
+        # L4565: build + apply the directional standardize+winsorize transform.
+        # Fit on the TRAIN matrix only (this X) → leak-free when fit/predict run
+        # inside a walk-forward fold. Macro/regime columns pass through untouched.
+        self._scaler = None
+        if standardize_directional:
+            self._scaler = self._build_scaler(X, self._feature_names, float(winsor))
+            X = self._apply_scaler(X)
+
         self._n_samples = len(y)
         # BayesianRidge: uninformative Gamma hyperpriors (sklearn defaults of
         # 1e-6 on alpha_1/2, lambda_1/2) → Type-II ML drives α + λ from data.
@@ -191,12 +248,11 @@ class MetaModel:
         self._learned_alpha = float(getattr(self._model, "alpha_", None) or 0.0) or None
         self._learned_lambda = float(getattr(self._model, "lambda_", None) or 0.0) or None
 
-        # Store coefficients for interpretability
-        names = feature_names or META_FEATURES[:X.shape[1]]
-        self._feature_names = list(names)
+        # Store coefficients for interpretability (feature_names already set
+        # above, before the directional scaler was built).
         self._coefficients = {
             name: round(float(coef), 6)
-            for name, coef in zip(names, self._model.coef_)
+            for name, coef in zip(self._feature_names, self._model.coef_)
         }
         self._coefficients["intercept"] = round(float(self._model.intercept_), 6)
 
@@ -285,6 +341,50 @@ class MetaModel:
             },
         }
 
+    @staticmethod
+    def _build_scaler(X: np.ndarray, feature_names: list[str], winsor: float) -> dict:
+        """L4565: fit a per-feature standardizer on the directional columns.
+
+        Mean/std are computed over the (already NaN-filtered) rows of ``X``.
+        Columns with a degenerate (≈0) std are recorded with std=1.0 so the
+        transform is the identity for them — a constant directional column
+        carries no cross-sectional signal and must not be amplified by a
+        divide-by-tiny-σ.
+        """
+        directional = [f for f in feature_names if f in META_DIRECTIONAL_FEATURES]
+        mean: dict[str, float] = {}
+        std: dict[str, float] = {}
+        for f in directional:
+            j = feature_names.index(f)
+            col = X[:, j]
+            col = col[np.isfinite(col)]
+            mu = float(np.mean(col)) if col.size else 0.0
+            sigma = float(np.std(col)) if col.size else 0.0
+            mean[f] = mu
+            std[f] = sigma if sigma > 1e-9 else 1.0
+        return {"directional": directional, "mean": mean, "std": std, "winsor": float(winsor)}
+
+    def _apply_scaler(self, X: np.ndarray) -> np.ndarray:
+        """Apply the persisted directional standardize+winsorize transform.
+
+        Returns ``X`` unchanged when no scaler is set (legacy / non-standardized
+        models). Operates on a copy; macro/regime columns are untouched.
+        """
+        if not self._scaler:
+            return X
+        Xt = np.array(X, dtype=np.float64, copy=True)
+        w = float(self._scaler.get("winsor", 3.0))
+        names = self._feature_names
+        for f in self._scaler.get("directional", []):
+            if f not in names:
+                continue
+            j = names.index(f)
+            mu = self._scaler["mean"].get(f, 0.0)
+            sigma = self._scaler["std"].get(f, 1.0) or 1.0
+            z = (Xt[:, j] - mu) / sigma
+            Xt[:, j] = np.clip(z, -w, w)
+        return Xt
+
     @property
     def is_fitted(self) -> bool:
         return self._fitted
@@ -293,7 +393,8 @@ class MetaModel:
         """Predict final alpha scores. Shape (N, n_features) → (N,)."""
         if not self._fitted:
             raise RuntimeError("MetaModel not fitted")
-        return self._model.predict(np.asarray(X, dtype=np.float64))
+        X = self._apply_scaler(np.asarray(X, dtype=np.float64))
+        return self._model.predict(X)
 
     def predict_single(self, features: dict) -> float:
         """Predict for a single ticker given a feature dict.
@@ -325,6 +426,7 @@ class MetaModel:
             raise RuntimeError("MetaModel not fitted")
         feat_names = self._feature_names or META_FEATURES
         x = np.array([[features.get(f, 0.0) for f in feat_names]], dtype=np.float64)
+        x = self._apply_scaler(x)
         try:
             mean, std = self._model.predict(x, return_std=True)
             return float(mean[0]), float(std[0])
@@ -352,6 +454,10 @@ class MetaModel:
             "learned_lambda_weight_precision": (
                 round(self._learned_lambda, 6) if self._learned_lambda is not None else None
             ),
+            # L4565 directional standardize+winsorize scaler (None when the
+            # transform is off). Reported for human inspection; the pickle
+            # copy is the load-bearing one.
+            "meta_scaler": self._scaler,
         }
 
     # Pickle payload schema. v2 (L4543) embeds the load-bearing feature_names
@@ -362,7 +468,13 @@ class MetaModel:
     # live prefix would otherwise feed features in the wrong order → garbage
     # predictions. The sidecar remains for human-readable reporting (val_ic,
     # coefficients, importance), but is no longer correctness-critical.
-    _PICKLE_SCHEMA = 2
+    # v3 (L4565): the directional standardize+winsorize scaler joins the
+    # payload. Like feature_names, the transform conditions the fitted
+    # coefficients, so it MUST travel with the estimator bytes — serving the
+    # model without it would feed raw (un-standardized) features into a Ridge
+    # whose coefficients were fit on standardized ones → garbage predictions.
+    # None ⇒ no transform (back-compat with v2/legacy pickles).
+    _PICKLE_SCHEMA = 3
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -373,6 +485,7 @@ class MetaModel:
                     "_meta_model_schema": self._PICKLE_SCHEMA,
                     "model": self._model,
                     "feature_names": list(self._feature_names),
+                    "meta_scaler": self._scaler,
                 },
                 f,
             )
@@ -394,6 +507,9 @@ class MetaModel:
             mm._model = obj["model"]
             mm._feature_names = list(obj.get("feature_names") or [])
             embedded_names = bool(mm._feature_names)
+            # v3 (L4565): load-bearing directional scaler. Absent in v2 pickles
+            # → None → identity transform (legacy behaviour preserved).
+            mm._scaler = obj.get("meta_scaler")
         else:
             mm._model = obj
         mm._fitted = True
