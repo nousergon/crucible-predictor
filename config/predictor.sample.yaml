@@ -188,6 +188,7 @@ walk_forward:
   cpcv_k_test: 2                 # W1.2 (L4469) test groups per CPCV combination
   dsr_n_trials: 10               # W1.3 (L4469) Deflated-Sharpe trial count (placeholder until cumulative trial tracking — W1.3b)
   dsr_threshold: 0.95            # W1.3 (L4469) DSR significance bar (overfit leg) once W1.4 makes it gating (observe-only today)
+  dsr_registry_threshold: 0.80   # L4582(c) registry-entry bar BELOW the promotion bar — between the bars = leaderboard "near_miss_below_promotion_bar" (evidence accumulates, never promotes)
   sortino_ic_threshold: 0.0      # W1.3 (L4469) downside-aware Sortino-of-IC bar (skilled-risk basket — the house metric); observe-only today
   min_folds_positive: 0.60       # 60% of folds must have IC > 0
   median_ic_gate: 0.01           # median IC across folds (lower bar — includes black swan periods)
@@ -283,6 +284,10 @@ model_version_label: v3.0-meta     # base label; a spec overrides it per-run
 # L4488g: weekly rotation budget — `model_zoo --weekly-rotation` trains only the
 # N stalest active specs per run (round-robin refresh) to bound Saturday compute.
 model_zoo_weekly_budget: 3
+# L4582(a): CSCV-PBO target for the rotation's selection step (observe-only —
+# logged to the leaderboard `selection_pbo` block; <0.2 is the bar any public
+# DSR/selection claim must clear).
+model_zoo_pbo_target: 0.2
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
