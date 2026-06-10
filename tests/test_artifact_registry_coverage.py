@@ -47,7 +47,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "regime/retrospective_eval_handler.py": 2,
     "regime/substrate.py": 2,
     "training/meta_trainer.py": 7,
-    "training/model_zoo.py": 2,  # G2 live-contract RESTORE (re-puts existing champion keys, not a new artifact) + model_zoo/leaderboard/{date}.json (observe-only, best-effort, no freshness SLA — L4544)
+    "training/model_zoo.py": 3,  # G2 live-contract RESTORE (re-puts existing champion keys, not a new artifact) + model_zoo/leaderboard/{date}.json (observe-only, best-effort, no freshness SLA — L4544) + model_zoo/trial_log.json (cumulative trial ledger, observe-only, failure recorded in leaderboard trial_log_status — L4582)
     "training/risk_model_persist.py": 2,
     "training/train_handler.py": 2,
 }

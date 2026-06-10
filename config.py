@@ -329,6 +329,12 @@ WF_CPCV_K_TEST = _wf_cfg.get("cpcv_k_test", 2)
 # W1.4 makes it gating. OBSERVE only today (reported, not gating).
 WF_DSR_N_TRIALS = _wf_cfg.get("dsr_n_trials", 10)
 WF_DSR_THRESHOLD = _wf_cfg.get("dsr_threshold", 0.95)
+# L4582 two-threshold discipline: the REGISTRY-entry bar sits BELOW the
+# promotion bar so near-misses are labeled in the zoo leaderboard and
+# accumulate evidence across rotations instead of vanishing as a flat
+# "gate_failed". Entry bar = downside gate passes AND dsr >= this; promotion
+# bar = downside AND dsr >= WF_DSR_THRESHOLD (unchanged).
+WF_DSR_REGISTRY_THRESHOLD = _wf_cfg.get("dsr_registry_threshold", 0.80)
 # W1.3 (ROADMAP L4469): downside-aware IC performance lens — Sortino-of-IC
 # threshold (skilled-risk basket: Sortino + CVaR + maxDD, anchor-gates-on-
 # skilled-risk-not-sharpe). The predictor judges skill on DOWNSIDE risk, not
@@ -509,6 +515,11 @@ MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
 )
 # CPCV mean-IC margin a challenger must beat the champion by to be selected.
 MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
+# L4582: CSCV-PBO target for the rotation's selection step (Bailey-LdP 2014,
+# probability the in-sample winner lands in the bottom half out-of-sample).
+# OBSERVE-only — logged to the leaderboard, not gating; <0.2 is the bar any
+# public DSR/selection claim must clear.
+MODEL_ZOO_PBO_TARGET = float(_cfg.get("model_zoo_pbo_target", 0.2))
 
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the

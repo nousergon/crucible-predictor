@@ -44,6 +44,11 @@ log = logging.getLogger(__name__)
 # has no import cycle with the trainer).
 _REGISTRY_PREFIX = "predictor/registry"
 _LEADERBOARD_PREFIX = "predictor/model_zoo/leaderboard"
+# L4582(b): cumulative cross-rotation trial ledger — every candidate the zoo
+# has ever evaluated, deduped by version_id. The count is the honest n_trials
+# for DSR deflation (the per-run CPCV n_combos proxy understates the true
+# search breadth once rotations accumulate).
+_TRIAL_LOG_KEY = "predictor/model_zoo/trial_log.json"
 
 # Only these cfg knobs may be overridden by a spec — fail loud on anything else
 # so a spec can't set arbitrary attributes on the config module. Extend ONLY
@@ -397,6 +402,32 @@ def _gate_pass(manifest: dict | None) -> bool:
     return downside and overfit
 
 
+def _manifest_dsr(manifest: dict | None):
+    """The training-time DSR from a manifest's promotion stats, or None."""
+    p = (manifest or {}).get("meta_model_promotion_stats") or {}
+    v = (p.get("overfit") or {}).get("dsr")
+    try:
+        f = float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+    return f if (f is not None and math.isfinite(f)) else None
+
+
+def _registry_bar_pass(manifest: dict | None) -> bool:
+    """L4582(c) two-threshold discipline — the LOWER registry-entry bar.
+
+    Entry bar = downside gate passes AND DSR >= WF_DSR_REGISTRY_THRESHOLD
+    (default 0.80) vs the promotion bar's WF_DSR_THRESHOLD (0.95). A candidate
+    between the bars is a NEAR-MISS: ineligible to promote, but labeled so its
+    evidence accumulates legibly across rotation leaderboards instead of
+    reading as a flat gate_failed."""
+    p = (manifest or {}).get("meta_model_promotion_stats") or {}
+    downside = bool((p.get("downside") or {}).get("passes_downside_gate"))
+    dsr = _manifest_dsr(manifest)
+    bar = float(getattr(cfg, "WF_DSR_REGISTRY_THRESHOLD", 0.80))
+    return downside and dsr is not None and dsr >= bar
+
+
 def _read_registry_manifest(s3, bucket: str, version_id: str) -> dict:
     obj = s3.get_object(Bucket=bucket, Key=f"{_REGISTRY_PREFIX}/{version_id}/manifest.json")
     return json.loads(obj["Body"].read())
@@ -472,12 +503,101 @@ def _resolve_base_champion_version(s3, bucket: str, date_str: str | None) -> dic
     return {"spec_id": "champion-arch", "model_version": base_label, "version_id": vid}
 
 
-def select_winner(s3, bucket: str, *, trained: list[dict], margin: float | None = None) -> dict:
+def _record_trials(s3, bucket: str, date_str: str | None, trained: list[dict]):
+    """L4582(b): append this rotation's candidates to the cumulative trial
+    ledger (deduped by version_id) and return ``(n_trials_cumulative, status)``.
+
+    Best-effort like the leaderboard (a ledger failure must never fail the
+    rotation) — but the failure is RECORDED, not swallowed: WARN log here +
+    the caller writes ``trial_log_status`` into the leaderboard so a broken
+    ledger is visible in the artifact every week (per no-silent-fails)."""
+    try:
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=_TRIAL_LOG_KEY)
+            ledger = json.loads(obj["Body"].read())
+        except Exception:  # noqa: BLE001 — first rotation: no ledger yet
+            ledger = {"schema_version": 1, "trials": []}
+        seen = {t.get("version_id") for t in ledger.get("trials", [])}
+        for rec in trained:
+            vid = rec.get("version_id")
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            ledger["trials"].append({
+                "date": date_str,
+                "spec_id": rec.get("spec_id"),
+                "model_version": rec.get("model_version"),
+                "version_id": vid,
+            })
+        s3.put_object(
+            Bucket=bucket, Key=_TRIAL_LOG_KEY,
+            Body=json.dumps(ledger, indent=2, default=str).encode(),
+            ContentType="application/json",
+        )
+        n = len(ledger["trials"])
+        log.info("model_zoo: trial ledger at %d cumulative trials (%s)", n, _TRIAL_LOG_KEY)
+        return n, "ok"
+    except Exception as exc:  # noqa: BLE001 — observability artifact, never fatal
+        log.warning("model_zoo: trial ledger update FAILED: %s", exc, exc_info=True)
+        return None, f"error: {exc}"
+
+
+def _selection_pbo(candidates: list[dict], manifests: dict) -> dict:
+    """L4582(a): CSCV-PBO across this rotation's candidates from their per-combo
+    CPCV IC vectors (``meta_model_oos_ic_cpcv.ics``).
+
+    Rows only align across manifests trained on the SAME data vintage with the
+    same CPCV shape — true for same-rotation candidates by construction; the
+    serving champion's manifest is a stale vintage and is deliberately NOT in
+    the matrix. Candidates whose (n_groups, k_test, len(ics)) don't match the
+    modal shape are dropped (named in the output, not silently)."""
+    rows = []
+    for c in candidates:
+        m = manifests.get(c.get("version_id")) or {}
+        cpcv = m.get("meta_model_oos_ic_cpcv") or {}
+        ics = cpcv.get("ics") or []
+        if ics:
+            rows.append((c.get("spec_id"), (cpcv.get("n_groups"), cpcv.get("k_test"), len(ics)), ics))
+    if len(rows) < 2:
+        return {"status": "insufficient", "reason": "needs >=2 candidates with CPCV ics",
+                "n_specs": len(rows), "pbo": None}
+    shapes: dict = {}
+    for _, shape, _ics in rows:
+        shapes[shape] = shapes.get(shape, 0) + 1
+    modal = max(shapes, key=shapes.get)
+    aligned = [(sid, ics) for sid, shape, ics in rows if shape == modal]
+    dropped = [sid for sid, shape, _ in rows if shape != modal]
+    from training.deflated_sharpe import cscv_pbo
+    out = cscv_pbo(
+        list(map(list, zip(*[ics for _, ics in aligned]))),
+        spec_ids=[sid for sid, _ in aligned],
+    )
+    target = float(getattr(cfg, "MODEL_ZOO_PBO_TARGET", 0.2))
+    pbo = out.get("pbo")
+    out["pbo_target"] = target
+    out["pbo_pass"] = (
+        bool(pbo <= target) if isinstance(pbo, float) and math.isfinite(pbo) else None
+    )
+    if dropped:
+        out["dropped_misaligned_specs"] = dropped
+    return out
+
+
+def select_winner(
+    s3, bucket: str, *, trained: list[dict], margin: float | None = None,
+    n_trials_cumulative: int | None = None,
+) -> dict:
     """Rank freshly-trained challengers by gated CPCV mean IC and pick a winner
     that beats the live champion by ``margin``. Promotion-eligible iff
     ``forward_days == champion horizon`` (canonical 21d) — horizon variants are
     observe-only. Returns a leaderboard dict (all candidates with eligibility +
-    reason; ``winner_version_id`` is the best eligible challenger or None)."""
+    reason; ``winner_version_id`` is the best eligible challenger or None).
+
+    L4582 observability (none of it changes eligibility): per-candidate
+    ``dsr_training`` / ``dsr_selection`` (the latter re-deflated by the
+    cumulative trial count when supplied) + ``registry_bar_pass`` near-miss
+    labeling, and a leaderboard-level ``selection_pbo`` block (CSCV-PBO across
+    the rotation's aligned candidates, target <0.2, observe-only)."""
     if margin is None:
         margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
     champ_manifest: dict = {}
@@ -489,40 +609,75 @@ def select_winner(s3, bucket: str, *, trained: list[dict], margin: float | None 
     champ_ic = _cpcv_mean(champ_manifest)
 
     candidates: list[dict] = []
+    manifests: dict[str, dict] = {}
     for rec in trained:
         vid = rec.get("version_id")
         manifest: dict | None = None
         try:
             manifest = _read_registry_manifest(s3, bucket, vid)
+            manifests[vid] = manifest
         except Exception:  # noqa: BLE001 — a missing manifest just isn't ranked
             log.warning("model_zoo select: could not read manifest for %s", vid, exc_info=True)
         fwd = int((manifest or {}).get("forward_days") or 0)
         ic = _cpcv_mean(manifest)
         gate = _gate_pass(manifest)
+        registry_bar = _registry_bar_pass(manifest)
         if fwd != champ_fwd:
             eligible, reason = False, "non_canonical_horizon"
         elif ic is None:
             eligible, reason = False, "no_cpcv"
         elif not gate:
-            eligible, reason = False, "gate_failed"
+            # L4582(c): a near-miss (clears the registry bar, not the promotion
+            # bar) is labeled distinctly so evidence accumulates across weeks.
+            eligible = False
+            reason = "near_miss_below_promotion_bar" if registry_bar else "gate_failed"
         elif champ_ic is not None and ic < champ_ic + margin:
             eligible, reason = False, "below_champion_plus_margin"
         else:
             eligible, reason = True, "eligible"
+        # L4582(b): re-deflate this candidate's CPCV IC series by the CUMULATIVE
+        # trial count — the honest multiple-testing N once rotations accumulate
+        # (the manifest's training-time DSR used the within-run n_combos proxy).
+        dsr_selection = None
+        _ics = ((manifest or {}).get("meta_model_oos_ic_cpcv") or {}).get("ics") or []
+        if _ics and n_trials_cumulative:
+            try:
+                from training.deflated_sharpe import deflated_sharpe_ratio
+                _d = deflated_sharpe_ratio(
+                    _ics, n_trials=int(n_trials_cumulative),
+                    threshold=float(getattr(cfg, "WF_DSR_THRESHOLD", 0.95)),
+                )
+                dsr_selection = _d.get("dsr")
+            except Exception:  # noqa: BLE001 — observe-only stat, never blocks ranking
+                log.warning("model_zoo select: dsr_selection failed for %s", vid, exc_info=True)
         candidates.append({
             "spec_id": rec.get("spec_id"), "version_id": vid,
             "model_version": rec.get("model_version"),
             "forward_days": fwd, "cpcv_mean_ic": ic, "passes_gate": gate,
+            "registry_bar_pass": registry_bar,
+            "dsr_training": _manifest_dsr(manifest),
+            "dsr_selection": dsr_selection,
             "eligible": eligible, "reason": reason,
         })
 
     eligibles = [c for c in candidates if c["eligible"]]
     winner = max(eligibles, key=lambda c: c["cpcv_mean_ic"], default=None)
+    selection_pbo = _selection_pbo(candidates, manifests)
+    log.info(
+        "model_zoo selection PBO (OBSERVE, L4582): %s pbo=%s (target<%s, pass=%s) "
+        "over %s specs / %s splits; n_trials_cumulative=%s",
+        selection_pbo.get("status"), selection_pbo.get("pbo"),
+        selection_pbo.get("pbo_target"), selection_pbo.get("pbo_pass"),
+        selection_pbo.get("n_specs"), selection_pbo.get("n_splits"),
+        n_trials_cumulative,
+    )
     return {
         "champion": {"forward_days": champ_fwd, "cpcv_mean_ic": champ_ic},
         "margin": margin,
         "candidates": candidates,
         "winner_version_id": winner["version_id"] if winner else None,
+        "selection_pbo": selection_pbo,
+        "n_trials_cumulative": n_trials_cumulative,
     }
 
 
@@ -663,12 +818,18 @@ def run_rotation_and_select(
     if base and base["version_id"] not in {t.get("version_id") for t in trained}:
         trained.append(base)
         log.info("model_zoo select: base champion-arch %s in the pool", base["version_id"])
+    # L4582(b): ledger BEFORE selection so the cumulative count already includes
+    # this rotation's candidates (DSR must deflate for the trials just run too).
+    _n_trials_cum, _trial_log_status = _record_trials(s3, bucket, date_str, trained)
     # Capture the OUTGOING champion's registry version BEFORE any promote so the
     # operator alert can carry an exact, copy-pasteable revert command.
     _prior_champ_vid = _current_champion_version_id(s3, bucket)
-    leaderboard = select_winner(s3, bucket, trained=trained)
+    leaderboard = select_winner(
+        s3, bucket, trained=trained, n_trials_cumulative=_n_trials_cum,
+    )
     leaderboard["date"] = date_str
     leaderboard["mode"] = mode
+    leaderboard["trial_log_status"] = _trial_log_status
 
     winner_vid = leaderboard.get("winner_version_id")
     if winner_vid and auto_promote_winner:
