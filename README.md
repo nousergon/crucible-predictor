@@ -63,4 +63,4 @@ This repo is **public**. Hyperparameters, confidence thresholds, and tuned ensem
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial licenses available — contact brian@nousergon.ai.
