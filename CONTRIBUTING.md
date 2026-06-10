@@ -1,26 +1,25 @@
 # Contributing
 
-Alpha Engine is a personal project by [@cipher813](https://github.com/cipher813). Contributions are welcome.
+Thank you for your interest. Before any contribution can be accepted, please
+read the two policies below — they are required and exist to keep the
+project's licensing options intact.
 
-## How to contribute
+## 1. Developer Certificate of Origin (DCO)
 
-- **Bug reports**: Open an issue with steps to reproduce, expected vs actual behavior, and relevant logs.
-- **Bug fixes**: PRs welcome. Include a test that fails before the fix and passes after.
-- **Features**: Open an issue first to discuss the approach before writing code.
+All commits must be signed off (`git commit -s`), certifying the
+[Developer Certificate of Origin 1.1](https://developercertificate.org/).
+Pull requests containing commits without a `Signed-off-by:` line will not be
+merged.
 
-## Development workflow
+## 2. Inbound license
 
-1. Fork the repo and create a feature branch from `main`
-2. Make changes, add tests
-3. Run the test suite: `pytest tests/ -v`
-4. Open a PR against `main` with a clear description of what changed and why
+By submitting a contribution, you agree that your contribution is licensed to
+the project under the **MIT License**, regardless of the project's outbound
+license. This permits the project to distribute your contribution under its
+current license (see LICENSE) and under commercial licenses. If you cannot
+contribute under these terms, please open an issue instead of a pull request.
 
-## Code standards
+## Scope
 
-- All tests must pass before merging
-- No secrets, API keys, or proprietary config in commits (gitleaks pre-commit hook enforced)
-- Follow existing patterns — if unsure, check how similar code is structured elsewhere in the repo
-
-## Related repos
-
-This module is part of the [Nous Ergon](https://nousergon.ai) trading system. See the [system overview](https://github.com/cipher813/alpha-engine#readme) for architecture and the [documentation index](https://github.com/cipher813/alpha-engine-docs#readme) for all repos.
+Issues and discussions are welcome. Substantial changes should start as an
+issue before any code is written.
