@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.12+-blue?style=flat-square)](https://www.python.org/)
 [![LightGBM](https://img.shields.io/badge/LightGBM-1a73e8?style=flat-square)](https://lightgbm.readthedocs.io/)
 [![ArcticDB](https://img.shields.io/badge/ArcticDB-0e1117?style=flat-square)](https://docs.arcticdb.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/License-AGPL--3.0--only-yellow?style=flat-square)](LICENSE)
 [![Phase 2 · Reliability](https://img.shields.io/badge/Phase_2-Reliability-e9c46a?style=flat-square)](https://github.com/cipher813/alpha-engine-docs#phase-trajectory)
 
 Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** (`canonical_predicted_alpha` field, post-2026-05-09 cutover) for each ticker. Three Layer-1 specialized models — LightGBM momentum, LightGBM volatility, and a research-score calibrator — feed a Layer-2 Ridge meta-learner alongside research-context and raw macro features. Outputs UP/FLAT/DOWN with a confidence score and a veto gate that blocks high-confidence DOWN entries.
