@@ -353,3 +353,11 @@ feature_selection:
   shap_noise_threshold_pct: 1.0    # SHAP below this % of top feature → noise candidate
   ic_noise_threshold: 0.005        # |feature IC| below this → noise candidate
   auto_prune: false                # true → automatically exclude noise features from production model
+
+# ── L1 feature subscriptions (experiment belief — config#635) ────────────────
+# Which feature-store columns each Layer-1 model subscribes to. Omit to use
+# the public baseline lists in config.py. The experiment package overrides
+# these for the live run.
+# l1_features:
+#   momentum: [momentum_5d, momentum_20d, price_vs_ma50, price_vs_ma200, rsi_14, macd_cross, return_60d, return_120d, intraday_return_5d]
+#   volatility: [atr_14_pct, realized_vol_20d, vol_ratio_10_60, iv_rank, dist_from_52w_high, dist_from_52w_low]

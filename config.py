@@ -618,7 +618,11 @@ META_MODEL_ENABLED = _meta_cfg.get("enabled", False)
 #   useful in a different model architecture or different horizon
 #   later). This PR only updates which columns the Layer-1 GBMs
 #   subscribe to.
-MOMENTUM_FEATURES = [
+# L4597-resid / config#635: the L1 feature SUBSCRIPTIONS are experiment
+# beliefs (HARNESS_EXPERIMENT_CLASSIFICATION.md §1) — the experiment package
+# (predictor.yaml `l1_features:`) overrides them; these literals are the
+# public BASELINE the repo runs with when no package is present.
+_BASELINE_MOMENTUM_FEATURES = [
     "momentum_5d", "momentum_20d", "price_vs_ma50", "price_vs_ma200",
     "rsi_14", "macd_cross",
     # v3.1: longer-horizon returns — pulled real weight in Layer-1
@@ -626,10 +630,13 @@ MOMENTUM_FEATURES = [
     # v3.1: intraday component of 5d return — marginal but non-zero
     "intraday_return_5d",
 ]
-VOLATILITY_FEATURES = [
+_BASELINE_VOLATILITY_FEATURES = [
     "atr_14_pct", "realized_vol_20d", "vol_ratio_10_60",
     "iv_rank", "dist_from_52w_high", "dist_from_52w_low",
 ]
+_l1_cfg = _cfg.get("l1_features") or {}
+MOMENTUM_FEATURES = list(_l1_cfg.get("momentum") or _BASELINE_MOMENTUM_FEATURES)
+VOLATILITY_FEATURES = list(_l1_cfg.get("volatility") or _BASELINE_VOLATILITY_FEATURES)
 
 # Stage 2b of regime-conditioning rebuild (plan: regime-conditioning-260510.md)
 # — per-ticker risk features written to ArcticDB by alpha-engine-data Stage
