@@ -18,8 +18,14 @@ from alpha_engine_lib.secrets import get_secret
 # ── Load predictor config YAML ────────────────────────────────────────────────
 _CONFIG_DIR = Path(__file__).parent / "config"
 
+# Experiment package (HARNESS_EXPERIMENT_CLASSIFICATION.md §3): beliefs load
+# from experiments/$ALPHA_ENGINE_EXPERIMENT_ID/predictor/ ahead of the legacy
+# top-level predictor/ (kept as fallback through the transition).
+_EXPERIMENT_ID = os.environ.get("ALPHA_ENGINE_EXPERIMENT_ID", "reference")
 _CONFIG_SEARCH = [
+    Path.home() / "alpha-engine-config" / "experiments" / _EXPERIMENT_ID / "predictor" / "predictor.yaml",
     Path.home() / "alpha-engine-config" / "predictor" / "predictor.yaml",
+    Path(__file__).parent.parent / "alpha-engine-config" / "experiments" / _EXPERIMENT_ID / "predictor" / "predictor.yaml",
     Path(__file__).parent.parent / "alpha-engine-config" / "predictor" / "predictor.yaml",
     _CONFIG_DIR / "predictor.yaml",
 ]
