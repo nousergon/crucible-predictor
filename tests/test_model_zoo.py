@@ -327,7 +327,11 @@ def test_select_winner_horizon_floor_and_margin(monkeypatch):
     assert board["winner_version_id"] == "dsrfail-v"
     reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
     assert reasons["h60"] == "non_canonical_horizon"        # wrong horizon, never eligible
-    assert reasons["low"] == "below_champion_plus_margin"
+    # #679(ii): no champion-arch in this pool → the baseline falls back to the
+    # stale serving snapshot; the below-baseline reason is the vintage-consistent
+    # name. The fall-back is logged + reflected in promotion_baseline_source.
+    assert reasons["low"] == "below_champion_arch_plus_margin"
+    assert board["promotion_baseline_source"] == "serving_champion_stale"
     assert reasons["dsrfail"] == "eligible"
     # DSR is surfaced for OBSERVABILITY on the winner, but did NOT block promotion.
     win = next(c for c in board["candidates"] if c["spec_id"] == "dsrfail")
@@ -335,6 +339,44 @@ def test_select_winner_horizon_floor_and_margin(monkeypatch):
     assert win["dsr_training"] == 0.247                     # value surfaced
     assert "promote_min_ic" in board
     assert "observe_eligible_version_ids" not in board      # observe tier collapsed
+
+
+def test_select_winner_baseline_is_fresh_champion_arch_with_margin_zero(monkeypatch):
+    # #679(ii) + config#671: the promotion baseline is the FRESH champion-arch
+    # CPCV (vintage-consistent), NOT the stale serving snapshot. With margin=0 a
+    # challenger whose IC > champion-arch IC and > floor is eligible; one at/below
+    # champion-arch is not. The champion-arch row is the baseline (never a winner).
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
+    s3 = _FakeS3({
+        # serving snapshot CPCV 0.30 (STALE) — must NOT be the baseline.
+        cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.30, True),
+        # fresh champion-arch CPCV 0.10 = the vintage-consistent baseline.
+        "predictor/registry/arch-v/manifest.json": _mk_manifest(21, 0.10, True),
+        # challenger 0.12 > champion-arch 0.10 → eligible at margin 0.
+        "predictor/registry/win-v/manifest.json": _mk_manifest(21, 0.12, True),
+        # challenger 0.08 < champion-arch 0.10 → below baseline → ineligible.
+        "predictor/registry/lo-v/manifest.json": _mk_manifest(21, 0.08, True),
+    })
+    trained = [
+        {"spec_id": "champion-arch", "version_id": "arch-v", "model_version": "v3.0-meta"},
+        {"spec_id": "win", "version_id": "win-v", "model_version": "spec-win"},
+        {"spec_id": "lo", "version_id": "lo-v", "model_version": "spec-lo"},
+    ]
+    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.0)
+    # Baseline is the FRESH champion-arch (0.10), NOT the stale serving 0.30.
+    assert board["promotion_baseline_source"] == "champion_arch_fresh"
+    assert board["promotion_baseline_ic"] == 0.10
+    reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
+    assert reasons["champion-arch"] == "champion_arch_baseline"
+    assert reasons["win"] == "eligible"                       # 0.12 > 0.10 + 0
+    assert reasons["lo"] == "below_champion_arch_plus_margin"  # 0.08 < 0.10
+    assert board["winner_version_id"] == "win-v"
+    # champion-arch must NOT be double-counted as a challenger winner.
+    arch = next(c for c in board["candidates"] if c["spec_id"] == "champion-arch")
+    assert arch["eligible"] is False
+    assert arch["group"] == "champion_arch"
+    assert board["champion_arch"]["version_id"] == "arch-v"
 
 
 def test_select_winner_positive_ic_floor_blocks_negative_best_of_n(monkeypatch):

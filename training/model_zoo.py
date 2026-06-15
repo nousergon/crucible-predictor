@@ -760,19 +760,33 @@ def select_winner(
     n_trials_cumulative: int | None = None,
 ) -> dict:
     """Rank freshly-trained challengers by leak-free-CPCV mean IC and pick a
-    winner that beats the live champion by ``margin``. Promotion-eligible iff
-    ``forward_days == champion horizon`` (canonical 21d) — horizon variants are
-    never eligible. Returns a leaderboard dict (all candidates with eligibility +
-    reason; ``winner_version_id`` is the best eligible challenger or None).
+    winner that beats the VINTAGE-CONSISTENT baseline by ``margin``. Returns a
+    leaderboard dict with three labeled groups (serving_champion / champion_arch /
+    challengers); ``winner_version_id`` is the best eligible CHALLENGER or None;
+    ``champion_arch_refresh_version_id`` keeps the live model fresh when no
+    challenger wins.
 
-    config#671/#673/#1052 — RELATIVE-BEST promotion. The absolute DSR-0.95 hurdle
-    (``_gate_pass``) is NO LONGER a promotion blocker: both champion and challenger
-    are equally data-starved estimates on ~1 independent 21d block, so the incumbent
-    has no special epistemic claim, and 21d-alpha models go stale — fresh-best-wins
-    weekly is correct, not waiting for an absolute-significance gate (~late-2026).
-    Eligibility = right horizon AND CPCV IC > a positive floor AND IC >= champion +
-    margin. The DSR ``_gate_pass`` is still computed and surfaced (``dsr_gate_pass``,
-    ``dsr_training``, ``dsr_selection``) for OBSERVABILITY — never blocking.
+    config#671/#673/#1052 + #679(ii) — TRUE FRESH-BEST-WINS promotion.
+
+    BASELINE (#679ii): the promotion comparison is against the FRESH ``champion-arch``
+    candidate's CPCV — the champion ARCHITECTURE retrained on THIS data vintage — NOT
+    the stale serving manifest (a different, older vintage). This is the apples-to-
+    apples same-vintage comparison; we fall back to the serving snapshot ONLY when no
+    champion-arch trained this run (logged). The champion-arch row is the baseline, so
+    it is NEVER a "challenger" winner (it can't beat itself) — it carries reason
+    ``champion_arch_baseline``. But it CAN still refresh the live model when no
+    challenger wins (see ``champion_arch_refresh_version_id``), so the deployed 21d
+    model stays current weekly.
+
+    The absolute DSR-0.95 hurdle (``_gate_pass``) is NO LONGER a promotion blocker:
+    both estimates are equally data-starved on ~1 independent 21d block, so the
+    incumbent has no special epistemic claim, and 21d-alpha models go stale —
+    fresh-best-wins weekly is correct, not waiting for an absolute-significance gate
+    (~late-2026). With ``margin`` = 0 (config) eligibility is simply: right horizon
+    AND CPCV IC > the positive floor AND IC >= the champion-arch baseline (the
+    highest-CPCV challenger above the floor wins). NO incumbency hurdle beyond the
+    configurable margin. The DSR ``_gate_pass`` is still computed and surfaced
+    (``dsr_gate_pass``, ``dsr_training``, ``dsr_selection``) for OBSERVABILITY only.
 
     L4582 observability (none of it changes eligibility): per-candidate
     ``dsr_training`` / ``dsr_selection`` (the latter re-deflated by the
@@ -782,51 +796,99 @@ def select_winner(
     if margin is None:
         margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
     min_ic = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0))
-    champ_manifest: dict = {}
-    try:
-        champ_manifest = _read_live_manifest(s3, bucket)
-    except Exception:  # noqa: BLE001 — champion baseline best-effort
-        log.warning("model_zoo select: could not read live champion manifest", exc_info=True)
-    champ_fwd = int(champ_manifest.get("forward_days") or getattr(cfg, "FORWARD_DAYS", 21))
-    champ_ic = _cpcv_mean(champ_manifest)
 
-    candidates: list[dict] = []
+    # ── SERVING champion (the live model that's trading NOW) ──────────────────
+    # Its CPCV mean IC is a STALE last-promoted snapshot (a prior vintage), so it
+    # is NOT the apples-to-apples promotion baseline — it's surfaced only so the
+    # operator sees what the system is currently serving + when it was promoted.
+    serving_manifest: dict = {}
+    try:
+        serving_manifest = _read_live_manifest(s3, bucket)
+    except Exception:  # noqa: BLE001 — serving-champion snapshot best-effort
+        log.warning("model_zoo select: could not read live champion manifest", exc_info=True)
+    champ_fwd = int(serving_manifest.get("forward_days") or getattr(cfg, "FORWARD_DAYS", 21))
+    serving_ic = _cpcv_mean(serving_manifest)
+    serving_version = serving_manifest.get("served_version") or serving_manifest.get("version")
+    serving_date = serving_manifest.get("served_date") or serving_manifest.get("date")
+
+    # ── Read every candidate manifest up front (needed to locate champion-arch
+    # BEFORE the eligibility loop, since the fresh champion-arch CPCV is now the
+    # promotion baseline — #679(ii) vintage-consistent comparison). ────────────
     manifests: dict[str, dict] = {}
     for rec in trained:
         vid = rec.get("version_id")
-        manifest: dict | None = None
         try:
-            manifest = _read_registry_manifest(s3, bucket, vid)
-            manifests[vid] = manifest
+            manifests[vid] = _read_registry_manifest(s3, bucket, vid)
         except Exception:  # noqa: BLE001 — a missing manifest just isn't ranked
             log.warning("model_zoo select: could not read manifest for %s", vid, exc_info=True)
+
+    # #679(ii) — VINTAGE-CONSISTENT promotion baseline. The fresh ``champion-arch``
+    # candidate (the base champion-ARCHITECTURE retrained on THIS data vintage) is
+    # the correct apples-to-apples reference: a challenger must beat the champion
+    # ARCHITECTURE *on the same vintage*, not a stale serving snapshot trained on a
+    # different vintage. Fall back to the stale serving manifest ONLY when no
+    # champion-arch trained this run (logged either way).
+    champ_arch_rec = next(
+        (r for r in trained if r.get("spec_id") == "champion-arch"), None)
+    champ_arch_vid = champ_arch_rec.get("version_id") if champ_arch_rec else None
+    champ_arch_ic = _cpcv_mean(manifests.get(champ_arch_vid)) if champ_arch_vid else None
+    if champ_arch_ic is not None:
+        baseline_ic = champ_arch_ic
+        baseline_source = "champion_arch_fresh"
+        log.info(
+            "model_zoo select: promotion baseline = FRESH champion-arch CPCV "
+            "%.4f (vid=%s) — vintage-consistent (#679ii); serving snapshot CPCV "
+            "%s is observability only", baseline_ic, champ_arch_vid, serving_ic,
+        )
+    else:
+        baseline_ic = serving_ic
+        baseline_source = "serving_champion_stale"
+        log.warning(
+            "model_zoo select: no champion-arch candidate this run — promotion "
+            "baseline FALLS BACK to the stale serving-champion CPCV %s (a "
+            "cross-vintage comparison; #679ii degrades gracefully)", serving_ic,
+        )
+
+    candidates: list[dict] = []
+    for rec in trained:
+        vid = rec.get("version_id")
+        is_champ_arch = rec.get("spec_id") == "champion-arch"
+        manifest = manifests.get(vid)
         fwd = int((manifest or {}).get("forward_days") or 0)
         ic = _cpcv_mean(manifest)
         # config#671/#673/#1052: the DSR gate is OBSERVABILITY ONLY now — computed
         # and surfaced (dsr_gate_pass), never a promotion blocker. registry_bar is
-        # likewise informational. A challenger that beats the champion's CPCV mean
+        # likewise informational. A challenger that beats the baseline's CPCV mean
         # IC by ``margin`` (same horizon) and clears the positive floor PROMOTES.
         gate = _gate_pass(manifest)
         registry_bar = _registry_bar_pass(manifest)
-        beats_champion = (
+        beats_baseline = (
             ic is not None
-            and (champ_ic is None or ic >= champ_ic + margin)
+            and (baseline_ic is None or ic >= baseline_ic + margin)
         )
-        # config#671/#673/#1052 — RELATIVE-BEST eligibility chain (DSR ``_gate_pass``
-        # REMOVED as a blocker; replaced by a positive-IC floor):
+        # config#671/#673/#1052 + #679(ii) — RELATIVE-BEST CHALLENGER eligibility
+        # chain. The baseline is the FRESH champion-arch CPCV (vintage-consistent),
+        # NOT the stale serving snapshot. The champion-arch row itself is the
+        # baseline — it is NEVER a "challenger" winner (it can't beat itself); it is
+        # marked ``champion_arch_baseline`` and handled by the separate refresh path
+        # below (so the live model still stays fresh weekly when no challenger wins).
+        #   champion-arch row      → champion_arch_baseline (not a challenger)
         #   wrong horizon          → non_canonical_horizon
         #   no usable CPCV mean IC → no_cpcv
         #   IC <= positive floor   → below_floor (best-of-N noise is not edge)
-        #   IC <  champion+margin  → below_champion_plus_margin
+        #   IC <  baseline+margin  → below_champion_arch_plus_margin
         #   else                   → eligible (PROMOTES — DSR is not consulted)
-        if fwd != champ_fwd:
+        group = "champion_arch" if is_champ_arch else "challenger"
+        if is_champ_arch:
+            eligible, reason = False, "champion_arch_baseline"
+        elif fwd != champ_fwd:
             eligible, reason = False, "non_canonical_horizon"
         elif ic is None:
             eligible, reason = False, "no_cpcv"
         elif ic <= min_ic:
             eligible, reason = False, "below_floor"
-        elif champ_ic is not None and ic < champ_ic + margin:
-            eligible, reason = False, "below_champion_plus_margin"
+        elif baseline_ic is not None and ic < baseline_ic + margin:
+            eligible, reason = False, "below_champion_arch_plus_margin"
         else:
             eligible, reason = True, "eligible"
         # L4582(b): re-deflate this candidate's CPCV IC series by the CUMULATIVE
@@ -861,13 +923,20 @@ def select_winner(
         candidates.append({
             "spec_id": rec.get("spec_id"), "version_id": vid,
             "model_version": rec.get("model_version"),
+            # #679(ii): the disambiguation group — "champion_arch" (fresh retrain,
+            # the baseline) vs "challenger" (a rotated spec competing against it).
+            "group": group,
             "forward_days": fwd, "cpcv_mean_ic": ic, "passes_gate": gate,
             # config#671/#673/#1052: the DSR/Sortino gate result, surfaced for
             # OBSERVABILITY (is relative-best promotion chasing a model the absolute
             # gate would reject?) — NOT a promotion blocker. registry_bar likewise.
             "dsr_gate_pass": gate,
             "registry_bar_pass": registry_bar,
-            "beats_champion_by_margin": beats_champion,
+            # #679(ii): beats the FRESH champion-arch baseline by margin (the
+            # vintage-consistent comparison). ``beats_champion_by_margin`` kept as
+            # an alias for back-compat with any older consumer.
+            "beats_baseline_by_margin": beats_baseline,
+            "beats_champion_by_margin": beats_baseline,
             "dsr_training": _manifest_dsr(manifest),
             "dsr_selection": dsr_selection,
             # config #671 A1: the effective-N that fed dsr_selection + the IC-IR a
@@ -877,8 +946,44 @@ def select_winner(
             "eligible": eligible, "reason": reason,
         })
 
+    # The CHALLENGER winner: the highest-CPCV eligible challenger (champion-arch is
+    # excluded by construction — it carries reason ``champion_arch_baseline`` and is
+    # never ``eligible``, so it can't win against itself).
     eligibles = [c for c in candidates if c["eligible"]]
     winner = max(eligibles, key=lambda c: c["cpcv_mean_ic"], default=None)
+
+    # #679(ii) — CHAMPION-ARCH REFRESH path. When NO challenger wins, the fresh
+    # champion-arch (same architecture, retrained on this vintage) should still
+    # refresh the LIVE model if it improves on the *serving* champion's CPCV by
+    # margin + clears the positive floor — so the deployed 21d model never goes
+    # stale waiting for a challenger to win. This is NOT a challenger promotion
+    # (no incumbency hurdle is being introduced for challengers); it keeps the
+    # serving model on the current vintage. A challenger win always takes
+    # precedence (it already beat champion-arch, which beat serving).
+    champ_arch_refresh = None
+    if winner is None and champ_arch_vid is not None and champ_arch_ic is not None:
+        arch_cand = next((c for c in candidates if c["version_id"] == champ_arch_vid), None)
+        improves_serving = (
+            champ_arch_ic > min_ic
+            and (serving_ic is None or champ_arch_ic >= serving_ic + margin)
+        )
+        right_horizon = arch_cand is not None and arch_cand.get("forward_days") == champ_fwd
+        if improves_serving and right_horizon:
+            champ_arch_refresh = champ_arch_vid
+            log.info(
+                "model_zoo select: no challenger won — FRESH champion-arch %s "
+                "(CPCV %.4f) refreshes the live model (serving CPCV %s + margin "
+                "%s); keeps the deployed 21d model on the current vintage",
+                champ_arch_vid, champ_arch_ic, serving_ic, margin,
+            )
+        else:
+            log.info(
+                "model_zoo select: no challenger won and champion-arch does NOT "
+                "improve on serving (arch CPCV %s vs serving %s + margin %s, "
+                "right_horizon=%s) — live model unchanged",
+                champ_arch_ic, serving_ic, margin, right_horizon,
+            )
+
     selection_pbo = _selection_pbo(candidates, manifests)
     # config #671 — A1: surface the effective-N + the IC-IR each candidate would
     # need to clear the full DSR bar, so a data-starved 'too young' verdict is
@@ -903,11 +1008,37 @@ def select_winner(
         n_trials_cumulative,
     )
     return {
-        "champion": {"forward_days": champ_fwd, "cpcv_mean_ic": champ_ic},
+        # ── #679(ii): THREE clearly-labeled groups (disambiguated presentation) ──
+        # SERVING champion = the live model trading capital NOW. Its CPCV is a
+        # STALE last-promoted snapshot (prior vintage) — observability only, NOT
+        # the promotion baseline. served/promoted date carried so it reads as old.
+        "serving_champion": {
+            "forward_days": champ_fwd, "cpcv_mean_ic": serving_ic,
+            "cpcv_is_stale_snapshot": True,
+            "served_version": serving_version, "served_date": serving_date,
+        },
+        # CHAMPION-ARCH = the champion ARCHITECTURE retrained THIS run on the
+        # current vintage. Its CPCV is the vintage-consistent promotion BASELINE.
+        "champion_arch": {
+            "version_id": champ_arch_vid, "cpcv_mean_ic": champ_arch_ic,
+            "is_promotion_baseline": baseline_source == "champion_arch_fresh",
+        },
+        # The baseline a challenger must beat by margin + which group it came from.
+        "promotion_baseline_ic": baseline_ic,
+        "promotion_baseline_source": baseline_source,
+        # ``champion`` kept for back-compat (dashboard 7_Predictor reads it). It is
+        # the SERVING snapshot — same as serving_champion's CPCV. Older consumers
+        # see the old key/shape; new consumers read serving_champion/champion_arch.
+        "champion": {"forward_days": champ_fwd, "cpcv_mean_ic": serving_ic},
         "margin": margin,
         "promote_min_ic": min_ic,
         "candidates": candidates,
+        # The CHALLENGER winner (a rotated spec that beat the champion-arch
+        # baseline). champion-arch is excluded from this set by construction.
         "winner_version_id": winner["version_id"] if winner else None,
+        # #679(ii): when no challenger wins, the fresh champion-arch may still
+        # refresh the live model (keeps the deployed 21d model on this vintage).
+        "champion_arch_refresh_version_id": champ_arch_refresh,
         "selection_pbo": selection_pbo,
         "n_trials_cumulative": n_trials_cumulative,
     }
@@ -1113,17 +1244,22 @@ def _read_base_training_summary(s3, bucket: str, date_str: str | None) -> dict:
 
 def _digest_subject(leaderboard: dict, date_str: str | None) -> str:
     cands = leaderboard.get("candidates", []) or []
+    # #679(ii): the headline challenger count excludes the champion-arch baseline.
+    n_chal = sum(1 for c in cands if c.get("group") != "champion_arch")
     winner = leaderboard.get("winner_version_id")
+    refresh = leaderboard.get("champion_arch_refresh_version_id")
     promoted = leaderboard.get("promoted")
     if promoted:
         promo = f"promoted: {promoted}"
     elif winner:
         promo = f"recommended: {winner} (observe)"
+    elif refresh:
+        promo = f"champion-arch refresh: {refresh} (observe)"
     else:
         promo = "promoted: none"
     return (
         f"Alpha Engine | Model-Zoo Rotation {date_str or 'latest'} | "
-        f"{len(cands)} challengers | {promo}"
+        f"{n_chal} challengers | {promo}"
     )
 
 
@@ -1173,16 +1309,37 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
 
     base = _read_base_training_summary(s3, bucket, date_str) if s3 is not None else {}
 
-    champ = leaderboard.get("champion", {}) or {}
-    champ_ic = champ.get("cpcv_mean_ic")
-    champ_fwd = champ.get("forward_days")
-    cands = leaderboard.get("candidates", []) or []
+    # ── #679(ii): the THREE clearly-labeled groups ──────────────────────────────
+    # 1) SERVING champion = the live model (its CPCV is a STALE last-promoted
+    #    snapshot — explicitly flagged + dated so it never reads as fresh).
+    # 2) CHAMPION-ARCH = the fresh retrain this run (the promotion BASELINE).
+    # 3) CHALLENGERS = rotated specs competing against the champion-arch baseline.
+    serving = leaderboard.get("serving_champion") or leaderboard.get("champion", {}) or {}
+    serving_ic = serving.get("cpcv_mean_ic")
+    serving_fwd = serving.get("forward_days")
+    serving_ver = serving.get("served_version")
+    serving_date = serving.get("served_date")
+    arch = leaderboard.get("champion_arch", {}) or {}
+    arch_ic = arch.get("cpcv_mean_ic")
+    arch_vid = arch.get("version_id")
+    baseline_ic = leaderboard.get("promotion_baseline_ic")
+    baseline_src = leaderboard.get("promotion_baseline_source", "?")
+    all_cands = leaderboard.get("candidates", []) or []
+    # Split the candidate list by group; champion-arch is shown in its OWN section,
+    # never co-mingled with the challengers (eliminates the duplicative look).
+    challengers = [c for c in all_cands if c.get("group") != "champion_arch"]
     winner = leaderboard.get("winner_version_id")
+    refresh = leaderboard.get("champion_arch_refresh_version_id")
     promoted = leaderboard.get("promoted")
+    promoted_kind = leaderboard.get("promoted_kind")
     reverted_from = leaderboard.get("reverted_from")
     mode = leaderboard.get("mode", "?")
     margin = leaderboard.get("margin")
     floor = leaderboard.get("promote_min_ic")
+
+    baseline_label = ("FRESH champion-arch (vintage-consistent)"
+                      if baseline_src == "champion_arch_fresh"
+                      else "stale serving snapshot (no champion-arch this run)")
 
     # Base champion-arch enrichment (training_summary fields; all optional).
     base_version = base.get("model_version")
@@ -1192,41 +1349,52 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
 
     # ── PROMOTION line ──
     if promoted:
+        kind_txt = ("a CHALLENGER" if promoted_kind == "challenger"
+                    else "the FRESH champion-arch (no challenger won — keeping the "
+                         "live model on this vintage)")
         promo_plain = (
-            f"PROMOTED a new champion: {reverted_from or '?'} -> {promoted}\n"
-            f"  (relative-best: beats champion CPCV IC + margin {margin}, "
-            f"floor {floor}; revert: python -m model.registry --bucket {bucket} "
-            f"--promote {reverted_from or '<prior-id>'})"
+            f"PROMOTED {kind_txt}: {reverted_from or '?'} -> {promoted}\n"
+            f"  (relative-best vs the {baseline_label} CPCV {_fmt_ic(baseline_ic)} "
+            f"+ margin {margin}, floor {floor}; revert: python -m model.registry "
+            f"--bucket {bucket} --promote {reverted_from or '<prior-id>'})"
         )
         promo_html = (
-            f'<p style="color:#2e7d32;"><b>PROMOTED</b> a new champion: '
+            f'<p style="color:#2e7d32;"><b>PROMOTED</b> {kind_txt}: '
             f'<code>{reverted_from or "?"}</code> &rarr; <code>{promoted}</code><br>'
-            f'<span style="font-size:11px;color:#555;">relative-best (beats champion '
-            f'CPCV IC + margin {margin}, floor {floor}); revert: '
-            f'<code>python -m model.registry --bucket {bucket} --promote '
-            f'{reverted_from or "&lt;prior-id&gt;"}</code></span></p>'
+            f'<span style="font-size:11px;color:#555;">relative-best vs the '
+            f'{baseline_label} CPCV {_fmt_ic(baseline_ic)} + margin {margin}, '
+            f'floor {floor}; revert: <code>python -m model.registry --bucket '
+            f'{bucket} --promote {reverted_from or "&lt;prior-id&gt;"}</code></span></p>'
         )
-    elif winner:
+    elif winner or refresh:
+        rec = winner or refresh
+        kind_txt = ("challenger" if winner else
+                    "fresh champion-arch refresh (no challenger won)")
         promo_plain = (
-            f"No promotion executed (mode={mode}). Recommended challenger: {winner} "
-            f"(beats champion; observe — promote manually if confirmed)."
+            f"No promotion executed (mode={mode}). Recommended {kind_txt}: {rec} "
+            f"(beats the {baseline_label} baseline; observe — promote manually if "
+            f"confirmed)."
         )
         promo_html = (
             f'<p style="color:#ef6c00;">No promotion executed (mode=<b>{mode}</b>). '
-            f'Recommended challenger <code>{winner}</code> beats the champion '
-            f'(observe — promote manually if confirmed).</p>'
+            f'Recommended {kind_txt} <code>{rec}</code> beats the {baseline_label} '
+            f'baseline (observe — promote manually if confirmed).</p>'
         )
     else:
-        promo_plain = "No promotion — no eligible challenger beat the champion this rotation."
+        promo_plain = (
+            "No promotion — no challenger beat the champion-arch baseline and the "
+            "champion-arch does not improve on the serving champion this rotation."
+        )
         promo_html = (
-            '<p style="color:#555;">No promotion — no eligible challenger beat the '
-            'champion this rotation.</p>'
+            '<p style="color:#555;">No promotion — no challenger beat the '
+            'champion-arch baseline and the champion-arch does not improve on the '
+            'serving champion this rotation.</p>'
         )
 
-    # ── CHALLENGER table ──
+    # ── CHALLENGER table (champion-arch excluded — it's the baseline, shown above) ──
     cand_rows_plain = []
     cand_rows_html = []
-    for c in cands:
+    for c in challengers:
         sid = c.get("spec_id", "?")
         cpcv = _fmt_ic(c.get("cpcv_mean_ic"))
         fwd = c.get("forward_days")
@@ -1246,23 +1414,28 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
             f'<td style="padding:2px 8px;font-family:monospace;color:{row_color};">{elig}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{reason}</td></tr>'
         )
-    if not cands:
+    if not challengers:
         cand_rows_plain.append("  (no challenger candidates this rotation)")
 
     base_plain = ""
     if base:
         base_plain = (
-            f"\n  Base champion-arch retrain: model={base_version} "
-            f"OOS_IC={_fmt_ic(base_oos)} passes_gate={base_passes} promoted={base_promoted}"
+            f"\n  (base retrain training_summary: model={base_version} "
+            f"OOS_IC={_fmt_ic(base_oos)} passes_gate={base_passes} promoted={base_promoted})"
         )
 
     plain_body = (
         f"Alpha Engine — Model-Zoo Rotation Digest ({date_str})\n"
         f"Mode: {mode}\n"
-        f"\n=== CHAMPION ===\n"
-        f"  CPCV mean IC: {_fmt_ic(champ_ic)}  (forward_days={champ_fwd})"
+        f"\n=== SERVING CHAMPION (live model now — CPCV is a STALE snapshot) ===\n"
+        f"  CPCV mean IC: {_fmt_ic(serving_ic)}  (forward_days={serving_fwd}; "
+        f"served_version={serving_ver}; promoted/served on {serving_date})\n"
+        f"\n=== CHAMPION-ARCH (fresh retrain THIS run — promotion baseline) ===\n"
+        f"  CPCV mean IC: {_fmt_ic(arch_ic)}  (version={arch_vid})"
         f"{base_plain}\n"
-        f"\n=== CHALLENGERS ({len(cands)}) ===\n"
+        f"  >> PROMOTION BASELINE = {baseline_label}: CPCV {_fmt_ic(baseline_ic)} "
+        f"(challengers must beat this + margin {margin})\n"
+        f"\n=== CHALLENGERS ({len(challengers)}) ===\n"
         + "\n".join(cand_rows_plain)
         + f"\n\n=== PROMOTION ===\n{promo_plain}\n"
     )
@@ -1270,8 +1443,8 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
     base_html = ""
     if base:
         base_html = (
-            f'<p style="font-size:12px;color:#555;margin:2px 0;">Base champion-arch '
-            f'retrain: model=<b>{base_version}</b> &nbsp; OOS IC '
+            f'<p style="font-size:11px;color:#777;margin:2px 0;">base retrain '
+            f'training_summary: model=<b>{base_version}</b> &nbsp; OOS IC '
             f'<b>{_fmt_ic(base_oos)}</b> &nbsp; passes_gate=<b>{base_passes}</b> '
             f'&nbsp; promoted=<b>{base_promoted}</b></p>'
         )
@@ -1279,11 +1452,22 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         f'<html><body style="font-family:sans-serif;font-size:13px;color:#222;max-width:640px;">'
         f'<h2 style="margin-bottom:4px;">Model-Zoo Rotation Digest — {date_str}</h2>'
         f'<p style="color:#555;font-size:12px;margin-top:0;">Mode: <b>{mode}</b></p>'
-        f'<h3 style="margin-bottom:4px;">Champion</h3>'
+        f'<h3 style="margin-bottom:2px;">Serving champion '
+        f'<span style="font-size:11px;font-weight:normal;color:#999;">'
+        f'(live model now — CPCV is a STALE snapshot)</span></h3>'
         f'<p style="font-size:13px;margin:2px 0;">CPCV mean IC: '
-        f'<b>{_fmt_ic(champ_ic)}</b> &nbsp;|&nbsp; forward_days: <b>{champ_fwd}</b></p>'
+        f'<b>{_fmt_ic(serving_ic)}</b> &nbsp;|&nbsp; forward_days: <b>{serving_fwd}</b> '
+        f'&nbsp;|&nbsp; served: <code>{serving_ver}</code> on {serving_date}</p>'
+        f'<h3 style="margin-top:16px;margin-bottom:2px;">Champion-arch '
+        f'<span style="font-size:11px;font-weight:normal;color:#999;">'
+        f'(fresh retrain this run — promotion baseline)</span></h3>'
+        f'<p style="font-size:13px;margin:2px 0;">CPCV mean IC: '
+        f'<b>{_fmt_ic(arch_ic)}</b> &nbsp;|&nbsp; version: <code>{arch_vid}</code></p>'
         f'{base_html}'
-        f'<h3 style="margin-top:16px;margin-bottom:4px;">Challengers ({len(cands)})</h3>'
+        f'<p style="font-size:12px;color:#1565c0;margin:4px 0;"><b>Promotion baseline</b> '
+        f'= {baseline_label}: CPCV <b>{_fmt_ic(baseline_ic)}</b> '
+        f'(challengers must beat this + margin {margin}).</p>'
+        f'<h3 style="margin-top:16px;margin-bottom:4px;">Challengers ({len(challengers)})</h3>'
         f'<table style="border-collapse:collapse;font-size:11px;">'
         f'<tr style="background:#e0e0e0;">'
         f'<th style="padding:3px 8px;">Spec</th>'
@@ -1493,28 +1677,41 @@ def select_and_finalize(
         leaderboard["trial_log_status"] = _trial_log_status
 
         winner_vid = leaderboard.get("winner_version_id")
-        if winner_vid and auto_promote_winner:
+        # #679(ii): the version that will actually become champion. A CHALLENGER win
+        # takes precedence; otherwise the fresh champion-arch may refresh the live
+        # model (keeps the deployed 21d model on the current vintage). The two are
+        # mutually exclusive by construction (refresh is only set when winner is None).
+        refresh_vid = leaderboard.get("champion_arch_refresh_version_id")
+        promote_vid = winner_vid or refresh_vid
+        promote_kind = "challenger" if winner_vid else ("champion-arch-refresh" if refresh_vid else None)
+        if promote_vid and auto_promote_winner:
             try:
                 from model.registry import promote_to_champion
-                promote_to_champion(s3, bucket, winner_vid)
-                leaderboard["promoted"] = winner_vid
+                promote_to_champion(s3, bucket, promote_vid)
+                leaderboard["promoted"] = promote_vid
+                leaderboard["promoted_kind"] = promote_kind
                 leaderboard["reverted_from"] = _prior_champ_vid
-                log.info("model_zoo CUTOVER: promoted challenger %s to champion", winner_vid)
-                _alert_promotion(bucket, date_str, leaderboard, winner_vid, _prior_champ_vid)
+                log.info("model_zoo CUTOVER: promoted %s %s to champion",
+                         promote_kind, promote_vid)
+                _alert_promotion(bucket, date_str, leaderboard, promote_vid, _prior_champ_vid)
             except Exception as exc:  # noqa: BLE001 — a promote failure must not fail the SF
                 leaderboard["promoted"] = None
                 leaderboard["promote_error"] = str(exc)
-                log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", winner_vid, exc, exc_info=True)
+                log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", promote_vid, exc, exc_info=True)
         else:
             leaderboard["promoted"] = None
-            if winner_vid:
+            if promote_vid:
                 log.info(
-                    "model_zoo OBSERVE: recommended promotion %s — NOT executed "
-                    "(MODEL_ZOO_AUTO_PROMOTE_WINNER off; flip after soak)", winner_vid,
+                    "model_zoo OBSERVE: recommended promotion %s (%s) — NOT executed "
+                    "(MODEL_ZOO_AUTO_PROMOTE_WINNER off; flip after soak)",
+                    promote_vid, promote_kind,
                 )
-                _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid)
+                _alert_observe_recommendation(bucket, date_str, leaderboard, promote_vid)
             else:
-                log.info("model_zoo: no eligible challenger beat the champion this rotation")
+                log.info(
+                    "model_zoo: no challenger beat the champion-arch baseline and "
+                    "champion-arch does not improve on serving — live model unchanged"
+                )
 
         _write_leaderboard(s3, bucket, date_str, leaderboard)
 
