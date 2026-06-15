@@ -299,6 +299,63 @@ def test_cleanup_confirms_spot_log_before_terminate():
     )
 
 
+# ── Model-zoo flow-doctor wiring (spot heredoc) ───────────────────────────────
+# GAP 1 fix: the model-zoo rotation is its OWN spot entrypoint. The staged
+# /tmp/spot-model-zoo-weekly.py heredoc does `from training.model_zoo import
+# run_rotation_and_select` — it does NOT route through the train_handler-wired
+# path (train_handler is imported only LAZILY inside model_zoo.train_spec). So
+# zoo-orchestration crashes (spec resolution / selection / leaderboard, before
+# the first per-spec train) were uncaptured: the heredoc only did
+# logging.basicConfig. The fix wires alpha_engine_lib.logging.setup_logging
+# (predictor-model-zoo + flow-doctor-model-zoo.yaml) into BOTH model_zoo's
+# module-top (covers the import) AND the heredoc explicitly (belt-and-suspenders
+# against import-order changes + a config-import crash). These tests pin that.
+
+
+def test_model_zoo_heredoc_wires_flow_doctor_setup_logging():
+    """The /tmp/spot-model-zoo-weekly.py heredoc MUST call
+    ``setup_logging(...predictor-model-zoo...)`` so the rotation runs under
+    flow-doctor, mirroring how train_handler/inference are wired. The bare
+    ``logging.basicConfig`` it previously used does NOT attach a
+    FlowDoctorHandler, so a zoo-orchestration crash bypassed flow-doctor."""
+    text = _SCRIPT.read_text()
+    # Locate the model-zoo workload python body.
+    start = text.find("cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'")
+    assert start != -1, "model-zoo workload heredoc not found in spot_train.sh"
+    body = text[start:]
+    end = body.find("PYEOF\n$PY -m alpha_engine_lib.ssm_log_capture")
+    assert end != -1, "model-zoo workload heredoc terminator not found"
+    body = body[:end]
+    assert "from alpha_engine_lib.logging import setup_logging" in body, (
+        "spot-model-zoo-weekly.py heredoc must import setup_logging from "
+        "alpha_engine_lib.logging."
+    )
+    assert 'setup_logging("predictor-model-zoo"' in body, (
+        "spot-model-zoo-weekly.py heredoc must call "
+        'setup_logging("predictor-model-zoo", ...) so the rotation is wired '
+        "to flow-doctor (it imports run_rotation_and_select directly, NOT via "
+        "the train_handler-wired path)."
+    )
+    assert "flow-doctor-model-zoo.yaml" in body, (
+        "spot-model-zoo-weekly.py heredoc must point setup_logging at "
+        "flow-doctor-model-zoo.yaml."
+    )
+
+
+def test_spot_train_script_syntactically_valid():
+    """``bash -n`` must accept spot_train.sh — guards the bash 3.2
+    heredoc/command-substitution paren-scan constraint that the inline NOTE
+    comments warn about (the model-zoo wiring edits live inside the ZOO
+    run_ssm command substitution)."""
+    import subprocess
+    r = subprocess.run(
+        ["bash", "-n", str(_SCRIPT)], capture_output=True, text=True
+    )
+    assert r.returncode == 0, (
+        f"bash -n rejected spot_train.sh:\n{r.stderr}"
+    )
+
+
 def test_run_ssm_signature_unchanged():
     """The L342 PR 4 lift kept the caller-facing signature:
     ``run_ssm "<description>" "<bash script>" [timeout_seconds]``.

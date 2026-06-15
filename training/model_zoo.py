@@ -36,6 +36,42 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
+
+# Structured logging + flow-doctor singleton via alpha-engine-lib (shared
+# pattern across all entrypoints; mirrors training/train_handler.py +
+# inference/handler.py). Module-top so import-time errors below (config
+# resolution, the lazy train_handler/meta_trainer imports that pull in the
+# heavy GBM stack) are captured by flow-doctor's ERROR handler.
+#
+# The model-zoo rotation is its OWN spot entrypoint (spot_train.sh
+# --model-zoo-weekly stages /tmp/spot-model-zoo-weekly.py which does
+# `from training.model_zoo import run_rotation_and_select`) — importing this
+# module IS the wiring point for that path, AND the `python -m
+# training.model_zoo` CLI hits the same module-top. Wiring here covers both
+# without a per-entrypoint call. Zoo-orchestration crashes (spec resolution /
+# selection / leaderboard, before the first per-spec train) are now captured;
+# previously they were uncaptured because train_handler (the only wired
+# entrypoint) is imported only LAZILY inside train_spec().
+#
+# Runs on EC2 spot (NOT Lambda) — no LAMBDA_TASK_ROOT, so the yaml path
+# resolves via two-dirs-up from this file (training/model_zoo.py → repo root,
+# where flow-doctor-model-zoo.yaml lives). The model-zoo yaml mirrors the
+# training yaml's email sink AND the inference yaml's S3 sink so crash
+# artifacts persist even when SMTP/email delivery is unavailable.
+#
+# exclude_patterns starts empty by deliberate convention; add patterns only
+# after observing real ERROR-level noise during rotation runs.
+from alpha_engine_lib.logging import setup_logging
+_FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
+_FLOW_DOCTOR_YAML = str(
+    Path(__file__).resolve().parent.parent / "flow-doctor-model-zoo.yaml"
+)
+setup_logging(
+    "predictor-model-zoo",
+    flow_doctor_yaml=_FLOW_DOCTOR_YAML,
+    exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+)
 
 import config as cfg
 
