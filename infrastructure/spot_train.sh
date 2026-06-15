@@ -578,7 +578,17 @@ os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-res
 bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
 
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
+# Flow-doctor wiring: importing training.model_zoo runs its module-top
+# setup_logging (predictor-model-zoo + flow-doctor-model-zoo.yaml: email +
+# S3 sink), which clears+reinstalls the root handler. We ALSO call it
+# explicitly here BEFORE the import so this entrypoint stays wired even if
+# the import order is later changed, and so a config-import crash inside the
+# import is captured. Idempotent: setup_logging clears existing handlers.
+# NOTE keep this heredoc free of apostrophes per the bash 3.2 note above.
+import os.path as _osp
+_FD_YAML = _osp.join(_osp.abspath("."), "flow-doctor-model-zoo.yaml")
+from alpha_engine_lib.logging import setup_logging
+setup_logging("predictor-model-zoo", flow_doctor_yaml=_FD_YAML, exclude_patterns=[])
 
 import config as cfg
 from training.model_zoo import run_rotation_and_select

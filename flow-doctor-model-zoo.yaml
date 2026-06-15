@@ -1,4 +1,4 @@
-flow_name: predictor-training
+flow_name: predictor-model-zoo
 repo: cipher813/alpha-engine-predictor
 owner: "@brianmcmahon"
 notify:

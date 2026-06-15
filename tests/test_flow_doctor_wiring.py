@@ -98,6 +98,9 @@ class TestFlowDoctorYamlPresence:
     def test_training_yaml_at_repo_root_exists(self):
         assert (REPO_ROOT / "flow-doctor-training.yaml").is_file()
 
+    def test_model_zoo_yaml_at_repo_root_exists(self):
+        assert (REPO_ROOT / "flow-doctor-model-zoo.yaml").is_file()
+
     def test_yaml_path_resolved_by_inference_handler_exists(self):
         # Mirrors inference/handler.py's local-dev path (LAMBDA_TASK_ROOT unset):
         #   os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -137,6 +140,14 @@ class TestFlowDoctorYamlPresence:
         resolved = train_path.resolve().parent.parent / "flow-doctor-training.yaml"
         assert resolved.is_file(), f"training/train_handler.py resolves to {resolved}"
 
+    def test_yaml_path_resolved_by_model_zoo_exists(self):
+        # The model-zoo rotation runs on EC2 spot (no LAMBDA_TASK_ROOT). Its
+        # module-top setup_logging resolves
+        #   Path(__file__).resolve().parent.parent / "flow-doctor-model-zoo.yaml"
+        zoo_path = REPO_ROOT / "training" / "model_zoo.py"
+        resolved = zoo_path.resolve().parent.parent / "flow-doctor-model-zoo.yaml"
+        assert resolved.is_file(), f"training/model_zoo.py resolves to {resolved}"
+
 
 class TestFlowDoctorYamlSchema:
     """Both yamls must declare keys consistent with the lib contract."""
@@ -156,6 +167,47 @@ class TestFlowDoctorYamlSchema:
         for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
             assert key in cfg, f"missing top-level key: {key}"
         assert cfg["repo"] == "cipher813/alpha-engine-predictor"
+
+    def test_training_yaml_has_s3_sink(self):
+        # The S3 sink is the spot-side crash-artifact durability path: on the
+        # EC2 spot the email ${VAR}s resolve via the lib's SSM secret-seed, but
+        # the S3 sink persists the artifact regardless of SMTP-delivery state.
+        # Mirrors flow-doctor.yaml (inference)'s `- type: s3` block.
+        import yaml
+        with open(REPO_ROOT / "flow-doctor-training.yaml") as f:
+            cfg = yaml.safe_load(f)
+        sinks = {n.get("type") for n in cfg["notify"]}
+        assert "s3" in sinks, (
+            "flow-doctor-training.yaml must declare an `- type: s3` sink so "
+            "training crash artifacts persist on the spot even when SMTP/email "
+            "delivery is unavailable. Mirror flow-doctor.yaml's s3 block."
+        )
+        assert "email" in sinks, "training yaml must KEEP its email sink too"
+        s3 = next(n for n in cfg["notify"] if n.get("type") == "s3")
+        assert s3.get("bucket") == "alpha-engine-research"
+        assert s3.get("subsystem") == "predictor"
+
+    def test_model_zoo_yaml_has_required_top_level_keys(self):
+        import yaml
+        with open(REPO_ROOT / "flow-doctor-model-zoo.yaml") as f:
+            cfg = yaml.safe_load(f)
+        for key in ("flow_name", "repo", "notify", "store", "rate_limits"):
+            assert key in cfg, f"missing top-level key: {key}"
+        assert cfg["repo"] == "cipher813/alpha-engine-predictor"
+        assert cfg["flow_name"] == "predictor-model-zoo"
+
+    def test_model_zoo_yaml_has_email_and_s3_sinks(self):
+        # The model-zoo yaml mirrors flow-doctor-training.yaml's email sink AND
+        # flow-doctor.yaml (inference)'s S3 sink: email for delivery, S3 for
+        # durable crash-artifact persistence on the spot.
+        import yaml
+        with open(REPO_ROOT / "flow-doctor-model-zoo.yaml") as f:
+            cfg = yaml.safe_load(f)
+        sinks = {n.get("type") for n in cfg["notify"]}
+        assert sinks == {"email", "s3"}, f"expected email+s3 sinks, got {sinks}"
+        s3 = next(n for n in cfg["notify"] if n.get("type") == "s3")
+        assert s3.get("bucket") == "alpha-engine-research"
+        assert s3.get("subsystem") == "predictor"
 
 
 @flow_doctor_required
@@ -260,6 +312,37 @@ class TestEntrypointModuleTopWiring:
         body = self._strip_comments_and_docstrings(text[main_def_idx:])
         assert "setup_logging(" not in body, (
             "duplicate setup_logging call inside main() — should only run once at module-top"
+        )
+
+    def test_model_zoo_calls_setup_logging_at_module_top(self):
+        # The model-zoo rotation is its own spot entrypoint. The spot heredoc
+        # does `from training.model_zoo import run_rotation_and_select`, so the
+        # ONLY reliable wiring point is model_zoo's module-top — train_handler
+        # (the previously-wired entrypoint) is imported only LAZILY inside
+        # train_spec(), so a zoo-orchestration crash before the first per-spec
+        # train would otherwise bypass flow-doctor.
+        text = (REPO_ROOT / "training" / "model_zoo.py").read_text()
+        setup_idx = self._index_of("setup_logging(", text)
+        # Must run BEFORE `import config as cfg` so a config-resolution crash
+        # (the 6/13 empty-MODEL_SPECS class) is captured at import time.
+        config_idx = self._index_of("import config as cfg", text)
+        assert setup_idx < config_idx, (
+            "setup_logging must be called at module-top, before `import config "
+            "as cfg`, so config-import crashes are captured by flow-doctor"
+        )
+        # Must run before the CLI entry function too.
+        cli_def_idx = self._index_of("def _cli(", text)
+        assert setup_idx < cli_def_idx, (
+            "setup_logging must be at module-top, before def _cli()"
+        )
+        assert "exclude_patterns=" in text[setup_idx:config_idx]
+        assert 'flow-doctor-model-zoo.yaml' in text, (
+            "model_zoo.py must resolve the predictor-model-zoo flow-doctor yaml"
+        )
+        # Not duplicated inside _cli() (strip comments/docstrings first).
+        body = self._strip_comments_and_docstrings(text[cli_def_idx:])
+        assert "setup_logging(" not in body, (
+            "duplicate setup_logging call inside _cli() — runs once at module-top"
         )
 
 
