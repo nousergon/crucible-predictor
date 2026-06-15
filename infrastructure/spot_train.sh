@@ -71,6 +71,20 @@ S3_BUCKET="${S3_BUCKET:-alpha-engine-research}"
 # config.py's own _EXPERIMENT_ID default.
 ALPHA_ENGINE_EXPERIMENT_ID="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
 BRANCH="${BRANCH:-main}"
+# Defer-email propagation: the Saturday SF exports PREDICTOR_DEFER_TRAINING_EMAIL
+# before invoking this script for the --full-only champion retrain, so the base
+# retrain defers its per-run training email to the consolidated model-zoo digest
+# (the --model-zoo-weekly workload sends the digest). The full-training heredoc
+# is a single-quoted heredoc and cannot interpolate a bash var, so we compute an
+# export line HERE and prepend it to the heredoc body via string concatenation
+# (an interpolating prefix + the quoted body). Empty when the var is unset, so a
+# bare full-only run is byte-equivalent to before. Keep this single-line and
+# paren/apostrophe-free per the bash 3.2 run_ssm note.
+if [ -n "${PREDICTOR_DEFER_TRAINING_EMAIL:-}" ]; then
+  DEFER_EMAIL_EXPORT="export PREDICTOR_DEFER_TRAINING_EMAIL=${PREDICTOR_DEFER_TRAINING_EMAIL}"$'\n'
+else
+  DEFER_EMAIL_EXPORT=""
+fi
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # spot launches in single-AZ subnet-e07166ec/us-east-1f hit
 # InsufficientInstanceCapacity). Order = preference; the lib CLI tries
@@ -651,7 +665,7 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
-run_ssm "full-training" "$(cat <<'TRAIN'
+run_ssm "full-training" "${DEFER_EMAIL_EXPORT}$(cat <<'TRAIN'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
