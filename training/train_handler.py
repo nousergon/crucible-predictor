@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import smtplib
 import tempfile
 import time
@@ -1044,6 +1045,14 @@ def _write_training_summary(result: dict, bucket: str, date_str: str) -> None:
         log.warning("Training summary write failed (non-blocking): %s", _sum_err)
 
 
+def _env_truthy(val: Optional[str]) -> bool:
+    """A standard truthy-env reading: set + not one of {"", "0", "false", "no",
+    "off"} (case-insensitive). Used by the PREDICTOR_DEFER_TRAINING_EMAIL gate."""
+    if val is None:
+        return False
+    return val.strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def main(
     bucket: str,
     date_str: Optional[str] = None,
@@ -1052,6 +1061,7 @@ def main(
     skip_phases: str = "",
     force_phases: str = "",
     force: bool = False,
+    send_email: bool = True,
 ) -> dict:
     """Top-level training entrypoint.
 
@@ -1063,11 +1073,34 @@ def main(
     ``ALPHA_ENGINE_DEPLOYED=1`` is exported by ``infrastructure/spot_train.sh``).
     The spot driver calls ``train_handler.main()`` directly, so wrapping
     here is the true top-level entrypoint.
+
+    ``send_email`` gates the per-run training summary email. The model-zoo
+    rotation trains every challenger via ``train_spec`` → ``main()``; without
+    this gate each challenger emails, producing the per-challenger email storm
+    the consolidated zoo digest replaces. The zoo passes ``send_email=False``;
+    the base ``--full-only`` retrain defers its own email to the digest via the
+    ``PREDICTOR_DEFER_TRAINING_EMAIL`` env (honored below) so the SF/spot can
+    defer without threading the arg through the spot heredoc. The dated
+    ``training_summary_{date}.json`` S3 write is ALWAYS performed regardless of
+    ``send_email`` (the email is observability over an artifact that already
+    persisted).
     """
+    # Env override so the spot/SF can defer the base retrain's email to the
+    # zoo digest without arg-threading: when PREDICTOR_DEFER_TRAINING_EMAIL is
+    # set/truthy, default send_email to False. An explicit send_email=False
+    # caller (the zoo) is already covered; the env only flips the default-True
+    # callers (the base --full-only spot heredoc, which passes no send_email).
+    if send_email and _env_truthy(os.environ.get("PREDICTOR_DEFER_TRAINING_EMAIL")):
+        log.info(
+            "PREDICTOR_DEFER_TRAINING_EMAIL set — deferring the per-run training "
+            "email to the model-zoo digest (training_summary S3 write unaffected)."
+        )
+        send_email = False
     with guard_entrypoint():
         return _main_impl(
             bucket, date_str=date_str, dry_run=dry_run,
             skip_phases=skip_phases, force_phases=force_phases, force=force,
+            send_email=send_email,
         )
 
 
@@ -1079,6 +1112,7 @@ def _main_impl(
     skip_phases: str = "",
     force_phases: str = "",
     force: bool = False,
+    send_email: bool = True,
 ) -> dict:
     """
     Entry point called from inference/handler.py for the "train" action.
@@ -1270,9 +1304,20 @@ def _main_impl(
                 _gate_err,
             )
 
-    # Step 3: Email
-    if not dry_run:
+    # Step 3: Email — gated on send_email (model-zoo passes False so each
+    # challenger does NOT email; the base --full-only retrain defers via
+    # PREDICTOR_DEFER_TRAINING_EMAIL → the consolidated zoo digest). The dated
+    # training_summary_{date}.json S3 write happened above regardless, so a
+    # suppressed email loses no DATA — only the per-run notification.
+    if not dry_run and send_email:
         send_training_email(result, date_str)
+    elif not dry_run:
+        log.info(
+            "Per-run training email suppressed (send_email=False) — summary "
+            "persisted to predictor/metrics/training_summary_%s.json; the "
+            "model-zoo digest reports champion + challengers + promotion.",
+            date_str,
+        )
 
     # Step 4: Health status
     if not dry_run:

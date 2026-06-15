@@ -170,7 +170,15 @@ def train_spec(
         "MODEL_VERSION_LABEL", spec.get("model_version_label", f"spec-{spec_id}")
     )
     if train_fn is None:
-        from training.train_handler import main as train_fn
+        # The zoo trains CHALLENGERS — each must NOT send its own per-run
+        # training email (that was the per-challenger email storm). Bind
+        # send_email=False onto the real trainer here; the consolidated zoo
+        # digest (send_zoo_digest_email, end of run_rotation_and_select) is the
+        # single email for the whole rotation. An injected test train_fn keeps
+        # its own (send_email-free) signature — the partial is only the default.
+        import functools
+        from training.train_handler import main as _train_main
+        train_fn = functools.partial(_train_main, send_email=False)
     log.info("model_zoo: training spec %s — overrides %s", spec_id, overrides)
     with spec_overrides(overrides):
         return train_fn(bucket, date_str=date_str, dry_run=dry_run)
@@ -945,6 +953,230 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
         log.warning("model_zoo: observe alert failed", exc_info=True)
 
 
+def _read_base_training_summary(s3, bucket: str, date_str: str | None) -> dict:
+    """Best-effort read of the base champion-arch retrain's training summary
+    (``predictor/metrics/training_summary_{date}.json``, else ``_latest``) to
+    enrich the champion section of the digest with the base retrain's IC /
+    promotion detail. A read failure just leaves the champion section to the
+    leaderboard's CPCV numbers — never fatal."""
+    keys = []
+    if date_str:
+        keys.append(f"predictor/metrics/training_summary_{date_str}.json")
+    keys.append("predictor/metrics/training_summary_latest.json")
+    for key in keys:
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            return json.loads(obj["Body"].read())
+        except Exception:  # noqa: BLE001 — best-effort enrichment
+            continue
+    log.info("model_zoo digest: no base training_summary found (champion section uses CPCV only)")
+    return {}
+
+
+def _digest_subject(leaderboard: dict, date_str: str | None) -> str:
+    cands = leaderboard.get("candidates", []) or []
+    winner = leaderboard.get("winner_version_id")
+    promoted = leaderboard.get("promoted")
+    if promoted:
+        promo = f"promoted: {promoted}"
+    elif winner:
+        promo = f"recommended: {winner} (observe)"
+    else:
+        promo = "promoted: none"
+    return (
+        f"Alpha Engine | Model-Zoo Rotation {date_str or 'latest'} | "
+        f"{len(cands)} challengers | {promo}"
+    )
+
+
+def _fmt_ic(v) -> str:
+    try:
+        return f"{float(v):+.4f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
+                          *, s3=None) -> bool:
+    """Send the ONE consolidated model-zoo rotation digest email — the single
+    email that replaces both the per-challenger email storm AND the base
+    champion-arch retrain's separate email.
+
+    Sections:
+      • CHAMPION  — CPCV mean IC + horizon from the leaderboard, enriched with
+        the base champion-arch retrain's IC / promotion detail read from
+        predictor/metrics/training_summary_{date}.json (if present).
+      • CHALLENGERS — per-candidate table (spec_id, cpcv_mean_ic, forward_days,
+        passes_gate, eligible, reason).
+      • PROMOTION — winner_version_id / promoted: old→new champion if promoted,
+        else "no promotion" + why (observe recommendation, or no eligible
+        challenger).
+
+    Reuses the train_handler SMTP/SES email chokepoint
+    (``alpha_engine_lib.email_sender.send_email`` via train_handler) — NOT a
+    hand-rolled mailer. Returns True on send success, False if email is not
+    configured. Raising is the caller's concern (see run_rotation_and_select's
+    try/except — a digest-send failure is logged + recorded, never aborts the
+    rotation, per no-silent-fails)."""
+    import config as cfg
+
+    sender = getattr(cfg, "EMAIL_SENDER", None)
+    recipients = getattr(cfg, "EMAIL_RECIPIENTS", None)
+    if not sender or not recipients:
+        log.info("model_zoo digest: EMAIL_SENDER/EMAIL_RECIPIENTS not set — skipping")
+        return False
+
+    if s3 is None:
+        try:
+            import boto3
+            s3 = boto3.client("s3")
+        except Exception:  # noqa: BLE001 — enrichment is best-effort
+            s3 = None
+
+    base = _read_base_training_summary(s3, bucket, date_str) if s3 is not None else {}
+
+    champ = leaderboard.get("champion", {}) or {}
+    champ_ic = champ.get("cpcv_mean_ic")
+    champ_fwd = champ.get("forward_days")
+    cands = leaderboard.get("candidates", []) or []
+    winner = leaderboard.get("winner_version_id")
+    promoted = leaderboard.get("promoted")
+    reverted_from = leaderboard.get("reverted_from")
+    mode = leaderboard.get("mode", "?")
+    margin = leaderboard.get("margin")
+    floor = leaderboard.get("promote_min_ic")
+
+    # Base champion-arch enrichment (training_summary fields; all optional).
+    base_version = base.get("model_version")
+    base_oos = base.get("meta_model_oos_ic")
+    base_promoted = base.get("promoted")
+    base_passes = base.get("passes_ic_gate")
+
+    # ── PROMOTION line ──
+    if promoted:
+        promo_plain = (
+            f"PROMOTED a new champion: {reverted_from or '?'} -> {promoted}\n"
+            f"  (relative-best: beats champion CPCV IC + margin {margin}, "
+            f"floor {floor}; revert: python -m model.registry --bucket {bucket} "
+            f"--promote {reverted_from or '<prior-id>'})"
+        )
+        promo_html = (
+            f'<p style="color:#2e7d32;"><b>PROMOTED</b> a new champion: '
+            f'<code>{reverted_from or "?"}</code> &rarr; <code>{promoted}</code><br>'
+            f'<span style="font-size:11px;color:#555;">relative-best (beats champion '
+            f'CPCV IC + margin {margin}, floor {floor}); revert: '
+            f'<code>python -m model.registry --bucket {bucket} --promote '
+            f'{reverted_from or "&lt;prior-id&gt;"}</code></span></p>'
+        )
+    elif winner:
+        promo_plain = (
+            f"No promotion executed (mode={mode}). Recommended challenger: {winner} "
+            f"(beats champion; observe — promote manually if confirmed)."
+        )
+        promo_html = (
+            f'<p style="color:#ef6c00;">No promotion executed (mode=<b>{mode}</b>). '
+            f'Recommended challenger <code>{winner}</code> beats the champion '
+            f'(observe — promote manually if confirmed).</p>'
+        )
+    else:
+        promo_plain = "No promotion — no eligible challenger beat the champion this rotation."
+        promo_html = (
+            '<p style="color:#555;">No promotion — no eligible challenger beat the '
+            'champion this rotation.</p>'
+        )
+
+    # ── CHALLENGER table ──
+    cand_rows_plain = []
+    cand_rows_html = []
+    for c in cands:
+        sid = c.get("spec_id", "?")
+        cpcv = _fmt_ic(c.get("cpcv_mean_ic"))
+        fwd = c.get("forward_days")
+        gate = c.get("passes_gate")
+        elig = c.get("eligible")
+        reason = c.get("reason", "")
+        cand_rows_plain.append(
+            f"  {str(sid):<18} cpcv={cpcv}  fwd={fwd}  gate={gate}  "
+            f"eligible={elig}  ({reason})"
+        )
+        row_color = "#2e7d32" if elig else "#888"
+        cand_rows_html.append(
+            f'<tr><td style="padding:2px 8px;font-family:monospace;">{sid}</td>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{cpcv}</td>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{fwd}</td>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{gate}</td>'
+            f'<td style="padding:2px 8px;font-family:monospace;color:{row_color};">{elig}</td>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{reason}</td></tr>'
+        )
+    if not cands:
+        cand_rows_plain.append("  (no challenger candidates this rotation)")
+
+    base_plain = ""
+    if base:
+        base_plain = (
+            f"\n  Base champion-arch retrain: model={base_version} "
+            f"OOS_IC={_fmt_ic(base_oos)} passes_gate={base_passes} promoted={base_promoted}"
+        )
+
+    plain_body = (
+        f"Alpha Engine — Model-Zoo Rotation Digest ({date_str})\n"
+        f"Mode: {mode}\n"
+        f"\n=== CHAMPION ===\n"
+        f"  CPCV mean IC: {_fmt_ic(champ_ic)}  (forward_days={champ_fwd})"
+        f"{base_plain}\n"
+        f"\n=== CHALLENGERS ({len(cands)}) ===\n"
+        + "\n".join(cand_rows_plain)
+        + f"\n\n=== PROMOTION ===\n{promo_plain}\n"
+    )
+
+    base_html = ""
+    if base:
+        base_html = (
+            f'<p style="font-size:12px;color:#555;margin:2px 0;">Base champion-arch '
+            f'retrain: model=<b>{base_version}</b> &nbsp; OOS IC '
+            f'<b>{_fmt_ic(base_oos)}</b> &nbsp; passes_gate=<b>{base_passes}</b> '
+            f'&nbsp; promoted=<b>{base_promoted}</b></p>'
+        )
+    html_body = (
+        f'<html><body style="font-family:sans-serif;font-size:13px;color:#222;max-width:640px;">'
+        f'<h2 style="margin-bottom:4px;">Model-Zoo Rotation Digest — {date_str}</h2>'
+        f'<p style="color:#555;font-size:12px;margin-top:0;">Mode: <b>{mode}</b></p>'
+        f'<h3 style="margin-bottom:4px;">Champion</h3>'
+        f'<p style="font-size:13px;margin:2px 0;">CPCV mean IC: '
+        f'<b>{_fmt_ic(champ_ic)}</b> &nbsp;|&nbsp; forward_days: <b>{champ_fwd}</b></p>'
+        f'{base_html}'
+        f'<h3 style="margin-top:16px;margin-bottom:4px;">Challengers ({len(cands)})</h3>'
+        f'<table style="border-collapse:collapse;font-size:11px;">'
+        f'<tr style="background:#e0e0e0;">'
+        f'<th style="padding:3px 8px;">Spec</th>'
+        f'<th style="padding:3px 8px;">CPCV IC</th>'
+        f'<th style="padding:3px 8px;">Fwd</th>'
+        f'<th style="padding:3px 8px;">Gate</th>'
+        f'<th style="padding:3px 8px;">Eligible</th>'
+        f'<th style="padding:3px 8px;">Reason</th></tr>'
+        + ("".join(cand_rows_html) if cand_rows_html
+           else '<tr><td colspan="6" style="padding:4px 8px;color:#888;">'
+                '(no challenger candidates this rotation)</td></tr>')
+        + f'</table>'
+        f'<h3 style="margin-top:16px;margin-bottom:4px;">Promotion</h3>'
+        f'{promo_html}'
+        f'<p style="font-size:10px;color:#aaa;margin-top:20px;">'
+        f'Consolidated model-zoo digest — replaces the per-challenger training '
+        f'emails and the base --full-only retrain email.</p>'
+        f'</body></html>'
+    )
+
+    subject = _digest_subject(leaderboard, date_str)
+    # REUSE the train_handler SMTP/SES chokepoint (Gmail primary, SES fallback)
+    # — same mailer the per-run training email uses. NOT a hand-rolled sender.
+    from alpha_engine_lib.email_sender import send_email as _send_email
+    return _send_email(
+        subject, plain_body,
+        recipients=recipients, html=html_body,
+        sender=sender, region=getattr(cfg, "AWS_REGION", None),
+    )
+
+
 def run_rotation_and_select(
     bucket: str,
     *,
@@ -1043,58 +1275,87 @@ def run_rotation_and_select(
     # Capture the OUTGOING champion's registry version BEFORE any promote so the
     # operator alert can carry an exact, copy-pasteable revert command.
     _prior_champ_vid = _current_champion_version_id(s3, bucket)
-    leaderboard = select_winner(
-        s3, bucket, trained=trained, n_trials_cumulative=_n_trials_cum,
-    )
-    leaderboard["date"] = date_str
-    leaderboard["mode"] = mode
-    leaderboard["trial_log_status"] = _trial_log_status
 
-    winner_vid = leaderboard.get("winner_version_id")
-    if winner_vid and auto_promote_winner:
-        try:
-            from model.registry import promote_to_champion
-            promote_to_champion(s3, bucket, winner_vid)
-            leaderboard["promoted"] = winner_vid
-            leaderboard["reverted_from"] = _prior_champ_vid
-            log.info("model_zoo CUTOVER: promoted challenger %s to champion", winner_vid)
-            _alert_promotion(bucket, date_str, leaderboard, winner_vid, _prior_champ_vid)
-        except Exception as exc:  # noqa: BLE001 — a promote failure must not fail the SF
-            leaderboard["promoted"] = None
-            leaderboard["promote_error"] = str(exc)
-            log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", winner_vid, exc, exc_info=True)
-    else:
-        leaderboard["promoted"] = None
-        if winner_vid:
-            log.info(
-                "model_zoo OBSERVE: recommended promotion %s — NOT executed "
-                "(MODEL_ZOO_AUTO_PROMOTE_WINNER off; flip after soak)", winner_vid,
-            )
-            _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid)
-        else:
-            log.info("model_zoo: no eligible challenger beat the champion this rotation")
-
-    _write_leaderboard(s3, bucket, date_str, leaderboard)
-
-    # config#671/#673/#1052 — RELATIVE-BEST noise-chasing MONITOR (repurposed from
-    # the retired Option-B observe-tier leaderboard). With the relative-best rule a
-    # beats-champion challenger PROMOTES rather than entering an observe soak, so the
-    # leaderboard no longer gates an observe→champion move. It is repointed to SCORE
-    # THE PROMOTED CHAMPION's own predictions vs realized 21d alpha over a trailing
-    # window: if relative-best promotion is chasing noise, the live champion's
-    # realized rank-IC will be weak/negative — an OBSERVABILITY/alarm signal, NOT a
-    # gate (it never promotes, demotes, or allocates). Best-effort (its own crash
-    # must never fail the rotation SF — the promote already happened above).
+    # Minimal leaderboard so the try/finally digest below ALWAYS has something
+    # to report — even if select_winner itself raises (the digest reports
+    # whatever candidates exist, never goes silent on the rotation).
+    leaderboard: dict = {"date": date_str, "mode": mode, "candidates": [],
+                         "winner_version_id": None, "promoted": None}
     try:
-        from analysis.observe_leaderboard import build_champion_realized_monitor
-        _mon = build_champion_realized_monitor(bucket=bucket, date_str=date_str, s3_client=s3)
-        leaderboard["champion_realized_monitor"] = {
-            "realized_rank_ic": (_mon.get("champion") or {}).get("realized_rank_ic"),
-            "n_matured_outcomes": (_mon.get("champion") or {}).get("n_matured_outcomes"),
-            "chasing_noise": _mon.get("chasing_noise"),
-        }
-    except Exception:  # noqa: BLE001 — monitor is observability off a path that already promoted
-        log.warning("model_zoo: champion realized-edge monitor failed", exc_info=True)
+        leaderboard = select_winner(
+            s3, bucket, trained=trained, n_trials_cumulative=_n_trials_cum,
+        )
+        leaderboard["date"] = date_str
+        leaderboard["mode"] = mode
+        leaderboard["trial_log_status"] = _trial_log_status
+
+        winner_vid = leaderboard.get("winner_version_id")
+        if winner_vid and auto_promote_winner:
+            try:
+                from model.registry import promote_to_champion
+                promote_to_champion(s3, bucket, winner_vid)
+                leaderboard["promoted"] = winner_vid
+                leaderboard["reverted_from"] = _prior_champ_vid
+                log.info("model_zoo CUTOVER: promoted challenger %s to champion", winner_vid)
+                _alert_promotion(bucket, date_str, leaderboard, winner_vid, _prior_champ_vid)
+            except Exception as exc:  # noqa: BLE001 — a promote failure must not fail the SF
+                leaderboard["promoted"] = None
+                leaderboard["promote_error"] = str(exc)
+                log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", winner_vid, exc, exc_info=True)
+        else:
+            leaderboard["promoted"] = None
+            if winner_vid:
+                log.info(
+                    "model_zoo OBSERVE: recommended promotion %s — NOT executed "
+                    "(MODEL_ZOO_AUTO_PROMOTE_WINNER off; flip after soak)", winner_vid,
+                )
+                _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid)
+            else:
+                log.info("model_zoo: no eligible challenger beat the champion this rotation")
+
+        _write_leaderboard(s3, bucket, date_str, leaderboard)
+
+        # config#671/#673/#1052 — RELATIVE-BEST noise-chasing MONITOR (repurposed from
+        # the retired Option-B observe-tier leaderboard). With the relative-best rule a
+        # beats-champion challenger PROMOTES rather than entering an observe soak, so the
+        # leaderboard no longer gates an observe→champion move. It is repointed to SCORE
+        # THE PROMOTED CHAMPION's own predictions vs realized 21d alpha over a trailing
+        # window: if relative-best promotion is chasing noise, the live champion's
+        # realized rank-IC will be weak/negative — an OBSERVABILITY/alarm signal, NOT a
+        # gate (it never promotes, demotes, or allocates). Best-effort (its own crash
+        # must never fail the rotation SF — the promote already happened above).
+        try:
+            from analysis.observe_leaderboard import build_champion_realized_monitor
+            _mon = build_champion_realized_monitor(bucket=bucket, date_str=date_str, s3_client=s3)
+            leaderboard["champion_realized_monitor"] = {
+                "realized_rank_ic": (_mon.get("champion") or {}).get("realized_rank_ic"),
+                "n_matured_outcomes": (_mon.get("champion") or {}).get("n_matured_outcomes"),
+                "chasing_noise": _mon.get("chasing_noise"),
+            }
+        except Exception:  # noqa: BLE001 — monitor is observability off a path that already promoted
+            log.warning("model_zoo: champion realized-edge monitor failed", exc_info=True)
+    finally:
+        # ONE consolidated digest email — ALWAYS fires when the real rotation
+        # python runs (this finally is reached even if select_winner / promote
+        # raised; the minimal leaderboard above guarantees a reportable shape).
+        # no-silent-fails carve-out: the digest is SECONDARY OBSERVABILITY on a
+        # path whose primary outputs (leaderboard.json, training_summary.json,
+        # promoted weights) already persisted to S3, so a send failure is
+        # logged LOUD (WARN + a named "model_zoo_digest_email_failed" marker on
+        # the returned leaderboard) but does NOT abort the rotation. Recording
+        # surface: WARN log + leaderboard["digest_email"] field (visible in the
+        # persisted leaderboard.json + the spot log). We do NOT re-raise.
+        if not dry_run:
+            try:
+                _sent = send_zoo_digest_email(leaderboard, bucket, date_str, s3=s3)
+                leaderboard["digest_email"] = "sent" if _sent else "skipped_not_configured"
+            except Exception as exc:  # noqa: BLE001 — see carve-out comment above
+                leaderboard["digest_email"] = f"model_zoo_digest_email_failed: {exc}"
+                log.warning(
+                    "model_zoo: consolidated digest email FAILED (rotation NOT "
+                    "aborted — leaderboard/weights already persisted to S3): %s",
+                    exc, exc_info=True,
+                )
 
     return leaderboard
 
