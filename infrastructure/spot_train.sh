@@ -121,7 +121,7 @@ IAM_PROFILE="alpha-engine-executor-profile"
 # state; the dispatcher's .venv has alpha-engine-lib installed (see
 # deploy-on-merge.sh in the dashboard repo).
 LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
-REPO_URL="https://github.com/cipher813/alpha-engine-predictor.git"  # public repo, no auth
+REPO_URL="https://github.com/nousergon/crucible-predictor.git"  # public repo, no auth
 
 # Parse flags
 MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly | model-zoo-spec | model-zoo-select

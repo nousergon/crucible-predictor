@@ -42,14 +42,14 @@ MIN_LIB_VERSION = "0.39.0"
 
 # The co-install pair that MUST match (spot_backtest.sh installs both into one
 # venv). Order is (first-installed, second-installed) for the message only.
-_CO_INSTALL_PAIR = ("cipher813/alpha-engine-backtester", "cipher813/alpha-engine-predictor")
+_CO_INSTALL_PAIR = ("nousergon/crucible-backtester", "nousergon/crucible-predictor")
 
 # Every repo that participates in the Saturday SF must clear the floor.
 _FLOOR_REPOS = (
-    "cipher813/alpha-engine-data",
-    "cipher813/alpha-engine-predictor",
-    "cipher813/alpha-engine-backtester",
-    "cipher813/alpha-engine-research",
+    "nousergon/nousergon-data",
+    "nousergon/crucible-predictor",
+    "nousergon/crucible-backtester",
+    "nousergon/crucible-research",
 )
 
 # Lifted from {predictor,backtester}/tests/test_lib_pin_lockstep.py (the pin
@@ -60,7 +60,7 @@ _FLOOR_REPOS = (
 # a lib release + cross-repo re-pin.
 _LIB_PIN_RE = re.compile(
     r"alpha-engine-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/"
-    r"cipher813/alpha-engine-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 
 _RAW_REQUIREMENTS_URL = (
