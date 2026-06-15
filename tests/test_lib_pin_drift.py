@@ -13,10 +13,10 @@ import inference.lib_pin_drift as lpd
 
 # Today's aligned fleet: co-install pair matched, all >= floor (v0.39.0).
 _ALIGNED = {
-    "cipher813/alpha-engine-backtester": "v0.53.0",
-    "cipher813/alpha-engine-predictor": "v0.53.0",
-    "cipher813/alpha-engine-data": "v0.39.0",      # == floor → passes
-    "cipher813/alpha-engine-research": "v0.42.0",
+    "nousergon/crucible-backtester": "v0.53.0",
+    "nousergon/crucible-predictor": "v0.53.0",
+    "nousergon/nousergon-data": "v0.39.0",      # == floor → passes
+    "nousergon/crucible-research": "v0.42.0",
 }
 
 
@@ -30,7 +30,7 @@ def _patch_pins(mapping):
 def test_parse_pin_happy():
     line = (
         "alpha-engine-lib[arcticdb,flow_doctor,quant-xs] @ "
-        "git+https://github.com/cipher813/alpha-engine-lib@v0.53.0"
+        "git+https://github.com/nousergon/nousergon-lib@v0.53.0"
     )
     assert lpd._parse_pin(line) == "v0.53.0"
 
@@ -60,7 +60,7 @@ def test_aligned_fleet_no_drift():
 
 def test_co_install_parity_mismatch_halts():
     pins = dict(_ALIGNED)
-    pins["cipher813/alpha-engine-predictor"] = "v0.52.1"  # predictor lags backtester
+    pins["nousergon/crucible-predictor"] = "v0.52.1"  # predictor lags backtester
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     assert out["has_drift"] is True
@@ -72,18 +72,18 @@ def test_co_install_parity_mismatch_halts():
 
 def test_below_floor_halts_and_names_offender():
     pins = dict(_ALIGNED)
-    pins["cipher813/alpha-engine-data"] = "v0.38.0"  # regressed below floor
+    pins["nousergon/nousergon-data"] = "v0.38.0"  # regressed below floor
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     assert out["has_drift"] is True
     assert out["floor_ok"] is False
-    assert any("below floor" in o and "alpha-engine-data" in o and "v0.38.0" in o
+    assert any("below floor" in o and "nousergon-data" in o and "v0.38.0" in o
                for o in out["offenders"])
 
 
 def test_fetch_failure_fails_open():
     pins = dict(_ALIGNED)
-    pins["cipher813/alpha-engine-research"] = None  # GitHub unreachable / parse miss
+    pins["nousergon/crucible-research"] = None  # GitHub unreachable / parse miss
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     # The checker's own fragility must NEVER halt the weekly run.
@@ -93,10 +93,10 @@ def test_fetch_failure_fails_open():
 
 def test_parity_mismatch_below_floor_combined():
     pins = {
-        "cipher813/alpha-engine-backtester": "v0.53.0",
-        "cipher813/alpha-engine-predictor": "v0.49.0",   # parity break
-        "cipher813/alpha-engine-data": "v0.30.0",        # below floor
-        "cipher813/alpha-engine-research": "v0.42.0",
+        "nousergon/crucible-backtester": "v0.53.0",
+        "nousergon/crucible-predictor": "v0.49.0",   # parity break
+        "nousergon/nousergon-data": "v0.30.0",        # below floor
+        "nousergon/crucible-research": "v0.42.0",
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
