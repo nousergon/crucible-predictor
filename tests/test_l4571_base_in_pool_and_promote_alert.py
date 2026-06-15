@@ -100,19 +100,35 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
 
 
 class TestBaseInPool:
-    def test_base_arch_is_ranked_and_can_win(self, monkeypatch):
-        # base-arch (0.30) > variant (0.15) > champion (0.10) → base-arch wins.
+    def test_base_arch_is_baseline_and_refreshes_live_when_no_challenger_wins(self, monkeypatch):
+        # #679(ii): champion-arch (0.30) is the vintage-consistent BASELINE, NOT a
+        # challenger winner — it can't beat itself. The variant (0.15) does NOT clear
+        # baseline+margin, so no CHALLENGER wins (winner_version_id is None). But the
+        # fresh champion-arch beats the stale serving champion (0.10), so it REFRESHES
+        # the live model (keeps the deployed 21d model on the current vintage).
         board, promotes, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                            base_ic=0.30, variant_ic=0.15)
         ids = {c["spec_id"] for c in board["candidates"]}
         assert "champion-arch" in ids            # base IS in the pool
-        assert board["winner_version_id"] == "base-today"
+        # champion-arch is the BASELINE — never a challenger winner.
+        assert board["winner_version_id"] is None
+        assert board["promotion_baseline_source"] == "champion_arch_fresh"
+        arch_cand = next(c for c in board["candidates"] if c["spec_id"] == "champion-arch")
+        assert arch_cand["reason"] == "champion_arch_baseline"
+        assert arch_cand["eligible"] is False
+        # …but it refreshes the live model (no challenger won, beats serving+margin).
+        assert board["champion_arch_refresh_version_id"] == "base-today"
+        assert board["promoted"] == "base-today"
+        assert board["promoted_kind"] == "champion-arch-refresh"
         assert promotes == ["base-today"]
 
     def test_variant_can_beat_the_base(self, monkeypatch):
+        # A challenger (0.25) that clears the champion-arch baseline (0.12) + margin
+        # WINS as a true challenger — takes precedence over any refresh.
         board, _, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                     base_ic=0.12, variant_ic=0.25)
         assert board["winner_version_id"] == "resid-v"
+        assert board["champion_arch_refresh_version_id"] is None  # challenger won → no refresh
 
 
 class TestPromotionAlert:

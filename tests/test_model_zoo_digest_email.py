@@ -142,6 +142,50 @@ def test_send_zoo_digest_email_has_champion_challengers_promotion(monkeypatch):
     assert "Champion" in html and "Challengers" in html and "Promotion" in html
 
 
+def test_digest_renders_three_labeled_groups_no_double_count(monkeypatch):
+    # #679(ii): the digest shows three CLEARLY-LABELED groups — Serving champion
+    # (stale), Champion-arch (fresh baseline), Challengers — and champion-arch is
+    # NOT double-counted in the challenger table.
+    captured = _capture_digest_send(monkeypatch)
+    s3 = _FakeS3({})
+    leaderboard = {
+        "date": "2026-06-20", "mode": "observe",
+        "serving_champion": {"forward_days": 21, "cpcv_mean_ic": 0.10,
+                             "served_version": "v3.0-meta", "served_date": "2026-05-30",
+                             "cpcv_is_stale_snapshot": True},
+        "champion_arch": {"version_id": "arch-v", "cpcv_mean_ic": 0.15,
+                          "is_promotion_baseline": True},
+        "promotion_baseline_ic": 0.15, "promotion_baseline_source": "champion_arch_fresh",
+        "champion": {"forward_days": 21, "cpcv_mean_ic": 0.10},  # back-compat alias
+        "margin": 0.0, "promote_min_ic": 0.0,
+        "candidates": [
+            {"spec_id": "champion-arch", "version_id": "arch-v", "group": "champion_arch",
+             "cpcv_mean_ic": 0.15, "forward_days": 21, "passes_gate": True,
+             "eligible": False, "reason": "champion_arch_baseline"},
+            {"spec_id": "resid", "version_id": "resid-v", "group": "challenger",
+             "cpcv_mean_ic": 0.20, "forward_days": 21, "passes_gate": True,
+             "eligible": True, "reason": "eligible"},
+        ],
+        "winner_version_id": "resid-v", "promoted": "resid-v",
+        "promoted_kind": "challenger", "reverted_from": "old-champ-v",
+    }
+    ok = mz.send_zoo_digest_email(leaderboard, "bkt", "2026-06-20", s3=s3)
+    assert ok is True
+    plain = captured["plain"]
+    # Three distinct, labeled groups present.
+    assert "SERVING CHAMPION" in plain
+    assert "CHAMPION-ARCH" in plain
+    assert "CHALLENGERS (1)" in plain                 # ONE challenger — arch excluded
+    # Serving CPCV (stale) + served date; champion-arch CPCV (baseline) both shown.
+    assert "2026-05-30" in plain                      # serving served-date
+    assert "PROMOTION BASELINE" in plain
+    # Subject counts ONE challenger (champion-arch not double-counted).
+    assert "1 challengers" in captured["subject"]
+    html = captured["html"]
+    assert "Serving champion" in html and "Champion-arch" in html
+    assert "Challengers (1)" in html
+
+
 def test_digest_no_promotion_says_so(monkeypatch):
     captured = _capture_digest_send(monkeypatch)
     s3 = _FakeS3({})  # no base summary → champion section uses CPCV only
