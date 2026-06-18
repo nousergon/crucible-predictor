@@ -274,6 +274,45 @@ def run(ctx: PipelineContext) -> None:
     # See feature_store/compute.py and alpha-engine-data-feature-store-260402.md
 
 
+def _set_feature_drift_ks(ctx, drift_feature_rows: list) -> None:
+    """Compute the inference-vs-training feature-drift KS block and stash it on
+    ``ctx.feature_drift_ks`` for write_output (config#859).
+
+    Fail-soft secondary observability: a failure here must NOT break daily
+    predictions — (a) swallowed: drift compute/load error; (c) recording
+    surface: the WARN below + the report-card feature_drift_ks component shows
+    N/A when the block is absent. Per the feedback_no_silent_fails
+    secondary-observability carve-out.
+    """
+    ctx.feature_drift_ks = None
+    try:
+        import numpy as _np
+
+        from model.meta_model import META_FEATURES
+        from monitoring.feature_drift import (
+            compute_feature_drift_ks,
+            load_training_reference,
+        )
+
+        if not drift_feature_rows:
+            return
+        ref = load_training_reference(
+            bucket=ctx.bucket, region=getattr(ctx, "region", "us-east-1"),
+        )
+        if not ref:
+            return
+        matrix = _np.array(
+            [[row.get(f, _np.nan) for f in META_FEATURES] for row in drift_feature_rows],
+            dtype=float,
+        )
+        ctx.feature_drift_ks = compute_feature_drift_ks(matrix, META_FEATURES, ref)
+    except Exception as e:  # noqa: BLE001 — secondary observability (see docstring)
+        log.warning(
+            "[feature_drift] KS computation failed (predictions unaffected; "
+            "report card shows feature_drift_ks N/A): %s", e,
+        )
+
+
 def _run_meta_inference(ctx: PipelineContext) -> None:
     """Run Layer 1 specialized models → meta-model → predictions."""
     # Note: `data.feature_engineer.compute_features` is no longer imported here
@@ -566,6 +605,9 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                 "non-blocking): %s", e,
             )
 
+    # config#859: collect per-ticker META_FEATURES rows for the feature-drift
+    # KS test (computed post-loop, fail-soft).
+    drift_feature_rows: list = []
     for ticker in ctx.tickers:
         latest = precomputed.get(ticker)
         if latest is None:
@@ -730,6 +772,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             "sector_macro_modifier": sector_modifier,
             **macro_row_for_meta,  # raw macro features
         }
+        drift_feature_rows.append(meta_features)
 
         # Track A PR 5/6 cutover (2026-05-09): canonical_predicted_alpha
         # parallel-output retired. predicted_alpha IS the canonical alpha
@@ -957,6 +1000,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
     _rescale_cross_sectional(ctx)
     _apply_level_neutralization(ctx)
+    _set_feature_drift_ks(ctx, drift_feature_rows)
     log.info(
         "Meta-inference complete: %d predictions, %d skipped, "
         "%d tickers had NaN meta-features (neutral-imputed)",

@@ -1159,6 +1159,9 @@ def run(ctx: PipelineContext) -> None:
             "ece_after": gbm_meta.get("isotonic_ece_after"),
             "n_samples": gbm_meta.get("isotonic_n_samples"),
         }
+        # config#859: inference-vs-training feature-drift KS (None when no
+        # training reference yet or compute failed → report card shows N/A).
+        metrics["feature_drift_ks"] = getattr(ctx, "feature_drift_ks", None)
 
     # ── Supplemental merge (re-invocation coverage-gap path) ────────────────
     # When invoked with explicit_tickers, merge these new predictions into the
