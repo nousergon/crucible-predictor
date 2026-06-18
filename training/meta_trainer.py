@@ -1888,6 +1888,35 @@ def run_meta_training(
         )
     meta_X = meta_X_all[canonical_finite_mask]
     meta_y = canonical_y_full[canonical_finite_mask]
+
+    # config#859: persist the training feature-drift reference (cross-sectional
+    # META_FEATURES subsample) so daily inference can KS-test its feature
+    # distribution against the distribution the model was trained on. meta_X is
+    # the same raw-feature representation the model fits + inference feeds, so
+    # the comparison is apples-to-apples by the model's own contract. Fail-soft:
+    # a reference-write failure must NOT abort training (model + manifest are
+    # the primary deliverable); the report card shows feature_drift_ks N/A until
+    # a reference lands. Per the feedback_no_silent_fails secondary carve-out.
+    try:
+        from alpha_engine_lib.dates import now_dual
+
+        from monitoring.feature_drift import (
+            build_training_reference,
+            save_training_reference,
+        )
+
+        _drift_ref = build_training_reference(
+            meta_X, TRAIN_META_FEATURES, trained_date=now_dual().trading_day,
+        )
+        _drift_key = save_training_reference(_drift_ref, bucket=bucket)
+        log.info(
+            "[feature_drift] saved training reference: %d features n=%d -> s3://%s/%s",
+            len(_drift_ref.get("features", [])), _drift_ref.get("n_samples", 0),
+            bucket, _drift_key,
+        )
+    except Exception as _drift_err:  # noqa: BLE001 — secondary observability (see comment)
+        log.warning("[feature_drift] failed to save training reference: %s", _drift_err)
+
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(
         meta_X, meta_y, feature_names=TRAIN_META_FEATURES,
