@@ -78,6 +78,33 @@ class TestPlateauLiveBatch:
         assert result.failed_check == "unique_p_up"
         assert "2026-05-07-class plateau" in result.reason
         assert result.metrics["n_unique_p_up"] == 6
+        # The plateau's dominant mode (16/27) is what trips the (modal-gated)
+        # check — assert it so a future relax can't silently un-catch it.
+        assert result.metrics["modal_fraction"] >= 0.5
+
+    def test_2026_06_22_low_dispersion_staircase_passes(self):
+        # Regression for the false-positive that halted the book on a
+        # low-dispersion post-holiday day. The promoted (isotonic-calibrated)
+        # model produced a clean MONOTONIC staircase across 26 tickers — 7
+        # distinct p_up values spanning 0.35→0.70 — but the largest step held
+        # only 8/26 (31%). Old gate failed on unique_p_up=7<8; the modal-gated
+        # check must now PASS (no pile-up, healthy spread).
+        from collections import Counter
+        dist = Counter({
+            0.3514: 1, 0.4566: 8, 0.5068: 4, 0.5150: 6,
+            0.5300: 3, 0.6452: 3, 0.7037: 1,
+        })
+        preds, i = [], 0
+        for p_up, count in dist.items():
+            for _ in range(count):
+                preds.append({"ticker": f"T{i:02d}", "p_up": p_up,
+                              "predicted_direction": "UP" if p_up >= 0.5 else "DOWN"})
+                i += 1
+        result = validate_live_batch_distribution(preds)
+        assert result.passed is True, result.reason
+        assert result.metrics["n_unique_p_up"] == 7
+        assert result.metrics["modal_fraction"] < 0.5
+        assert result.metrics["stdev_p_up"] > 0.005
 
 
 class TestSaturationLiveBatch:
@@ -147,16 +174,31 @@ class TestSmallBatchPassthrough:
         assert result.passed is True
         assert "below min_batch_size" in result.reason
 
-    def test_at_min_batch_size_runs_checks(self):
-        # 5 predictions at default min_batch_size. The actual checks run
-        # but with such a tiny batch the uniqueness threshold (8) cannot
-        # be met. So this fails on uniqueness — confirming the gate ran.
+    def test_at_min_batch_size_a_pileup_still_fails(self):
+        # Confirm the gate actually RUNS at min_batch_size (not passthrough)
+        # by feeding a tiny batch with a genuine pile-up: 4/5 on one value
+        # (modal 80%, 2 unique). Low distinct-count AND a dominant mode →
+        # the flat-region check fires. (Post the 2026-06-22 dispersion-aware
+        # fix, a tiny batch of DISTINCT well-spread values no longer fails on
+        # count alone — see test_at_min_batch_size_well_spread_passes.)
+        preds = [{"ticker": f"T{i}", "p_up": 0.458, "predicted_direction": "DOWN"}
+                 for i in range(4)]
+        preds.append({"ticker": "T4", "p_up": 0.62, "predicted_direction": "UP"})
+        result = validate_live_batch_distribution(preds)
+        assert result.passed is False
+        assert result.failed_check == "unique_p_up"
+        assert result.metrics["modal_fraction"] >= 0.5
+
+    def test_at_min_batch_size_well_spread_passes(self):
+        # The 2026-06-22 regression in miniature: a tiny but well-spread batch
+        # (5 distinct values, no pile-up, healthy stdev) must PASS — low
+        # distinct-count alone must not halt the book.
         preds = [{"ticker": f"T{i}", "p_up": 0.40 + i * 0.05,
                   "predicted_direction": "DOWN" if i < 2 else "UP"}
                  for i in range(5)]
         result = validate_live_batch_distribution(preds)
-        assert result.passed is False
-        assert result.failed_check == "unique_p_up"
+        assert result.passed is True
+        assert result.metrics["modal_fraction"] < 0.5
 
 
 # ── Defensive on malformed predictions ───────────────────────────────────

@@ -59,6 +59,7 @@ def validate_calibrator_distribution(
     alpha_range: tuple[float, float] = (-0.05, 0.05),
     n_synthetic: int = 25,
     min_unique_p_up: int = 8,
+    max_modal_fraction: float = 0.5,
     max_saturation_rate: float = 0.25,
     min_stdev: float = 0.005,
     max_direction_skew: float = 0.85,
@@ -70,12 +71,19 @@ def validate_calibrator_distribution(
 
     The four checks (and what they catch):
 
-    1. **Unique p_up values** — the calibrator should produce at least
-       ``min_unique_p_up`` distinct outputs across the synthetic sweep.
-       Catches the isotonic-plateau failure mode (16 of 27 tickers all
-       at p_up=0.458, 2026-05-07): the calibrator learned a flat region
-       in the raw-alpha space and maps any input in that region to the
-       same output.
+    1. **Flat-region collapse** — fires only when the output has BOTH a
+       low distinct-value count (< ``min_unique_p_up``) AND a single
+       dominant modal value (>= ``max_modal_fraction`` of the batch piled
+       on one p_up). Catches the isotonic-plateau failure mode (16 of 27
+       tickers all at p_up=0.458, 2026-05-07 → modal 59%): the calibrator
+       learned a flat region and maps any input in it to the same output.
+       The modal-concentration condition is what stops this check from
+       false-halting on benign isotonic-staircase coarseness — an isotonic
+       calibrator quantizes alpha→p_up into monotonic steps, so a thin or
+       low-dispersion live batch legitimately lands in few distinct values
+       with NO dominant mode (2026-06-22: 26 post-holiday tickers → 7
+       monotonic steps spanning 0.35→0.70, modal 8/26=31% — healthy spread,
+       must pass). Raw distinct-count alone cannot separate these.
 
     2. **Saturation rate** — at most ``max_saturation_rate`` of outputs
        can sit at the calibrator's floor (0.01) or ceiling (0.99) clip
@@ -159,6 +167,7 @@ def validate_calibrator_distribution(
         directions=directions,
         source_label=f"synthetic alpha sweep ({n_synthetic} samples)",
         min_unique_p_up=min_unique_p_up,
+        max_modal_fraction=max_modal_fraction,
         max_saturation_rate=max_saturation_rate,
         min_stdev=min_stdev,
         max_direction_skew=max_direction_skew,
@@ -172,6 +181,7 @@ def validate_live_batch_distribution(
     predictions: list[dict],
     *,
     min_unique_p_up: int = 8,
+    max_modal_fraction: float = 0.5,
     max_saturation_rate: float = 0.25,
     min_stdev: float = 0.005,
     max_direction_skew: float = 0.85,
@@ -251,6 +261,7 @@ def validate_live_batch_distribution(
         directions=directions,
         source_label=f"live inference batch ({len(p_ups)} tickers)",
         min_unique_p_up=min_unique_p_up,
+        max_modal_fraction=max_modal_fraction,
         max_saturation_rate=max_saturation_rate,
         min_stdev=min_stdev,
         max_direction_skew=max_direction_skew,
@@ -266,6 +277,7 @@ def validate_stratified_per_regime(
     *,
     min_per_regime_size: int = 25,
     min_unique_p_up: int = 8,
+    max_modal_fraction: float = 0.5,
     max_saturation_rate: float = 0.25,
     min_stdev: float = 0.005,
     max_direction_skew: float = 0.85,
@@ -369,6 +381,7 @@ def validate_stratified_per_regime(
         regime_result = validate_live_batch_distribution(
             regime_preds,
             min_unique_p_up=min_unique_p_up,
+            max_modal_fraction=max_modal_fraction,
             max_saturation_rate=max_saturation_rate,
             min_stdev=min_stdev,
             max_direction_skew=max_direction_skew,
@@ -440,6 +453,7 @@ def _evaluate_distribution_invariants(
     directions: list,
     source_label: str,
     min_unique_p_up: int,
+    max_modal_fraction: float,
     max_saturation_rate: float,
     min_stdev: float,
     max_direction_skew: float,
@@ -459,7 +473,20 @@ def _evaluate_distribution_invariants(
     import numpy as np
 
     # Check 1: unique p_up count (round to 6 decimals to handle FP noise)
-    n_unique = int(len(np.unique(np.round(p_ups, 6))))
+    rounded = np.round(p_ups, 6)
+    uniq_vals, uniq_counts = np.unique(rounded, return_counts=True)
+    n_unique = int(len(uniq_vals))
+    # Modal concentration: the fraction of the batch sitting on the single
+    # most common p_up value. This is what distinguishes a genuine flat-region
+    # COLLAPSE (one dominant value swallowing most of the mass — the
+    # 2026-05-07 pathology) from benign quantization coarseness (an isotonic
+    # calibrator maps alpha→p_up as a STAIRCASE, so a thin / low-dispersion
+    # live batch legitimately lands in only a handful of monotonic steps with
+    # NO single value dominating). Raw unique-count alone can't tell these
+    # apart and false-halts the book on low-dispersion days (2026-06-22: 26
+    # post-holiday tickers → 7 monotonic steps, p_up 0.35→0.70, modal 8/26=31%
+    # — gate fired on unique_p_up=7<8 despite a perfectly healthy spread).
+    modal_fraction = float(uniq_counts.max() / len(rounded))
 
     # Check 2: saturation rate at floor/ceiling
     n_saturated = int(np.sum((p_ups <= floor) | (p_ups >= ceiling)))
@@ -481,6 +508,7 @@ def _evaluate_distribution_invariants(
     metrics = {
         **extra_metrics,
         "n_unique_p_up": n_unique,
+        "modal_fraction": round(modal_fraction, 4),
         "saturation_rate": round(saturation_rate, 4),
         "stdev_p_up": round(stdev, 6),
         "direction_skew": round(direction_skew, 4),
@@ -489,11 +517,19 @@ def _evaluate_distribution_invariants(
     }
 
     # Run checks in priority order (most distinctive failure first).
-    if n_unique < min_unique_p_up:
+    #
+    # Check 1 fires only on a genuine flat-region COLLAPSE: a low distinct-value
+    # count AND a single dominant modal value (>= max_modal_fraction of the
+    # batch piled on one p_up). A low distinct-count WITHOUT a dominant mode is
+    # benign isotonic-staircase coarseness on a thin/low-dispersion batch and
+    # must NOT halt the book (saturation / stdev / skew checks below still guard
+    # the true degeneracy modes). See modal_fraction comment above.
+    if n_unique < min_unique_p_up and modal_fraction >= max_modal_fraction:
         reason = (
             f"only {n_unique} unique p_up values across {source_label} "
-            f"(min: {min_unique_p_up}) — output likely has flat regions; "
-            f"the 2026-05-07-class plateau"
+            f"(min: {min_unique_p_up}) AND a dominant mode holds "
+            f"{modal_fraction:.0%} of the batch (>= {max_modal_fraction:.0%}) "
+            f"— output collapsed onto a flat region; the 2026-05-07-class plateau"
         )
         log.warning("Output-distribution gate FAILED — %s", reason)
         return OutputDistributionGateResult(
@@ -537,8 +573,8 @@ def _evaluate_distribution_invariants(
 
     log.info(
         "Output-distribution gate PASSED — "
-        "%d unique p_up, saturation %.1f%%, stdev %.4f, skew %.1f%%",
-        n_unique, saturation_rate * 100, stdev, direction_skew * 100,
+        "%d unique p_up (modal %.0f%%), saturation %.1f%%, stdev %.4f, skew %.1f%%",
+        n_unique, modal_fraction * 100, saturation_rate * 100, stdev, direction_skew * 100,
     )
     return OutputDistributionGateResult(
         passed=True, failed_check=None, reason="all checks passed",
