@@ -14,7 +14,10 @@ scikit-learn>=1.3.0
 
 # Shared lib (used by inference + training entrypoints). Public since
 # 2026-05-03 — pip installs from git+https with no auth.
-alpha-engine-lib[arcticdb,flow_doctor,quant-xs,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8
+# NOTE: flow-doctor extra is HYPHENATED — setuptools normalizes the lib's
+# `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
+# normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
+alpha-engine-lib[arcticdb,flow-doctor,quant-xs,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.59.8
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.11
