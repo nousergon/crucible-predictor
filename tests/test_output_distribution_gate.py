@@ -194,13 +194,31 @@ class TestUnfittedCalibrator:
 
 class TestThresholdCustomization:
 
-    def test_tighter_min_unique_blocks_borderline(self):
-        # Linear calibrator yields ~25 unique values — tighten threshold to 30.
+    def test_tighter_min_unique_does_not_block_well_spread(self):
+        # NEW SEMANTICS (2026-06-22 dispersion-aware fix): the unique_p_up
+        # check is modal-gated — it fires only when a low distinct-count
+        # COINCIDES with a dominant modal pile-up. A well-spread linear
+        # calibrator has no pile-up (modal fraction tiny), so even an
+        # aggressively tight min_unique_p_up must NOT block it. This is the
+        # whole point of the fix: don't false-halt healthy, well-dispersed
+        # output just because it has "few" distinct values.
         result = validate_calibrator_distribution(
             _LinearCalibrator(), min_unique_p_up=30,
         )
+        assert result.passed is True
+        assert result.metrics["modal_fraction"] < 0.5
+
+    def test_tighter_max_modal_fraction_blocks_concentrated(self):
+        # max_modal_fraction is the knob that gates the unique check. A
+        # plateau calibrator piles all mass on one value (modal 100%), so
+        # the unique_p_up (flat-region) check fires — confirming the modal
+        # condition is wired through the public threshold surface.
+        result = validate_calibrator_distribution(
+            _PlateauCalibrator(), min_unique_p_up=8, max_modal_fraction=0.5,
+        )
         assert result.passed is False
         assert result.failed_check == "unique_p_up"
+        assert result.metrics["modal_fraction"] >= 0.5
 
     def test_looser_min_unique_allows_borderline(self):
         # Plateau calibrator has 1 unique — relax threshold to 1.
