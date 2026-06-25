@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import smtplib
 import tempfile
 import time
@@ -937,6 +938,66 @@ def send_training_email(result: dict, date_str: str) -> bool:
 # ── Orchestrator ───────────────────────────────────────────────────────────────
 
 _TRAINING_SUMMARY_KEY = "predictor/metrics/training_summary_{date}.json"
+# config#1170 — per-challenger-spec training summary (the meta_training phase's
+# L4524 reload artifact). Namespaced under the spec's MODEL_VERSION_LABEL so a
+# zoo rerun reloads ITS OWN summary, never a sibling spec's (consequence #3).
+_TRAINING_SUMMARY_KEY_SPEC = "predictor/model_zoo/{spec}/metrics/training_summary_{date}.json"
+
+
+def _spec_namespace() -> "str | None":
+    """The current zoo-challenger spec namespace, or ``None`` for the base champion.
+
+    config#1170 — phase markers + the training-summary reload artifact were
+    keyed at DATE granularity (``predictor/{date}/.phases/meta_training.json``),
+    a SINGLE file shared by every model-zoo spec for that date. That made
+    same-date reruns skip ALL specs (any spec's marker auto-skipped every spec)
+    and blocked a FAILED spec from retrying same-day (it saw a sibling's success
+    marker). The fix namespaces the markers + reload artifact per challenger spec.
+
+    The namespace is derived from ``cfg.MODEL_VERSION_LABEL`` — the model_zoo
+    sets this per spec via ``spec_overrides`` around the ``main()`` call
+    (model_zoo.train_spec). When it equals the base champion default
+    (``v3.0-meta`` / config ``model_version_label``) the run IS the base champion,
+    so we return None and the legacy spec-less paths are preserved (the issue
+    requires the base champion keeps its current path). A challenger returns a
+    filesystem-safe slug of its label so each spec's skip/reload is independent.
+    """
+    try:
+        import config as _cfg
+    except Exception:  # config unreadable (dev/CI w/o predictor.yaml)
+        return None
+    label = getattr(_cfg, "MODEL_VERSION_LABEL", None)
+    base = _cfg_default_label(_cfg)
+    if not label or label == base:
+        return None
+    # Slugify so an arbitrary spec label is a safe single S3 path segment.
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label)).strip("_")
+    return slug or None
+
+
+def _cfg_default_label(_cfg) -> str:
+    """The base champion's model_version_label (the spec-less identity).
+
+    config sets ``MODEL_VERSION_LABEL`` from ``model_version_label`` (default
+    ``v3.0-meta``); a zoo spec then OVERRIDES the module attr at train time. So
+    the live attr can't tell us the base — we read the underlying yaml default
+    via ``config._cfg`` when present, else fall back to the documented default.
+    """
+    try:
+        raw = getattr(_cfg, "_cfg", None)
+        if isinstance(raw, dict):
+            return raw.get("model_version_label", "v3.0-meta") or "v3.0-meta"
+    except Exception:
+        pass
+    return "v3.0-meta"
+
+
+def _training_summary_key(date_str: str, spec: "str | None") -> str:
+    """The training-summary S3 key for this run — spec-namespaced for a zoo
+    challenger (config#1170), the legacy date-only key for the base champion."""
+    if spec:
+        return _TRAINING_SUMMARY_KEY_SPEC.format(spec=spec, date=date_str)
+    return _TRAINING_SUMMARY_KEY.format(date=date_str)
 
 
 def _build_registry(
@@ -947,6 +1008,7 @@ def _build_registry(
     skip_phases: str = "",
     force_phases: str = "",
     force: bool = False,
+    spec: "str | None" = None,
 ) -> "PhaseRegistry | None":
     """Construct the training :class:`PhaseRegistry` (markers under
     ``predictor/{date}/.phases/`` + watchdog), or ``None`` in dry-run.
@@ -959,6 +1021,14 @@ def _build_registry(
     Watchdog caps read from ``config.FULL_RUN_HARD_CAPS_SECONDS`` — best-effort,
     so a dev/CI run with no ``predictor.yaml`` degrades to an unwatchdogged
     registry (logged) rather than failing the import.
+
+    config#1170 — ``spec`` namespaces the markers per zoo challenger:
+    ``predictor/model_zoo/{spec}/{date}/.phases/{phase}.json`` instead of the
+    date-only ``predictor/{date}/.phases/{phase}.json``. The base champion
+    (spec is None) keeps its legacy path, so each challenger's skip/auto-skip is
+    independent: a same-date rerun re-runs only the not-yet-completed / failed
+    specs, and a failed spec can retry same-day without a sibling's marker
+    short-circuiting it.
     """
     if dry_run:
         return None
@@ -976,10 +1046,13 @@ def _build_registry(
     except Exception as _cap_err:  # config unreadable (dev/CI w/o predictor.yaml)
         log.warning("phase watchdog caps unavailable (%s) — running unwatchdogged", _cap_err)
         hard_caps = {}
+    # config#1170 — per-spec marker prefix for zoo challengers; the base champion
+    # (spec is None) keeps the spec-less "predictor" prefix.
+    marker_prefix = f"predictor/model_zoo/{spec}" if spec else "predictor"
     return PhaseRegistry(
         date=date_str,
         bucket=bucket,
-        marker_prefix="predictor",
+        marker_prefix=marker_prefix,
         skip_phases=skip,
         force=force_all,
         force_phases=fphases,
@@ -996,19 +1069,20 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
     return reg.phase(name, supports_auto_skip=False, **log_ctx)
 
 
-def _load_training_result(bucket: str, date_str: str) -> "dict | None":
+def _load_training_result(bucket: str, date_str: str, spec: "str | None" = None) -> "dict | None":
     """Reload a prior run's ``result`` dict from the persisted training summary
     so a recovery that AUTO-SKIPS the ~90-min ``meta_training`` phase can still
     drive the downstream summary/risk-model/gate/email/health stages. The summary
-    (``predictor/metrics/training_summary_{date}.json``) IS the json-serialized
-    ``result`` and is the meta_training phase's recorded artifact — so L4524 only
-    auto-skips when it exists, and this reload then succeeds. Mirrors the
-    backtester's ``_load_predictor_artifacts``. 404 → None (caller refuses to
-    proceed on a half-trained state); any other S3 error → raise (fail loud)."""
+    (``predictor/metrics/training_summary_{date}.json``, or the spec-namespaced
+    key for a zoo challenger — config#1170) IS the json-serialized ``result`` and
+    is the meta_training phase's recorded artifact — so L4524 only auto-skips when
+    it exists, and this reload then succeeds. Mirrors the backtester's
+    ``_load_predictor_artifacts``. 404 → None (caller refuses to proceed on a
+    half-trained state); any other S3 error → raise (fail loud)."""
     import boto3
     from botocore.exceptions import ClientError
 
-    key = _TRAINING_SUMMARY_KEY.format(date=date_str)
+    key = _training_summary_key(date_str, spec)
     try:
         obj = boto3.client("s3").get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
@@ -1023,11 +1097,18 @@ def _load_training_result(bucket: str, date_str: str) -> "dict | None":
         raise
 
 
-def _write_training_summary(result: dict, bucket: str, date_str: str) -> None:
+def _write_training_summary(
+    result: dict, bucket: str, date_str: str, spec: "str | None" = None,
+) -> None:
     """Annotate + persist the training ``result`` to S3 (dated + latest). Extracted
     from the inline Step-2d block so the ``meta_training`` phase can record the
     dated summary as its L4524 artifact (the reload source). Non-blocking: a write
-    failure logs a WARN — the training itself already succeeded."""
+    failure logs a WARN — the training itself already succeeded.
+
+    config#1170 — for a zoo challenger (``spec`` set) the dated summary is written
+    to the spec-namespaced key so it's that spec's OWN reload artifact, and the
+    shared ``training_summary_latest.json`` champion pointer is NOT overwritten
+    (only the base champion advances "latest")."""
     try:
         import boto3 as _b3_sum
         _s3_sum = _b3_sum.client("s3")
@@ -1038,15 +1119,19 @@ def _write_training_summary(result: dict, bucket: str, date_str: str) -> None:
         _sum_body = json.dumps(result, indent=2, default=str).encode()
         _s3_sum.put_object(
             Bucket=bucket,
-            Key=_TRAINING_SUMMARY_KEY.format(date=date_str),
+            Key=_training_summary_key(date_str, spec),
             Body=_sum_body, ContentType="application/json",
         )
-        _s3_sum.put_object(
-            Bucket=bucket,
-            Key="predictor/metrics/training_summary_latest.json",
-            Body=_sum_body, ContentType="application/json",
+        if not spec:
+            _s3_sum.put_object(
+                Bucket=bucket,
+                Key="predictor/metrics/training_summary_latest.json",
+                Body=_sum_body, ContentType="application/json",
+            )
+        log.info(
+            "Training summary written to S3 (%s)",
+            "dated, spec-namespaced" if spec else "dated + latest",
         )
-        log.info("Training summary written to S3 (dated + latest)")
     except Exception as _sum_err:
         log.warning("Training summary write failed (non-blocking): %s", _sum_err)
 
@@ -1154,11 +1239,23 @@ def _main_impl(
     # alpha_engine_lib.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
-    # Phase registry: markers under predictor/{date}/.phases/ + watchdog +
+    # config#1170 — the zoo-challenger spec namespace (None for the base
+    # champion). Derived from cfg.MODEL_VERSION_LABEL, which model_zoo sets per
+    # spec via spec_overrides around this main() call. Namespaces the phase
+    # markers + the meta_training reload artifact PER SPEC so a same-date rerun
+    # re-runs only the not-yet-completed / failed specs (and a failed spec can
+    # retry same-day) instead of every spec skipping on the first spec's marker.
+    spec_ns = _spec_namespace()
+    if spec_ns:
+        log.info("model-zoo challenger run: phase markers namespaced under spec=%s", spec_ns)
+
+    # Phase registry: markers under predictor/{date}/.phases/ (or, for a zoo
+    # challenger, predictor/model_zoo/{spec}/{date}/.phases/) + watchdog +
     # meta_training auto-skip-reload (L4528, 3rd lib consumer). None in dry-run.
     reg = _build_registry(
         bucket, date_str, dry_run,
         skip_phases=skip_phases, force_phases=force_phases, force=force,
+        spec=spec_ns,
     )
 
     # Preflight — fail fast on env / connectivity / ArcticDB staleness
@@ -1215,7 +1312,7 @@ def _main_impl(
         # alpha-engine-data (Phase 1) — nothing to do here.
         log.info("Slim cache write: skipped (handled by alpha-engine-data)")
         if not dry_run:
-            _write_training_summary(_r, bucket, date_str)
+            _write_training_summary(_r, bucket, date_str, spec_ns)
         return _r
 
     if reg is None:
@@ -1223,7 +1320,7 @@ def _main_impl(
     else:
         with reg.phase("meta_training", supports_auto_skip=True) as ctx:
             if ctx.skipped:
-                result = _load_training_result(bucket, date_str)
+                result = _load_training_result(bucket, date_str, spec_ns)
                 if result is None:
                     raise RuntimeError(
                         "meta_training marker is ok but the training summary is absent "
@@ -1236,7 +1333,7 @@ def _main_impl(
                 )
             else:
                 result = _train_and_summarize()
-                ctx.record_artifact(_TRAINING_SUMMARY_KEY.format(date=date_str))
+                ctx.record_artifact(_training_summary_key(date_str, spec_ns))
 
     # Step 2d2: Factor-risk-model F + D weekly persistence (ROADMAP C.2b).
     # Reads the per-ticker parquets the train_handler already populated

@@ -194,3 +194,185 @@ def test_meta_training_half_state_forces_rerun(monkeypatch):
         train_fn=lambda: calls.append(1) or {"promoted": True},
     )
     assert mode == "trained" and calls == [1], "missing summary must force a re-train"
+
+
+# ── config#1170 — spec-level (not date-level) phase markers ───────────────────
+#
+# The bug: phase markers were keyed at DATE granularity
+# (`predictor/{date}/.phases/meta_training.json`, ONE file shared by every
+# zoo spec). So a same-date rerun skipped ALL specs (any spec's marker
+# auto-skipped every spec) and a FAILED spec couldn't retry same-day (it saw a
+# sibling's success marker). The fix namespaces the marker prefix + the
+# meta_training reload artifact per challenger spec; the base champion keeps the
+# spec-less path. These tests assert the per-spec idempotency the fix buys.
+
+
+def test_spec_namespace_none_for_base_champion(monkeypatch):
+    """The base champion (label == config default) keeps the spec-less paths."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", train_handler._cfg_default_label(cfg))
+    assert train_handler._spec_namespace() is None
+    reg = train_handler._build_registry("b", "2026-06-20", dry_run=False, spec=None)
+    assert reg.marker_prefix == "predictor"
+    assert reg._marker_key("meta_training") == "predictor/2026-06-20/.phases/meta_training.json"
+    assert (
+        train_handler._training_summary_key("2026-06-20", None)
+        == "predictor/metrics/training_summary_2026-06-20.json"
+    )
+
+
+def test_spec_namespace_per_challenger_label(monkeypatch):
+    """A zoo challenger derives a filesystem-safe per-spec namespace from its
+    MODEL_VERSION_LABEL, and the marker key lands UNDER that namespace."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", "resid-mom-v1")
+    ns = train_handler._spec_namespace()
+    assert ns == "resid-mom-v1"
+    reg = train_handler._build_registry("b", "2026-06-20", dry_run=False, spec=ns)
+    assert reg._marker_key("meta_training") == (
+        "predictor/model_zoo/resid-mom-v1/2026-06-20/.phases/meta_training.json"
+    )
+    assert train_handler._training_summary_key("2026-06-20", ns) == (
+        "predictor/model_zoo/resid-mom-v1/metrics/training_summary_2026-06-20.json"
+    )
+
+
+def test_spec_namespace_slugifies_unsafe_label(monkeypatch):
+    """An arbitrary spec label is reduced to a single safe S3 path segment."""
+    import config as cfg
+    monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", "spec/with bad:chars")
+    assert train_handler._spec_namespace() == "spec_with_bad_chars"
+
+
+# ── the idempotency contract, end-to-end across two specs on ONE date ─────────
+
+
+def _spec_reg(fake, spec):
+    """A PhaseRegistry keyed exactly as _build_registry(spec=...) would key it."""
+    prefix = f"predictor/model_zoo/{spec}" if spec else "predictor"
+    return PhaseRegistry(
+        date="2026-06-20", bucket="alpha-engine-research",
+        marker_prefix=prefix, s3_client=fake,
+    )
+
+
+def _run_spec_meta_phase(fake, spec, *, monkeypatch, train_fn):
+    """Mirror _main_impl's meta_training block for a NAMED spec: the marker +
+    the reload artifact are both spec-namespaced (config#1170)."""
+    monkeypatch.setattr("boto3.client", lambda *a, **k: fake)
+    monkeypatch.setattr(train_handler, "_annotate_subsample_noise_floor", lambda *a, **k: None)
+    reg = _spec_reg(fake, spec)
+    summary_key = train_handler._training_summary_key("2026-06-20", spec)
+    with reg.phase("meta_training", supports_auto_skip=True) as ctx:
+        if ctx.skipped:
+            result = train_handler._load_training_result(
+                "alpha-engine-research", "2026-06-20", spec,
+            )
+            if result is None:
+                raise RuntimeError("half-state")
+            return result, "skipped"
+        result = train_fn()  # may raise to simulate a spec FAILURE
+        train_handler._write_training_summary(
+            result, "alpha-engine-research", "2026-06-20", spec,
+        )
+        ctx.record_artifact(summary_key)
+        return result, "trained"
+
+
+def test_same_date_rerun_reruns_only_incomplete_specs(monkeypatch):
+    """Same-date rerun: a completed spec auto-skips (and is NOT re-trained),
+    while a spec that never ran on the first pass DOES train on the rerun.
+
+    Pre-fix this was the headline bug: spec A's date-level marker made spec B
+    auto-skip even though B never ran.
+    """
+    fake = _FakeS3()
+
+    # First pass: only spec A trains + completes (artifact present).
+    a_calls = []
+    _, mode_a = _run_spec_meta_phase(
+        fake, "spec-a", monkeypatch=monkeypatch,
+        train_fn=lambda: a_calls.append(1) or {"promoted": True, "test_ic": 0.06},
+    )
+    assert mode_a == "trained" and a_calls == [1]
+    fake.artifacts.add(train_handler._training_summary_key("2026-06-20", "spec-a"))
+
+    # Rerun (same date): A must auto-skip (already done), B must still train
+    # because B has its OWN marker namespace — A's marker no longer touches it.
+    a_calls2, b_calls = [], []
+    _, mode_a2 = _run_spec_meta_phase(
+        fake, "spec-a", monkeypatch=monkeypatch,
+        train_fn=lambda: a_calls2.append(1) or {"x": 1},
+    )
+    _, mode_b = _run_spec_meta_phase(
+        fake, "spec-b", monkeypatch=monkeypatch,
+        train_fn=lambda: b_calls.append(1) or {"promoted": False, "test_ic": 0.02},
+    )
+    assert mode_a2 == "skipped" and a_calls2 == [], "completed spec must not double-run"
+    assert mode_b == "trained" and b_calls == [1], "a never-run spec must NOT be skipped"
+
+
+def test_failed_spec_can_retry_same_day(monkeypatch):
+    """A spec that FAILED on the first pass can retry same-day — a sibling's
+    success marker must not short-circuit it.
+
+    Pre-fix: spec A's success wrote the shared date-level marker, so failed
+    spec B saw it and skipped on retry instead of re-training.
+    """
+    fake = _FakeS3()
+
+    # Spec A succeeds (writes its marker + artifact).
+    _run_spec_meta_phase(
+        fake, "spec-a", monkeypatch=monkeypatch,
+        train_fn=lambda: {"promoted": True, "test_ic": 0.06},
+    )
+    fake.artifacts.add(train_handler._training_summary_key("2026-06-20", "spec-a"))
+
+    # Spec B FAILS on its first run (train raises) — its marker is status=error,
+    # no artifact written.
+    with pytest.raises(RuntimeError, match="boom"):
+        _run_spec_meta_phase(
+            fake, "spec-b", monkeypatch=monkeypatch,
+            train_fn=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+    # Same-day retry of B: it must RE-TRAIN (its error marker is not status=ok,
+    # and A's success marker is in a different namespace).
+    b_calls = []
+    _, mode_b = _run_spec_meta_phase(
+        fake, "spec-b", monkeypatch=monkeypatch,
+        train_fn=lambda: b_calls.append(1) or {"promoted": False, "test_ic": 0.03},
+    )
+    assert mode_b == "trained" and b_calls == [1], "a failed spec must retry same-day"
+
+
+def test_completed_spec_never_double_runs_on_rerun(monkeypatch):
+    """A completed spec auto-skips on every subsequent same-date rerun and
+    reloads ITS OWN summary (never a sibling's)."""
+    fake = _FakeS3()
+    _run_spec_meta_phase(
+        fake, "spec-a", monkeypatch=monkeypatch,
+        train_fn=lambda: {"promoted": True, "test_ic": 0.061},
+    )
+    fake.artifacts.add(train_handler._training_summary_key("2026-06-20", "spec-a"))
+    # A different spec also completes with a DIFFERENT result.
+    _run_spec_meta_phase(
+        fake, "spec-b", monkeypatch=monkeypatch,
+        train_fn=lambda: {"promoted": False, "test_ic": 0.019},
+    )
+    fake.artifacts.add(train_handler._training_summary_key("2026-06-20", "spec-b"))
+
+    calls = []
+    res_a, mode_a = _run_spec_meta_phase(
+        fake, "spec-a", monkeypatch=monkeypatch,
+        train_fn=lambda: calls.append("a") or {"x": 1},
+    )
+    res_b, mode_b = _run_spec_meta_phase(
+        fake, "spec-b", monkeypatch=monkeypatch,
+        train_fn=lambda: calls.append("b") or {"x": 1},
+    )
+    assert mode_a == "skipped" and mode_b == "skipped"
+    assert calls == [], "no completed spec may re-train on a same-date rerun"
+    # Each reloads its OWN summary — not a sibling's (consequence #3).
+    assert res_a["test_ic"] == 0.061
+    assert res_b["test_ic"] == 0.019
