@@ -88,7 +88,6 @@ class PipelineContext:
     # ── Alternative data (set by fetch_alt_data) ─────────────────────────────
     earnings_all: dict = field(default_factory=dict)
     revision_all: dict = field(default_factory=dict)
-    options_all: dict = field(default_factory=dict)
     fundamental_all: dict = field(default_factory=dict)
 
     # ── Results (set by run_inference) ───────────────────────────────────────

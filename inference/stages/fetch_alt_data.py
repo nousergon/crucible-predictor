@@ -1,4 +1,4 @@
-"""Stage: fetch_alt_data — Fetch alternative data (earnings, revisions, options, fundamentals)."""
+"""Stage: fetch_alt_data — Fetch alternative data (earnings, revisions, fundamentals)."""
 
 from __future__ import annotations
 
@@ -30,18 +30,6 @@ def run(ctx: PipelineContext) -> None:
         log.info("O11: Loaded revision data for %d tickers", len(ctx.revision_all))
     except Exception as exc:
         log.warning("O11: Revision data fetch failed (features will use defaults): %s", exc)
-
-    # O12: Options
-    try:
-        from data.options_fetcher import load_historical_options, fetch_options_features
-        ctx.options_all = load_historical_options(ctx.date_str, ctx.bucket) or {}
-        if ctx.options_all:
-            log.info("O12: Loaded cached options for %d tickers from S3", len(ctx.options_all))
-        else:
-            ctx.options_all = fetch_options_features(ctx.tickers, reference_date=ctx.date_str)
-            log.info("O12: Fetched options features for %d tickers via yfinance", len(ctx.options_all))
-    except Exception as exc:
-        log.warning("O12: Options features fetch failed (features will use defaults): %s", exc)
 
     # Fundamentals — read from S3 cache (written weekly by DataPhase1)
     try:
@@ -76,7 +64,6 @@ def run(ctx: PipelineContext) -> None:
     _alt_data_sources = {
         "O10_earnings": ctx.earnings_all,
         "O11_revisions": ctx.revision_all,
-        "O12_options": ctx.options_all,
         "fundamentals": ctx.fundamental_all,
     }
     _alt_data_populated = {k: len(v) for k, v in _alt_data_sources.items() if v}
