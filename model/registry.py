@@ -25,10 +25,63 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from datetime import datetime, timezone
 
 DEFAULT_SOURCE_PREFIX = "predictor/weights/meta/"
 DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
+
+# The Docker build stamps the deployed revision here from the ``GIT_SHA``
+# build-arg (``$GITHUB_SHA`` in CI) — see infrastructure/Dockerfile
+# (`RUN echo "${GIT_SHA}" > /var/task/GIT_SHA.txt`). It is the authoritative
+# code-revision marker inside the running container/Lambda image.
+_CODE_SHA_FILE = "/var/task/GIT_SHA.txt"
+
+
+def resolve_code_sha() -> str | None:
+    """Best-effort resolution of the code revision the current process runs on.
+
+    Lineage completeness (L4577 / config#708): every registered model bundle
+    should record the code SHA that produced it. Resolution order mirrors the
+    deploy chain, most-authoritative first:
+
+      1. ``/var/task/GIT_SHA.txt`` — written by the Docker build from the
+         ``GIT_SHA`` build-arg (``$GITHUB_SHA`` in CI); the deployed-revision
+         stamp baked into the container/Lambda image.
+      2. the ``GIT_SHA`` env var — the same value when exported into the runtime
+         environment instead of (or in addition to) the file.
+      3. ``git rev-parse HEAD`` — local-dev / non-containerized training.
+
+    Returns ``None`` (never raises) when none resolve, so snapshotting a model
+    of unknown provenance degrades to a null ``code_sha`` rather than failing
+    training. The placeholder ``"unknown"`` (the Dockerfile's ARG default) is
+    treated as unresolved.
+    """
+    try:
+        with open(_CODE_SHA_FILE, encoding="utf-8") as fh:
+            sha = fh.read().strip()
+        if sha and sha != "unknown":
+            return sha
+    except OSError:
+        pass
+
+    env_sha = os.environ.get("GIT_SHA", "").strip()
+    if env_sha and env_sha != "unknown":
+        return env_sha
+
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        sha = proc.stdout.strip()
+        if proc.returncode == 0 and sha:
+            return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return None
 
 # The lifecycle stages a registered version can carry. `snapshot_to_registry`
 # records one into the lineage; the CLI validates `--stage` against this set.

@@ -4148,13 +4148,21 @@ def run_meta_training(
             # the exact Phase-0 gap that left the registry holding only the
             # champion (found 2026-06-02).
             try:
-                from model.registry import snapshot_to_registry
+                from model.registry import resolve_code_sha, snapshot_to_registry
+
+                # Lineage completeness (config#708): stamp the producing code
+                # revision and use the single-source descriptive version label
+                # (cfg.MODEL_VERSION_LABEL) rather than a bare hardcoded default,
+                # so registry lineage never drifts from the configured label.
+                _code_sha = resolve_code_sha()
+                _model_version = manifest.get("version", cfg.MODEL_VERSION_LABEL)
 
                 if promoted:
                     _vid = snapshot_to_registry(
                         s3_up, bucket,
-                        model_version=manifest.get("version", "v3.0-meta"),
+                        model_version=_model_version,
                         date=date_str, stage="champion",
+                        code_sha=_code_sha,
                     )
                     log.info(
                         "Phase-0 registry snapshot (champion): predictor/registry/%s/",
@@ -4177,9 +4185,10 @@ def run_meta_training(
                         )
                     _vid = snapshot_to_registry(
                         s3_up, bucket,
-                        model_version=manifest.get("version", "v3.0-meta"),
+                        model_version=_model_version,
                         date=date_str, stage="challenger",
                         source_prefix=_arch_prefix,
+                        code_sha=_code_sha,
                     )
                     log.info(
                         "Phase-0 registry snapshot (challenger): predictor/registry/%s/",
