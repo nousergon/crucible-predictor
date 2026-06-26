@@ -231,7 +231,7 @@ if [ -n "$CANARY_FUNC_ERR" ] || [ "$CANARY_STATUS" != "200" ]; then
   # breaks N Lambdas' canaries within the hour into one alert per
   # (Lambda, version) — lib v0.24.0 substrate (L221 retrofit 2026-05-22).
   # Best-effort; trailing || true never overrides exit 1.
-  python3 -m alpha_engine_lib.alerts publish \
+  python3 -m nousergon_lib.alerts publish \
     --severity error \
     --source "alpha-engine-predictor/infrastructure/deploy.sh" \
     --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
@@ -344,7 +344,7 @@ echo "  Found (or freshly created) — updating..."
     # Lambda is already live at this point so the alert MUST surface:
     # the operator may need to revert inference too if the regime
     # canary failure indicates an upstream image issue.
-    python3 -m alpha_engine_lib.alerts publish \
+    python3 -m nousergon_lib.alerts publish \
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
       --dedup-key "canary-fail-${REGIME_LAMBDA_FUNCTION}-v${REGIME_VERSION}" \
@@ -445,7 +445,7 @@ echo "  Found (or freshly created) — updating..."
     # within the hour into one alert per (Lambda, version). Two upstream
     # Lambdas already promoted; the alert is load-bearing for operator
     # triage.
-    python3 -m alpha_engine_lib.alerts publish \
+    python3 -m nousergon_lib.alerts publish \
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
       --dedup-key "canary-fail-${REGIME_EVAL_LAMBDA_FUNCTION}-v${REGIME_EVAL_VERSION}" \
