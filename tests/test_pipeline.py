@@ -71,8 +71,8 @@ class TestRunPipeline:
         def side_effect(path):
             mod = MagicMock()
             call_count["n"] += 1
-            if path == "inference.stages.fetch_alt_data":
-                mod.run.side_effect = RuntimeError("alt data unavailable")
+            if path == "inference.stages.regime_fast_signal":
+                mod.run.side_effect = RuntimeError("regime signal unavailable")
             return mod
 
         mock_import.side_effect = side_effect

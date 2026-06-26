@@ -7,11 +7,10 @@ write ``predictor/predictions_shadow/{version_id}/{date}.json``. Challengers
 files exist so Phase 2 can score each version on realized outcomes under a fixed
 policy (plan: ``alpha-engine-docs/private/model-shadow-comparison-260601.md``).
 
-Cost-aware design: the expensive fetches (load_universe / load_prices /
-fetch_alt_data) are NOT repeated — the shadow context reuses the live context's
-already-loaded universe + prices + alt-data and only swaps the model weights (via
-``ctx.weights_prefix_override`` → the challenger's registry bundle) and re-runs
-load_model + run_inference.
+Cost-aware design: the expensive fetches (load_universe / load_prices) are NOT
+repeated — the shadow context reuses the live context's already-loaded universe
++ prices and only swaps the model weights (via ``ctx.weights_prefix_override`` →
+the challenger's registry bundle) and re-runs load_model + run_inference.
 
 Safety: this stage is non-critical and time-guarded. It runs AFTER write_output
 (the live predictions are already on S3 and untouched), skips remaining
@@ -39,7 +38,6 @@ _REGISTRY_PREFIX = "predictor/registry/"
 _SHARED_FIELDS = (
     "tickers", "ticker_sources", "signals_data", "sector_map",
     "price_data", "macro", "ticker_data_age",
-    "earnings_all", "revision_all", "options_all", "fundamental_all",
 )
 _IDENTITY_FIELDS = (
     "date_str", "bucket", "dry_run", "local", "model_type",

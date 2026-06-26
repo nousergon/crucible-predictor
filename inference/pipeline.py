@@ -85,12 +85,6 @@ class PipelineContext:
     macro: dict = field(default_factory=dict)
     ticker_data_age: dict = field(default_factory=dict)
 
-    # ── Alternative data (set by fetch_alt_data) ─────────────────────────────
-    earnings_all: dict = field(default_factory=dict)
-    revision_all: dict = field(default_factory=dict)
-    options_all: dict = field(default_factory=dict)
-    fundamental_all: dict = field(default_factory=dict)
-
     # ── Results (set by run_inference) ───────────────────────────────────────
     predictions: list = field(default_factory=list)
     n_skipped: int = 0
@@ -178,7 +172,6 @@ STAGES = [
     ("load_model",     "inference.stages.load_model",     True),
     ("load_universe",  "inference.stages.load_universe",  True),
     ("load_prices",    "inference.stages.load_prices",    True),
-    ("fetch_alt_data", "inference.stages.fetch_alt_data", False),
     ("run_inference",  "inference.stages.run_inference",  True),
     # regime-fast-signal-260515.md. Runs AFTER run_inference (which
     # stamps ctx.regime_intensity_z) and BEFORE write_output so the

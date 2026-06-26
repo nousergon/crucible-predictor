@@ -39,7 +39,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/observe_leaderboard.py": 2,  # observe_leaderboard/{date}.json + latest.json — realized-edge measurement artifact, observe-only, no freshness SLA (config#671/#702 L4539)
     "analysis/triple_barrier_cutover_runner.py": 2,
-    "data/earnings_fetcher.py": 2,
     "health_status.py": 2,
     "inference/s3_io.py": 2,
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)

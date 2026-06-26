@@ -300,16 +300,6 @@ if __name__ == "__main__":
         _wo.send_predictor_email = lambda *a, **k: log.info("[OFFLINE] Skipped email")
         _wo.get_veto_threshold = lambda *a, **k: 0.65
 
-        # Stub data fetchers (imported inside stages from sub-modules)
-        import data.earnings_fetcher as _ef
-        _ef.fetch_earnings_data = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
-        _ef.cache_earnings_to_s3 = lambda *a, **k: None
-        _ef.fetch_revision_history = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
-
-        import data.options_fetcher as _of
-        _of.fetch_options_features = lambda *a, **k: {t: {} for t in _OFFLINE_TICKERS}
-        _of.load_historical_options = lambda *a, **k: {}
-
         # Stub health write
         try:
             import health_status
