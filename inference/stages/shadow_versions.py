@@ -39,7 +39,7 @@ _REGISTRY_PREFIX = "predictor/registry/"
 _SHARED_FIELDS = (
     "tickers", "ticker_sources", "signals_data", "sector_map",
     "price_data", "macro", "ticker_data_age",
-    "earnings_all", "revision_all", "options_all", "fundamental_all",
+    "earnings_all", "revision_all", "fundamental_all",
 )
 _IDENTITY_FIELDS = (
     "date_str", "bucket", "dry_run", "local", "model_type",
