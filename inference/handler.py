@@ -21,6 +21,13 @@ training exceeding Lambda's 15-minute timeout.
     weekday Step Function's first state (DeployDriftCheck) to halt the
     pipeline when infrastructure code has been merged but not deployed.
 
+  action == "check_pipeline_contract":
+    Validate PIPELINE_CONTRACT.yaml's self-consistency + every artifact_id ∈
+    ARTIFACT_REGISTRY.yaml, fetched from GitHub raw. Used by the Saturday Step
+    Function as an early pre-spend gate (mirrors check_lib_pin_drift) so a
+    contract break halts before any spot launch. Fail-open on a fetch/parse
+    miss; halts only on a confirmed structural violation.
+
   action == "train":
     DEPRECATED — returns error directing to spot_train.sh.
 
@@ -122,9 +129,13 @@ def handler(event: dict, context) -> dict:
     # (dry_run=false) and the SF drift gate below are unaffected.
     _dry_run = bool(event.get("dry_run", False))
     _pf = PredictorPreflight(bucket=_bucket)
-    if _action in ("check_deploy_drift", "check_lib_pin_drift"):
-        # Both are lightweight pre-spend SF gates (GitHub reads only) — run the
-        # minimal preflight, not the full predictor bootstrap.
+    if _action in (
+        "check_deploy_drift",
+        "check_lib_pin_drift",
+        "check_pipeline_contract",
+    ):
+        # All three are lightweight pre-spend SF gates (GitHub reads only) — run
+        # the minimal preflight, not the full predictor bootstrap.
         _pf.run_for_drift_gate()
     else:
         _pf.run(skip_deploy_drift=_dry_run)
@@ -192,6 +203,18 @@ def handler(event: dict, context) -> dict:
             "Lib-pin drift check: has_drift=%s reason=%s pins=%s%s",
             result["has_drift"], result["reason"], result["pins"],
             (" offenders=" + "; ".join(result["offenders"])) if result["offenders"] else "",
+        )
+        return result
+
+    # ── Pipeline-contract preflight (Saturday SF early state, L4595) ─────────
+    if action == "check_pipeline_contract":
+        from inference.pipeline_contract_check import check_pipeline_contract
+        result = check_pipeline_contract()
+        log.info(
+            "Pipeline-contract preflight: has_violation=%s reason=%s boundaries=%s%s",
+            result["has_violation"], result["reason"], result["boundary_count"],
+            (" violations=" + "; ".join(result["violations"]))
+            if result["violations"] else "",
         )
         return result
 
