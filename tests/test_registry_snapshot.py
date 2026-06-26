@@ -256,3 +256,66 @@ def test_no_demote_when_bundle_exists():
                          stage="challenger")
     s3.copy_object.assert_not_called()
     s3.put_object.assert_not_called()  # no demote
+
+
+def test_code_sha_recorded_in_lineage():
+    """A passed code_sha lands in the bundle's _lineage.json (config#708)."""
+    names = ["meta_model.pkl", "feature_list.json", "manifest.json"]
+    s3 = _make_s3(names)
+    snapshot_to_registry(s3, "bkt", model_version="v", date="2026-06-02",
+                         stage="champion", code_sha="deadbeefcafe")
+    body = s3.put_object.call_args_list[-1].kwargs["Body"]
+    assert json.loads(body)["code_sha"] == "deadbeefcafe"
+
+
+def test_code_sha_null_when_unknown_provenance():
+    names = ["meta_model.pkl", "feature_list.json", "manifest.json"]
+    s3 = _make_s3(names)
+    snapshot_to_registry(s3, "bkt", model_version="v", date="2026-06-02")
+    body = s3.put_object.call_args_list[-1].kwargs["Body"]
+    assert json.loads(body)["code_sha"] is None
+
+
+class TestResolveCodeSha:
+    """resolve_code_sha walks file -> env -> git rev-parse, treating the
+    Dockerfile ARG placeholder 'unknown' as unresolved (config#708)."""
+
+    def test_reads_stamp_file_first(self, tmp_path, monkeypatch):
+        import model.registry as reg
+        f = tmp_path / "GIT_SHA.txt"
+        f.write_text("abc123fromfile\n")
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(f))
+        monkeypatch.setenv("GIT_SHA", "shouldNotWin")
+        assert reg.resolve_code_sha() == "abc123fromfile"
+
+    def test_falls_back_to_env(self, tmp_path, monkeypatch):
+        import model.registry as reg
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(tmp_path / "missing.txt"))
+        monkeypatch.setenv("GIT_SHA", "envsha456")
+        assert reg.resolve_code_sha() == "envsha456"
+
+    def test_unknown_placeholder_is_skipped(self, tmp_path, monkeypatch):
+        import model.registry as reg
+        f = tmp_path / "GIT_SHA.txt"
+        f.write_text("unknown\n")
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(f))
+        monkeypatch.setenv("GIT_SHA", "unknown")
+        # both file and env are the placeholder -> falls through to git (mocked None)
+        with patch("subprocess.run", side_effect=OSError):
+            assert reg.resolve_code_sha() is None
+
+    def test_git_fallback(self, tmp_path, monkeypatch):
+        import model.registry as reg
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(tmp_path / "missing.txt"))
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        proc = MagicMock(returncode=0, stdout="githeadsha789\n")
+        with patch("subprocess.run", return_value=proc):
+            assert reg.resolve_code_sha() == "githeadsha789"
+
+    def test_all_unresolved_returns_none(self, tmp_path, monkeypatch):
+        import model.registry as reg
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(tmp_path / "missing.txt"))
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        proc = MagicMock(returncode=128, stdout="")
+        with patch("subprocess.run", return_value=proc):
+            assert reg.resolve_code_sha() is None
