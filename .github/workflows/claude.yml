@@ -1,0 +1,40 @@
+# Interactive @claude PR/issue assistant (thin caller).
+#
+# Comment "@claude <request>" on a PR (Conversation tab), an inline single
+# comment, a review, or an issue and Claude responds. Commit-capable.
+#
+# IMPORTANT: a top-level Conversation-tab comment is the reliable trigger.
+# An @claude typed as an inline comment that is part of a SUBMITTED REVIEW
+# ("Start a review -> Submit review") does NOT fire — use "Add single comment"
+# or the Conversation tab instead.
+#
+# All behavior (model, tool scope, trusted-author gate) lives in the shared
+# reusable workflow. Edit it THERE once; this caller never changes:
+#   nousergon/crucible-dashboard/.github/workflows/claude-assistant.yml
+name: Claude PR Assistant
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened]
+
+jobs:
+  claude:
+    # Cheap pre-filter: proceed only if "@claude" appears in the relevant body.
+    # The authoritative trusted-author gate is in the reusable workflow.
+    if: |
+      contains(github.event.comment.body, '@claude') ||
+      contains(github.event.review.body, '@claude') ||
+      contains(github.event.issue.body, '@claude')
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    uses: nousergon/crucible-dashboard/.github/workflows/claude-assistant.yml@main
+    secrets: inherit
