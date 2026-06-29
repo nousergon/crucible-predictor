@@ -319,3 +319,19 @@ class TestResolveCodeSha:
         proc = MagicMock(returncode=128, stdout="")
         with patch("subprocess.run", return_value=proc):
             assert reg.resolve_code_sha() is None
+
+    def test_git_call_declares_safe_directory(self, tmp_path, monkeypatch):
+        """The git fallback declares the checkout root as a trusted
+        ``safe.directory`` inline, so a root-run job against a foreign-owned
+        clone can't trip git's dubious-ownership guard and silently null the
+        code_sha (config#1375 Layer-0; mirrors crucible-executor#305)."""
+        import model.registry as reg
+        monkeypatch.setattr(reg, "_CODE_SHA_FILE", str(tmp_path / "missing.txt"))
+        monkeypatch.delenv("GIT_SHA", raising=False)
+        proc = MagicMock(returncode=0, stdout="githeadsha789\n")
+        with patch("subprocess.run", return_value=proc) as run:
+            assert reg.resolve_code_sha() == "githeadsha789"
+        argv = run.call_args.args[0]
+        assert argv[:3] == ["git", "-c", f"safe.directory={reg._REPO_ROOT}"]
+        assert argv[-2:] == ["rev-parse", "HEAD"]
+        assert run.call_args.kwargs["cwd"] == str(reg._REPO_ROOT)

@@ -28,9 +28,16 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 DEFAULT_SOURCE_PREFIX = "predictor/weights/meta/"
 DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
+
+# The predictor checkout root (``model/registry.py`` → repo root is two
+# parents up). Used as the trusted ``safe.directory`` for the in-process
+# ``git rev-parse`` below — the same path the package is imported from, so
+# declaring it trusted is host-independent and cannot widen exposure.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The Docker build stamps the deployed revision here from the ``GIT_SHA``
 # build-arg (``$GITHUB_SHA`` in CI) — see infrastructure/Dockerfile
@@ -51,7 +58,9 @@ def resolve_code_sha() -> str | None:
          stamp baked into the container/Lambda image.
       2. the ``GIT_SHA`` env var — the same value when exported into the runtime
          environment instead of (or in addition to) the file.
-      3. ``git rev-parse HEAD`` — local-dev / non-containerized training.
+      3. ``git rev-parse HEAD`` — local-dev / non-containerized training
+         (e.g. the spot-trainer clone), declaring ``_REPO_ROOT`` trusted
+         inline (see below).
 
     Returns ``None`` (never raises) when none resolve, so snapshotting a model
     of unknown provenance degrades to a null ``code_sha`` rather than failing
@@ -71,8 +80,18 @@ def resolve_code_sha() -> str | None:
         return env_sha
 
     try:
+        # Declare the checkout we already own (``_REPO_ROOT``) trusted inline
+        # so the read is immune to who runs it on any box. Without this, git's
+        # dubious-ownership guard (CVE-2022-24765) exits 128 whenever the
+        # process user differs from the checkout owner — e.g. a root-run job
+        # against an ec2-user clone, or a future bundled spot (drift-on-
+        # predictor-instance, config#902). That exit silently degrades
+        # ``code_sha`` to ``None``, defeating the lineage completeness this
+        # function exists for (config#708). Mirrors the executor's deploy-drift
+        # guard (crucible-executor#305); the Layer-0 sweep of config#1375.
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "-c", f"safe.directory={_REPO_ROOT}", "rev-parse", "HEAD"],
+            cwd=str(_REPO_ROOT),
             capture_output=True, text=True, timeout=5, check=False,
         )
         sha = proc.stdout.strip()
