@@ -26,7 +26,13 @@ scikit-learn>=1.3.0
 # krepis transitively, but the dual-import warrants a direct krepis pin too.
 # Bumped to >=0.4.0: training/model_zoo.py now builds its console deep-link via
 # the lifted krepis.console.console_url chokepoint (config#1300).
-krepis[flow_doctor]>=0.4.0
+# Bumped to >=0.6.0 (config#1450, completing config#1332 which bumped research+
+# data but missed this consumer + executor): krepis>=0.6.0 pins
+# flow-doctor[diagnosis,s3]>=0.6.2, whose DEFAULT_DIAGNOSIS_MODEL is the served
+# `claude-sonnet-4-6` alias. The old >=0.4.0 floor let krepis 0.4/0.5 resolve
+# flow-doctor 0.6.0rc6, whose retired `claude-sonnet-4-6-20250514` pin 404'd on
+# every flow-doctor diagnosis call.
+krepis[flow_doctor]>=0.6.0
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.72.0
 
 # Training dependencies (not needed in Lambda)
