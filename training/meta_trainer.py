@@ -31,6 +31,60 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 
+def _load_research_calibrator_frame(db_path, policy=None) -> pd.DataFrame:
+    """Load the research-calibrator label frame (score, beat_spy, score_date).
+
+    config#1483/#1527: the label (did the signal beat SPY at the canonical
+    horizon?) is read from the LONG-FORMAT ``score_performance_outcomes``
+    store filtered ``WHERE horizon_days = :primary`` — resolved from the
+    ``nousergon_lib.quant.horizons.HorizonPolicy`` chokepoint, never a
+    hardcoded horizon-suffixed column literal (an incomplete hand-rename is
+    how the retired 10d horizon silently starved this L1 calibrator to
+    March-only data, config#1456). ``score`` still comes from
+    ``score_performance`` (it is a score fact, not an outcome).
+
+    A missing store table returns an EMPTY frame after a loud, cause-naming
+    WARN (→ the caller's existing priors fallback): the producer
+    (alpha-engine-data ``signal_returns`` Step 2c, DataPhase1) runs before
+    PredictorTraining in the Saturday SF, so absence means a producer/ordering
+    bug to investigate — but calibrator data has always been
+    optional-with-priors, and this migration must not change that contract.
+    """
+    import sqlite3
+
+    from nousergon_lib.quant.horizons import DEFAULT_POLICY
+
+    policy = policy or DEFAULT_POLICY
+    conn = sqlite3.connect(str(db_path))
+    try:
+        has_store = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='score_performance_outcomes'"
+        ).fetchone()
+        if not has_store:
+            log.warning(
+                "score_performance_outcomes ABSENT from research.db — the "
+                "long-format store is not populated (producer: "
+                "alpha-engine-data signal_returns Step 2c, config#1483). "
+                "Research calibrator falls back to priors THIS cycle; "
+                "investigate producer ordering rather than trusting it."
+            )
+            return pd.DataFrame(columns=["score", "beat_spy", "score_date"])
+        return pd.read_sql_query(
+            "SELECT sp.score, o.beat_spy, sp.score_date "
+            "FROM score_performance sp "
+            "JOIN score_performance_outcomes o "
+            "  ON o.symbol = sp.symbol AND o.score_date = sp.score_date "
+            "WHERE o.horizon_days = ? AND o.beat_spy IS NOT NULL "
+            "  AND sp.score IS NOT NULL AND sp.score_date IS NOT NULL "
+            "ORDER BY sp.score_date, sp.symbol",
+            conn,
+            params=(int(policy.primary_horizon),),
+        )
+    finally:
+        conn.close()
+
+
 def _log_rss(label: str) -> int:
     """Log current process RSS in MB and return the integer MB value.
 
@@ -1412,29 +1466,21 @@ def run_meta_training(
     try:
         import boto3
         s3 = boto3.client("s3")
-        # Try to load research.db score_performance table
-        import sqlite3
+        # Try to load the research calibrator label frame from research.db
         db_tmp = Path(tempfile.gettempdir()) / "research_train.db"
         s3.download_file(bucket, "research.db", str(db_tmp))
-        conn = sqlite3.connect(str(db_tmp))
-        # score_date pulled in 2026-04-28 (PR #56) so the walk-forward
-        # calibrator below can filter to entries dated <= train_end_date
-        # per fold and avoid leaking forward outcomes into earlier folds'
-        # research_calibrator_prob lookups.
-        # config#1456: the calibrator target is beat_spy_21d (the canonical
-        # horizon). The 10d/30d outcome columns were retired in the
-        # canonical-alpha cutover (dead since April) — training on beat_spy_10d
-        # silently starved this L1 calibrator to March-only data.
-        sp_df = pd.read_sql_query(
-            "SELECT score, beat_spy_21d, score_date FROM score_performance "
-            "WHERE beat_spy_21d IS NOT NULL AND score IS NOT NULL "
-            "AND score_date IS NOT NULL",
-            conn,
-        )
-        conn.close()
+        # config#1483/#1527: the calibrator label is read from the LONG-FORMAT
+        # score_performance_outcomes store filtered to the HorizonPolicy
+        # primary horizon (the canonical beat-SPY outcome), joined to
+        # score_performance for the research score. score_date is pulled
+        # (2026-04-28, PR #56) so the walk-forward calibrator below can filter
+        # to entries dated <= train_end_date per fold and avoid leaking
+        # forward outcomes into earlier folds' research_calibrator_prob
+        # lookups.
+        sp_df = _load_research_calibrator_frame(db_tmp)
         if not sp_df.empty:
             research_scores = sp_df["score"].to_numpy()
-            research_beat_spy = sp_df["beat_spy_21d"].to_numpy().astype(int)
+            research_beat_spy = sp_df["beat_spy"].to_numpy().astype(int)
             research_score_dates = pd.to_datetime(
                 sp_df["score_date"]
             ).to_numpy().astype("datetime64[D]")
