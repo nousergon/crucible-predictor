@@ -108,6 +108,48 @@ canary_status_ok() {
   return 1
 }
 
+# ── Throttle-aware Lambda invoke (bounded, jittered retry) ───────────────────
+# A canary `aws lambda invoke` can throttle (TooManyRequestsException /
+# ReservedFunctionConcurrentInvocationLimitExceeded) when the function's
+# concurrency slot is momentarily occupied — an overlapping deploy's canary
+# (cancelling a GitHub Actions run does NOT stop the Lambda execution it already
+# dispatched) or an in-flight scheduled invocation. The AWS CLI's own retry
+# (max 2) can't outwait an in-flight execution, and under `set -euo pipefail`
+# the invoke's non-zero exit aborts the deploy on a transient smoke-test
+# throttle (bit crucible-research CI 2026-07-01). This retries ONLY on that
+# throttle signal (bounded exp backoff + jitter, ~3 min); non-throttle errors
+# are not retried; exhaustion returns non-zero (fail loud). It captures the
+# invoke METADATA stream (stdout — FunctionError lives here, not in the payload)
+# to <meta-file> so the caller can parse it exactly as before.
+# Args: <payload-out-file> <meta-out-file> <aws lambda invoke flags...>
+#       (the payload positional is appended internally — pass only flags).
+_invoke_lambda_with_throttle_retry() {
+  local out_file="$1" meta_file="$2"; shift 2
+  local max_attempts=6 attempt=1 rc base sleep_s err_file
+  err_file=$(mktemp)
+  while :; do
+    rc=0
+    aws lambda invoke "$@" "$out_file" >"$meta_file" 2>"$err_file" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [ "$attempt" -lt "$max_attempts" ] && \
+       grep -qE 'TooManyRequestsException|ReservedFunctionConcurrentInvocationLimitExceeded' "$err_file"; then
+      base=$(( 2 ** (attempt - 1) * 5 ))   # 5, 10, 20, 40, 80s
+      sleep_s=$(( base + RANDOM % 5 ))     # + 0-4s jitter
+      echo "  Canary invoke throttled — concurrency slot busy (attempt ${attempt}/${max_attempts}); retrying in ${sleep_s}s..." >&2
+      sleep "$sleep_s"
+      attempt=$(( attempt + 1 ))
+      continue
+    fi
+    echo "  ERROR: canary invoke failed (exit ${rc}) after ${attempt} attempt(s):" >&2
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return "$rc"
+  done
+}
+
 # When sourced for unit testing (tests/test_canary_status_allowlist.py sets
 # CANARY_LIB_SOURCE_ONLY=1), stop here: expose the helper without running the
 # deploy. Placed BEFORE flag parsing so the test can source the script without
@@ -268,13 +310,29 @@ echo "  Published version: ${VERSION}"
 echo ""
 echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
 CANARY_OUT=$(mktemp)
-CANARY_META=$(aws lambda invoke \
-  --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
-  --payload '{"dry_run": true}' \
-  --cli-binary-format raw-in-base64-out \
-  --cli-read-timeout 300 \
-  --region "${AWS_REGION}" \
-  "$CANARY_OUT")
+CANARY_META_FILE=$(mktemp)
+if ! _invoke_lambda_with_throttle_retry "$CANARY_OUT" "$CANARY_META_FILE" \
+    --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
+    --payload '{"dry_run": true}' \
+    --cli-binary-format raw-in-base64-out \
+    --cli-read-timeout 300 \
+    --region "${AWS_REGION}"; then
+  # Invoke never completed (throttle exhausted or non-throttle error). This
+  # canary runs against :${VERSION} BEFORE promotion, so live is untouched —
+  # refuse to promote (the safe default) and fail loud + alert.
+  rm -f "$CANARY_OUT" "$CANARY_META_FILE"
+  echo ""
+  echo "ERROR: Canary could not be invoked for :${VERSION} (throttle/concurrency or invoke error, retries exhausted) — refusing to promote. Live alias unchanged."
+  python3 -m nousergon_lib.alerts publish \
+    --severity error \
+    --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+    --dedup-key "canary-uninvokable-${LAMBDA_FUNCTION}-v${VERSION}" \
+    --message "Canary could NOT be invoked for ${LAMBDA_FUNCTION}:${VERSION} (throttle/concurrency or invoke error, retries exhausted). Refused to promote; live alias unchanged. Investigate." \
+    || true
+  exit 1
+fi
+CANARY_META=$(cat "$CANARY_META_FILE")
+rm -f "$CANARY_META_FILE"
 
 CANARY_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$CANARY_META" 2>/dev/null || echo "")
 CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
@@ -383,13 +441,30 @@ echo "  Found (or freshly created) — updating..."
 
   echo "==> Running regime canary against :${REGIME_VERSION} (action=dry_run)..."
   REGIME_CANARY_OUT=$(mktemp)
-  REGIME_CANARY_META=$(aws lambda invoke \
-    --function-name "${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}" \
-    --payload '{"action": "dry_run"}' \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 300 \
-    --region "${AWS_REGION}" \
-    "$REGIME_CANARY_OUT")
+  REGIME_CANARY_META_FILE=$(mktemp)
+  if ! _invoke_lambda_with_throttle_retry "$REGIME_CANARY_OUT" "$REGIME_CANARY_META_FILE" \
+      --function-name "${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}" \
+      --payload '{"action": "dry_run"}' \
+      --cli-binary-format raw-in-base64-out \
+      --cli-read-timeout 300 \
+      --region "${AWS_REGION}"; then
+    # Invoke never completed — regime canary runs pre-promotion, so the regime
+    # live alias is untouched. Refuse to promote regime + fail loud + alert.
+    # (Inference Lambda was already promoted above — same caveat as the
+    # bad-STATUS path below.)
+    rm -f "$REGIME_CANARY_OUT" "$REGIME_CANARY_META_FILE"
+    echo ""
+    echo "ERROR: Regime canary could not be invoked for :${REGIME_VERSION} (throttle/concurrency or invoke error, retries exhausted) — refusing to promote regime. Regime live alias unchanged."
+    python3 -m nousergon_lib.alerts publish \
+      --severity error \
+      --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+      --dedup-key "canary-uninvokable-${REGIME_LAMBDA_FUNCTION}-v${REGIME_VERSION}" \
+      --message "Regime canary could NOT be invoked for ${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION} (throttle/concurrency or invoke error). Refused to promote regime; regime live alias unchanged. NOTE: inference Lambda already promoted to :${VERSION}." \
+      || true
+    exit 1
+  fi
+  REGIME_CANARY_META=$(cat "$REGIME_CANARY_META_FILE")
+  rm -f "$REGIME_CANARY_META_FILE"
 
   REGIME_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_CANARY_META" 2>/dev/null || echo "")
   REGIME_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
@@ -487,13 +562,28 @@ echo "  Found (or freshly created) — updating..."
 
   echo "==> Running regime-eval canary against :${REGIME_EVAL_VERSION} (action=dry_run)..."
   REGIME_EVAL_CANARY_OUT=$(mktemp)
-  REGIME_EVAL_CANARY_META=$(aws lambda invoke \
-    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION}" \
-    --payload '{"action": "dry_run"}' \
-    --cli-binary-format raw-in-base64-out \
-    --cli-read-timeout 600 \
-    --region "${AWS_REGION}" \
-    "$REGIME_EVAL_CANARY_OUT")
+  REGIME_EVAL_CANARY_META_FILE=$(mktemp)
+  if ! _invoke_lambda_with_throttle_retry "$REGIME_EVAL_CANARY_OUT" "$REGIME_EVAL_CANARY_META_FILE" \
+      --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION}" \
+      --payload '{"action": "dry_run"}' \
+      --cli-binary-format raw-in-base64-out \
+      --cli-read-timeout 600 \
+      --region "${AWS_REGION}"; then
+    # Invoke never completed — regime-eval canary runs pre-promotion, so its
+    # live alias is untouched. Refuse to promote + fail loud + alert.
+    rm -f "$REGIME_EVAL_CANARY_OUT" "$REGIME_EVAL_CANARY_META_FILE"
+    echo ""
+    echo "ERROR: Regime-eval canary could not be invoked for :${REGIME_EVAL_VERSION} (throttle/concurrency or invoke error, retries exhausted) — refusing to promote. Regime-eval live alias unchanged."
+    python3 -m nousergon_lib.alerts publish \
+      --severity error \
+      --source "alpha-engine-predictor/infrastructure/deploy.sh" \
+      --dedup-key "canary-uninvokable-${REGIME_EVAL_LAMBDA_FUNCTION}-v${REGIME_EVAL_VERSION}" \
+      --message "Regime-eval canary could NOT be invoked for ${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION} (throttle/concurrency or invoke error). Refused to promote; regime-eval live alias unchanged." \
+      || true
+    exit 1
+  fi
+  REGIME_EVAL_CANARY_META=$(cat "$REGIME_EVAL_CANARY_META_FILE")
+  rm -f "$REGIME_EVAL_CANARY_META_FILE"
 
   REGIME_EVAL_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_EVAL_CANARY_META" 2>/dev/null || echo "")
   REGIME_EVAL_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
