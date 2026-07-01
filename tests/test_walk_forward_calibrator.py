@@ -33,14 +33,16 @@ class TestWalkForwardCalibratorSource:
     def test_loads_score_date_alongside_score_and_beat_spy(self, meta_trainer_source):
         """Without ``score_date`` we cannot filter score_performance per
         fold — the SELECT must include it."""
-        # Allow any whitespace, including newlines, between "SELECT" and
-        # the column list since pd.read_sql_query takes a multi-line string
+        # config#1527: the label now comes from the long-format
+        # score_performance_outcomes store (o.beat_spy at the HorizonPolicy
+        # primary horizon) joined to score_performance for the score —
+        # score_date must STILL be selected for the per-fold filter.
         pattern = re.compile(
-            r"SELECT\s+score,\s+beat_spy_21d,\s+score_date\s+FROM\s+score_performance",
+            r"SELECT\s+sp\.score,\s+o\.beat_spy,\s+sp\.score_date",
             re.IGNORECASE,
         )
         assert pattern.search(meta_trainer_source), (
-            "score_performance load must SELECT score_date so the fold "
+            "calibrator label load must SELECT sp.score_date so the fold "
             "calibrator can filter to entries dated <= train_end_date."
         )
 
