@@ -1030,7 +1030,7 @@ TRAIN
 
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Training complete. Instance will be terminated."
+echo "  Training complete."
 echo "═══════════════════════════════════════════════════════════════"
 
 # CloudWatch heartbeat on successful completion (unchanged).
@@ -1042,3 +1042,125 @@ aws cloudwatch put-metric-data \
   --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
   && echo "Heartbeat emitted: predictor-training" \
   || echo "WARNING: Failed to emit heartbeat (non-fatal)"
+
+# ── DriftDetection — BUNDLED onto this training spot (config#902) ──────────────
+# Origin: after the 2026-04-16 spot migration, DriftDetection launched its OWN
+# ~7-min-bootstrap spot (nousergon-data/infrastructure/spot_drift_detection.sh)
+# for a ~5-min workload — disproportionate cost. It reads the champion baseline
+# THIS training run just produced+promoted (monitoring.drift_detector's inputs
+# are ALL S3 objects in alpha-engine-research: predictor/metrics/
+# training_feature_stats.json + features/{date}/technical.parquet + the
+# inference snapshots — NO data-repo checkout is functionally needed; the module
+# lives in THIS repo under monitoring/, already cloned + deps-installed above).
+# So run it HERE, on the same spot, before teardown. Collapses the standalone
+# SF DriftDetection state (nousergon-data step_function.json — separate PR,
+# Part of #902).
+#
+# NON-BLOCKING (preserves DriftDetection's semantics): monitoring.drift_detector
+# .main() does sys.exit(1) on ANY detected drift — that is an EXPECTED ALERT,
+# not a workload failure — so the exit code is SWALLOWED at BOTH the spot layer
+# (inner `exit 0`) and the dispatcher layer (`|| echo ... ignored`). Either
+# alone keeps drift non-blocking; both make it explicit. This mirrors the old
+# SF DriftDetection state's `Catch → CheckSkipBacktester`.
+#
+# TRAINING-FAILURE STILL HALTS (blocking): this block is UNREACHABLE on a
+# training failure. `set -euo pipefail` (top of file) aborts the whole script
+# the instant the full-training run_ssm above returns non-zero, so drift runs
+# ONLY after training SUCCEEDED — the exact ordering #902 requires.
+#
+# ── THE GUARD (config#902 root-cause, not a bandaid) ──────────────────────────
+# drift audits training_feature_stats.json = the BASE champion this --full-only
+# retrain just promoted. That equals the FINAL champion ONLY while
+# MODEL_ZOO_AUTO_PROMOTE_WINNER is False (today's observe-first default): with
+# auto-promote OFF, ModelZooSelect (which runs AFTER this in SF Branch B) never
+# re-promotes, so the base champion IS the final champion and bundling here is
+# correct. If auto-promote is ever flipped ON, ModelZooSelect may promote a
+# DIFFERENT winner after this point, so a bundled run here would silently audit
+# the WRONG (about-to-be-replaced) baseline. We must NEVER silently audit the
+# wrong champion: when auto-promote is ON we SKIP the bundled run and emit a
+# LOUD warning (+ a CloudWatch marker) that drift must migrate to placement B
+# (bundle onto ModelZooSelect, post-promotion). The flag is read via config.py
+# (config.MODEL_ZOO_AUTO_PROMOTE_WINNER) — the SAME env-or-yaml resolution the
+# training run itself uses — so the guard tracks the live cutover with no
+# redeploy. See the #902 PR body for the placement-B migration.
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  DRIFT DETECTION (bundled onto training spot, non-blocking)"
+echo "═══════════════════════════════════════════════════════════════"
+run_ssm "drift" "$(cat <<'DRIFT'
+set -eo pipefail
+export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
+cd /home/ec2-user/predictor
+command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# Route the workload through the lib log-capture chokepoint so the drift log
+# reaches S3 on EXIT even if the box is torn down - mirrors every other step.
+# The inner script is NON-BLOCKING by construction: it always exit 0 so this
+# SSM step reports Success regardless of drift alert / detector error. This
+# whole heredoc body stays paren-free and apostrophe-free per the bash 3.2
+# run_ssm command-substitution note above - the guard config read that NEEDS
+# parens/apostrophes is isolated in its own /tmp/drift-guard.py heredoc, exactly
+# like the smoke / full-training steps stage their python to /tmp/spot-*.py.
+# THE GUARD writes 1 when auto-promote is ON, 0 when OFF, err on failure.
+cat > /tmp/drift-guard.py <<'PYEOF'
+# Write the auto-promote verdict to a FILE - stdout capture at bash level would
+# need $(...), and this whole heredoc must stay paren-free for bash 3.2 - so the
+# INNER script reads the file with `read`, no command substitution.
+import sys
+verdict = "err"
+try:
+    import config
+    verdict = "1" if config.MODEL_ZOO_AUTO_PROMOTE_WINNER else "0"
+except Exception:
+    verdict = "err"
+with open("/tmp/drift-guard.verdict", "w") as fh:
+    fh.write(verdict + "\n")
+sys.exit(0)
+PYEOF
+cat > /tmp/spot-drift.sh <<'INNER'
+set +e
+# THE GUARD: only run bundled drift when auto-promote is OFF - base champion
+# equals final champion. config.MODEL_ZOO_AUTO_PROMOTE_WINNER resolves via the
+# SAME env-or-yaml path the training run used, so it tracks the live cutover.
+# The verdict is written to a file by drift-guard.py and read with `read` here
+# so this bash body needs NO command substitution - bash 3.2 paren-safe.
+AUTOPROMOTE=err
+$PY /tmp/drift-guard.py 2>/dev/null
+read -r AUTOPROMOTE < /tmp/drift-guard.verdict 2>/dev/null || AUTOPROMOTE=err
+if [ "$AUTOPROMOTE" = "1" ]; then
+  echo "GUARD: MODEL_ZOO_AUTO_PROMOTE_WINNER is ON - SKIPPING bundled drift."
+  echo "GUARD: bundled drift here audits the BASE champion, but ModelZooSelect may"
+  echo "GUARD: promote a different winner AFTER this point, so this baseline is stale."
+  echo "GUARD: MIGRATE drift to placement B - bundle onto ModelZooSelect, post-promotion - see config#902."
+  aws cloudwatch put-metric-data --namespace AlphaEngine --metric-name DriftBundleSkippedAutoPromote --dimensions Process=drift-detection --value 1 --unit Count --region us-east-1 >/dev/null 2>&1 || true
+  exit 0
+fi
+if [ "$AUTOPROMOTE" = "err" ]; then
+  echo "GUARD: could not read MODEL_ZOO_AUTO_PROMOTE_WINNER from config - SKIPPING bundled drift - fail-safe, never audit an unknown-baseline champion."
+  aws cloudwatch put-metric-data --namespace AlphaEngine --metric-name DriftBundleSkippedConfigError --dimensions Process=drift-detection --value 1 --unit Count --region us-east-1 >/dev/null 2>&1 || true
+  exit 0
+fi
+echo "GUARD: MODEL_ZOO_AUTO_PROMOTE_WINNER OFF - base champion is final champion - running bundled drift."
+$PY -m monitoring.drift_detector --alert
+rc=$?
+echo "drift_detector exit=$rc - non-blocking, 1=drift-detected-alert, 0=clean"
+exit 0
+INNER
+$PY -m nousergon_lib.ssm_log_capture run --slug spot-drift --log /var/log/spot-drift.log --bucket "$S3_BUCKET" -- bash /tmp/spot-drift.sh
+DRIFT
+)" 1800 || echo "WARNING: bundled drift step returned non-zero (non-blocking — ignored)"
+
+# Drift heartbeat (mirrors the standalone launcher's success heartbeat so the
+# drift-detection liveness signal is unbroken after the bundle). Non-fatal.
+aws cloudwatch put-metric-data \
+  --namespace "AlphaEngine" \
+  --metric-name "Heartbeat" \
+  --dimensions "Process=drift-detection" \
+  --value 1 --unit "Count" \
+  --region "${AWS_REGION:-us-east-1}" 2>/dev/null \
+  && echo "Heartbeat emitted: drift-detection" \
+  || echo "WARNING: Failed to emit drift heartbeat (non-fatal)"
+
+echo ""
+echo "═══════════════════════════════════════════════════════════════"
+echo "  Training + bundled drift complete. Instance will be terminated."
+echo "═══════════════════════════════════════════════════════════════"
