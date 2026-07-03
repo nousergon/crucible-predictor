@@ -295,13 +295,13 @@ cleanup() {
   echo ""
   # Belt-and-suspenders (STEP 3): BEFORE terminating the spot, confirm where
   # each workload's spot-side log landed in S3. The spot SELF-SHIP via
-  # nousergon_lib.ssm_log_capture (each workload heredoc) is PRIMARY — this
+  # krepis.ssm_log_capture (each workload heredoc) is PRIMARY — this
   # is only a bounded best-effort confirmation + a one-hop pointer in the
   # dispatcher log so an operator triaging a failure (esp. an OOM RC=-1 where
   # SSM get-command-invocation returns empty) can find the full log immediately.
   # Bounded: a single short `aws s3 ls` per slug, all failures swallowed, never
   # blocks teardown. Key shape: _ssm_logs/{slug}/{YYYY-MM-DD}/{host}-{HHMMSSZ}.log
-  # (nousergon_lib.ssm_log_capture._exit_key). The exit-time UTC date is the
+  # (krepis.ssm_log_capture._exit_key). The exit-time UTC date is the
   # key component; on a run straddling UTC midnight the log lands under the exit
   # date, so probe today's date.
   local _logdate_now _hit
@@ -609,7 +609,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # its stdout/stderr lived ONLY in SSM get-command-invocation, which returns
 # EMPTY when the spot dies mid-run e.g. OOM RC=-1 and is destroyed when the
 # dispatcher cleanup EXIT trap terminates the box. Route the workload through
-# the lib chokepoint nousergon_lib.ssm_log_capture: it tees combined
+# the lib chokepoint krepis.ssm_log_capture: it tees combined
 # stdout+stderr to a spot-local logfile AND ships that logfile to S3 on EXIT
 # including SIGKILL of the workload BEFORE the dispatcher tears the box down,
 # then propagates the workload exit code verbatim so set -eo pipefail and the
@@ -691,7 +691,7 @@ if noise:
     print(f'  Noise features: {noise}')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
+$PY -m krepis.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
 SMOKE
 )" 1800
   echo "Smoke test complete."
@@ -724,7 +724,7 @@ export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — see the smoke step comment. Route the workload
-# through nousergon_lib.ssm_log_capture so the model-zoo log reaches S3 on
+# through krepis.ssm_log_capture so the model-zoo log reaches S3 on
 # EXIT including OOM-kill before the dispatcher terminates the box. Paren-free
 # and apostrophe-free per the bash 3.2 note above.
 cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'
@@ -784,7 +784,7 @@ print(f'  Winner:         {board.get("winner_version_id")}')
 print(f'  Promoted:       {board.get("promoted")}')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
 ZOO
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -866,7 +866,7 @@ print('=' * 60)
 print('  MODEL-ZOO TRAIN-SPEC ' + spec_id + ' COMPLETE')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
 ZOOSPEC
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -945,7 +945,7 @@ print('  Winner:         ' + str(board.get('winner_version_id')))
 print('  Promoted:       ' + str(board.get('promoted')))
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
 ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -976,7 +976,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — this is THE workload whose log was lost on the
 # off-cycle full-only OOM RC=-1 incident the python ran inline via $PY - so its
 # full training log lived only in SSM get-command-invocation which returns empty
-# on instance death. Route it through nousergon_lib.ssm_log_capture: tee
+# on instance death. Route it through krepis.ssm_log_capture: tee
 # combined stdout+stderr to /var/log/spot-full-training.log AND ship to S3 on
 # EXIT including SIGKILL BEFORE the dispatcher cleanup EXIT trap terminates the
 # box, propagating the workload exit code so set -eo pipefail and the SF still
@@ -1033,7 +1033,7 @@ print(f'  Elapsed:        {result.get("elapsed_s", "n/a")}s')
 print(f'  Slim cache:     {result.get("slim_cache_tickers", "n/a")} tickers')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
+$PY -m krepis.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
 TRAIN
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -1154,7 +1154,7 @@ rc=$?
 echo "drift_detector exit=$rc - non-blocking, 1=drift-detected-alert, 0=clean"
 exit 0
 INNER
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-drift --log /var/log/spot-drift.log --bucket "$S3_BUCKET" -- bash /tmp/spot-drift.sh
+$PY -m krepis.ssm_log_capture run --slug spot-drift --log /var/log/spot-drift.log --bucket "$S3_BUCKET" -- bash /tmp/spot-drift.sh
 DRIFT
 )" 1800 || echo "WARNING: bundled drift step returned non-zero (non-blocking — ignored)"
 
