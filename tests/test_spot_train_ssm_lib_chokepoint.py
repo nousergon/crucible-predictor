@@ -79,18 +79,27 @@ def test_run_ssm_uses_lib_dispatcher():
         "and delegate the body to the lib CLI."
     )
     body = m.group(0)
-    assert "nousergon_lib.ssm_dispatcher" in body, (
-        "run_ssm() body does not reference nousergon_lib.ssm_dispatcher. "
+    assert "krepis.ssm_dispatcher" in body, (
+        "run_ssm() body does not reference krepis.ssm_dispatcher. "
         "The 2026-05-27 L342 PR 4 lift replaced the inline aws-ssm-send-command "
-        "+ poll body with `python -m nousergon_lib.ssm_dispatcher run "
+        "+ poll body with `python -m krepis.ssm_dispatcher run "
         "--script-stdin`. Re-introducing the inline form undoes the lift. "
-        "(Package renamed alpha_engine_lib -> nousergon_lib at lib 0.60.0; "
-        "config#1245 — '-m alpha_engine_lib' breaks under runpy on crossed boxes.)"
+        "(Package renamed alpha_engine_lib -> nousergon_lib at lib 0.60.0, "
+        "then the module relocated to krepis and is invoked directly per "
+        "config#1649 — the nousergon_lib re-export shim is guard-less under "
+        "`python -m` on lib >=0.81.0 and silently no-ops.)"
     )
     assert "-m alpha_engine_lib." not in body, (
         "run_ssm() still invokes 'python -m alpha_engine_lib.<mod>'. The "
         "deprecated alias shim lacks runpy's get_code, so '-m' dies under "
-        "runpy on boxes crossed to nousergon-lib >=0.60.x; use nousergon_lib."
+        "runpy on boxes crossed to nousergon-lib >=0.60.x; use krepis."
+    )
+    assert "-m nousergon_lib." not in body, (
+        "run_ssm() still invokes 'python -m nousergon_lib.<mod>'. On lib "
+        ">=0.81.0 that path is a guard-less re-export shim: under `python "
+        "-m` (runpy) it exits 0 silently WITHOUT executing the inner "
+        "dispatch (config#1646 bug class). Invoke `-m krepis.ssm_dispatcher` "
+        "directly (config#1649)."
     )
     assert "--script-stdin" in body, (
         "run_ssm() must pipe the script body via --script-stdin so the "
@@ -149,7 +158,7 @@ def test_no_inline_aws_ssm_send_command():
         f"invocations in spot_train.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
         + "\n\nRoute through the lib chokepoint: "
-        "``python -m alpha_engine_lib.ssm_dispatcher run --script-stdin``."
+        "``python -m krepis.ssm_dispatcher run --script-stdin``."
     )
 
 
@@ -168,7 +177,7 @@ def test_no_inline_aws_ssm_get_command_invocation():
         f"polls in spot_train.sh:\n"
         + "\n".join(f"  line {n}: {line.strip()}" for n, line in offenders)
         + "\n\nThe lib CLI absorbs the polling loop — the only caller "
-        "should be inside alpha_engine_lib.ssm_dispatcher, not this script."
+        "should be inside krepis.ssm_dispatcher, not this script."
     )
 
 
