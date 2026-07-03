@@ -236,7 +236,7 @@ def test_spot_workloads_ship_log_on_exit_via_lib():
     text = _SCRIPT.read_text()
     for slug in _SPOT_WORKLOAD_SLUGS:
         wrap = (
-            f"nousergon_lib.ssm_log_capture run --slug {slug} "
+            f"krepis.ssm_log_capture run --slug {slug} "
             f"--log /var/log/{slug}.log"
         )
         assert wrap in text, (
@@ -246,7 +246,7 @@ def test_spot_workloads_ship_log_on_exit_via_lib():
             "get-command-invocation, which returns EMPTY on instance death "
             "(OOM RC=-1) and is destroyed when the dispatcher cleanup EXIT "
             "trap terminates the spot. Route the workload through "
-            "`$PY -m nousergon_lib.ssm_log_capture run --slug <X> "
+            "`$PY -m krepis.ssm_log_capture run --slug <X> "
             "--log /var/log/<X>.log --bucket \"$S3_BUCKET\" -- $PY /tmp/<X>.py`."
         )
         # The wrapper must pass --bucket so the ship targets the right bucket.
@@ -330,7 +330,7 @@ def test_model_zoo_heredoc_wires_flow_doctor_setup_logging():
     start = text.find("cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'")
     assert start != -1, "model-zoo workload heredoc not found in spot_train.sh"
     body = text[start:]
-    end = body.find("PYEOF\n$PY -m nousergon_lib.ssm_log_capture")
+    end = body.find("PYEOF\n$PY -m krepis.ssm_log_capture")
     assert end != -1, "model-zoo workload heredoc terminator not found"
     body = body[:end]
     assert "from krepis.logging import setup_logging" in body, (
