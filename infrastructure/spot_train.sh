@@ -266,7 +266,16 @@ if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
   if [ "$ec2_spot_rc" -eq 64 ]; then
     echo "ERROR: capacity exhausted across all instance_type × subnet combinations" >&2
   fi
-  exit "${ec2_spot_rc:-1}"
+  if [ "$ec2_spot_rc" -eq 0 ]; then
+   # rc=0 with an EMPTY instance id = the launch layer produced nothing
+   # (e.g. the guard-less `-m nousergon_lib.ec2_spot` shim no-op,
+   # config#1646). `${ec2_spot_rc:-1}` defaults only when UNSET — a
+   # captured 0 passed through and the SF recorded a silent success
+   # on 2026-07-03. An empty id must always fail loud.
+   echo "ERROR: ec2_spot launch exited 0 without an instance id — failing loud (config#1646)" >&2
+   ec2_spot_rc=1
+  fi
+  exit "$ec2_spot_rc"
 fi
 echo "  Instance ID: $INSTANCE_ID"
 
