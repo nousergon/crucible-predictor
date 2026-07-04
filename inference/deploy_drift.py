@@ -202,7 +202,7 @@ def _shas_match(deployed: Optional[str], upstream: Optional[str]) -> bool:
 def check_deploy_drift(
     region: str,
     account_id: str,
-    sf_name: str = "alpha-engine-weekday-pipeline",
+    sf_name: str = "ne-preopen-trading-pipeline",
     stack_name: str = "alpha-engine-orchestration",
     repo: str = "nousergon/nousergon-data",
     branch: str = "main",
