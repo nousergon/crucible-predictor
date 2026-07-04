@@ -9,8 +9,10 @@ Non-secret env vars (``LANGCHAIN_PROJECT``, ``EMAIL_SENDER``,
 ``PREDICTOR_PARAMS_CACHE``, etc.) are allowed for now — they migrate to
 alpha-engine-config YAML in PR 8 of the arc.
 
-``ssm_secrets.py`` is allowlisted — it's the per-repo bulk-load shim
-that stays alive until PR 9 of the arc.
+The legacy ``ssm_secrets.py`` bulk-load shim was retired in PR 9 of the
+.env→SSM arc (config#890); the allowlist below is empty and the invariant
+applies to every module. Re-add a filename here only if a new deliberate
+shim is ever introduced.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ _PINNED_SECRETS = frozenset(
     ]
 )
 
-_ALLOWED_FILES = frozenset(["ssm_secrets.py"])
+_ALLOWED_FILES: frozenset[str] = frozenset()
 
 _ENV_READ_RE = re.compile(
     r'os\.(?:environ\.get|getenv)\(\s*["\']([A-Z_][A-Z0-9_]*)["\']'

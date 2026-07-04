@@ -118,8 +118,10 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 # instance-terminated-no-capacity / Server.SpotInstanceTermination), the
 # cleanup() EXIT trap relaunches a FRESH spot up to MAX_SPOT_ATTEMPTS, re-using
 # the S3-staged config + the same argv. The classify→decide DECISION is the lib
-# chokepoint `python -m nousergon_lib.ec2_spot relaunch-decision` (lib v0.65.0+,
-# now krepis.ec2_spot): ONLY a confirmed reclaim relaunches; a genuine workload
+# chokepoint `python -m krepis.ec2_spot relaunch-decision` (lib v0.65.0+
+# nousergon_lib.ec2_spot re-export, now invoked directly as krepis.ec2_spot
+# per config#1649 — the re-export shim is guard-less under `python -m` on
+# lib >=0.81.0 and silently no-ops): ONLY a confirmed reclaim relaunches; a genuine workload
 # failure (OOM / crash / timeout) classifies as "other"/"unknown" and fails loud
 # — a blind retry would mask a real training bug. SPOT_ATTEMPT is threaded across
 # re-execs via the env (first run = 1).
@@ -247,12 +249,15 @@ if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/tr
 fi
 
 # ── Launch spot instance ──────────────────────────────────────────────────────
-# Capacity-resilient launch via nousergon_lib.ec2_spot (lib v0.26.0+).
+# Capacity-resilient launch via krepis.ec2_spot (lib v0.26.0+ as
+# nousergon_lib.ec2_spot; invoked directly via krepis per config#1649 — the
+# nousergon_lib re-export shim is guard-less under `python -m` on lib
+# >=0.81.0 and silently no-ops, the 2026-07-03 incident class).
 # Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
 # Replaces the broken-by-design hardcoded single-subnet + single-instance-type
 # pattern (2026-05-22 incident — Evaluator failed in sibling backtester spot).
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
-INSTANCE_ID=$("$LIB_PYTHON" -m nousergon_lib.ec2_spot launch \
+INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
   --types "$INSTANCE_TYPES" \
   --subnets "$SUBNETS" \
   --image-id "$AMI_ID" \
@@ -266,7 +271,17 @@ if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
   if [ "$ec2_spot_rc" -eq 64 ]; then
     echo "ERROR: capacity exhausted across all instance_type × subnet combinations" >&2
   fi
-  exit "${ec2_spot_rc:-1}"
+  if [ "$ec2_spot_rc" -eq 0 ]; then
+   # rc=0 with an EMPTY instance id = the launch layer produced nothing
+   # (e.g. the guard-less `-m nousergon_lib.ec2_spot` shim no-op,
+   # config#1646 — closed at this launcher's transport by the krepis
+   # migration, config#1649). `${ec2_spot_rc:-1}` defaults only when UNSET — a
+   # captured 0 passed through and the SF recorded a silent success
+   # on 2026-07-03. An empty id must always fail loud.
+   echo "ERROR: ec2_spot launch exited 0 without an instance id — failing loud (config#1646)" >&2
+   ec2_spot_rc=1
+  fi
+  exit "$ec2_spot_rc"
 fi
 echo "  Instance ID: $INSTANCE_ID"
 
@@ -286,13 +301,13 @@ cleanup() {
   echo ""
   # Belt-and-suspenders (STEP 3): BEFORE terminating the spot, confirm where
   # each workload's spot-side log landed in S3. The spot SELF-SHIP via
-  # nousergon_lib.ssm_log_capture (each workload heredoc) is PRIMARY — this
+  # krepis.ssm_log_capture (each workload heredoc) is PRIMARY — this
   # is only a bounded best-effort confirmation + a one-hop pointer in the
   # dispatcher log so an operator triaging a failure (esp. an OOM RC=-1 where
   # SSM get-command-invocation returns empty) can find the full log immediately.
   # Bounded: a single short `aws s3 ls` per slug, all failures swallowed, never
   # blocks teardown. Key shape: _ssm_logs/{slug}/{YYYY-MM-DD}/{host}-{HHMMSSZ}.log
-  # (nousergon_lib.ssm_log_capture._exit_key). The exit-time UTC date is the
+  # (krepis.ssm_log_capture._exit_key). The exit-time UTC date is the
   # key component; on a run straddling UTC midnight the log lands under the exit
   # date, so probe today's date.
   local _logdate_now _hit
@@ -318,7 +333,7 @@ cleanup() {
   local _spot_relaunch=0
   if [ "$exit_code" -ne 0 ] && [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
     local _decide_out _decide_rc
-    _decide_out="$("$LIB_PYTHON" -m nousergon_lib.ec2_spot relaunch-decision \
+    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
       --instance-id "$INSTANCE_ID" \
       --region "$AWS_REGION" \
       --attempt "$SPOT_ATTEMPT" \
@@ -397,8 +412,11 @@ done
 # **2026-05-27 — Lib chokepoint lift (ROADMAP L342 PR 4).** This helper
 # was the 54-line inline ``aws ssm send-command`` + poll + stream + S3
 # capture bash function that L342 was explicitly chartered to retire.
-# The lib equivalent ships in ``nousergon_lib.ssm_dispatcher`` (lib
-# v0.35.0+, [#73](https://github.com/nousergon/nousergon-lib/pull/73))
+# The lib equivalent ships in ``krepis.ssm_dispatcher`` (lib
+# v0.35.0+ as ``nousergon_lib.ssm_dispatcher``; invoked directly via
+# ``krepis`` per config#1649 — the nousergon_lib re-export shim is
+# guard-less under ``python -m`` on lib >=0.81.0 and silently no-ops,
+# [#73](https://github.com/nousergon/nousergon-lib/pull/73))
 # with identical contract: base64-wrap → SendCommand → poll → stream
 # StandardOutputContent delta → fetch StandardErrorContent on terminal
 # non-Success → propagate exit. Adds InvocationDoesNotExist
@@ -422,7 +440,7 @@ done
 # {date}.json key shape would otherwise clobber within a shared prefix.
 run_ssm() {
   local description="$1" script="$2" timeout_s="${3:-3600}"
-  printf '%s' "$script" | "$LIB_PYTHON" -m nousergon_lib.ssm_dispatcher run \
+  printf '%s' "$script" | "$LIB_PYTHON" -m krepis.ssm_dispatcher run \
     --instance-id "$INSTANCE_ID" \
     --description "predictor-training: $description" \
     --timeout "$timeout_s" \
@@ -600,7 +618,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # its stdout/stderr lived ONLY in SSM get-command-invocation, which returns
 # EMPTY when the spot dies mid-run e.g. OOM RC=-1 and is destroyed when the
 # dispatcher cleanup EXIT trap terminates the box. Route the workload through
-# the lib chokepoint nousergon_lib.ssm_log_capture: it tees combined
+# the lib chokepoint krepis.ssm_log_capture: it tees combined
 # stdout+stderr to a spot-local logfile AND ships that logfile to S3 on EXIT
 # including SIGKILL of the workload BEFORE the dispatcher tears the box down,
 # then propagates the workload exit code verbatim so set -eo pipefail and the
@@ -682,7 +700,7 @@ if noise:
     print(f'  Noise features: {noise}')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
+$PY -m krepis.ssm_log_capture run --slug spot-smoke --log /var/log/spot-smoke.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-smoke.py
 SMOKE
 )" 1800
   echo "Smoke test complete."
@@ -715,7 +733,7 @@ export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — see the smoke step comment. Route the workload
-# through nousergon_lib.ssm_log_capture so the model-zoo log reaches S3 on
+# through krepis.ssm_log_capture so the model-zoo log reaches S3 on
 # EXIT including OOM-kill before the dispatcher terminates the box. Paren-free
 # and apostrophe-free per the bash 3.2 note above.
 cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'
@@ -775,7 +793,7 @@ print(f'  Winner:         {board.get("winner_version_id")}')
 print(f'  Promoted:       {board.get("promoted")}')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-weekly --log /var/log/spot-model-zoo-weekly.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-weekly.py
 ZOO
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -857,7 +875,7 @@ print('=' * 60)
 print('  MODEL-ZOO TRAIN-SPEC ' + spec_id + ' COMPLETE')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-spec --log /var/log/spot-model-zoo-spec.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-spec.py
 ZOOSPEC
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -936,7 +954,7 @@ print('  Winner:         ' + str(board.get('winner_version_id')))
 print('  Promoted:       ' + str(board.get('promoted')))
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
 ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -967,7 +985,7 @@ command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
 # Spot-side log durability — this is THE workload whose log was lost on the
 # off-cycle full-only OOM RC=-1 incident the python ran inline via $PY - so its
 # full training log lived only in SSM get-command-invocation which returns empty
-# on instance death. Route it through nousergon_lib.ssm_log_capture: tee
+# on instance death. Route it through krepis.ssm_log_capture: tee
 # combined stdout+stderr to /var/log/spot-full-training.log AND ship to S3 on
 # EXIT including SIGKILL BEFORE the dispatcher cleanup EXIT trap terminates the
 # box, propagating the workload exit code so set -eo pipefail and the SF still
@@ -1024,7 +1042,7 @@ print(f'  Elapsed:        {result.get("elapsed_s", "n/a")}s')
 print(f'  Slim cache:     {result.get("slim_cache_tickers", "n/a")} tickers')
 print('=' * 60)
 PYEOF
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
+$PY -m krepis.ssm_log_capture run --slug spot-full-training --log /var/log/spot-full-training.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-full-training.py
 TRAIN
 )" "${MAX_RUNTIME_SECONDS}"
 
@@ -1145,7 +1163,7 @@ rc=$?
 echo "drift_detector exit=$rc - non-blocking, 1=drift-detected-alert, 0=clean"
 exit 0
 INNER
-$PY -m nousergon_lib.ssm_log_capture run --slug spot-drift --log /var/log/spot-drift.log --bucket "$S3_BUCKET" -- bash /tmp/spot-drift.sh
+$PY -m krepis.ssm_log_capture run --slug spot-drift --log /var/log/spot-drift.log --bucket "$S3_BUCKET" -- bash /tmp/spot-drift.sh
 DRIFT
 )" 1800 || echo "WARNING: bundled drift step returned non-zero (non-blocking — ignored)"
 

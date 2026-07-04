@@ -77,16 +77,26 @@ def test_orig_args_captured_before_parse():
 
 def test_cleanup_uses_lib_relaunch_decision_chokepoint():
     """The relaunch DECISION MUST come from the lib chokepoint
-    ``python -m nousergon_lib.ec2_spot relaunch-decision`` (lib v0.65.0+),
-    NOT a re-introduced inline reclaim classifier. The lib owns the
-    classify (describe-instances) + the bounded/SF-coupled decision; the
-    launcher branches on the exit code."""
+    ``python -m krepis.ec2_spot relaunch-decision`` (lib v0.65.0+ as
+    ``nousergon_lib.ec2_spot``; invoked directly via ``krepis`` per
+    config#1649 — the nousergon_lib re-export shim is guard-less under
+    ``python -m`` on lib >=0.81.0 and silently no-ops), NOT a
+    re-introduced inline reclaim classifier. The lib owns the classify
+    (describe-instances) + the bounded/SF-coupled decision; the launcher
+    branches on the exit code."""
     body = _cleanup_body()
-    assert "nousergon_lib.ec2_spot relaunch-decision" in body, (
+    assert "krepis.ec2_spot relaunch-decision" in body, (
         "cleanup() does not call the lib chokepoint "
-        "`python -m nousergon_lib.ec2_spot relaunch-decision`. #883 lifts the "
+        "`python -m krepis.ec2_spot relaunch-decision`. #883 lifts the "
         "classify→decide logic into the lib (krepis.ec2_spot); the launcher "
         "must consume it, not re-inline a Server.SpotInstanceTermination grep."
+    )
+    assert "-m nousergon_lib.ec2_spot" not in body, (
+        "cleanup() still invokes '-m nousergon_lib.ec2_spot'. On lib "
+        ">=0.81.0 that path is a guard-less re-export shim: under `python "
+        "-m` (runpy) it exits 0 silently WITHOUT running the decision "
+        "logic (config#1646 bug class). Invoke `-m krepis.ec2_spot` "
+        "directly (config#1649)."
     )
     # Must pass the bounded-attempt args the lib decision needs.
     for flag in ("--instance-id", "--attempt", "--max-attempts"):
@@ -117,7 +127,7 @@ def test_cleanup_no_inline_reclaim_classifier():
         "cleanup() re-inlines reclaim classification instead of using the lib "
         "chokepoint:\n"
         + "\n".join(f"  line {n}: {tok} :: {ln}" for n, tok, ln in offenders)
-        + "\n\nRoute through `python -m nousergon_lib.ec2_spot relaunch-decision`."
+        + "\n\nRoute through `python -m krepis.ec2_spot relaunch-decision`."
     )
 
 
