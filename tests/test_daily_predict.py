@@ -20,7 +20,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # ---------------------------------------------------------------------------
 
 class TestBuildPredictorEmail:
-    """Tests for _build_predictor_email() — email formatting helper."""
+    """Tests for _build_predictor_email() — email formatting helper.
+
+    config#856 slimmed the predictor email to a summary + console deep-link;
+    the full per-ticker table / research brief / effective-optimizer-params
+    block moved to the console Predictor page. These tests exercise that
+    shape via the ``inference.daily_predict`` backward-compatible re-export
+    (the implementation lives in ``inference.stages.write_output`` — see
+    ``tests/test_write_output.py::TestSlimPredictorEmail`` for the primary
+    coverage).
+    """
 
     def _make_predictions(self, n: int = 5) -> list[dict]:
         """Create synthetic prediction dicts."""
@@ -82,30 +91,35 @@ class TestBuildPredictorEmail:
         assert "UP" in subject
         assert "DOWN" in subject
 
-    def test_html_contains_tickers(self):
-        """HTML body should contain all ticker names."""
+    def test_html_links_to_console_report(self):
+        """The slim email no longer inlines tickers — it links to the
+        console Predictor page for the full per-ticker table instead."""
         from inference.daily_predict import _build_predictor_email
+        from inference.stages.write_output import predictor_report_url
 
         preds = self._make_predictions(3)
         metrics = self._make_metrics()
 
         _, html, _ = _build_predictor_email(preds, metrics, "2024-06-01")
         for p in preds:
-            assert p["ticker"] in html
+            assert p["ticker"] not in html
+        assert predictor_report_url("2024-06-01") in html
 
-    def test_plain_contains_tickers(self):
-        """Plain text body should contain all ticker names."""
+    def test_plain_links_to_console_report(self):
         from inference.daily_predict import _build_predictor_email
+        from inference.stages.write_output import predictor_report_url
 
         preds = self._make_predictions(3)
         metrics = self._make_metrics()
 
         _, _, plain = _build_predictor_email(preds, metrics, "2024-06-01")
         for p in preds:
-            assert p["ticker"] in plain
+            assert p["ticker"] not in plain
+        assert predictor_report_url("2024-06-01") in plain
 
-    def test_veto_section_appears_for_high_confidence_down(self):
-        """Vetoes should appear when a DOWN prediction has negative alpha and low rank."""
+    def test_veto_count_appears_for_high_confidence_down(self):
+        """Veto COUNT should appear in subject + summary (not a per-ticker
+        veto section — that detail moved to the console page)."""
         from inference.daily_predict import _build_predictor_email
 
         # Veto logic: predicted_alpha < 0 AND combined_rank > n_preds / 2
@@ -133,8 +147,8 @@ class TestBuildPredictorEmail:
             preds, metrics, "2024-06-01", veto_threshold=0.65
         )
         assert "veto" in subject.lower()
-        assert "VETOME" in html
-        assert "VETO" in plain or "VETOME" in plain
+        assert "VETOME" not in html  # per-ticker detail moved to the console
+        assert "Vetoes" in html
 
     def test_empty_predictions(self):
         """Should handle empty prediction list gracefully."""
@@ -143,10 +157,12 @@ class TestBuildPredictorEmail:
         subject, html, plain = _build_predictor_email([], self._make_metrics(), "2024-06-01")
         assert isinstance(subject, str)
         assert "0 UP" in subject
-        assert "No predictions" in html or "none" in html.lower() or len(html) > 0
+        assert len(html) > 0
 
-    def test_with_signals_data(self):
-        """Research section should appear when signals_data is provided."""
+    def test_with_signals_data_surfaces_regime_only(self):
+        """Market regime is still surfaced in the summary (decision-relevant);
+        the full research brief (universe/buy-candidates tables) moved to the
+        console page."""
         from inference.daily_predict import _build_predictor_email
 
         signals = {
@@ -168,12 +184,13 @@ class TestBuildPredictorEmail:
             preds, metrics, "2024-06-01", signals_data=signals
         )
         assert "BULLISH" in subject
-        assert "AAPL" in html
-        assert "Research" in html or "research" in html.lower()
-        assert "AAPL" in plain
+        assert "BULLISH" in html
+        assert "AAPL" not in html          # per-ticker research detail moved to console
+        assert "Research Brief" not in html
 
-    def test_buy_candidates_render_in_research_brief(self):
-        """Buy Candidates section should render and include unscored tickers."""
+    def test_unscored_buy_candidates_still_warn_in_email(self):
+        """A red flag (actionable ticker with no GBM score) must still reach
+        the inbox as a DATA WARNING, not hide behind the console click."""
         from inference.daily_predict import _build_predictor_email
 
         # Predictions cover only TICK1 — TICK2/TICK3 are in buy_candidates but unscored
@@ -207,13 +224,12 @@ class TestBuildPredictorEmail:
         subject, html, plain = _build_predictor_email(
             preds, self._make_metrics(), "2024-06-01", signals_data=signals
         )
-        assert "Buy Candidates (3)" in html
-        assert "Buy Candidates (3)" in plain
+        assert "DATA WARNING" in html
         assert "TICK2" in html and "TICK3" in html
+        assert "DATA WARNING" in plain
         assert "TICK2" in plain and "TICK3" in plain
-        assert "NO PRED" in html
-        assert "not scored by GBM" in html
-        assert "[NO PRED]" in plain
+        # Buy Candidates table itself no longer renders inline.
+        assert "Buy Candidates (3)" not in html
 
     def test_missing_ic_metric(self):
         """Should handle missing ic_30d metric without crashing."""
