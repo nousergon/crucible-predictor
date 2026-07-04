@@ -41,7 +41,6 @@ Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** 
 | Earnings + options fetchers (alt data) | [`data/earnings_fetcher.py`](data/earnings_fetcher.py), [`data/options_fetcher.py`](data/options_fetcher.py) |
 | Mode-comparison utilities | [`analysis/compare_modes.py`](analysis/compare_modes.py) |
 | Health-status writer | [`health_status.py`](health_status.py) |
-| SSM secret loader | [`ssm_secrets.py`](ssm_secrets.py) |
 
 ## Inputs / outputs
 
