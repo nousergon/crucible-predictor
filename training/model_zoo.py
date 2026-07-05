@@ -1134,8 +1134,9 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
             f"governor caps the first-day book move.\n"
             f"  REVERT (if it misbehaves): {revert}"
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_promote_{date_str}",
@@ -1203,8 +1204,9 @@ def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) ->
         cfg_path, exp_id,
     )
     try:
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_inert_{date_str}",
@@ -1227,8 +1229,9 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
             f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
             f"`python -m model.registry --bucket {bucket} --promote {winner_vid}`."
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="info",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_observe_{date_str}",
@@ -1269,8 +1272,9 @@ def _alert_champion_chasing_noise(bucket, date_str, monitor) -> None:
             f"  Detail: predictor/model_zoo/observe_leaderboard/{date_str}.json "
             f"(kind=champion_realized_monitor)."
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_champion_chasing_noise_{date_str}",
