@@ -1544,11 +1544,12 @@ def _main_impl(
     # Step 4: Health status
     if not dry_run:
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
             write_health(
-                bucket=bucket,
                 module_name="predictor_training",
-                status="ok",
+                deliverables=[
+                    Deliverable(name="training_run", required=True, produced=True),
+                ],
                 run_date=date_str,
                 duration_seconds=result.get("train_time_seconds", 0),
                 summary={
@@ -1558,13 +1559,14 @@ def _main_impl(
                     "slim_cache_tickers": result.get("slim_cache_tickers"),
                     "slim_cache_failed": result.get("slim_cache_failed", 0),
                 },
+                bucket=bucket,
             )
         except Exception as _he:
             log.warning("Health status write failed: %s", _he)
 
         # Data manifest
         try:
-            from health_status import write_data_manifest
+            from data_manifest import write_data_manifest
             write_data_manifest(
                 bucket=bucket,
                 module_name="predictor_training",
