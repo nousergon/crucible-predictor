@@ -4325,6 +4325,39 @@ def run_meta_training(
                     else {}
                 ),
             }
+            # alpha-engine-config#969: tag every scalar IC field the manifest
+            # emits with its methodological reliability (leak-free vs
+            # in-sample/overlapping-pooled) so the report-card evaluator can
+            # pass ``reliability=`` into ``build_metric`` and the Director
+            # digest can flag an inflated IC before acting on it. Additive
+            # top-level key per the S3 contract-safety rule (no existing field
+            # is renamed/removed). The classification is a PRODUCER contract —
+            # the producer knows how each number was computed; the consumer
+            # only reads this map. See training/ic_reliability.py.
+            from training.ic_reliability import build_ic_reliability_map
+            # The IC field names the manifest exposes and/or the evaluator
+            # grades. Nested-dict ICs (walk_forward.*_median_ic,
+            # meta_l1_standalone_alpha_ic, meta_model_oos_ic_cpcv) are keyed by
+            # the field name each downstream metric derives from.
+            _ic_field_names = [
+                # leak-free / OOS reads (→ high)
+                "meta_model_oos_ic_cpcv",
+                "meta_model_oos_ic_leakfree",
+                "momentum_median_ic",
+                "volatility_median_ic",
+                "residual_momentum_median_ic",
+                "residual_momentum_leakfree_oos_ic",
+                "meta_l1_standalone_alpha_ic",
+                "meta_oos_ic_leakfree_no_expected_move",
+                "meta_oos_ic_leakfree_post2020",
+                "meta_oos_ic_leakfree_nonlinear",
+                "meta_oos_ic_cpcv_nonlinear",
+                # in-sample / overlapping-pooled / split-only reads (→ low)
+                "meta_model_ic",
+                "meta_model_in_sample_ic",
+                "meta_model_oos_ic",
+            ]
+            manifest["ic_reliability"] = build_ic_reliability_map(_ic_field_names)
             s3_up.put_object(
                 Bucket=bucket, Key=manifest_key,
                 Body=json.dumps(manifest, indent=2).encode(),
