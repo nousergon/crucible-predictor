@@ -513,6 +513,7 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
     # SNS alert fired (severity warning, dedup keyed on the date).
     assert alerts.publish.called
     _, kwargs = alerts.publish.call_args
+    assert kwargs["telegram"] is False
     assert kwargs["severity"] == "warning"
     assert kwargs["dedup_key"] == "model_zoo_inert_2026-06-13"
     assert "0 CHALLENGERS" in kwargs["message"]
