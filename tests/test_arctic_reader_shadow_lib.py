@@ -51,7 +51,7 @@ def test_default_reads_universe_library(fake_arcticdb, tmp_path):
     macro = _mock_library(["SPY"])
     requested = []
 
-    def get_library(name):
+    def get_library(name, **kwargs):
         requested.append(name)
         return {"universe": universe, "macro": macro}[name]
 
@@ -76,7 +76,7 @@ def test_shadow_reads_universe_crsp_library(fake_arcticdb, tmp_path):
     macro = _mock_library(["SPY"])
     requested = []
 
-    def get_library(name):
+    def get_library(name, **kwargs):
         requested.append(name)
         return {"universe_crsp": crsp, "macro": macro}[name]
 

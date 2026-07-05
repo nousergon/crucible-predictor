@@ -1377,13 +1377,14 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Health status ────────────────────────────────────────────────────────
     try:
-        from health_status import write_health
+        from nousergon_lib.health import Deliverable, write_health
         n_up = sum(1 for p in ctx.predictions if p.get("predicted_direction") == "UP")
         n_down = sum(1 for p in ctx.predictions if p.get("predicted_direction") == "DOWN")
         write_health(
-            bucket=ctx.bucket,
             module_name="predictor_inference",
-            status="ok",
+            deliverables=[
+                Deliverable(name="predictions", required=True, produced=True),
+            ],
             run_date=ctx.date_str,
             duration_seconds=ctx.elapsed_seconds(),
             summary={
@@ -1391,13 +1392,14 @@ def run(ctx: PipelineContext) -> None:
                 "n_up": n_up,
                 "n_down": n_down,
             },
+            bucket=ctx.bucket,
         )
     except Exception as _he:
         log.warning("Health status write failed: %s", _he)
 
     # ── Data manifest ────────────────────────────────────────────────────────
     try:
-        from health_status import write_data_manifest
+        from data_manifest import write_data_manifest
         write_data_manifest(
             bucket=ctx.bucket,
             module_name="predictor_inference",
