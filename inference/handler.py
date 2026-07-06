@@ -28,6 +28,14 @@ training exceeding Lambda's 15-minute timeout.
     the prior on-box SSM trading_calendar check whose stdout was unreliably
     captured on a cold-booted instance (config#1430).
 
+  action == "check_weekly_run_day":
+    Weekly-SF run-day gate (pure calendar, no preflight; config#1824).
+    Returns {is_weekly_run_day, check_date, day_name, marker, ...} — true
+    iff the date is one calendar day after the LAST trading session of its
+    Mon-Fri week (normally Saturday; Friday/Thursday on holiday-shortened
+    weeks). Lets the weekly pipeline's THU-SAT cron self-select the single
+    correct firing.
+
   action == "check_pipeline_contract":
     Validate PIPELINE_CONTRACT.yaml's self-consistency + every artifact_id ∈
     ARTIFACT_REGISTRY.yaml, fetched from GitHub raw. Used by the Saturday Step
@@ -128,6 +136,18 @@ def handler(event: dict, context) -> dict:
             "Trading-day gate: %s (%s) -> %s%s",
             _r["check_date"], _r["day_name"], _r["marker"],
             "" if _r["is_trading_day"] else f" (next: {_r.get('next_trading_day')})",
+        )
+        return _r
+
+    # ── Weekly run-day gate (weekly SF THU-SAT cron self-selection) ─────────
+    # Same zero-infra posture as check_trading_day (config#1824).
+    if event.get("action") == "check_weekly_run_day":
+        from inference.trading_day_gate import check_weekly_run_day
+        _r = check_weekly_run_day(event.get("date"))
+        log.info(
+            "Weekly run-day gate: %s (%s) -> %s%s",
+            _r["check_date"], _r["day_name"], _r["marker"],
+            "" if _r["is_weekly_run_day"] else f" ({_r.get('reason')})",
         )
         return _r
 
