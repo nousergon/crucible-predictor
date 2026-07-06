@@ -16,6 +16,7 @@ import pandas as pd
 
 import config as cfg
 from inference.level_neutralization import apply_cross_sectional_neutralization
+from model.calibrator import derive_direction
 from inference.pipeline import PipelineContext, PipelineAbort
 from model.momentum_scorer import predict_dict as _momentum_scorer_predict_dict
 from model.stance_classifier import classify_stance
@@ -868,7 +869,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         else:
             p_up = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
             p_down = 1.0 - p_up
-            predicted_direction = "UP" if p_up >= 0.5 else "DOWN"
+            predicted_direction = derive_direction(alpha)
             confidence = abs(p_up - 0.5) * 2.0
 
         # Shadow (Platt) calibration — OBSERVE-ONLY parallel p_up (config#1176).
@@ -1133,12 +1134,8 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         a = p.get("predicted_alpha", 0) or 0
         p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
         p_down = 1.0 - p_up
-        if a >= 0:
-            direction = "UP"
-            confidence = p_up
-        else:
-            direction = "DOWN"
-            confidence = p_down
+        direction = derive_direction(a)
+        confidence = p_up if direction == "UP" else p_down
         p["p_up"] = round(p_up, 4)
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction

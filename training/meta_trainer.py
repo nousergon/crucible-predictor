@@ -4535,6 +4535,29 @@ def run_meta_training(
         mom_test_ic, vol_test_ic, meta_model._val_ic, promoted, elapsed_s,
     )
 
+    # ── L1 dead-component alert (config#1815) ────────────────────────────────
+    # A component at/below the IC floor keeps feeding L2 silently: the blend
+    # gate deliberately doesn't block on a weak base (see the composite-gate
+    # design note), so a dead L1 previously surfaced only DAYS later as a
+    # report-card RED (momentum test IC 0.002 / OOS −0.011 shipped promoted
+    # on 2026-07-03 with zero training-time signal). Alert-only, fail-loud at
+    # the chokepoint: log.error (flow-doctor escalation surface) + manifest
+    # field consumers/email can render. Blocking changes require replay
+    # evidence per the operational-gates discipline — tracked in config#1815.
+    l1_components_below_ic_floor = {
+        name: round(ic, 6)
+        for name, ic in (("momentum", mom_test_ic), ("volatility", vol_test_ic))
+        if ic is not None and ic <= cfg.L1_COMPONENT_IC_ALERT_FLOOR
+    }
+    if l1_components_below_ic_floor:
+        log.error(
+            "L1 component(s) at/below the IC alert floor (%.3f): %s — the "
+            "ensemble blend can mask a dead component (config#1815). "
+            "Promotion is NOT blocked (alert-only by design); investigate "
+            "the component's features/recipe before the next training run.",
+            cfg.L1_COMPONENT_IC_ALERT_FLOOR, l1_components_below_ic_floor,
+        )
+
     return {
         "model_version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
         "promoted": promoted,
@@ -4545,6 +4568,9 @@ def run_meta_training(
         "n_test": N - val_end,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
+        # config#1815: components at/below cfg.L1_COMPONENT_IC_ALERT_FLOOR —
+        # {} when all healthy. Alert surface, not a promotion input.
+        "l1_components_below_ic_floor": l1_components_below_ic_floor,
         # regime_* fields removed from result dict 2026-04-16 (Tier 0 model
         # retired). Email formatter and downstream consumers must not expect
         # regime_accuracy / regime_oos_* keys; they will be restored when the

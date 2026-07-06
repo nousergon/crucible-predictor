@@ -658,7 +658,17 @@ def _build_predictor_email(
 
     _vt = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     model_version = metrics.get("model_version", "unknown")
-    val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
+    # IC header (config#1815): prefer the realized 30d IC (backtester-owned
+    # rolling field, carried forward by the metrics build); fall back to the
+    # training-time validation IC with an honest label. Pre-fix this read
+    # only ic_30d - null in meta mode since the daily metrics rebuild
+    # clobbered the backtester's rolling patch - so the header rendered a
+    # dash while meta_val_ic=0.346 sat in the same metrics dict.
+    val_ic        = metrics.get("ic_30d")        # realized, 30d rolling
+    ic_label      = "IC (30d)"
+    if not isinstance(val_ic, (int, float)):
+        val_ic   = metrics.get("meta_val_ic")    # training-time CPCV val IC
+        ic_label = "IC (val)"
     n_total       = len(predictions)
     is_meta       = metrics.get("inference_mode") == "meta" or "meta" in model_version.lower()
 
@@ -669,14 +679,16 @@ def _build_predictor_email(
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
 
-    # Vetoes: negative predicted alpha AND combined_rank in bottom half
+    # Vetoes (config#1815): single-sourced from the authoritative gbm_veto
+    # boolean - the ONLY veto the executor acts on (deciders.py
+    # predictor_gbm_veto override). Pre-fix the subject counted a
+    # display-only rule (negative alpha + bottom-half rank, NO confidence
+    # floor) that diverged from gbm_veto: on 2026-07-06 the email claimed
+    # "14 vetoes - executor will override ENTER -> HOLD" while gbm_veto was
+    # false for all 28 names (confidences 4-11% vs the ~0.65 floor) and the
+    # executor vetoed nothing.
     n_preds = len(predictions)
-    vetoes = [
-        p for p in predictions
-        if (p.get("predicted_alpha", 0) or 0) < 0
-        and p.get("combined_rank") is not None
-        and p["combined_rank"] > n_preds / 2
-    ]
+    vetoes = [p for p in predictions if p.get("gbm_veto")]
     n_vetoed = len(vetoes)
 
     # ── Research data extraction ───────────────────────────────────────────────
@@ -730,8 +742,11 @@ def _build_predictor_email(
     TABLE = 'style="border-collapse:collapse; width:100%; font-family:monospace; font-size:12px;"'
 
     def _dir_badge(p: dict) -> str:
+        # Veto badge single-sourced from the authoritative gbm_veto boolean
+        # (config#1815) - was a third divergent display rule (DOWN +
+        # confidence only, no alpha/rank term).
         d = p.get("predicted_direction", "")
-        is_veto = (d == "DOWN" and p.get("prediction_confidence", 0) >= _vt)
+        is_veto = bool(p.get("gbm_veto"))
         if is_veto:
             return '<span style="color:#c62828; font-weight:bold;">⚠ VETO</span>'
         colors = {"UP": "#2e7d32", "DOWN": "#c62828"}
@@ -759,12 +774,8 @@ def _build_predictor_email(
         for p in preds:
             cr = p.get("combined_rank")
             cr_str = f'{cr:.1f}' if cr is not None else "—"
-            is_vetoed = (
-                p.get("predicted_alpha", 0) is not None
-                and (p.get("predicted_alpha", 0) or 0) < 0
-                and cr is not None
-                and cr > n_preds / 2
-            )
+            # Single-sourced from the authoritative gbm_veto (config#1815).
+            is_vetoed = bool(p.get("gbm_veto"))
             veto_tag = ' <span style="color:#d32f2f;">⚠ VETO</span>' if is_vetoed else ""
             rows.append(
                 f'<tr>'
@@ -804,7 +815,7 @@ def _build_predictor_email(
             f'<hr style="border:1px solid #eee; margin:16px 0;">'
             f'<h3 style="color:#c62828;">⚠ Vetoes ({n_vetoed})</h3>'
             f'<p style="font-size:12px; margin:4px 0;">'
-            f'Negative predicted α + bottom-half combined rank — executor will override ENTER → HOLD:</p>'
+            f'gbm_veto fired (negative α + bottom-half rank + confidence ≥ regime threshold) — executor overrides ENTER → HOLD:</p>'
             f'<p style="font-family:monospace; font-size:13px;"><b>{veto_tickers}</b></p>'
         )
 
@@ -983,7 +994,7 @@ def _build_predictor_email(
         f'<h2 style="margin-bottom:4px;">Alpha Engine Brief — {date_str}</h2>'
         f'<p style="color:#555; font-size:12px; margin-top:0;">'
         f'Model: <b>{model_version}</b> &nbsp;|&nbsp;'
-        f'IC (val): <b>{ic_str}</b> &nbsp;|&nbsp;'
+        f'{ic_label}: <b>{ic_str}</b> &nbsp;|&nbsp;'
         f'Mode: <b>{metrics.get("inference_mode", "mse")}</b> &nbsp;|&nbsp;'
         f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
         f'Run at <b>{run_time}</b></p>'
@@ -993,7 +1004,7 @@ def _build_predictor_email(
         f'{_html_prediction_table(sorted_preds)}'
         f'{veto_section_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
-        f'⚠ VETO = negative α + bottom-half rank'
+        f'⚠ VETO = gbm_veto: negative α + bottom-half rank + confidence ≥ regime threshold (the boolean the executor acts on)'
         + (' &nbsp;|&nbsp; Mom = momentum &nbsp;|&nbsp; Vol = expected move &nbsp;|&nbsp; Res.Cal = research calibrator P(correct)' if is_meta else '')
         + f'</p>'
         f'<p style="font-size:11px; color:#aaa; margin-top:8px;">'
@@ -1077,7 +1088,7 @@ def _build_predictor_email(
 
     plain_body = (
         f"Alpha Engine Brief — {date_str}\n"
-        f"Model: {model_version}  IC(val): {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
+        f"Model: {model_version}  {ic_label}: {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
         f"{research_plain}"
         f"{executor_params_plain}"
         f"\n{'='*60}\n"
@@ -1166,6 +1177,44 @@ def send_predictor_email(
 
 # ── Stage entry point ────────────────────────────────────────────────────────
 
+# Backtester-owned rolling fields (pipeline_common.push_predictor_rolling_metrics
+# patches these into predictor/metrics/latest.json weekly). The daily inference
+# metrics rebuild must CARRY THEM FORWARD, not reinitialize them — pre-fix it
+# hardcoded hit_rate_30d_rolling=None (and meta-mode ic_30d/ic_ir_30d=None),
+# clobbering the backtester's realized-outcome values every morning. That is
+# why hit_rate_30d_rolling read null for months and the email IC header
+# rendered a dash (config#1815).
+_ROLLING_METRIC_FIELDS = (
+    "hit_rate_30d_rolling",
+    "ic_30d",
+    "ic_ir_30d",
+    "rolling_metrics_updated_at",
+    "rolling_n",
+)
+
+
+def _load_rolling_metrics(bucket: str) -> dict:
+    """Fetch the backtester-owned rolling fields from the existing metrics file.
+
+    Best-effort READ of secondary observability state: a fetch failure must
+    not block the primary predictions write — it is WARN-logged (the recorded
+    surface) and returns {} so the rolling fields render as honest nulls
+    until the next backtester pass repopulates them.
+    """
+    import boto3
+    try:
+        s3 = boto3.client("s3")
+        resp = s3.get_object(Bucket=bucket, Key=cfg.METRICS_KEY)
+        existing = json.loads(resp["Body"].read())
+        return {k: existing.get(k) for k in _ROLLING_METRIC_FIELDS if existing.get(k) is not None}
+    except Exception as exc:  # noqa: BLE001 — see docstring: WARN is the surface
+        log.warning(
+            "Rolling-metrics carry-forward read failed (%s); backtester-owned "
+            "fields will be null until the next weekly rolling push", exc,
+        )
+        return {}
+
+
 def run(ctx: PipelineContext) -> None:
     """Write predictions, metrics, email, and health status."""
 
@@ -1183,6 +1232,10 @@ def run(ctx: PipelineContext) -> None:
     else:
         last_trained = ctx.checkpoint.get("epoch", "unknown")
 
+    # Carry forward the backtester-owned rolling fields (config#1815) —
+    # skipped in dry-run to keep local drills hermetic (fields render null).
+    rolling = _load_rolling_metrics(ctx.bucket) if not ctx.dry_run else {}
+
     metrics = {
         "model_version": ctx.model_version,
         "model_type": ctx.model_type,
@@ -1190,9 +1243,11 @@ def run(ctx: PipelineContext) -> None:
         "last_trained": last_trained,
         "training_samples": gbm_meta.get("n_train") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
         "val_loss": round(float(ctx.val_loss), 6) if isinstance(ctx.val_loss, (int, float)) else None,
-        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
-        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
-        "hit_rate_30d_rolling": None,
+        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else rolling.get("ic_30d"),
+        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else rolling.get("ic_ir_30d"),
+        "hit_rate_30d_rolling": rolling.get("hit_rate_30d_rolling"),
+        "rolling_metrics_updated_at": rolling.get("rolling_metrics_updated_at"),
+        "rolling_n": rolling.get("rolling_n"),
         "price_freshness": {
             "max_age_days": max(ctx.ticker_data_age.values()) if ctx.ticker_data_age else -1,
             "n_stale": sum(1 for d in ctx.ticker_data_age.values() if d > 1),
