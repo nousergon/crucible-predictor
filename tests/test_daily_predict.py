@@ -105,10 +105,14 @@ class TestBuildPredictorEmail:
             assert p["ticker"] in plain
 
     def test_veto_section_appears_for_high_confidence_down(self):
-        """Vetoes should appear when a DOWN prediction has negative alpha and low rank."""
+        """Vetoes render from the authoritative gbm_veto boolean (config#1815).
+
+        The fixture stamps gbm_veto exactly as run() does before the email
+        builds (VETOME: negative α + bottom-half rank + confidence 0.95 ≥
+        the 0.65 threshold → True). The email must not re-derive the rule.
+        """
         from inference.daily_predict import _build_predictor_email
 
-        # Veto logic: predicted_alpha < 0 AND combined_rank > n_preds / 2
         preds = [
             {
                 "ticker": "GOOD",
@@ -117,6 +121,7 @@ class TestBuildPredictorEmail:
                 "prediction_confidence": 0.70,
                 "combined_rank": 1.0,
                 "watchlist_source": "tracked",
+                "gbm_veto": False,
             },
             {
                 "ticker": "VETOME",
@@ -125,6 +130,7 @@ class TestBuildPredictorEmail:
                 "prediction_confidence": 0.95,
                 "combined_rank": 2.0,  # > n_preds/2 (2 > 1)
                 "watchlist_source": "tracked",
+                "gbm_veto": True,
             },
         ]
         metrics = self._make_metrics()
