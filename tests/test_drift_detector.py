@@ -1,19 +1,22 @@
-"""Tests for monitoring.drift_detector — feature + prediction drift checks.
+"""Tests for monitoring.drift_detector — prediction drift checks.
 
-check_feature_drift / check_prediction_drift now return a list of STRUCTURED
-alert dicts (``{code, severity, headline, detail, cause, action, line, ...}``)
-so each alert is self-describing (severity + distance-from-threshold + trend +
-cause + action). ``check_drift`` keeps ``alerts`` as a backward-compatible
-list[str] (the rendered ``line`` of each) and adds ``severity``,
-``alert_details`` and ``skipped_checks``.
+Prediction-drift only (config#1853): feature-distribution drift is a separate
+layer owned by ``monitoring/feature_drift.py`` (``feature_drift_ks``,
+config#859), which already runs at daily inference time — this module
+deliberately does not duplicate it.
+
+check_prediction_drift returns a list of STRUCTURED alert dicts
+(``{code, severity, headline, detail, cause, action, line, ...}``) so each
+alert is self-describing (severity + distance-from-threshold + trend + cause +
+action). ``check_drift`` keeps ``alerts`` as a backward-compatible list[str]
+(the rendered ``line`` of each) and adds ``severity``, ``alert_details`` and
+``skipped_checks`` (always empty now — retained for output-shape stability).
 """
 
-import io
 import json
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from monitoring.drift_detector import (
@@ -22,14 +25,11 @@ from monitoring.drift_detector import (
     CONSECUTIVE_DAYS_THRESHOLD,
     CRITICAL,
     DIRECTION_CLUSTER_THRESHOLD,
-    FEATURE_ZSCORE_THRESHOLD,
     INFO,
     WARN,
     _load_json,
-    _load_parquet,
     _max_severity,
     check_drift,
-    check_feature_drift,
     check_prediction_drift,
     format_alert_report,
 )
@@ -60,7 +60,7 @@ def _s3_with_json(payload):
 
 
 def _s3_with_routes(routes):
-    """routes: dict[key, "json"|"parquet"|"missing", payload]."""
+    """routes: dict[key, "json"|"missing", payload]."""
     s3 = MagicMock()
 
     def get_object(*, Bucket, Key):
@@ -70,11 +70,6 @@ def _s3_with_routes(routes):
         body = MagicMock()
         if kind == "json":
             body.read.return_value = json.dumps(payload).encode()
-        elif kind == "parquet":
-            buf = io.BytesIO()
-            payload.to_parquet(buf)
-            buf.seek(0)
-            body.read.return_value = buf.read()
         else:
             raise RuntimeError(f"Unknown kind {kind}")
         return {"Body": body}
@@ -94,19 +89,6 @@ def test_load_json_failure_returns_none():
     assert _load_json(s3, "bucket", "key") is None
 
 
-def test_load_parquet_success():
-    df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
-    s3 = _s3_with_routes({"k.parquet": ("parquet", df)})
-    loaded = _load_parquet(s3, "bucket", "k.parquet")
-    pd.testing.assert_frame_equal(loaded, df)
-
-
-def test_load_parquet_failure_returns_none():
-    s3 = MagicMock()
-    s3.get_object.side_effect = RuntimeError("NoSuchKey")
-    assert _load_parquet(s3, "bucket", "missing.parquet") is None
-
-
 # ── severity helper ─────────────────────────────────────────────────────────
 
 
@@ -115,87 +97,6 @@ def test_max_severity_orders_correctly():
     assert _max_severity([INFO, WARN]) == WARN
     assert _max_severity([INFO]) == INFO
     assert _max_severity([]) is None
-
-
-# ── check_feature_drift ────────────────────────────────────────────────────
-
-
-def test_check_feature_drift_no_stats_returns_empty():
-    s3 = MagicMock()
-    s3.get_object.side_effect = RuntimeError("missing")
-    assert check_feature_drift(s3, "bucket", "2026-04-01") == []
-
-
-def test_check_feature_drift_missing_snapshot_alerts():
-    stats = {"mean": [50.0], "std": [10.0], "features": ["rsi_14"]}
-    s3 = _s3_with_routes({
-        "predictor/metrics/training_feature_stats.json": ("json", stats),
-        # no feature snapshot for the date → triggers "Feature snapshot missing"
-    })
-    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert "feature_snapshot_missing" in _codes(alerts)
-    assert any("Feature snapshot missing" in ln for ln in _lines(alerts))
-    assert alerts[0]["severity"] == WARN
-
-
-def test_check_feature_drift_flags_zscore_above_threshold():
-    stats = {
-        "mean": [50.0, 0.0, 100.0],
-        "std": [10.0, 1.0, 5.0],
-        "features": ["rsi_14", "momentum", "price"],
-    }
-    # today's snapshot: rsi shifted by 4 stdevs, momentum and price stable
-    snapshot = pd.DataFrame({
-        "rsi_14": [90.0, 90.0, 90.0],     # mean=90 vs train 50, z=4 → flag
-        "momentum": [0.1, 0.0, -0.1],     # mean=0 vs train 0 → stable
-        "price": [101.0, 99.0, 100.0],    # mean=100 vs train 100 → stable
-    })
-    s3 = _s3_with_routes({
-        "predictor/metrics/training_feature_stats.json": ("json", stats),
-        "features/2026-04-01/technical.parquet": ("parquet", snapshot),
-    })
-    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert len(alerts) == 1
-    assert alerts[0]["code"] == "feature_drift"
-    assert "rsi_14" in alerts[0]["line"]
-    assert "Feature drift" in alerts[0]["line"]
-    # z=4 < 5 → WARN (not a hard break)
-    assert alerts[0]["severity"] == WARN
-    assert alerts[0]["max_zscore"] == pytest.approx(4.0, abs=0.01)
-
-
-def test_check_feature_drift_extreme_zscore_is_critical():
-    stats = {"mean": [50.0], "std": [10.0], "features": ["rsi_14"]}
-    snapshot = pd.DataFrame({"rsi_14": [120.0, 120.0, 120.0]})  # z=7 → CRITICAL
-    s3 = _s3_with_routes({
-        "predictor/metrics/training_feature_stats.json": ("json", stats),
-        "features/2026-04-01/technical.parquet": ("parquet", snapshot),
-    })
-    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert alerts[0]["severity"] == CRITICAL
-
-
-def test_check_feature_drift_skips_constant_features():
-    """Features with std < 1e-10 are skipped (would divide by zero)."""
-    stats = {"mean": [50.0], "std": [1e-15], "features": ["constant"]}
-    snapshot = pd.DataFrame({"constant": [999.0, 999.0]})  # huge shift but skipped
-    s3 = _s3_with_routes({
-        "predictor/metrics/training_feature_stats.json": ("json", stats),
-        "features/2026-04-01/technical.parquet": ("parquet", snapshot),
-    })
-    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert alerts == []
-
-
-def test_check_feature_drift_skips_missing_or_nan_features():
-    stats = {"mean": [50.0, 0.0], "std": [10.0, 1.0], "features": ["rsi", "missing_col"]}
-    snapshot = pd.DataFrame({"rsi": [55.0, 60.0]})  # missing_col absent
-    s3 = _s3_with_routes({
-        "predictor/metrics/training_feature_stats.json": ("json", stats),
-        "features/2026-04-01/technical.parquet": ("parquet", snapshot),
-    })
-    alerts = check_feature_drift(s3, "bucket", "2026-04-01")
-    assert alerts == []
 
 
 # ── check_prediction_drift ─────────────────────────────────────────────────
@@ -361,7 +262,6 @@ def test_check_drift_ok_when_no_alerts():
     )
     fake_s3 = _s3_with_routes({
         "predictor/predictions/2026-04-15.json": ("json", preds),
-        # No training_feature_stats → feature drift skipped (recorded, not silent)
     })
     fake_s3.put_object = MagicMock()
     with patch("boto3.client", return_value=fake_s3):
@@ -372,8 +272,9 @@ def test_check_drift_ok_when_no_alerts():
     assert result["n_alerts"] == 0
     assert result["severity"] is None
     assert result["date"] == "2026-04-15"
-    # feature-drift skip is surfaced, not silent
-    assert any(s["check"] == "feature_drift" for s in result["skipped_checks"])
+    # prediction-drift-only producer: no conditional-skip arm anymore, but the
+    # key is retained in the output shape for backward compatibility.
+    assert result["skipped_checks"] == []
     # Result persisted to S3
     fake_s3.put_object.assert_called_once()
     args = fake_s3.put_object.call_args.kwargs
