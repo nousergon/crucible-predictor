@@ -895,32 +895,24 @@ def _build_predictor_email(
                 f'</table>'
             )
 
-        buy_block = ""
-        if buy_table:
-            unscored_note = ""
-            if unscored_buys:
-                _names = ", ".join(sorted(t for t in unscored_tickers if t))
-                unscored_note = (
-                    f'<p style="margin:4px 0 0 0; font-size:11px; color:#d84315;">'
-                    f'⚠ {len(unscored_buys)} buy candidate{"s" if len(unscored_buys) != 1 else ""} '
-                    f'not scored by GBM (executor can still size them): <b>{_names}</b>'
-                    f'</p>'
-                )
-            buy_block = (
-                f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#2e7d32;">'
-                f'Buy Candidates ({len(buy_candidates)}) — actionable</h4>'
-                f'{buy_table}'
-                f'{unscored_note}'
+        # config#856: slim email — render market regime only, not the full research brief.
+        # Buy Candidates, Population, and Sector Ratings moved to the console page.
+        # Unscored buy candidates (actionable tickers with no GBM prediction) are still surfaced
+        # as a DATA WARNING at the end of the email since they block executor execution.
+        unscored_warning_html = ""
+        if unscored_buys:
+            _names = ", ".join(sorted(t for t in unscored_tickers if t))
+            unscored_warning_html = (
+                f'<hr style="border:1px solid #eee; margin:16px 0;">'
+                f'<h3 style="color:#d84315;">⚠ DATA WARNING</h3>'
+                f'<p style="font-size:12px; margin:4px 0;">'
+                f'{len(unscored_buys)} buy candidate{"s" if len(unscored_buys) != 1 else ""} '
+                f'not scored by GBM (blocks executor): <b>{_names}</b></p>'
             )
 
         research_html = (
             f'<div style="background:#f8f9fa; border-left:3px solid #555; padding:12px 16px; margin-bottom:16px;">'
-            f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Research Brief</h3>'
-            f'<p style="margin:0 0 8px 0;">Market Regime: {regime_pill}</p>'
-            f'{buy_block}'
-            f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Population ({len(population)})</h4>'
-            f'{cand_table}'
-            f'{"<h4 style=margin:8px 0 4px 0; font-size:12px; color:#555;>Sector Ratings</h4>" + sector_table if sector_table else ""}'
+            f'<p style="margin:0; font-size:13px;">Market Regime: {regime_pill}</p>'
             f'</div>'
         )
 
@@ -1000,10 +992,10 @@ def _build_predictor_email(
         f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
         f'Run at <b>{run_time}</b></p>'
         f'{research_html}'
-        f'{executor_params_html}'
         f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">{"Predictions" if is_meta else "GBM Predictions"}</h3>'
         f'{_html_prediction_table(sorted_preds)}'
         f'{veto_section_html}'
+        f'{unscored_warning_html}'
         f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
         f'⚠ VETO = gbm_veto: negative α + bottom-half rank + confidence ≥ regime threshold (the boolean the executor acts on)'
         + (' &nbsp;|&nbsp; Mom = momentum &nbsp;|&nbsp; Vol = expected move &nbsp;|&nbsp; Res.Cal = research calibrator P(correct)' if is_meta else '')
