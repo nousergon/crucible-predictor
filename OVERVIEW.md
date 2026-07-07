@@ -40,8 +40,7 @@ Stacked meta-ensemble that predicts **21-day log-domain market-relative alpha** 
 | Label generator (sector-neutral 5d alpha) | [`data/label_generator.py`](data/label_generator.py) |
 | Earnings + options fetchers (alt data) | [`data/earnings_fetcher.py`](data/earnings_fetcher.py), [`data/options_fetcher.py`](data/options_fetcher.py) |
 | Mode-comparison utilities | [`analysis/compare_modes.py`](analysis/compare_modes.py) |
-| Health-status writer | [`health_status.py`](health_status.py) |
-| SSM secret loader | [`ssm_secrets.py`](ssm_secrets.py) |
+| Data manifest writer | [`data_manifest.py`](data_manifest.py) |
 
 ## Inputs / outputs
 

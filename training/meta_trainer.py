@@ -4325,6 +4325,39 @@ def run_meta_training(
                     else {}
                 ),
             }
+            # alpha-engine-config#969: tag every scalar IC field the manifest
+            # emits with its methodological reliability (leak-free vs
+            # in-sample/overlapping-pooled) so the report-card evaluator can
+            # pass ``reliability=`` into ``build_metric`` and the Director
+            # digest can flag an inflated IC before acting on it. Additive
+            # top-level key per the S3 contract-safety rule (no existing field
+            # is renamed/removed). The classification is a PRODUCER contract —
+            # the producer knows how each number was computed; the consumer
+            # only reads this map. See training/ic_reliability.py.
+            from training.ic_reliability import build_ic_reliability_map
+            # The IC field names the manifest exposes and/or the evaluator
+            # grades. Nested-dict ICs (walk_forward.*_median_ic,
+            # meta_l1_standalone_alpha_ic, meta_model_oos_ic_cpcv) are keyed by
+            # the field name each downstream metric derives from.
+            _ic_field_names = [
+                # leak-free / OOS reads (→ high)
+                "meta_model_oos_ic_cpcv",
+                "meta_model_oos_ic_leakfree",
+                "momentum_median_ic",
+                "volatility_median_ic",
+                "residual_momentum_median_ic",
+                "residual_momentum_leakfree_oos_ic",
+                "meta_l1_standalone_alpha_ic",
+                "meta_oos_ic_leakfree_no_expected_move",
+                "meta_oos_ic_leakfree_post2020",
+                "meta_oos_ic_leakfree_nonlinear",
+                "meta_oos_ic_cpcv_nonlinear",
+                # in-sample / overlapping-pooled / split-only reads (→ low)
+                "meta_model_ic",
+                "meta_model_in_sample_ic",
+                "meta_model_oos_ic",
+            ]
+            manifest["ic_reliability"] = build_ic_reliability_map(_ic_field_names)
             s3_up.put_object(
                 Bucket=bucket, Key=manifest_key,
                 Body=json.dumps(manifest, indent=2).encode(),
@@ -4502,6 +4535,29 @@ def run_meta_training(
         mom_test_ic, vol_test_ic, meta_model._val_ic, promoted, elapsed_s,
     )
 
+    # ── L1 dead-component alert (config#1815) ────────────────────────────────
+    # A component at/below the IC floor keeps feeding L2 silently: the blend
+    # gate deliberately doesn't block on a weak base (see the composite-gate
+    # design note), so a dead L1 previously surfaced only DAYS later as a
+    # report-card RED (momentum test IC 0.002 / OOS −0.011 shipped promoted
+    # on 2026-07-03 with zero training-time signal). Alert-only, fail-loud at
+    # the chokepoint: log.error (flow-doctor escalation surface) + manifest
+    # field consumers/email can render. Blocking changes require replay
+    # evidence per the operational-gates discipline — tracked in config#1815.
+    l1_components_below_ic_floor = {
+        name: round(ic, 6)
+        for name, ic in (("momentum", mom_test_ic), ("volatility", vol_test_ic))
+        if ic is not None and ic <= cfg.L1_COMPONENT_IC_ALERT_FLOOR
+    }
+    if l1_components_below_ic_floor:
+        log.error(
+            "L1 component(s) at/below the IC alert floor (%.3f): %s — the "
+            "ensemble blend can mask a dead component (config#1815). "
+            "Promotion is NOT blocked (alert-only by design); investigate "
+            "the component's features/recipe before the next training run.",
+            cfg.L1_COMPONENT_IC_ALERT_FLOOR, l1_components_below_ic_floor,
+        )
+
     return {
         "model_version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
         "promoted": promoted,
@@ -4512,6 +4568,9 @@ def run_meta_training(
         "n_test": N - val_end,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
+        # config#1815: components at/below cfg.L1_COMPONENT_IC_ALERT_FLOOR —
+        # {} when all healthy. Alert surface, not a promotion input.
+        "l1_components_below_ic_floor": l1_components_below_ic_floor,
         # regime_* fields removed from result dict 2026-04-16 (Tier 0 model
         # retired). Email formatter and downstream consumers must not expect
         # regime_accuracy / regime_oos_* keys; they will be restored when the

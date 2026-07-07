@@ -54,7 +54,7 @@ def test_download_from_arctic_writes_universe_and_macro_parquets(fake_arcticdb, 
     universe_lib = _mock_library(["AAPL", "MSFT", "GOOGL"])
     macro_lib = _mock_library(["SPY", "VIX"])
 
-    def get_library(name):
+    def get_library(name, **kwargs):
         return {"universe": universe_lib, "macro": macro_lib}[name]
 
     arctic_inst.get_library.side_effect = get_library
@@ -87,7 +87,7 @@ def test_download_from_arctic_skips_empty_dataframes(fake_arcticdb, tmp_path):
 
     universe_lib = _mock_library(["AAPL", "EMPTY"], get_df=get_df)
     macro_lib = _mock_library([])
-    arctic_inst.get_library.side_effect = lambda n: {"universe": universe_lib, "macro": macro_lib}[n]
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
 
     fake_s3 = MagicMock()
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
@@ -107,7 +107,7 @@ def test_download_from_arctic_per_ticker_read_failure_continues(fake_arcticdb, t
 
     universe_lib = _mock_library(["AAPL", "MSFT", "BAD"], raise_on={"BAD"})
     macro_lib = _mock_library([])
-    arctic_inst.get_library.side_effect = lambda n: {"universe": universe_lib, "macro": macro_lib}[n]
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
 
     fake_s3 = MagicMock()
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
@@ -127,7 +127,7 @@ def test_download_from_arctic_macro_read_failure_continues(fake_arcticdb, tmp_pa
 
     universe_lib = _mock_library(["AAPL"])
     macro_lib = _mock_library(["SPY", "VIX"], raise_on={"VIX"})
-    arctic_inst.get_library.side_effect = lambda n: {"universe": universe_lib, "macro": macro_lib}[n]
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
 
     fake_s3 = MagicMock()
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
@@ -147,7 +147,7 @@ def test_download_from_arctic_progress_log_every_200(fake_arcticdb, tmp_path, ca
     symbols = [f"T{i}" for i in range(420)]
     universe_lib = _mock_library(symbols)
     macro_lib = _mock_library([])
-    arctic_inst.get_library.side_effect = lambda n: {"universe": universe_lib, "macro": macro_lib}[n]
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
 
     fake_s3 = MagicMock()
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
@@ -165,7 +165,7 @@ def test_download_from_arctic_uri_region_from_env(monkeypatch, fake_arcticdb, tm
     monkeypatch.setenv("AWS_REGION", "eu-west-1")
     arctic_inst = MagicMock()
     fake_arcticdb.Arctic.return_value = arctic_inst
-    arctic_inst.get_library.side_effect = lambda n: _mock_library([])
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: _mock_library([])
 
     fake_s3 = MagicMock()
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")

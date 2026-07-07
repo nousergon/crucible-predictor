@@ -41,10 +41,15 @@ def stub_flow_doctor_env(monkeypatch):
     strings; nothing actually contacts SMTP/GitHub since no report() fires.
     """
     monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_SKIP_PREFLIGHT", "1")
     monkeypatch.setenv("EMAIL_SENDER", "test@example.com")
     monkeypatch.setenv("EMAIL_RECIPIENTS", "test@example.com")
     monkeypatch.setenv("GMAIL_APP_PASSWORD", "stub-password")
     monkeypatch.setenv("FLOW_DOCTOR_GITHUB_TOKEN", "stub-token")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:stub-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-100stub")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL", "1")
+    monkeypatch.setenv("FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH", "2")
 
 
 @pytest.fixture
@@ -211,18 +216,21 @@ class TestFlowDoctorYamlSchema:
         assert cfg["repo"] == "nousergon/crucible-predictor"
         assert cfg["flow_name"] == "predictor-model-zoo"
 
-    def test_model_zoo_yaml_has_email_and_s3_sinks(self):
+    def test_model_zoo_yaml_has_email_s3_and_telegram_sinks(self):
         # The model-zoo yaml mirrors flow-doctor-training.yaml's email sink AND
         # flow-doctor.yaml (inference)'s S3 sink: email for delivery, S3 for
-        # durable crash-artifact persistence on the spot.
+        # durable crash-artifact persistence on the spot. T3 adds telegram
+        # forum-topic notifiers for rotation alerts (config#1749).
         import yaml
         with open(REPO_ROOT / "flow-doctor-model-zoo.yaml") as f:
             cfg = yaml.safe_load(f)
         sinks = {n.get("type") for n in cfg["notify"]}
-        assert sinks == {"email", "s3"}, f"expected email+s3 sinks, got {sinks}"
+        assert sinks == {"email", "s3", "telegram"}, f"expected email+s3+telegram, got {sinks}"
         s3 = next(n for n in cfg["notify"] if n.get("type") == "s3")
         assert s3.get("bucket") == "alpha-engine-research"
         assert s3.get("subsystem") == "predictor"
+        telegram_blocks = [n for n in cfg["notify"] if n.get("type") == "telegram"]
+        assert len(telegram_blocks) == 2
 
 
 @flow_doctor_required

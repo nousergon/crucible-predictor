@@ -370,6 +370,15 @@ WF_SORTINO_IC_THRESHOLD = _wf_cfg.get("sortino_ic_threshold", 0.0)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
 
+# config#1815: training-time L1-component IC alert floor. A component whose
+# held-out test IC is at/below this floor is flagged LOUDLY at the training
+# chokepoint (log.error + manifest `l1_components_below_ic_floor` + email
+# surfacing) instead of surfacing days later as a report-card RED. Alert-only
+# by design: blend promotion deliberately does NOT block on a weak base (see
+# the design note above the composite gate) — changing blocking behavior
+# requires replay evidence per the operational-gates discipline.
+L1_COMPONENT_IC_ALERT_FLOOR = float(os.environ.get("L1_COMPONENT_IC_ALERT_FLOOR", "0.0"))
+
 # Audit Phase 2a output-distribution gate (2026-05-07). When True, a
 # calibrator-output-shape check is added to the promotion gate alongside
 # the existing meta-IC and per-component subsample gates. Default False

@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from krepis.console import console_url as build_console_url
 from krepis.secrets import get_secret
 
 import config as cfg
@@ -18,23 +17,6 @@ from inference.pipeline import PipelineContext
 from inference.s3_io import _s3_put_json
 
 log = logging.getLogger(__name__)
-
-# Deep-link target for the slim predictor email → the console Predictor page
-# (config#856 pipeline-reporting revamp: "pull-for-state console page +
-# push-on-transition emails"). The slug is pinned in crucible-dashboard
-# app.py (url_path="predictor") and guarded by
-# tests/test_predictor_page.py; the page honors ?date=YYYY-MM-DD keyed by
-# this run's date_str, so the email link opens the exact day it describes.
-# Base URL is built by the lifted krepis.console.console_url chokepoint
-# (config#1300) — only the slug (the cross-repo contract with the
-# dashboard url_path) stays local, mirroring training/model_zoo.py's
-# MODEL_ZOO_SLUG usage.
-PREDICTOR_SLUG = "predictor"
-
-
-def predictor_report_url(date_str: str, console_base_url: str | None = None) -> str:
-    """Deep-link to the console Predictor page for ``date_str``."""
-    return build_console_url(PREDICTOR_SLUG, date=date_str or None, base=console_base_url)
 
 
 # ── S3-delivered predictor params (veto threshold) ────────────────────────────
@@ -655,25 +637,18 @@ def _build_predictor_email(
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
     bucket: str | None = None,
-    console_base_url: str | None = None,
 ) -> tuple[str, str, str]:
-    """Build the slim predictor email: subject + (html_body, plain_body).
+    """
+    Build subject, HTML body, and plain-text body for the combined morning briefing.
 
-    As of 2026-07-03 this is a **slim link email** (config#856 pipeline-
-    reporting revamp, "pull-for-state console page + push-on-transition
-    emails"): the body carries the at-a-glance summary (model/IC, UP/DOWN/
-    veto counts, market regime, any unscored-buy-candidate warning) plus a
-    deep-link to the full morning briefing on the console Predictor page
-    (alpha-engine-dashboard ``views/7_Predictor.py``), which renders the
-    complete ``predictor/predictions/{date}.json`` artifact — full
-    per-ticker prediction table, research brief, and effective optimizer
-    params live there now, not inlined in the email.
+    When signals_data is supplied (the raw signals.json payload from the research
+    pipeline), a research section is prepended containing market regime, buy
+    candidates, and sector ratings. The GBM predictions follow as the second half.
 
-    Note: this only changes what the EMAIL inlines. ``write_predictions``
-    (this module) still writes the complete predictions payload to S3
-    unchanged — the console page is simply the canonical render of that
-    artifact, mirroring the EOD-report / analysis-digest / model-zoo
-    conversions already shipped for config#856.
+    When ``bucket`` is supplied, the email also includes an "Effective
+    optimizer params" block sourced from ``config/executor_params.json``
+    (ROADMAP L234 morning-email side). Best-effort — missing artifact
+    silently skips the block.
 
     Returns
     -------
@@ -683,41 +658,57 @@ def _build_predictor_email(
 
     _vt = veto_threshold if veto_threshold is not None else cfg.MIN_CONFIDENCE
     model_version = metrics.get("model_version", "unknown")
-    val_ic        = metrics.get("ic_30d")        # 30-day information coefficient
+    # IC header (config#1815): prefer the realized 30d IC (backtester-owned
+    # rolling field, carried forward by the metrics build); fall back to the
+    # training-time validation IC with an honest label. Pre-fix this read
+    # only ic_30d - null in meta mode since the daily metrics rebuild
+    # clobbered the backtester's rolling patch - so the header rendered a
+    # dash while meta_val_ic=0.346 sat in the same metrics dict.
+    val_ic        = metrics.get("ic_30d")        # realized, 30d rolling
+    ic_label      = "IC (30d)"
+    if not isinstance(val_ic, (int, float)):
+        val_ic   = metrics.get("meta_val_ic")    # training-time CPCV val IC
+        ic_label = "IC (val)"
     n_total       = len(predictions)
     is_meta       = metrics.get("inference_mode") == "meta" or "meta" in model_version.lower()
 
-    # Counts for subject + summary
+    # Single list sorted by combined_rank (best first)
+    sorted_preds = sorted(predictions, key=lambda p: p.get("combined_rank") or 999)
+
+    # Counts for subject line
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
     downs = [p for p in predictions if p.get("predicted_direction") == "DOWN"]
 
-    # Vetoes: negative predicted alpha AND combined_rank in bottom half
+    # Vetoes (config#1815): single-sourced from the authoritative gbm_veto
+    # boolean - the ONLY veto the executor acts on (deciders.py
+    # predictor_gbm_veto override). Pre-fix the subject counted a
+    # display-only rule (negative alpha + bottom-half rank, NO confidence
+    # floor) that diverged from gbm_veto: on 2026-07-06 the email claimed
+    # "14 vetoes - executor will override ENTER -> HOLD" while gbm_veto was
+    # false for all 28 names (confidences 4-11% vs the ~0.65 floor) and the
+    # executor vetoed nothing.
     n_preds = len(predictions)
-    vetoes = [
-        p for p in predictions
-        if (p.get("predicted_alpha", 0) or 0) < 0
-        and p.get("combined_rank") is not None
-        and p["combined_rank"] > n_preds / 2
-    ]
+    vetoes = [p for p in predictions if p.get("gbm_veto")]
     n_vetoed = len(vetoes)
 
-    # ── Research data extraction (summary-only; full brief is on the console) ──
+    # ── Research data extraction ───────────────────────────────────────────────
     sd = signals_data or {}
-    market_regime  = sd.get("market_regime", "")
-    population     = sd.get("universe", []) or sd.get("population", [])
-    buy_candidates = sd.get("buy_candidates", []) or []
+    market_regime    = sd.get("market_regime", "")
+    population       = sd.get("universe", []) or sd.get("population", [])
+    buy_candidates   = sd.get("buy_candidates", []) or []
+    sector_ratings   = sd.get("sector_ratings", {})
+    sorted_sectors: list = []
 
-    # Tickers the executor can act on that the GBM did NOT score — a red flag
-    # that must still reach the inbox, not hide behind the console click (per
-    # [[feedback_no_silent_fails]]), mirroring the EOD email's DATA WARNINGS.
-    _pred_tickers    = {p.get("ticker") for p in predictions}
-    unscored_buys    = [
+    # Tickers the executor can act on that the GBM did NOT score — surface these
+    # prominently so a stale/short predictions run can't silently hide buys.
+    _pred_tickers     = {p.get("ticker") for p in predictions}
+    unscored_buys     = [
         c for c in buy_candidates
         if isinstance(c, dict) and c.get("ticker") not in _pred_tickers
     ]
-    unscored_tickers = sorted(t for t in {c.get("ticker") for c in unscored_buys} if t)
+    unscored_tickers  = {c.get("ticker") for c in unscored_buys}
 
-    # ── Subject (unchanged shape — NAV/regime/counts at a glance) ────────────
+    # ── Subject ───────────────────────────────────────────────────────────────
     veto_str    = f" | {n_vetoed} veto{'es' if n_vetoed != 1 else ''}" if n_vetoed else ""
     regime_str  = f" | {market_regime.upper()}" if market_regime else ""
     cand_str    = f" | {len(population)} stocks" if population else ""
@@ -727,70 +718,295 @@ def _build_predictor_email(
         f"{veto_str}"
     )
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
     _pt = _dt.timezone(_dt.timedelta(hours=-7))  # PDT
     run_time = _dt.datetime.now(_pt).strftime("%-I:%M %p PT")
     ic_str   = f"{val_ic:.4f}" if isinstance(val_ic, (int, float)) else "—"
 
-    url = predictor_report_url(date_str, console_base_url)
+    def _source_tag(p: dict) -> str:
+        return ""  # buy_candidates merged into universe — no separate source tag
+
+    def _alpha_str(p: dict) -> str:
+        a = p.get("predicted_alpha")
+        if a is None:
+            return "—"
+        return f"{'+' if a >= 0 else ''}{a * 100:.2f}%"
+
+    def _conf_pct(p: dict) -> str:
+        return f"{p.get('prediction_confidence', 0) * 100:.0f}%"
 
     # ── HTML ──────────────────────────────────────────────────────────────────
     TH = 'style="background:#f0f0f0; padding:4px 8px; text-align:left; border:1px solid #ccc;"'
     TD = 'style="padding:4px 8px; border:1px solid #ddd;"'
+    TDR = 'style="padding:4px 8px; border:1px solid #ddd; text-align:right;"'
     TABLE = 'style="border-collapse:collapse; width:100%; font-family:monospace; font-size:12px;"'
 
-    regime_color = {"bullish": "#2e7d32", "bearish": "#c62828"}.get(
-        market_regime.lower(), "#555"
-    )
-    regime_pill = (
-        f'<span style="display:inline-block; background:{regime_color}; color:#fff; '
-        f'font-size:11px; padding:2px 8px; border-radius:3px; font-weight:bold;">'
-        f'{market_regime.upper() if market_regime else "NEUTRAL"}</span>'
-    ) if market_regime else ""
+    def _dir_badge(p: dict) -> str:
+        # Veto badge single-sourced from the authoritative gbm_veto boolean
+        # (config#1815) - was a third divergent display rule (DOWN +
+        # confidence only, no alpha/rank term).
+        d = p.get("predicted_direction", "")
+        is_veto = bool(p.get("gbm_veto"))
+        if is_veto:
+            return '<span style="color:#c62828; font-weight:bold;">⚠ VETO</span>'
+        colors = {"UP": "#2e7d32", "DOWN": "#c62828"}
+        return f'<span style="color:{colors.get(d, "#888")}; font-weight:bold;">{d}</span>'
 
-    summary_rows_html = [
-        f'<tr><td {TD}>Model</td><td {TD}>{model_version}</td></tr>',
-        f'<tr><td {TD}>IC (val)</td><td {TD}>{ic_str}</td></tr>',
-        f'<tr><td {TD}>Mode</td><td {TD}>{metrics.get("inference_mode", "mse")}</td></tr>',
-        f'<tr><td {TD}>Universe</td><td {TD}>{n_total} tickers</td></tr>',
-        f'<tr><td {TD}>UP / DOWN</td><td {TD}>{len(ups)} / {len(downs)}</td></tr>',
-        f'<tr><td {TD}>Vetoes</td><td {TD}>{n_vetoed}</td></tr>',
-    ]
-    if market_regime:
-        summary_rows_html.append(
-            f'<tr><td {TD}>Market Regime</td><td {TD}>{regime_pill}</td></tr>'
+    def _meta_cols(p: dict) -> str:
+        """Extra columns for meta-model predictions: momentum, vol, research.
+        Regime column removed 2026-04-16 (Tier 0 classifier retired). The
+        LLM-derived market_regime from research still renders in the header
+        pill above the table — that's the regime signal the executor consumes."""
+        mom = p.get("momentum_confirmation")
+        vol = p.get("expected_move")
+        rscore = p.get("research_calibrator_prob")
+        return (
+            f'<td {TDR}>{f"{mom:+.3f}" if mom is not None else "—"}</td>'
+            f'<td {TDR}>{f"{vol:.3f}" if vol is not None else "—"}</td>'
+            f'<td {TDR}>{f"{rscore:.0%}" if rscore is not None else "—"}</td>'
         )
-    summary_html = (
-        f'<h2 style="margin-bottom:4px;">Alpha Engine Brief — {date_str}</h2>'
-        f'<p style="color:#555; font-size:12px; margin-top:0;">Run at <b>{run_time}</b></p>'
-        f'<table {TABLE}><tr><th {TH}>Metric</th><th {TH}>Value</th></tr>'
-        + "".join(summary_rows_html)
-        + '</table>'
-    )
 
-    warning_html = ""
-    warning_plain = ""
-    if unscored_buys:
-        _names = ", ".join(unscored_tickers)
-        warning_html = (
-            '<div style="background:#fff3cd;border:1px solid #ffc107;padding:10px;margin:10px 0;">'
-            f'<strong>DATA WARNING:</strong> {len(unscored_buys)} buy candidate'
-            f'{"s" if len(unscored_buys) != 1 else ""} not scored by GBM '
-            f'(executor can still size them): <b>{_names}</b></div>'
+    def _html_prediction_table(preds: list[dict]) -> str:
+        if not preds:
+            return '<p style="color:#888; font-style:italic;">No predictions available.</p>'
+        n_preds = len(preds)
+        rows = []
+        for p in preds:
+            cr = p.get("combined_rank")
+            cr_str = f'{cr:.1f}' if cr is not None else "—"
+            # Single-sourced from the authoritative gbm_veto (config#1815).
+            is_vetoed = bool(p.get("gbm_veto"))
+            veto_tag = ' <span style="color:#d32f2f;">⚠ VETO</span>' if is_vetoed else ""
+            rows.append(
+                f'<tr>'
+                f'<td {TD}><b>{p["ticker"]}{_source_tag(p)}</b></td>'
+                f'<td {TDR}>{_alpha_str(p)}</td>'
+                f'<td {TDR}>{cr_str}</td>'
+                f'<td {TDR}>{_conf_pct(p)}</td>'
+                f'<td {TD} style="text-align:center;">{_dir_badge(p)}{veto_tag}</td>'
+                + (_meta_cols(p) if is_meta else "")
+                + f'<td {TD}>{p.get("watchlist_source", "—")}</td>'
+                f'</tr>'
+            )
+        meta_headers = (
+            f'<th {TH}>Mom</th>'
+            f'<th {TH}>Vol</th>'
+            f'<th {TH}>Res.Cal</th>'
+        ) if is_meta else ""
+        return (
+            f'<table {TABLE}>'
+            f'<tr>'
+            f'<th {TH}>Ticker</th>'
+            f'<th {TH}>Alpha</th>'
+            f'<th {TH}>Rank</th>'
+            f'<th {TH}>Conf</th>'
+            f'<th {TH}>Signal</th>'
+            + meta_headers
+            + f'<th {TH}>Source</th>'
+            f'</tr>'
+            + "\n".join(rows)
+            + f'</table>'
         )
-        warning_plain = (
-            f"DATA WARNING: {len(unscored_buys)} buy candidate(s) not scored "
-            f"by GBM: {_names}\n\n"
+
+    veto_section_html = ""
+    if vetoes:
+        veto_tickers = ", ".join(p["ticker"] for p in vetoes)
+        veto_section_html = (
+            f'<hr style="border:1px solid #eee; margin:16px 0;">'
+            f'<h3 style="color:#c62828;">⚠ Vetoes ({n_vetoed})</h3>'
+            f'<p style="font-size:12px; margin:4px 0;">'
+            f'gbm_veto fired (negative α + bottom-half rank + confidence ≥ regime threshold) — executor overrides ENTER → HOLD:</p>'
+            f'<p style="font-family:monospace; font-size:13px;"><b>{veto_tickers}</b></p>'
         )
+
+    # ── Research section HTML ─────────────────────────────────────────────────
+    research_html = ""
+    if sd:
+        # Market regime pill
+        regime_color = {"bullish": "#2e7d32", "bearish": "#c62828"}.get(
+            market_regime.lower(), "#555"
+        )
+        regime_pill = (
+            f'<span style="display:inline-block; background:{regime_color}; color:#fff; '
+            f'font-size:11px; padding:2px 8px; border-radius:3px; font-weight:bold;">'
+            f'{market_regime.upper() if market_regime else "NEUTRAL"}</span>'
+        )
+
+        def _render_research_row(c: dict) -> str:
+            score      = c.get("score") or c.get("long_term_score") or "—"
+            conviction = c.get("conviction", "—")
+            signal     = c.get("signal") or c.get("long_term_rating") or "—"
+            sector     = c.get("sector", "—")
+            gbm_veto   = c.get("gbm_veto", False)
+            score_str  = f"{score:.1f}" if isinstance(score, (int, float)) else str(score)
+            badges = ""
+            if gbm_veto:
+                badges += ' <span style="color:#c62828; font-weight:bold; font-size:10px;">GBM⚠</span>'
+            if c.get("ticker") in unscored_tickers:
+                badges += ' <span style="color:#d84315; font-weight:bold; font-size:10px;" title="Actionable but no GBM prediction">NO PRED</span>'
+            return (
+                f'<tr>'
+                f'<td {TD}><b>{c.get("ticker","?")}</b>{badges}</td>'
+                f'<td {TDR}>{score_str}</td>'
+                f'<td {TD}>{conviction}</td>'
+                f'<td {TD}>{signal}</td>'
+                f'<td {TD}>{sector}</td>'
+                f'</tr>'
+            )
+
+        def _render_research_table(rows_src: list) -> str:
+            rows = "".join(_render_research_row(c) for c in rows_src if isinstance(c, dict))
+            if not rows:
+                rows = f'<tr><td colspan="5" style="padding:4px 8px; color:#888; font-style:italic;">none</td></tr>'
+            return (
+                f'<table {TABLE}>'
+                f'<tr><th {TH}>Ticker</th><th {TH}>Score</th><th {TH}>Conviction</th>'
+                f'<th {TH}>Signal</th><th {TH}>Sector</th></tr>'
+                f'{rows}'
+                f'</table>'
+            )
+
+        # Buy Candidates = the actionable set (signal == ENTER). This is what the
+        # executor sizes positions on; render it explicitly so every tradeable
+        # ticker is visible in the morning brief even if it isn't in predictions.
+        buy_table = _render_research_table(buy_candidates) if buy_candidates else ""
+        cand_table = _render_research_table(population)
+
+        # Sector ratings (top sectors sorted by rating desc, skip empty)
+        sector_rows = ""
+        sorted_sectors = sorted(
+            [(s, v) for s, v in sector_ratings.items() if isinstance(v, dict)],
+            key=lambda x: x[1].get("rating", 0),
+            reverse=True,
+        )
+        for sector, v in sorted_sectors[:8]:
+            rating   = v.get("rating", "—")
+            modifier = v.get("modifier", "—")
+            rating_str   = f"{rating:.0f}" if isinstance(rating, (int, float)) else str(rating)
+            modifier_str = f"{modifier:.2f}x" if isinstance(modifier, (int, float)) else str(modifier)
+            sector_rows += f'<tr><td {TD}>{sector}</td><td {TDR}>{rating_str}</td><td {TDR}>{modifier_str}</td></tr>'
+        sector_table = ""
+        if sector_rows:
+            sector_table = (
+                f'<table {TABLE}>'
+                f'<tr><th {TH}>Sector</th><th {TH}>Rating</th><th {TH}>Modifier</th></tr>'
+                f'{sector_rows}'
+                f'</table>'
+            )
+
+        buy_block = ""
+        if buy_table:
+            unscored_note = ""
+            if unscored_buys:
+                _names = ", ".join(sorted(t for t in unscored_tickers if t))
+                unscored_note = (
+                    f'<p style="margin:4px 0 0 0; font-size:11px; color:#d84315;">'
+                    f'⚠ {len(unscored_buys)} buy candidate{"s" if len(unscored_buys) != 1 else ""} '
+                    f'not scored by GBM (executor can still size them): <b>{_names}</b>'
+                    f'</p>'
+                )
+            buy_block = (
+                f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#2e7d32;">'
+                f'Buy Candidates ({len(buy_candidates)}) — actionable</h4>'
+                f'{buy_table}'
+                f'{unscored_note}'
+            )
+
+        research_html = (
+            f'<div style="background:#f8f9fa; border-left:3px solid #555; padding:12px 16px; margin-bottom:16px;">'
+            f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Research Brief</h3>'
+            f'<p style="margin:0 0 8px 0;">Market Regime: {regime_pill}</p>'
+            f'{buy_block}'
+            f'<h4 style="margin:8px 0 4px 0; font-size:12px; color:#555;">Population ({len(population)})</h4>'
+            f'{cand_table}'
+            f'{"<h4 style=margin:8px 0 4px 0; font-size:12px; color:#555;>Sector Ratings</h4>" + sector_table if sector_table else ""}'
+            f'</div>'
+        )
+
+    # ── Effective optimizer params (ROADMAP L234) ──────────────────────────
+    # Surface the auto-tuned executor params alongside the briefing so
+    # the operator sees effective min_score_to_enter / max_position_pct /
+    # atr_multiplier (and the rest) without tailing executor.log. Best-
+    # effort — missing artifact silently skips the block.
+    executor_params_html = ""
+    executor_params_plain = ""
+    if bucket:
+        _ep = _load_executor_params_for_email(bucket)
+        if _ep:
+            _ep_keys_to_surface = [
+                ("min_score", "min_score_to_enter"),
+                ("max_position_pct", "max_position_pct"),
+                ("atr_multiplier", "atr_multiplier"),
+                ("profit_take_pct", "profit_take_pct"),
+                ("time_decay_reduce_days", "time_decay_reduce_days"),
+                ("time_decay_exit_days", "time_decay_exit_days"),
+            ]
+            _surface_rows: list[tuple[str, str]] = []
+            for key, label in _ep_keys_to_surface:
+                if key not in _ep:
+                    continue
+                val = _ep[key]
+                if isinstance(val, float):
+                    display = f"{val:.4f}" if abs(val) < 1 else f"{val:.2f}"
+                else:
+                    display = str(val)
+                _surface_rows.append((label, display))
+            _updated = _ep.get("updated_at", "—")
+            _best_sharpe = _ep.get("best_sharpe")
+            _improvement = _ep.get("improvement_pct")
+            _manual_override = bool(_ep.get("manual_override"))
+            if _surface_rows:
+                _meta_parts = [f"updated <b>{_updated}</b>"]
+                if isinstance(_best_sharpe, (int, float)):
+                    _meta_parts.append(f"best Sharpe <b>{_best_sharpe:.2f}</b>")
+                if isinstance(_improvement, (int, float)):
+                    _meta_parts.append(f"improvement <b>{_improvement:+.1%}</b>")
+                if _manual_override:
+                    _meta_parts.append('<span style="color:#b71c1c; font-weight:bold;">manual override</span>')
+                _ep_rows_html = "".join(
+                    f'<tr><td {TD}>{lbl}</td><td {TD} align="right">{v}</td>'
+                    f'<td {TD} style="color:#888; font-size:11px;">S3 (auto-tuned)</td></tr>'
+                    for lbl, v in _surface_rows
+                )
+                executor_params_html = (
+                    f'<div style="background:#fffbe6; border-left:3px solid #b8860b; padding:12px 16px; margin-bottom:16px;">'
+                    f'<h3 style="margin:0 0 8px 0; font-size:14px; color:#333;">Effective Optimizer Params</h3>'
+                    f'<p style="margin:0 0 8px 0; font-size:11px; color:#555;">'
+                    f'{" &middot; ".join(_meta_parts)}</p>'
+                    f'<table style="border-collapse:collapse; font-size:12px;">'
+                    f'<tr><th {TH}>Param</th><th {TH}>Live value</th><th {TH}>Source</th></tr>'
+                    f'{_ep_rows_html}'
+                    f'</table>'
+                    f'<p style="font-size:10px; color:#888; margin:8px 0 0 0;">'
+                    f'Keys absent here fall through to the executor\'s local risk.yaml.'
+                    f'</p>'
+                    f'</div>'
+                )
+                executor_params_plain = (
+                    "\n--- EFFECTIVE OPTIMIZER PARAMS (auto-tuned) ---\n"
+                    + " | ".join(p.replace("<b>", "").replace("</b>", "").replace('<span style="color:#b71c1c; font-weight:bold;">', "").replace("</span>", "") for p in _meta_parts) + "\n"
+                    + "\n".join(f"  {lbl:30s} {v}" for lbl, v in _surface_rows) + "\n"
+                    + "(Keys absent fall through to risk.yaml.)\n"
+                )
 
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:700px;">'
-        f'{summary_html}'
-        f'{warning_html}'
-        f'<a class="cta" style="display:inline-block; margin:14px 0; padding:10px 18px; '
-        f'background:#0b5; color:#fff !important; text-decoration:none; border-radius:4px; '
-        f'font-weight:bold;" href="{url}">View full morning briefing on the console →</a>'
-        f'<p style="font-size:11px;color:#888;">Full per-ticker predictions, research brief, '
-        f'and effective optimizer params are on the console report.</p>'
+        f'<h2 style="margin-bottom:4px;">Alpha Engine Brief — {date_str}</h2>'
+        f'<p style="color:#555; font-size:12px; margin-top:0;">'
+        f'Model: <b>{model_version}</b> &nbsp;|&nbsp;'
+        f'{ic_label}: <b>{ic_str}</b> &nbsp;|&nbsp;'
+        f'Mode: <b>{metrics.get("inference_mode", "mse")}</b> &nbsp;|&nbsp;'
+        f'Universe: <b>{n_total}</b> tickers &nbsp;|&nbsp;'
+        f'Run at <b>{run_time}</b></p>'
+        f'{research_html}'
+        f'{executor_params_html}'
+        f'<h3 style="font-size:13px; color:#333; margin-bottom:4px;">{"Predictions" if is_meta else "GBM Predictions"}</h3>'
+        f'{_html_prediction_table(sorted_preds)}'
+        f'{veto_section_html}'
+        f'<p style="font-size:11px; color:#aaa; margin-top:24px;">'
+        f'⚠ VETO = gbm_veto: negative α + bottom-half rank + confidence ≥ regime threshold (the boolean the executor acts on)'
+        + (' &nbsp;|&nbsp; Mom = momentum &nbsp;|&nbsp; Vol = expected move &nbsp;|&nbsp; Res.Cal = research calibrator P(correct)' if is_meta else '')
+        + f'</p>'
         f'<p style="font-size:11px; color:#aaa; margin-top:8px;">'
         f'ⓘ α is <b>log-domain decimal</b> at the 21d horizon (post 2026-05-09 '
         f'canonical-alpha cutover; was 5d arithmetic %). Displayed as % for '
@@ -802,16 +1018,93 @@ def _build_predictor_email(
     )
 
     # ── Plain text ────────────────────────────────────────────────────────────
+    def _plain_prediction_list(preds: list[dict]) -> str:
+        if not preds:
+            return "  (none)\n"
+        _n = len(preds)
+        lines = []
+        for p in preds:
+            cr = p.get("combined_rank")
+            cr_str = f"{cr:.1f}" if cr is not None else "—"
+            is_vetoed = (
+                (p.get("predicted_alpha", 0) or 0) < 0
+                and cr is not None
+                and cr > _n / 2
+            )
+            veto = " [VETO]" if is_vetoed else ""
+            lines.append(
+                f"  {p['ticker']:<6}  α={_alpha_str(p):>7}  Rank {cr_str:<5}"
+                f"  {_conf_pct(p):>4}  {p.get('predicted_direction','—'):<4}"
+                f"  {p.get('watchlist_source', '—')}{_source_tag(p)}{veto}"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _plain_research_row(c: dict) -> str:
+        score = c.get("score")
+        score_str = f"{score:.1f}" if isinstance(score, (int, float)) else "—"
+        flags = ""
+        if c.get("gbm_veto"):
+            flags += " [GBM VETO]"
+        if c.get("ticker") in unscored_tickers:
+            flags += " [NO PRED]"
+        return (
+            f"  {c.get('ticker','?'):<6}  score={score_str:>5}  "
+            f"{c.get('conviction','—'):<10}  {c.get('signal','—'):<8}  "
+            f"{c.get('sector','—')}{flags}\n"
+        )
+
+    # Research plain section
+    research_plain = ""
+    if sd:
+        research_plain = (
+            f"\n{'='*60}\n"
+            f"RESEARCH BRIEF\n"
+            f"{'='*60}\n"
+            f"Market Regime: {market_regime.upper() if market_regime else 'NEUTRAL'}\n"
+        )
+        if buy_candidates:
+            research_plain += f"\nBuy Candidates ({len(buy_candidates)}) — actionable:\n"
+            for c in buy_candidates:
+                if isinstance(c, dict):
+                    research_plain += _plain_research_row(c)
+            if unscored_buys:
+                _names = ", ".join(sorted(t for t in unscored_tickers if t))
+                research_plain += (
+                    f"  ⚠ {len(unscored_buys)} not scored by GBM: {_names}\n"
+                )
+        if population:
+            research_plain += f"\nPopulation ({len(population)}):\n"
+            for c in population:
+                if isinstance(c, dict):
+                    research_plain += _plain_research_row(c)
+        if sector_ratings:
+            research_plain += "\nSector Ratings:\n"
+            for sector, v in sorted_sectors[:8]:
+                rating = v.get("rating", "—")
+                modifier = v.get("modifier", "—")
+                rating_str   = f"{rating:.0f}" if isinstance(rating, (int, float)) else str(rating)
+                modifier_str = f"{modifier:.2f}x" if isinstance(modifier, (int, float)) else str(modifier)
+                research_plain += f"  {sector:<20}  rating={rating_str:>3}  modifier={modifier_str}\n"
+
     plain_body = (
         f"Alpha Engine Brief — {date_str}\n"
-        f"Model: {model_version}  IC(val): {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  "
-        f"Universe: {n_total}  Run: {run_time}\n"
-        f"UP / DOWN: {len(ups)} / {len(downs)}"
-        + (f"  Vetoes: {n_vetoed}" if n_vetoed else "")
-        + (f"  Regime: {market_regime.upper()}" if market_regime else "")
-        + "\n\n"
-        f"{warning_plain}"
-        f"Full morning briefing: {url}\n"
+        f"Model: {model_version}  {ic_label}: {ic_str}  Mode: {metrics.get('inference_mode', 'mse')}  Universe: {n_total}  Run: {run_time}\n"
+        f"{research_plain}"
+        f"{executor_params_plain}"
+        f"\n{'='*60}\n"
+        f"{'PREDICTIONS' if is_meta else 'GBM PREDICTIONS'}\n"
+        f"{'='*60}\n"
+        f"\nPredictions (sorted by combined rank, {len(ups)} UP / {len(downs)} DOWN)\n"
+        f"{_plain_prediction_list(sorted_preds)}"
+    )
+    if vetoes:
+        veto_tickers = ", ".join(p["ticker"] for p in vetoes)
+        plain_body += (
+            f"\nOPTION A VETOES ({n_vetoed}): {veto_tickers}\n"
+            f"(DOWN + conf >= {int(_vt * 100)}% → executor HOLD override)\n"
+        )
+
+    plain_body += (
         "\nNote: α is log-domain decimal at the 21d horizon "
         "(post 2026-05-09 canonical-alpha cutover; was 5d arithmetic %). "
         "Displayed as % for readability — small magnitudes are equivalent, "
@@ -828,19 +1121,17 @@ def send_predictor_email(
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
     bucket: str | None = None,
-    console_base_url: str | None = None,
 ) -> bool:
     """
-    Send the slim predictor morning-briefing link email via Gmail SMTP
-    (primary) or SES (fallback).
+    Send combined morning briefing email via Gmail SMTP (primary) or SES (fallback).
 
-    As of 2026-07-03 (config#856) this is a **slim link email**: a summary
-    (model/IC, UP/DOWN/veto counts, market regime, any unscored-buy-candidate
-    warning) plus a deep-link to the full morning briefing on the console
-    Predictor page. The full per-ticker prediction table, research brief, and
-    effective optimizer params live there now — this function still writes
-    the complete artifact to S3 via ``write_predictions`` (unchanged), only
-    the EMAIL content is slimmed.
+    When signals_data is provided (research pipeline's signals.json payload),
+    the email includes a research section (market regime, buy candidates, sector
+    ratings) followed by the GBM predictions — one complete morning briefing.
+
+    When ``bucket`` is provided, the email also includes an "Effective
+    optimizer params" block sourced from ``config/executor_params.json``
+    (ROADMAP L234 morning-email side). Best-effort.
 
     Reads from environment / config:
         EMAIL_SENDER        — from-address
@@ -865,7 +1156,6 @@ def send_predictor_email(
             predictions, metrics, date_str, signals_data=signals_data,
             veto_threshold=veto_threshold,
             bucket=bucket,
-            console_base_url=console_base_url,
         )
     except Exception as exc:
         log.warning("Failed to build predictor email body: %s", exc)
@@ -887,6 +1177,44 @@ def send_predictor_email(
 
 # ── Stage entry point ────────────────────────────────────────────────────────
 
+# Backtester-owned rolling fields (pipeline_common.push_predictor_rolling_metrics
+# patches these into predictor/metrics/latest.json weekly). The daily inference
+# metrics rebuild must CARRY THEM FORWARD, not reinitialize them — pre-fix it
+# hardcoded hit_rate_30d_rolling=None (and meta-mode ic_30d/ic_ir_30d=None),
+# clobbering the backtester's realized-outcome values every morning. That is
+# why hit_rate_30d_rolling read null for months and the email IC header
+# rendered a dash (config#1815).
+_ROLLING_METRIC_FIELDS = (
+    "hit_rate_30d_rolling",
+    "ic_30d",
+    "ic_ir_30d",
+    "rolling_metrics_updated_at",
+    "rolling_n",
+)
+
+
+def _load_rolling_metrics(bucket: str) -> dict:
+    """Fetch the backtester-owned rolling fields from the existing metrics file.
+
+    Best-effort READ of secondary observability state: a fetch failure must
+    not block the primary predictions write — it is WARN-logged (the recorded
+    surface) and returns {} so the rolling fields render as honest nulls
+    until the next backtester pass repopulates them.
+    """
+    import boto3
+    try:
+        s3 = boto3.client("s3")
+        resp = s3.get_object(Bucket=bucket, Key=cfg.METRICS_KEY)
+        existing = json.loads(resp["Body"].read())
+        return {k: existing.get(k) for k in _ROLLING_METRIC_FIELDS if existing.get(k) is not None}
+    except Exception as exc:  # noqa: BLE001 — see docstring: WARN is the surface
+        log.warning(
+            "Rolling-metrics carry-forward read failed (%s); backtester-owned "
+            "fields will be null until the next weekly rolling push", exc,
+        )
+        return {}
+
+
 def run(ctx: PipelineContext) -> None:
     """Write predictions, metrics, email, and health status."""
 
@@ -904,6 +1232,10 @@ def run(ctx: PipelineContext) -> None:
     else:
         last_trained = ctx.checkpoint.get("epoch", "unknown")
 
+    # Carry forward the backtester-owned rolling fields (config#1815) —
+    # skipped in dry-run to keep local drills hermetic (fields render null).
+    rolling = _load_rolling_metrics(ctx.bucket) if not ctx.dry_run else {}
+
     metrics = {
         "model_version": ctx.model_version,
         "model_type": ctx.model_type,
@@ -911,9 +1243,11 @@ def run(ctx: PipelineContext) -> None:
         "last_trained": last_trained,
         "training_samples": gbm_meta.get("n_train") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
         "val_loss": round(float(ctx.val_loss), 6) if isinstance(ctx.val_loss, (int, float)) else None,
-        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
-        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else None,
-        "hit_rate_30d_rolling": None,
+        "ic_30d": gbm_meta.get("test_ic") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else rolling.get("ic_30d"),
+        "ic_ir_30d": gbm_meta.get("ic_ir") if ctx.model_type == "gbm" and ctx.inference_mode != "meta" else rolling.get("ic_ir_30d"),
+        "hit_rate_30d_rolling": rolling.get("hit_rate_30d_rolling"),
+        "rolling_metrics_updated_at": rolling.get("rolling_metrics_updated_at"),
+        "rolling_n": rolling.get("rolling_n"),
         "price_freshness": {
             "max_age_days": max(ctx.ticker_data_age.values()) if ctx.ticker_data_age else -1,
             "n_stale": sum(1 for d in ctx.ticker_data_age.values() if d > 1),
@@ -1098,13 +1432,14 @@ def run(ctx: PipelineContext) -> None:
 
     # ── Health status ────────────────────────────────────────────────────────
     try:
-        from health_status import write_health
+        from nousergon_lib.health import Deliverable, write_health
         n_up = sum(1 for p in ctx.predictions if p.get("predicted_direction") == "UP")
         n_down = sum(1 for p in ctx.predictions if p.get("predicted_direction") == "DOWN")
         write_health(
-            bucket=ctx.bucket,
             module_name="predictor_inference",
-            status="ok",
+            deliverables=[
+                Deliverable(name="predictions", required=True, produced=True),
+            ],
             run_date=ctx.date_str,
             duration_seconds=ctx.elapsed_seconds(),
             summary={
@@ -1112,13 +1447,14 @@ def run(ctx: PipelineContext) -> None:
                 "n_up": n_up,
                 "n_down": n_down,
             },
+            bucket=ctx.bucket,
         )
     except Exception as _he:
         log.warning("Health status write failed: %s", _he)
 
     # ── Data manifest ────────────────────────────────────────────────────────
     try:
-        from health_status import write_data_manifest
+        from data_manifest import write_data_manifest
         write_data_manifest(
             bucket=ctx.bucket,
             module_name="predictor_inference",
