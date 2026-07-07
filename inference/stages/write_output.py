@@ -637,6 +637,7 @@ def _build_predictor_email(
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
     bucket: str | None = None,
+    console_base_url: str | None = None,
 ) -> tuple[str, str, str]:
     """
     Build subject, HTML body, and plain-text body for the combined morning briefing.
@@ -1121,6 +1122,7 @@ def send_predictor_email(
     signals_data: dict | None = None,
     veto_threshold: float | None = None,
     bucket: str | None = None,
+    console_base_url: str | None = None,
 ) -> bool:
     """
     Send combined morning briefing email via Gmail SMTP (primary) or SES (fallback).
@@ -1156,6 +1158,7 @@ def send_predictor_email(
             predictions, metrics, date_str, signals_data=signals_data,
             veto_threshold=veto_threshold,
             bucket=bucket,
+            console_base_url=console_base_url,
         )
     except Exception as exc:
         log.warning("Failed to build predictor email body: %s", exc)
