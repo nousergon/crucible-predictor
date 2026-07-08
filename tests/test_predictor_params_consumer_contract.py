@@ -29,6 +29,11 @@ DECLARED_READS = {
     "veto_confidence",
     "regime_veto_enabled", "regime_veto_scale", "regime_veto_cap",
     "regime_forced_bear_enabled", "drawdown_regime_enabled",
+    # Per-sector veto threshold shadow soak (config#921, Brian's ruling
+    # 2026-07-07 "proceed with shadow soak"). Default-off; shadow-only —
+    # never touches the live gbm_veto decision. Producer: crucible-backtester
+    # analysis/veto_analysis.py::apply (gated on veto_sector_shadow_enabled).
+    "veto_sector_shadow_enabled", "per_sector_overrides",
 }
 
 
