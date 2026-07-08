@@ -493,6 +493,192 @@ class TestGbmVetoConfidenceFloor:
         )
 
 
+class TestPerSectorVetoShadowSoak:
+    """config#921 shadow soak (Brian's ruling 2026-07-07): attach what the
+    per-sector-threshold veto decision WOULD have been, without ever
+    touching the live ``gbm_veto`` value computed just above this block.
+
+    Sector-per-ticker resolves via ``ctx.signals_data['universe']`` (GICS-
+    style names, canonicalized through
+    ``model.research_features.SECTOR_NAME_CANONICAL``) — NOT
+    ``ctx.sector_map``, which is ticker → sector-ETF-symbol (e.g. "XLE") and
+    cannot key into the backtester's ``per_sector_overrides`` map.
+    """
+
+    def setup_method(self):
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+
+    def _ctx(self, predictions, universe=None):
+        import copy
+        from inference.pipeline import PipelineContext
+        # Deep-copy: predictions/universe are class-level fixtures shared
+        # across tests, and wo.run() mutates prediction dicts in place
+        # (gbm_veto, gbm_veto_shadow_sector, ...) — a shallow copy would leak
+        # keys set by one test into the next test's shared dict instances.
+        ctx = PipelineContext(
+            date_str="2026-07-08",
+            bucket="bucket",
+            dry_run=True,
+            predictions=copy.deepcopy(list(predictions)),
+            signals_data={
+                "buy_candidates": [],
+                "universe": copy.deepcopy(universe or []),
+            },
+            explicit_tickers=[],
+        )
+        return ctx
+
+    _PREDS = [
+        # DOWN, bottom half, high confidence — fires the live gbm_veto at the
+        # global 0.40 threshold used by every test in this class.
+        {"ticker": "XOM", "predicted_alpha": -0.05, "combined_rank": 3,
+         "predicted_direction": "DOWN", "prediction_confidence": 0.90},
+        # DOWN, bottom half, confidence between the sector override (0.85)
+        # and the global threshold (0.40) — live veto still fires (>=0.40),
+        # but the sector-shadow decision differs only when confidence is
+        # BELOW the sector threshold; see the dedicated divergence test.
+        {"ticker": "JPM", "predicted_alpha": -0.03, "combined_rank": 4,
+         "predicted_direction": "DOWN", "prediction_confidence": 0.50},
+    ]
+
+    _UNIVERSE = [
+        {"ticker": "XOM", "sector": "Energy"},
+        {"ticker": "JPM", "sector": "Financials"},  # canonicalizes -> Financial
+    ]
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_flag_off_no_shadow_fields(self, _m1, _m2):
+        """Default (flag unset in predictor_params): no shadow fields
+        attached at all, and live gbm_veto is unaffected."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={"veto_confidence": 0.40},
+        ):
+            ctx = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx)
+        by_ticker = {p["ticker"]: p for p in ctx.predictions}
+        assert "gbm_veto_shadow_sector" not in by_ticker["XOM"]
+        assert "gbm_veto_shadow_sector" not in by_ticker["JPM"]
+        assert by_ticker["XOM"]["gbm_veto"] is True
+        assert by_ticker["JPM"]["gbm_veto"] is True
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_flag_on_no_overrides_no_shadow_fields(self, _m1, _m2):
+        """Flag on but no per_sector_overrides present — no-op, no crash."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={
+                "veto_confidence": 0.40,
+                "veto_sector_shadow_enabled": True,
+            },
+        ):
+            ctx = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx)
+        by_ticker = {p["ticker"]: p for p in ctx.predictions}
+        assert "gbm_veto_shadow_sector" not in by_ticker["XOM"]
+        assert "gbm_veto_shadow_sector" not in by_ticker["JPM"]
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_flag_on_with_override_attaches_shadow_field(self, _m1, _m2):
+        """Flag on + override present for the ticker's (canonicalized)
+        sector: shadow field reflects the sector-threshold decision, and
+        the threshold used is recorded. Live gbm_veto is untouched."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={
+                "veto_confidence": 0.40,
+                "veto_sector_shadow_enabled": True,
+                "per_sector_overrides": {"Energy": 0.60, "Financial": 0.95},
+            },
+        ):
+            ctx = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx)
+        by_ticker = {p["ticker"]: p for p in ctx.predictions}
+        # XOM: Energy sector threshold 0.60, confidence 0.90 >= 0.60 → shadow veto True
+        assert by_ticker["XOM"]["gbm_veto_shadow_sector"] is True
+        assert by_ticker["XOM"]["gbm_veto_shadow_sector_threshold"] == 0.60
+        # JPM: Financials -> Financial threshold 0.95, confidence 0.50 < 0.95
+        # → shadow veto False, DIVERGES from live gbm_veto=True (global 0.40).
+        assert by_ticker["JPM"]["gbm_veto_shadow_sector"] is False
+        assert by_ticker["JPM"]["gbm_veto_shadow_sector_threshold"] == 0.95
+        # Live decision path is byte-identical to the flag-off case.
+        assert by_ticker["XOM"]["gbm_veto"] is True
+        assert by_ticker["JPM"]["gbm_veto"] is True
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_flag_on_ticker_sector_missing_from_overrides_no_shadow_field(self, _m1, _m2):
+        """Ticker's sector has no override entry — no shadow field for that
+        ticker (default no-op), matching the graceful-degrade style of the
+        existing regime/drawdown clamps."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={
+                "veto_confidence": 0.40,
+                "veto_sector_shadow_enabled": True,
+                "per_sector_overrides": {"Healthcare": 0.55},  # neither Energy nor Financial
+            },
+        ):
+            ctx = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx)
+        by_ticker = {p["ticker"]: p for p in ctx.predictions}
+        assert "gbm_veto_shadow_sector" not in by_ticker["XOM"]
+        assert "gbm_veto_shadow_sector" not in by_ticker["JPM"]
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_flag_on_ticker_missing_from_universe_no_shadow_field(self, _m1, _m2):
+        """Ticker absent from signals_data['universe'] (no sector resolvable)
+        — no-op, does not crash even with overrides present."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={
+                "veto_confidence": 0.40,
+                "veto_sector_shadow_enabled": True,
+                "per_sector_overrides": {"Energy": 0.60},
+            },
+        ):
+            ctx = self._ctx(self._PREDS, universe=[])  # empty universe
+            wo.run(ctx)
+        by_ticker = {p["ticker"]: p for p in ctx.predictions}
+        assert "gbm_veto_shadow_sector" not in by_ticker["XOM"]
+        assert "gbm_veto_shadow_sector" not in by_ticker["JPM"]
+        # Live veto still computed normally.
+        assert by_ticker["XOM"]["gbm_veto"] is True
+
+    @patch.object(wo, "get_veto_threshold", return_value=0.40)
+    @patch.object(wo, "_load_gbm_meta", return_value={})
+    def test_shadow_soak_never_alters_live_gbm_veto_value(self, _m1, _m2):
+        """Critical regression guard: run the SAME predictions through with
+        the flag off vs on (with overrides that would flip the decision
+        for JPM) and assert gbm_veto is byte-identical in both runs."""
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={"veto_confidence": 0.40},
+        ):
+            ctx_off = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx_off)
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+        with patch.object(
+            wo, "_load_predictor_params_from_s3",
+            return_value={
+                "veto_confidence": 0.40,
+                "veto_sector_shadow_enabled": True,
+                "per_sector_overrides": {"Energy": 0.60, "Financial": 0.95},
+            },
+        ):
+            ctx_on = self._ctx(self._PREDS, self._UNIVERSE)
+            wo.run(ctx_on)
+        live_off = {p["ticker"]: p["gbm_veto"] for p in ctx_off.predictions}
+        live_on = {p["ticker"]: p["gbm_veto"] for p in ctx_on.predictions}
+        assert live_off == live_on == {"XOM": True, "JPM": True}
+
+
 class TestReadExistingPredictions:
     """_read_existing_predictions — S3 read with clean 404 handling."""
 
