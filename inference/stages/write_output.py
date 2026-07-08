@@ -1377,6 +1377,46 @@ def run(ctx: PipelineContext) -> None:
             and confidence >= veto_thresh
         )
 
+    # ── Per-sector veto threshold shadow soak (config#921) ───────────────────
+    # Brian's ruling (2026-07-07, config#921): "proceed with shadow soak" —
+    # log/attach what the per-sector-threshold decision WOULD have been
+    # WITHOUT changing the live gbm_veto decision above. Default OFF
+    # (``veto_sector_shadow_enabled``, read from the same predictor_params.json
+    # ``get_veto_threshold`` already reads). Sector-per-ticker is NOT
+    # ``ctx.sector_map`` (that dict is ticker → sector-ETF-symbol, e.g. "XLE",
+    # used only as a benchmark lookup — see training/meta_trainer.py /
+    # analysis/variant_cutover_gate.py). The GICS-style sector name matching
+    # the backtester's ``per_sector_thresholds`` overrides keys instead comes
+    # from research's ``signals.json`` universe entries, canonicalized via
+    # ``model.research_features.SECTOR_NAME_CANONICAL`` (the same lookup
+    # ``extract_research_features`` uses for ``sector_macro_modifier``).
+    params = _load_predictor_params_from_s3(ctx.bucket) or {}
+    if bool(params.get("veto_sector_shadow_enabled", False)):
+        overrides = params.get("per_sector_overrides") or {}
+        if overrides:
+            from model.research_features import SECTOR_NAME_CANONICAL
+            sd_universe = (ctx.signals_data or {}).get("universe", []) or []
+            ticker_sector = {
+                u.get("ticker"): SECTOR_NAME_CANONICAL.get(u.get("sector", ""), u.get("sector", ""))
+                for u in sd_universe
+                if isinstance(u, dict) and u.get("ticker")
+            }
+            for p in ctx.predictions:
+                sector = ticker_sector.get(p.get("ticker"))
+                sector_thresh = overrides.get(sector) if sector else None
+                if sector_thresh is None:
+                    continue
+                cr = p.get("combined_rank")
+                alpha = p.get("predicted_alpha", 0) or 0
+                confidence = p.get("prediction_confidence", 0) or 0
+                p["gbm_veto_shadow_sector"] = bool(
+                    alpha < 0
+                    and cr is not None
+                    and cr > n_preds / 2
+                    and confidence >= sector_thresh
+                )
+                p["gbm_veto_shadow_sector_threshold"] = sector_thresh
+
     # ── Write predictions ────────────────────────────────────────────────────
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
                       dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd,
