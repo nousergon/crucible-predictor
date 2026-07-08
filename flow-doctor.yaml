@@ -11,6 +11,26 @@ notify:
   - type: s3
     bucket: alpha-engine-research
     subsystem: predictor
+  # Telegram forum-topic routing (config#1741 / config#645). Producer subset —
+  # CRITICAL + OPS_HEALTH forum topics, mirroring crucible-research /
+  # crucible-backtester flow-doctor.yaml. Canonical topic specs live in
+  # nousergon_lib.flow_doctor_fleet (_FLEET_TELEGRAM_TOPIC_SPECS). Thread IDs
+  # resolve from env (seeded from SSM /alpha-engine/ in prod).
+  - type: telegram
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    message_thread_id: ${FLOW_DOCTOR_TELEGRAM_THREAD_CRITICAL}
+    parse_mode: Markdown
+    disable_notification: false
+    notify_on: [critical]
+  - type: telegram
+    bot_token: ${TELEGRAM_BOT_TOKEN}
+    chat_id: ${TELEGRAM_CHAT_ID}
+    message_thread_id: ${FLOW_DOCTOR_TELEGRAM_THREAD_OPS_HEALTH}
+    parse_mode: Markdown
+    disable_notification: false
+    notify_on: [error, warning]
+    notify_on_category: [TRANSIENT, EXTERNAL, INFRA]
 store:
   type: sqlite
   path: /tmp/flow_doctor.db
