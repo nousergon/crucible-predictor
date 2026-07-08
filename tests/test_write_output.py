@@ -870,11 +870,16 @@ class TestSlimPredictorEmail:
 
     def test_veto_count_in_subject_and_summary(self):
         metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        # Veto count is single-sourced from the authoritative gbm_veto boolean
+        # (config#1815) — the only veto the executor acts on — not a display
+        # heuristic. Ticker A is the vetoed name.
         preds = [
             {"ticker": "A", "predicted_alpha": -0.01, "combined_rank": 2,
-             "predicted_direction": "DOWN", "prediction_confidence": 0.8},
+             "predicted_direction": "DOWN", "prediction_confidence": 0.8,
+             "gbm_veto": True},
             {"ticker": "B", "predicted_alpha": 0.01, "combined_rank": 1,
-             "predicted_direction": "UP", "prediction_confidence": 0.6},
+             "predicted_direction": "UP", "prediction_confidence": 0.6,
+             "gbm_veto": False},
         ]
         subject, html, _plain = wo._build_predictor_email(
             preds, metrics, "2026-07-03", veto_threshold=0.6,
