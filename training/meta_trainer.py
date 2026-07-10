@@ -2866,6 +2866,28 @@ def run_meta_training(
         log.warning("W4 per-L1 LOO read failed (OBSERVE, non-fatal): %s", _e)
         meta_oos_ic_leakfree_per_l1_dropout = {"status": "error", "error": str(_e)}
 
+    # (W4.2, config#1994) dead-L1 pruning monitor — OBSERVE-ONLY. Fuses the W4
+    # LOMO leak-free ΔIC (above) with the fitted meta-Ridge's scale-free
+    # standardized coefficient magnitude into a per-L1 dead-CANDIDATE flag, so
+    # per-L1 marginal contribution surfaces on the report card every weekly run.
+    # This is a pure DIAGNOSTIC: it NEVER de-weights/drops/deletes an L1; serving
+    # L2 is untouched. Retirement (reversible de-weight in a shadow lane) is a
+    # separate later step gated on persistence across ≥N weekly cohorts + Shapley
+    # ≤ 0 surviving CSCV/PBO (config#624) — this run contributes ONE cohort.
+    # Ratified observe-only 2026-07-10 (Decision Queue, config#1926).
+    dead_l1_observe: dict = {"status": "not_run"}
+    try:
+        from training.dead_l1_monitor import summarize_dead_l1 as _dead_l1
+
+        dead_l1_observe = _dead_l1(
+            meta_oos_ic_leakfree_per_l1_dropout,
+            meta_model._importance,
+            meta_model._coefficients,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4.2 dead-L1 monitor failed (OBSERVE, non-fatal): %s", _e)
+        dead_l1_observe = {"status": "error", "error": str(_e)}
+
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
     # linear curve_leakfree (W3.2)? Reuses leakfree_horizon_ic_curve with the
@@ -4663,6 +4685,12 @@ def run_meta_training(
         # IC — per-feature ΔIC vs the full read is the W4.2 pruning input
         # (which L1s carry leak-free IC). Additive per S3 contract.
         "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+        # W4.2 (config#1994, OBSERVE): dead-L1 pruning monitor — fuses the W4
+        # LOMO ΔIC above with the meta-Ridge standardized coefficient magnitude
+        # into per-L1 dead-CANDIDATE flags. Pure diagnostic: no de-weight/delete,
+        # serving L2 untouched; retirement is a later persistence-gated step
+        # (≥N weekly cohorts + Shapley ≤ 0, config#624). Additive per S3 contract.
+        "dead_l1_observe": dead_l1_observe,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
