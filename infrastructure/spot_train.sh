@@ -567,8 +567,8 @@ log.info('       OK — env vars present, S3 bucket reachable')
 #    NO parquet writes, NO training array build. Mirrors the connectivity
 #    the real run depends on without doing any work.
 log.info('[3/3] ArcticDB connectivity + universe-freshness probe...')
-from store.arctic_reader import _get_arctic
-arctic = _get_arctic(bucket)
+from nousergon_lib.arcticdb import open_arctic
+arctic = open_arctic(bucket)
 universe = arctic.get_library('universe')
 symbols = universe.list_symbols()
 n = len(symbols)
