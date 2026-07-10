@@ -142,10 +142,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     so the autocorrelation contribution is visible.
 
     Strategy: walk the sorted unique dates ascending; greedily keep a date
-    if it's at least ``horizon_trading_days`` calendar days past the most
-    recently kept date. Calendar-day spacing is a good proxy for trading-day
-    spacing at these horizons (5/10/15/21/40/60/90) and avoids needing the
-    NYSE calendar in this hot path. Returns a mask aligned to ``dates``.
+    if it's at least ``horizon_trading_days`` **trading sessions** past the
+    most recently kept date, measured on the NYSE calendar via
+    ``krepis.trading_calendar.count_trading_days``. Trading-day-exact spacing
+    is required here — a calendar-day proxy is NOT acceptable — because the
+    forward-return label these windows must not overlap is itself
+    trading-day-exact (``forward_return_{h}d = close.shift(-h)/close - 1`` is a
+    row-shift on a trading-day-only-indexed series). A calendar-day proxy
+    under-spaces samples at longer horizons (126 calendar days ≈ 90 trading
+    days), letting residual autocorrelation back into exactly the diagnostic
+    built to eliminate it — and it does so worst at the longest horizons,
+    i.e. worst on the 63d/126d points this battery was widened to test
+    (config#937 Step 0 / config#1993 long legs). Returns a mask aligned to
+    ``dates``.
 
     The greedy "keep-if-far-enough" pattern minimizes overlap pessimistically:
     dates dropped because their forward window overlapped with a kept date's
@@ -154,7 +163,12 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     """
     if not dates:
         return []
-    # Convert to pandas Timestamps for comparable arithmetic without losing
+    # Trading-day-exact spacing on the NYSE calendar (config#937 Step 0).
+    # krepis is already a direct fleet dependency; import locally to keep the
+    # calendar off the module-import hot path (mirrors the pandas import below).
+    from krepis.trading_calendar import count_trading_days
+
+    # Convert to pandas Timestamps for stable sorting without losing
     # precision. The training code stores dates as pd.Timestamp objects on
     # rows (per the row construction in Step 6); accept any sortable type.
     import pandas as pd
@@ -163,10 +177,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     sort_order = sorted(range(len(dates_ts)), key=lambda i: dates_ts[i])
     mask = [False] * len(dates_ts)
     last_kept_ts: pd.Timestamp | None = None
-    horizon_delta = pd.Timedelta(days=horizon_trading_days)
     for i in sort_order:
         ts = dates_ts[i]
-        if last_kept_ts is None or (ts - last_kept_ts) >= horizon_delta:
+        # Keep the first date unconditionally; thereafter keep only once at
+        # least ``horizon_trading_days`` NYSE sessions have elapsed since the
+        # last kept date. ``count_trading_days(a, b)`` counts sessions in the
+        # half-open interval [a, b), so an exact-horizon gap (b sitting exactly
+        # h sessions after a) yields h and is kept — matching the prior
+        # boundary-inclusive semantics, now on the trading-day axis.
+        if (
+            last_kept_ts is None
+            or count_trading_days(last_kept_ts.date(), ts.date())
+            >= horizon_trading_days
+        ):
             mask[i] = True
             last_kept_ts = ts
     return mask
