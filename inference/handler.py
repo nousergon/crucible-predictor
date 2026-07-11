@@ -317,6 +317,19 @@ def handler(event: dict, context) -> dict:
         explicit_tickers=explicit_tickers,
     )
     log.info("Predictor Lambda completed successfully")
+
+    # ── Flow-doctor end-of-run heartbeat (config#646) ───────────────────────
+    # Write the flow's end-of-run status() snapshot to the research bucket so
+    # the dashboard System Health consumer can read it from
+    # s3://alpha-engine-research/_flow_doctor/heartbeat/predictor/{date}.json.
+    # `bucket` resolves to alpha-engine-research (S3_BUCKET default set above).
+    # emit_heartbeat soft-fails (returns None, never raises), so the run's
+    # success is unaffected by a heartbeat write miss.
+    from krepis.logging import get_flow_doctor
+    fd = get_flow_doctor()
+    if fd:
+        fd.emit_heartbeat(bucket=bucket)
+
     return {
         "statusCode": 200,
         "body": (
