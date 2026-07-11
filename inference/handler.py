@@ -325,9 +325,13 @@ def handler(event: dict, context) -> dict:
     # `bucket` resolves to alpha-engine-research (S3_BUCKET default set above).
     # emit_heartbeat soft-fails (returns None, never raises), so the run's
     # success is unaffected by a heartbeat write miss.
+    # Guard on the method's presence too: the producing repos deploy
+    # independently and emit_heartbeat only exists in flow-doctor >=0.6.2, so a
+    # version-skewed lib pin would AttributeError at end-of-run without the
+    # hasattr check (mirrors flow-doctor's own soft-fail philosophy).
     from krepis.logging import get_flow_doctor
     fd = get_flow_doctor()
-    if fd:
+    if fd and hasattr(fd, "emit_heartbeat"):
         fd.emit_heartbeat(bucket=bucket)
 
     return {
