@@ -4,7 +4,14 @@ Before the fix, the v2 walk-forward fold table used ``f["n_train"]:,`` /
 ``f["ic"]`` direct-subscript, so a fold dict lacking ``n_train`` (or ``ic`` /
 ``fold`` / ``test_start`` / ``test_end``) raised KeyError and crashed the WHOLE
 training email — the 2nd of the two botched model-zoo rotations. send_training_email
-must now build successfully on a malformed fold (default-read every field).
+must build successfully on a malformed fold.
+
+config#856 slimmed the training email: the per-fold walk-forward TABLE (the
+original KeyError landmine) moved to the console Predictor Training page; the
+email now renders only a one-line walk-forward verdict (median IC + PASS/FAIL +
+fold COUNT), which never subscripts fold fields. So the crash vector is gone by
+construction — this test now pins that the slim email still builds cleanly on a
+malformed fold and surfaces the one-line verdict + the console deep-link.
 """
 from __future__ import annotations
 
@@ -50,7 +57,7 @@ def test_send_training_email_survives_fold_without_n_train(monkeypatch):
         return True
 
     # Stub the SMTP/SES chokepoint so no real email fires; the point is that
-    # building the body (which dereferences each fold) does not raise.
+    # building the slim body does not raise on the malformed fold.
     import krepis.email_sender as es
     import config as cfg
     monkeypatch.setattr(es, "send_email", _fake_send)
@@ -59,6 +66,11 @@ def test_send_training_email_survives_fold_without_n_train(monkeypatch):
 
     ok = th.send_training_email(_result_with_fold_missing_n_train(), "2026-06-13")
     assert ok is True
-    # The malformed fold rendered with defaults rather than raising.
-    assert "train=0" in captured["plain"]        # n_train defaulted to 0
     assert captured["html"] is not None
+    # The slim email renders the one-line walk-forward verdict (median IC +
+    # PASS/FAIL + fold COUNT) without subscripting any per-fold field — so the
+    # malformed second fold can't crash it. The full per-fold table now lives on
+    # the console Predictor Training page (config#856).
+    assert "Walk-forward" in captured["plain"]
+    assert "2 folds" in captured["plain"]          # fold COUNT, never fold fields
+    assert "predictor-training?date=2026-06-13" in captured["plain"]  # deep-link

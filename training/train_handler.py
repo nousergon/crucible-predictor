@@ -63,6 +63,17 @@ from pathlib import Path
 from typing import Optional
 
 from krepis.secrets import get_secret
+from krepis.console import console_url as build_console_url
+
+# Deep-link target for the slimmed training email → console Predictor Training
+# page (config#856). The slug is pinned in crucible-dashboard app.py
+# (url_path="predictor-training") and guarded by
+# tests/test_predictor_training_page.py; the page honors ?date=YYYY-MM-DD, keyed
+# by this cycle's date_str, so the email link lands on the exact training cycle
+# it summarizes. The base URL is built by the krepis.console.console_url
+# chokepoint (config#1300); only the slug (the cross-repo contract with the
+# dashboard url_path) stays local. Mirrors model_zoo.py's MODEL_ZOO_SLUG.
+TRAINING_PAGE_SLUG = "predictor-training"
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
 # pattern across all 5 entrypoints; see executor/main.py for reference).
@@ -200,171 +211,6 @@ def _build_shadow_calibration_html(sm: dict | None) -> str:
     )
 
 
-def _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
-                         promo_color, promo_label, val_ic, mse_ic, test_ic,
-                         rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos):
-    """Build the IC metrics table HTML for the training email."""
-    _bg_style = ' style="background:#f9f9f9;"'
-    _row = lambda label, value, bg=False: (
-        f'<tr{_bg_style if bg else ""}>'
-        f'<td style="padding:5px 10px; color:#555; width:160px;">{label}</td>'
-        f'<td style="padding:5px 10px; font-family:monospace; font-weight:bold;">{value}</td></tr>'
-    )
-
-    rows = '<table style="border-collapse:collapse; width:100%; margin-bottom:12px;">'
-
-    if is_meta:
-        # ── Headline ICs are OOS (held-out) per 2026-05-13 email facelift ──
-        # Pre-facelift the email led with the L2 Ridge's IN-SAMPLE Pearson
-        # (e.g. 0.4634) — `np.corrcoef(model.predict(X), y)` over the same
-        # pooled-OOF rows the Ridge just fit on. PR #133 added the honest
-        # OOS field; this rewrite makes it the headline. The in-sample
-        # value rides underneath as a secondary line for context.
-        #
-        # Meta-Model OOS IC sources:
-        #   1. meta_model_oos_ic (top-level, populated PR #133 onward)
-        #   2. horizon_diagnostic.curve.21d.spearman (fallback)
-        #   3. None — no OOS measurement, fall back to in-sample with a
-        #      "(in-sample — no OOS reference)" caveat.
-        hd = result.get("horizon_diagnostic") or {}
-        curve = hd.get("curve") or {}
-        h21 = curve.get("21d") or {}
-        meta_oos_ic = result.get("meta_model_oos_ic")
-        if meta_oos_ic is None:
-            meta_oos_ic = h21.get("spearman")
-        meta_in_sample = result.get("meta_model_in_sample_ic") or result.get(
-            "meta_model_ic", test_ic
-        )
-        meta_oos_ci_lo = h21.get("spearman_ci_lo")
-        meta_oos_ci_hi = h21.get("spearman_ci_hi")
-
-        if meta_oos_ic is not None:
-            ci_str = (
-                f' [95% CI {meta_oos_ci_lo:+.4f}, {meta_oos_ci_hi:+.4f}]'
-                if meta_oos_ci_lo is not None and meta_oos_ci_hi is not None
-                else ""
-            )
-            rows += _row("Meta-Model OOS IC (Spearman 21d)",
-                         f'{meta_oos_ic:+.4f}{ci_str}', bg=True)
-            rows += _row("Meta-Model in-sample IC (reference)",
-                         f'{meta_in_sample:+.4f}')
-        else:
-            rows += _row("Meta-Model IC (in-sample — no OOS reference)",
-                         f'{meta_in_sample:+.4f}', bg=True)
-
-        # Volatility OOS IC: walk-forward median across 16 held-out folds
-        # is the honest OOS measurement. Falls back to held-out test_ic
-        # if walk_forward isn't populated (legacy summaries).
-        wf = result.get("walk_forward") or {}
-        vol_oos_median = wf.get("volatility_median_ic")
-        if vol_oos_median is not None:
-            rows += _row("Volatility OOS IC (WF median, 16 folds)",
-                         f'{vol_oos_median:+.4f}', bg=False)
-        else:
-            vol_ic = result.get("volatility_test_ic", 0)
-            rows += _row("Volatility IC (held-out)", f'{vol_ic:+.4f}', bg=False)
-
-        # Research GBM OOS IC — exposed at top level per the 2026-05-13
-        # email facelift. ResearchGBMScorer is the canonical source for
-        # research_calibrator_prob META_FEATURE (Phase 3 PR 4/5 cutover
-        # 2026-05-09). val_ic is the held-out 20%-OOS measurement; the
-        # train_ic appears parenthetically so a widening train/val gap
-        # (~2× ratio is the typical overfitting signal) surfaces inline.
-        res_val = result.get("research_gbm_val_ic")
-        res_train = result.get("research_gbm_train_ic")
-        res_n = result.get("research_calibrator_n", 0)
-        if res_val is not None:
-            train_suffix = (
-                f' (train_ic {res_train:+.4f})'
-                if res_train is not None else ""
-            )
-            rows += _row("Research OOS IC (GBM val, held-out 20%)",
-                         f'{res_val:+.4f}{train_suffix}', bg=True)
-        else:
-            # Bucket-lookup fallback (no GBM fit this cycle). Surface the
-            # calibrator hit-rate instead of an IC.
-            res_metrics = result.get("research_calibrator_metrics") or {}
-            res_hr = res_metrics.get("overall_hit_rate")
-            if res_hr is not None:
-                rows += _row("Research signal (bucket lookup)",
-                             f'hit_rate={res_hr:.4f} (n={res_n})', bg=True)
-
-        # Momentum L1 is the deterministic weighted-blend baseline — there's
-        # no GBM fit IC. The WF median IC is observability-only post the
-        # 2026-05-13 gate change (per IC study, momentum standalone IC at
-        # 21d ≈ 0 but contributes Ridge-stack interaction value). Surface
-        # it dimmed so operators can spot regression without it being read
-        # as a headline.
-        mom_wf = wf.get("momentum_median_ic")
-        if mom_wf is not None:
-            rows += _row("Momentum WF median IC (observability)",
-                         f'<span style="color:#888;">{mom_wf:+.4f} '
-                         f'(deterministic baseline; not gating)</span>',
-                         bg=False)
-        # Regime classifier removed from the critical path 2026-04-16 (Tier 0
-        # model retired; raw macro features now feed the ridge directly).
-        # Tier 1 regime model will re-introduce regime rows here when it
-        # ships, with metrics tied to a named baseline.
-        coefs = result.get("meta_coefficients", {})
-        if coefs:
-            coef_str = " | ".join(
-                f'{k}={v:+.3f}' for k, v in sorted(coefs.items(), key=lambda x: -abs(x[1]))
-                if k != "intercept" and abs(v) > 0.0001
-            )
-            rows += _row("Meta Coefficients", coef_str, bg=True)
-        # Feature importance (Phase 4): show standardized coefficients +
-        # permutation IC drop side-by-side. Standardized reveals which features
-        # drive predictions independent of raw scale; permutation cross-checks
-        # against ridge's linearity assumption. Together they inform the
-        # classifier-output-vs-raw-macro pruning decision.
-        importance = result.get("meta_importance", {})
-        std_coef = importance.get("standardized_coef", {}) if importance else {}
-        perm = importance.get("permutation", {}) if importance else {}
-        if std_coef:
-            top = sorted(std_coef.items(), key=lambda x: -abs(x[1]))[:8]
-            imp_rows = "".join(
-                f'<tr><td style="padding:2px 8px; font-family:monospace; color:#555;">{name}</td>'
-                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{std:+.3f}</td>'
-                f'<td style="padding:2px 8px; font-family:monospace; text-align:right;">{perm.get(name, 0):+.4f}</td></tr>'
-                for name, std in top
-            )
-            imp_html = (
-                '<table style="border-collapse:collapse; font-size:11px; margin-top:4px;">'
-                '<tr style="color:#555;">'
-                '<th style="padding:2px 8px; text-align:left;">feature</th>'
-                '<th style="padding:2px 8px; text-align:right;">std_coef</th>'
-                '<th style="padding:2px 8px; text-align:right;">perm_ic_drop</th>'
-                '</tr>'
-                f'{imp_rows}</table>'
-            )
-            rows += (
-                '<tr>'
-                '<td style="padding:5px 10px; color:#555; vertical-align:top;">Feature Importance</td>'
-                f'<td style="padding:5px 10px;">{imp_html}</td>'
-                '</tr>'
-            )
-    else:
-        rows += _row("Val IC", f'{val_ic:.4f}', bg=True)
-        rows += _row("MSE Model IC",
-                      f'{mse_ic:.4f}{f" — {ic_label}" if promoted_mode == "mse" else ""}')
-        if ensemble_on and rank_ic is not None:
-            rows += _row("Lambdarank IC",
-                          f'{rank_ic:.4f}{f" — {ic_label}" if promoted_mode == "rank" else ""}', bg=True)
-            rows += _row("Ensemble IC",
-                          f'{ensemble_ic:.4f}{f" — {ic_label}" if promoted_mode == "ensemble" else ""}')
-        else:
-            rows += _row("Test IC", f'<span style="color:{ic_color};">{test_ic:.4f} — {ic_label}</span>')
-        rows += _row("IC IR", f'{ic_ir:.3f} ({ic_pos}/20 positive)', bg=True)
-
-    rows += (
-        f'<tr style="background:#f9f9f9;">'
-        f'<td style="padding:5px 10px; color:#555; font-weight:bold;">Promotion</td>'
-        f'<td style="padding:5px 10px; font-weight:bold; color:{promo_color};">{promo_label}</td></tr>'
-    )
-    rows += '</table>'
-    return rows
-
-
 def send_training_email(result: dict, date_str: str) -> bool:
     """
     Send GBM training summary email via Gmail SMTP (primary) or SES (fallback).
@@ -397,15 +243,12 @@ def send_training_email(result: dict, date_str: str) -> bool:
     test_ic      = result.get("test_ic", 0.0)
     mse_ic       = result.get("mse_ic", test_ic)
     rank_ic      = result.get("rank_ic")
-    ensemble_ic  = result.get("ensemble_ic")
-    ensemble_on  = result.get("ensemble_enabled", False)
     ic_ir        = result.get("ic_ir", 0.0)
     version      = result.get("model_version", "unknown")
     is_meta      = "meta" in str(version).lower()
     elapsed_s    = result.get("elapsed_s", 0)
     n_train      = result.get("n_train", 0)
     ic_pos       = result.get("ic_positive_20", 0)
-    top10        = result.get("feature_importance_top10", [])
 
     ic_color    = "#2e7d32" if passes_ic else "#c62828"
     ic_label    = "PASS ✓" if passes_ic else "FAIL ✗"
@@ -483,14 +326,6 @@ def send_training_email(result: dict, date_str: str) -> bool:
     )
     status_str  = "PASS" if passes_ic else "FAIL"
 
-    # CatBoost metrics for email
-    cat_enabled  = result.get("catboost_enabled", False)
-    cat_ic_val   = result.get("catboost_ic")
-    blend_ic_val = result.get("lgb_cat_blend_ic")
-    blend_wts    = result.get("blend_weights")
-    cal_metrics  = result.get("calibration")
-    mh_data      = result.get("multi_horizon")
-
     # Subject IC: prefer OOS Spearman over in-sample Ridge fit. PR #133's
     # meta_model_oos_ic field is the honest measurement; fall back to the
     # horizon_diagnostic curve at the active forward horizon, then to
@@ -519,413 +354,95 @@ def send_training_email(result: dict, date_str: str) -> bool:
         f"{_subj_promo}"
     )
 
-    # Feature importance bar chart (top 5)
-    max_gain  = max((r["gain"] for r in top10), default=1)
-    feat_rows = "".join(
-        f'<tr>'
-        f'<td style="padding:2px 8px; font-family:monospace; font-size:12px;">{r["feature"]}</td>'
-        f'<td style="padding:2px 8px; width:130px;">'
-        f'<div style="background:#1976d2; height:10px; width:{int(r["gain"]/max_gain*100)}%;"></div>'
-        f'</td>'
-        f'<td style="padding:2px 8px; font-family:monospace; font-size:12px;">{r["gain"]:.1f}</td>'
-        f'</tr>'
-        for r in top10[:5]
+    # ── Slim body (config#856: pull-for-state, push-on-transition) ──────────
+    # The per-step content email is replaced by the console Predictor Training
+    # page: the full detail (walk-forward folds, feature-importance bars, gain-
+    # vs-SHAP comparison, feature health, calibration + multi-horizon tables) now
+    # lives on …/predictor-training?date=YYYY-MM-DD, rendered from the SAME
+    # training_summary_{date}.json this run already writes (via
+    # _write_training_summary — untouched, no data loss). The email keeps only
+    # the operator-actionable headline: model + IC-gate verdict + promotion
+    # status + the shadow-calibrator readiness row, plus any data warnings and
+    # the deep-link.
+    console_link = build_console_url(TRAINING_PAGE_SLUG, date=date_str or None)
+
+    # One-line walk-forward verdict (the full fold table is on the console page).
+    # Fail-soft: only touches median + fold count, so a malformed fold (a fold
+    # dict missing n_train / ic — config#1083) can never crash the email.
+    wf_data = result.get("walk_forward") or {}
+    if wf_data.get("folds"):
+        _wf_median = (
+            wf_data.get("volatility_median_ic") if is_meta
+            else (wf_data.get("median_ic") or wf_data.get("momentum_median_ic"))
+        )
+        _wf_pass = wf_data.get("passes_wf")
+        _wf_median_txt = (
+            f"{_wf_median:+.4f}" if isinstance(_wf_median, (int, float)) else "n/a"
+        )
+        wf_line = (
+            f"Walk-forward ({'volatility ' if is_meta else ''}median IC "
+            f"{_wf_median_txt}): {'PASS' if _wf_pass else 'FAIL'} "
+            f"({len(wf_data['folds'])} folds)"
+        )
+    else:
+        wf_line = "Walk-forward: no folds recorded"
+
+    # Data warnings — feature-noise candidates are operator-actionable, so they
+    # stay inline; the per-feature IC table itself is on the console page.
+    noise_cands = result.get("noise_candidates") or []
+    warn_line = (
+        f"Noise candidates ({len(noise_cands)}): {', '.join(noise_cands)}"
+        if noise_cands else ""
     )
 
-    # Walk-forward section for email
-    wf_data = result.get("walk_forward")
-    wf_html = ""
-    wf_plain = ""
-    is_meta = "meta" in str(result.get("model_version", "")).lower()
-    if wf_data and wf_data.get("folds"):
-        # Meta-model uses per-model median ICs; v2.0 uses single median_ic
-        wf_median = wf_data.get("median_ic") or wf_data.get("momentum_median_ic", 0.0)
-        wf_pct = wf_data.get("pct_positive", 0.0)
-        wf_pass = wf_data.get("passes_wf", False)
-        wf_color = "#2e7d32" if wf_pass else "#c62828"
-        wf_label = "PASS ✓" if wf_pass else "FAIL ✗"
-
-        if is_meta:
-            mom_median = wf_data.get("momentum_median_ic", "n/a")
-            vol_median = wf_data.get("volatility_median_ic", "n/a")
-            fold_rows = "".join(
-                f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["fold"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_start"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f["test_end"]}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
-                f'color:{"#2e7d32" if f.get("mom_ic", 0) > 0 else "#c62828"};">{f.get("mom_ic", 0):.4f}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
-                f'color:#2e7d32;">{f.get("vol_ic", 0):.4f}</td>'
-                f'</tr>'
-                for i, f in enumerate(wf_data["folds"])
-            )
-            # Walk-forward header — vol gate result + momentum observability.
-            # Per the 2026-05-13 gate change, only vol gates promotion;
-            # momentum WF median is informational (the L1 stays in the
-            # Ridge for interaction value but is not gated).
-            mom_fmt = (
-                f'{mom_median:+.4f}'
-                if isinstance(mom_median, (int, float)) else str(mom_median)
-            )
-            vol_fmt = (
-                f'{vol_median:+.4f}'
-                if isinstance(vol_median, (int, float)) else str(vol_median)
-            )
-            wf_html = (
-                f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
-                f'({len(wf_data["folds"])} folds)</h3>'
-                f'<p style="font-size:12px; margin:2px 0;">'
-                f'Volatility median IC: <b>{vol_fmt}</b> '
-                f'&nbsp;|&nbsp; Status: <b style="color:{wf_color};">{wf_label}</b>'
-                f'<br><span style="color:#888;">Momentum median IC (observability, '
-                f'not gating): {mom_fmt}</span></p>'
-                f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
-                f'<tr style="background:#e0e0e0;">'
-                f'<th style="padding:3px 6px;">Fold</th>'
-                f'<th style="padding:3px 6px;">Test Start</th>'
-                f'<th style="padding:3px 6px;">Test End</th>'
-                f'<th style="padding:3px 6px;">Mom IC</th>'
-                f'<th style="padding:3px 6px;">Vol IC</th></tr>'
-                f'{fold_rows}</table>'
-            )
-            wf_plain = (
-                f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
-                f"\nVolatility median IC: {vol_fmt}  |  Status: {wf_label}"
-                f"\nMomentum median IC (observability, not gating): {mom_fmt}\n"
-                + "\n".join(
-                    f"  Fold {f['fold']}: [{f['test_start']} → {f['test_end']}] "
-                    f"mom={f.get('mom_ic', 0):+.4f}  vol={f.get('vol_ic', 0):+.4f}"
-                    for f in wf_data["folds"]
-                ) + "\n"
-            )
-        else:
-            # config#1083 n_train landmine fix: a fold dict can lack n_train / ic
-            # (e.g. a fold that errored or a CPCV-only summary). f["n_train"]:,
-            # KeyError'd and crashed the WHOLE training email — the 2nd of the two
-            # botched rotations. Default-read every fold field so the email never
-            # crashes on a malformed fold (fail-soft on the OBSERVABILITY email; the
-            # training result itself already persisted to S3).
-            fold_rows = "".join(
-                f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("fold", "?")}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("test_start", "?")}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("test_end", "?")}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px;">{f.get("n_train", 0):,}</td>'
-                f'<td style="padding:2px 6px; font-family:monospace; font-size:11px; '
-                f'color:{"#2e7d32" if f.get("ic", 0) > 0 else "#c62828"};">{f.get("ic", 0):.4f}</td>'
-                f'</tr>'
-                for i, f in enumerate(wf_data["folds"])
-            )
-            wf_html = (
-                f'<h3 style="margin-top:16px; margin-bottom:4px;">Walk-Forward Validation '
-                f'({len(wf_data["folds"])} folds)</h3>'
-                f'<p style="font-size:12px; margin:2px 0;">Median IC: <b style="color:{wf_color};">'
-                f'{wf_median:.4f}</b> — {wf_label} &nbsp;|&nbsp; '
-                f'Positive folds: <b>{wf_pct*100:.0f}%</b></p>'
-                f'<table style="border-collapse:collapse; width:100%; font-size:11px;">'
-                f'<tr style="background:#e0e0e0;">'
-                f'<th style="padding:3px 6px;">Fold</th>'
-                f'<th style="padding:3px 6px;">Test Start</th>'
-                f'<th style="padding:3px 6px;">Test End</th>'
-                f'<th style="padding:3px 6px;">Train N</th>'
-                f'<th style="padding:3px 6px;">IC</th></tr>'
-                f'{fold_rows}</table>'
-            )
-            wf_plain = (
-                f"\n--- Walk-Forward ({len(wf_data['folds'])} folds) ---"
-                f"\nMedian IC: {wf_median:.4f} — {wf_label}"
-                f"\nPositive folds: {wf_pct*100:.0f}%\n"
-                + "\n".join(
-                    f"  Fold {f.get('fold', '?')}: [{f.get('test_start', '?')} → {f.get('test_end', '?')}] "
-                    f"train={f.get('n_train', 0):,}  IC={f.get('ic', 0):.4f}"
-                    for f in wf_data["folds"]
-                ) + "\n"
-            )
-
-    # ── SHAP vs Gain comparison section ──────────────────────────────────────
-    shap_top10    = result.get("feature_importance_shap_top10", [])
-    shap_stability = result.get("shap_rank_stability")
-
-    shap_html = ""
-    shap_plain = ""
-    if shap_top10 and top10:
-        # Build rank lookup: feature → rank (1-based)
-        gain_rank = {r["feature"]: i + 1 for i, r in enumerate(top10)}
-        shap_rank = {r["feature"]: i + 1 for i, r in enumerate(shap_top10)}
-        all_features = list(dict.fromkeys(
-            [r["feature"] for r in top10] + [r["feature"] for r in shap_top10]
-        ))
-
-        comparison_rows = ""
-        comparison_plain_lines = []
-        for feat in all_features[:10]:
-            g_rank = gain_rank.get(feat, "-")
-            s_rank = shap_rank.get(feat, "-")
-            divergence = ""
-            if isinstance(g_rank, int) and isinstance(s_rank, int):
-                diff = abs(g_rank - s_rank)
-                if diff > 3:
-                    divergence = f' style="color:#c62828; font-weight:bold;"'
-            comparison_rows += (
-                f'<tr>'
-                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px;">{feat}</td>'
-                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px; text-align:center;">{g_rank}</td>'
-                f'<td style="padding:2px 8px; font-family:monospace; font-size:12px; text-align:center;"'
-                f'{divergence}>{s_rank}</td>'
-                f'</tr>'
-            )
-            flag = " ***" if isinstance(g_rank, int) and isinstance(s_rank, int) and abs(g_rank - s_rank) > 3 else ""
-            comparison_plain_lines.append(f"  {feat:<22} Gain:{g_rank}  SHAP:{s_rank}{flag}")
-
-        stability_note = ""
-        stability_plain = ""
-        if shap_stability is not None:
-            stab_color = "#2e7d32" if shap_stability >= 0.80 else "#c62828"
-            stab_label = "stable" if shap_stability >= 0.80 else "DRIFT WARNING"
-            stability_note = (
-                f'<p style="font-size:12px; margin:4px 0;">SHAP rank stability (vs last week): '
-                f'<b style="color:{stab_color};">rho={shap_stability:.4f} — {stab_label}</b></p>'
-            )
-            stability_plain = f"\nSHAP rank stability: rho={shap_stability:.4f} — {stab_label}"
-
-        shap_html = (
-            f'<h3 style="margin-top:16px; margin-bottom:4px;">Feature Importance: Gain vs SHAP</h3>'
-            f'{stability_note}'
-            f'<table style="border-collapse:collapse; font-size:11px;">'
-            f'<tr style="background:#e0e0e0;">'
-            f'<th style="padding:3px 8px;">Feature</th>'
-            f'<th style="padding:3px 8px;">Gain Rank</th>'
-            f'<th style="padding:3px 8px;">SHAP Rank</th></tr>'
-            f'{comparison_rows}</table>'
-            f'<p style="font-size:10px; color:#888;">Features with rank divergence &gt;3 highlighted in red.</p>'
-        )
-        shap_plain = (
-            "\n--- Gain vs SHAP Rank ---"
-            + stability_plain
-            + "\n" + "\n".join(comparison_plain_lines)
-            + "\n  (*** = rank divergence > 3)\n"
-        )
-
-    # ── Feature Health section (per-feature IC + noise detection) ──────────
-    feat_ics = result.get("feature_ics", {})
-    noise_cands = result.get("noise_candidates", [])
-    feat_health_html = ""
-    feat_health_plain = ""
-    if feat_ics:
-        sorted_ics = sorted(feat_ics.items(), key=lambda x: abs(x[1]), reverse=True)
-        ic_rows = "".join(
-            f'<tr style="background:{"#f9f9f9" if i % 2 == 0 else "#fff"};">'
-            f'<td style="padding:2px 8px; font-family:monospace; font-size:11px;">{fname}</td>'
-            f'<td style="padding:2px 8px; font-family:monospace; font-size:11px; '
-            f'color:{"#2e7d32" if fic > 0 else "#c62828"};">{fic:.4f}</td>'
-            f'</tr>'
-            for i, (fname, fic) in enumerate(sorted_ics[:10])
-        )
-        noise_note = ""
-        if noise_cands:
-            noise_note = (
-                f'<p style="font-size:11px; color:#c62828; margin:4px 0;">'
-                f'Noise candidates ({len(noise_cands)}): {", ".join(noise_cands)}</p>'
-            )
-        feat_health_html = (
-            f'<h3 style="margin-top:16px; margin-bottom:4px;">Feature Health</h3>'
-            f'<table style="border-collapse:collapse; font-size:11px;">'
-            f'<tr style="background:#e0e0e0;">'
-            f'<th style="padding:3px 8px;">Feature</th>'
-            f'<th style="padding:3px 8px;">IC vs Forward</th></tr>'
-            f'{ic_rows}</table>'
-            f'{noise_note}'
-        )
-        feat_health_plain = (
-            "\n--- Feature Health (top 10 by |IC|) ---\n"
-            + "\n".join(f"  {fname:<22} IC={fic:.4f}" for fname, fic in sorted_ics[:10])
-            + (f"\nNoise candidates: {', '.join(noise_cands)}" if noise_cands else "")
-            + "\n"
-        )
+    _ic_summary = (
+        f"Val IC {val_ic:+.4f} · Test IC {test_ic:+.4f} · MSE IC {mse_ic:+.4f}"
+        + (f" · Rank IC {rank_ic:+.4f}" if isinstance(rank_ic, (int, float)) else "")
+        + f" · IC IR {ic_ir:.3f} ({ic_pos}/20 positive)"
+    )
+    _oos_line = (
+        f"Meta OOS IC (Spearman): {result['meta_model_oos_ic']:+.4f}"
+        if is_meta and isinstance(result.get("meta_model_oos_ic"), (int, float))
+        else ""
+    )
 
     html_body = (
         f'<html><body style="font-family:sans-serif; font-size:13px; color:#222; max-width:600px;">'
         f'<h2 style="margin-bottom:4px;">Alpha Engine Training — {date_str}</h2>'
         f'<p style="color:#555; font-size:12px; margin-top:0;">'
-        f'Model: <b>{version}</b> &nbsp;|&nbsp;'
-        f'Training samples: <b>{n_train:,}</b> &nbsp;|&nbsp;'
-        f'Elapsed: <b>{elapsed_s:.0f}s ({elapsed_s/60:.1f} min)</b></p>'
-
-        + _build_ic_table_html(result, is_meta, ic_color, ic_label, promoted_mode,
-                               promo_color, promo_label, val_ic, mse_ic, test_ic,
-                               rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos) +
-
-        f'{wf_html}'
-
-        + (
-            f'<h3 style="margin-bottom:4px;">Top 5 Features by Gain</h3>'
-            f'<table>{feat_rows}</table>'
-            if feat_rows else ""
-        ) +
-
-        f'{shap_html}'
-
-        f'{feat_health_html}'
-
-        + (
-            f'<h3 style="margin-top:16px; margin-bottom:4px;">Confidence Calibration</h3>'
-            f'<p style="font-size:12px;">Method: <b>{cal_metrics["method"]}</b> &nbsp;|&nbsp; '
-            f'Samples: <b>{cal_metrics["n_samples"]:,}</b> &nbsp;|&nbsp; '
-            f'ECE: <b>{cal_metrics["ece_before"]:.4f} → {cal_metrics["ece_after"]:.4f}</b> '
-            f'({(1 - cal_metrics["ece_after"] / max(cal_metrics["ece_before"], 1e-8)) * 100:.0f}% reduction)</p>'
-            if cal_metrics and cal_metrics.get("fitted") else ""
-        )
-        # Shadow calibrator row — observability only. Surfaces shadow's
-        # method, ECE, gate-pass fingerprint so operators can decide when
-        # shadow is safe to promote → live (flip calibration.method in
-        # predictor.yaml). Empty when shadow disabled.
+        f'Model: <b>{version}</b> &nbsp;|&nbsp; Training samples: <b>{n_train:,}</b> '
+        f'&nbsp;|&nbsp; Elapsed: <b>{elapsed_s:.0f}s ({elapsed_s/60:.1f} min)</b></p>'
+        f'<p style="margin:6px 0;">IC gate: <b style="color:{ic_color};">{ic_label}</b> '
+        f'&nbsp;|&nbsp; Promotion: <b style="color:{promo_color};">{promo_label}</b></p>'
+        f'<p style="margin:6px 0; font-size:12px;">{_ic_summary}</p>'
+        + (f'<p style="margin:4px 0; font-size:12px;">{_oos_line}</p>' if _oos_line else "")
+        + f'<p style="margin:6px 0; font-size:12px;">{wf_line}</p>'
+        + (f'<p style="margin:6px 0; font-size:12px; color:#c62828;">{warn_line}</p>' if warn_line else "")
+        # Shadow calibrator readiness row — operator-actionable (tells the
+        # operator whether shadow is safe to promote → live); kept in-email.
         + _build_shadow_calibration_html(result.get("shadow_calibration"))
-        + (
-            f'<h3 style="margin-top:16px; margin-bottom:4px;">Multi-Horizon Models</h3>'
-            f'<table style="border-collapse:collapse; font-size:11px;">'
-            f'<tr style="background:#e0e0e0;">'
-            f'<th style="padding:3px 8px;">Horizon</th>'
-            f'<th style="padding:3px 8px;">IC</th>'
-            f'<th style="padding:3px 8px;">Promoted</th></tr>'
-            + "".join(
-                f'<tr><td style="padding:2px 8px; font-family:monospace;">{h}d</td>'
-                f'<td style="padding:2px 8px; font-family:monospace;">{v.get("test_ic", "err")}</td>'
-                f'<td style="padding:2px 8px; font-family:monospace;">{v.get("promoted", False)}</td></tr>'
-                for h, v in mh_data["auxiliary"].items() if isinstance(v, dict) and "error" not in v
-            )
-            + f'</table>'
-            if mh_data and mh_data.get("auxiliary") else ""
-        ) +
-
-        f'<p style="font-size:11px; color:#aaa; margin-top:20px;">'
-        # Meta (v3.0) trainer uses a simpler walk-forward gate:
-        # both base models must have strictly positive median IC.
-        # See meta_trainer.py:483. The v2 single-model path uses
-        # cfg.WF_MEDIAN_IC_GATE + WF_MIN_FOLDS_POSITIVE. Describe
-        # whichever one actually gates this run.
-        + (
-            # 2026-05-13 facelift: walk-forward gate dropped momentum check.
-            # Momentum's standalone IC at 21d ≈ 0 (per IC study) but the
-            # Ridge stack extracts interaction value, so the L1 stays in
-            # META_FEATURES while the gate only requires vol median > 0.
-            # Subject + headline ICs are OOS (Spearman 21d) per PR #133.
-            f'IC gate: ≥{cfg.MIN_IC:.2f} in-sample meta IC to promote &nbsp;|&nbsp; '
-            f'Walk-forward: volatility median IC &gt; 0 (momentum observability-only)</p>'
-            if is_meta else
-            f'IC gate: ≥{cfg.MIN_IC:.2f} to promote &nbsp;|&nbsp; '
-            f'Walk-forward: median IC ≥{cfg.WF_MEDIAN_IC_GATE:.2f}, '
-            f'{cfg.WF_MIN_FOLDS_POSITIVE*100:.0f}%+ positive folds</p>'
-        )
-        + f'</body></html>'
+        + f'<p style="margin-top:18px;">'
+        f'<a href="{console_link}" style="color:#1976d2; font-weight:bold;">'
+        f'View full training detail on the console →</a></p>'
+        f'<p style="font-size:11px; color:#aaa; margin-top:6px;">'
+        f'Walk-forward folds, feature importance (gain + SHAP), feature health, '
+        f'calibration and multi-horizon detail are on the console Predictor '
+        f'Training page (config#856).</p>'
+        f'</body></html>'
     )
 
-    if is_meta:
-        # ── Plain-text body: mirror the HTML facelift (OOS-headline) ──
-        _hd = result.get("horizon_diagnostic") or {}
-        _curve = _hd.get("curve") or {}
-        _h21 = _curve.get("21d") or {}
-        _meta_oos = (
-            result.get("meta_model_oos_ic")
-            or _h21.get("spearman")
-        )
-        _meta_in_sample = (
-            result.get("meta_model_in_sample_ic")
-            or result.get("meta_model_ic", test_ic)
-        )
-        _ci_lo = _h21.get("spearman_ci_lo")
-        _ci_hi = _h21.get("spearman_ci_hi")
-        _ci_text = (
-            f" [95% CI {_ci_lo:+.4f}, {_ci_hi:+.4f}]"
-            if _ci_lo is not None and _ci_hi is not None else ""
-        )
-        _meta_oos_line = (
-            f"Meta-Model OOS IC (Spearman 21d): {_meta_oos:+.4f}{_ci_text} — {ic_label}"
-            if _meta_oos is not None else
-            f"Meta-Model IC (in-sample, no OOS reference): {_meta_in_sample:+.4f} — {ic_label}"
-        )
-
-        _wf = result.get("walk_forward") or {}
-        _vol_oos_median = _wf.get("volatility_median_ic")
-        _vol_oos_line = (
-            f"Volatility OOS IC (WF median, 16 folds): {_vol_oos_median:+.4f}"
-            if _vol_oos_median is not None
-            else f"Volatility IC (held-out): {result.get('volatility_test_ic', 0):+.4f}"
-        )
-
-        _res_val = result.get("research_gbm_val_ic")
-        _res_train = result.get("research_gbm_train_ic")
-        if _res_val is not None:
-            _train_suffix = (
-                f" (train_ic {_res_train:+.4f})" if _res_train is not None else ""
-            )
-            _research_line = (
-                f"Research OOS IC (GBM val, held-out 20%): "
-                f"{_res_val:+.4f}{_train_suffix}"
-            )
-        else:
-            _res_metrics = result.get("research_calibrator_metrics") or {}
-            _res_hr = _res_metrics.get("overall_hit_rate")
-            _res_n = result.get("research_calibrator_n", 0)
-            _research_line = (
-                f"Research signal (bucket lookup): hit_rate={_res_hr:.4f} (n={_res_n})"
-                if _res_hr is not None else "Research signal: n/a"
-            )
-
-        _mom_wf_median = _wf.get("momentum_median_ic")
-        _mom_line = (
-            f"Momentum WF median IC (observability, not gating): "
-            f"{_mom_wf_median:+.4f}"
-            if _mom_wf_median is not None else
-            "Momentum: deterministic baseline (no GBM fit IC)"
-        )
-
-        plain_body = (
-            f"Alpha Engine Training — {date_str}\n"
-            f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
-            f"\n{_meta_oos_line}"
-            f"\nMeta-Model in-sample IC (reference): {_meta_in_sample:+.4f}"
-            f"\n{_vol_oos_line}"
-            f"\n{_research_line}"
-            f"\n{_mom_line}"
-            f"\nPromotion: {promo_label}\n"
-            f"{wf_plain}"
-        )
-        coefs = result.get("meta_coefficients", {})
-        if coefs:
-            plain_body += "\nMeta coefficients:\n" + "\n".join(
-                f"  {k:<28} {v:+.4f}"
-                for k, v in sorted(coefs.items(), key=lambda x: -abs(x[1]))
-                if k != "intercept" and abs(v) > 0.0001
-            ) + "\n"
-    else:
-        _mse_mark  = " ✓" if promoted_mode == "mse" else ""
-        _rank_mark = " ✓" if promoted_mode == "rank" else ""
-        _ens_mark  = " ✓" if promoted_mode == "ensemble" else ""
-        plain_body = (
-            f"Alpha Engine Training — {date_str}\n"
-            f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
-            f"\nVal IC:             {val_ic:.4f}"
-            f"\nMSE Model IC:       {mse_ic:.4f}{' — ' + ic_label if promoted_mode == 'mse' else ''}{_mse_mark}"
-            + (
-                f"\nLambdarank Model IC: {rank_ic:.4f}{' — ' + ic_label if promoted_mode == 'rank' else ''}{_rank_mark}"
-                f"\nEnsemble IC:        {ensemble_ic:.4f}{' — ' + ic_label if promoted_mode == 'ensemble' else ''}{_ens_mark}"
-                if ensemble_on and rank_ic is not None and ensemble_ic is not None else
-                f"\nTest IC:            {test_ic:.4f} — {ic_label}"
-            )
-            + (
-                f"\nCatBoost IC:        {cat_ic_val:.4f}"
-                f"\nLGB-Cat Blend IC:   {blend_ic_val:.4f} (w_lgb={blend_wts['lgb']:.1f})"
-                if cat_enabled and cat_ic_val is not None else ""
-            ) +
-            f"\nPromoted:           {promoted_mode if promoted else ('challenger' if challenger_registered else 'none')}"
-            f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
-            f"\nPromotion:          {promo_label}\n"
-            f"{wf_plain}"
-            f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
-            + f"\n{shap_plain}"
-            + f"{feat_health_plain}\n"
-        )
+    plain_body = (
+        f"Alpha Engine Training — {date_str}\n"
+        f"Model: {version}  Samples: {n_train:,}  Elapsed: {elapsed_s:.0f}s\n"
+        f"\nIC gate: {ic_label}"
+        f"\nPromotion: {promo_label}"
+        f"\n{_ic_summary}"
+        + (f"\n{_oos_line}" if _oos_line else "")
+        + f"\n{wf_line}"
+        + (f"\n{warn_line}" if warn_line else "")
+        + f"\n\nFull training detail (walk-forward folds, feature importance, "
+        f"feature health, calibration, multi-horizon):\n{console_link}\n"
+    )
 
     # SMTP/SES dispatch via the krepis.email_sender chokepoint
     # (L4356 — Gmail SMTP primary, SES fallback). Same semantics as the
