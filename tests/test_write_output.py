@@ -994,3 +994,53 @@ class TestMorningEmailOptimizerParamsBlock:
         with patch("boto3.client", side_effect=RuntimeError("S3 down")):
             result = wo._load_executor_params_for_email("b")
         assert result is None
+
+
+class TestS3WriteFail Loud:
+    """Test fail-loud on S3 dated-key failures, best-effort on secondary writes."""
+
+    def setup_method(self):
+        """Reset cache state before each test."""
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    def test_dated_key_failure_raises_hardfall(self, mock_put):
+        """Dated predictions write failure must raise PipelineHardFail."""
+        from inference.pipeline import PipelineHardFail
+        # First call (dated) fails, later calls not reached
+        mock_put.side_effect = Exception("S3 connection error")
+        predictions = [{"ticker": "AAPL", "prediction_confidence": 0.75}]
+        with pytest.raises(PipelineHardFail):
+            wo.write_predictions(predictions, "2026-04-08", "bucket", {"model_version": "v1"})
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    @patch("krepis.alerts.alert")
+    def test_secondary_writes_failure_alerts_not_raises(self, mock_alert, mock_put):
+        """Latest.json / metrics failures must alert but not raise."""
+        from inference.pipeline import PipelineHardFail
+        predictions = [{"ticker": "AAPL", "prediction_confidence": 0.75}]
+        # Dated succeeds, latest/metrics fail
+        mock_put.side_effect = [
+            None,  # dated succeeds
+            Exception("IAM denied"),  # latest fails
+            Exception("S3 throttle"),  # metrics fails
+        ]
+        # Should not raise
+        wo.write_predictions(predictions, "2026-04-08", "bucket", {"model_version": "v1"})
+        # Verify alerts were published for the two secondary failures
+        assert mock_alert.call_count >= 2
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    def test_all_writes_succeed_no_alerts(self, mock_put):
+        """When all three writes succeed, no alerts."""
+        from krepis.alerts import alert as mock_alert
+        mock_put.side_effect = [None, None, None]  # all succeed
+        predictions = [{"ticker": "AAPL"}]
+        with patch("krepis.alerts.alert") as alert_spy:
+            wo.write_predictions(predictions, "2026-04-08", "bucket", {})
+            # No alert() calls expected on full success
+            alert_spy.assert_not_called()

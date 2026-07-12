@@ -579,25 +579,36 @@ def write_predictions(
     import boto3
     s3 = boto3.client("s3")
 
-    # Write each S3 object independently so partial failures don't block others
-    writes = [
-        (dated_key, predictions_json, "predictions (dated)"),
+    from inference.pipeline import PipelineHardFail
+
+    # Write the primary dated artifact (fail-loud — this is the canonical prediction set)
+    try:
+        _s3_put_json(s3, s3_bucket, dated_key, predictions_json)
+        log.info("Written s3://%s/%s (primary dated artifact)", s3_bucket, dated_key)
+    except Exception as exc:
+        from krepis.alerts import alert
+        msg = f"S3 write FAILED for primary artifact {dated_key}: {exc}"
+        log.error(msg)
+        alert(msg, level="CRITICAL", recording_surface="predictor_s3_dated_write")
+        raise PipelineHardFail(msg) from exc
+
+    # Write latest.json + metrics (best-effort with alerts on failure)
+    secondary_writes = [
         (latest_key, predictions_json, "predictions (latest)"),
-        (metrics_key, metrics_json, "metrics"),
+        (metrics_key, metrics_json, "metrics (latest)"),
     ]
-    n_ok = 0
-    for key, body, label in writes:
+    for key, body, label in secondary_writes:
         try:
             _s3_put_json(s3, s3_bucket, key, body)
-            log.info("Written s3://%s/%s", s3_bucket, key)
-            n_ok += 1
+            log.info("Written s3://%s/%s (%s)", s3_bucket, key, label)
         except Exception as exc:
-            log.error("S3 write failed for %s: %s", label, exc)
-    if n_ok < len(writes):
-        log.error(
-            "Partial S3 write: %d/%d succeeded. Check IAM permissions for s3://%s",
-            n_ok, len(writes), s3_bucket,
-        )
+            from krepis.alerts import alert
+            log.error("S3 write failed for %s (%s): %s", label, key, exc)
+            alert(
+                f"S3 write failed for {label} ({key}): {exc}",
+                level="WARNING",
+                recording_surface="predictor_s3_secondary_write",
+            )
 
 
 # ── Predictor email ────────────────────────────────────────────────────────────
