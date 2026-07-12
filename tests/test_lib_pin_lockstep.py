@@ -53,3 +53,45 @@ def test_requirements_and_lambda_pins_match():
         f"Drift broke the predictor canary on 2026-05-12 (PR #147 / hotfix "
         f"fix/lambda-lib-pin-v0.12.0)."
     )
+
+
+def _parse_pip_pins(filename: str) -> dict[str, str]:
+    """Parse a requirements file into {package_name: specifier}."""
+    pins = {}
+    text = (_REPO_ROOT / filename).read_text()
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "@" in line:
+            # git+https format (e.g., nousergon-lib) — skip (handled separately)
+            continue
+        # PEP 508 format: package_name[extras]specifier (e.g., pandas>=2.0.0,<3)
+        match = re.match(r"^([a-zA-Z0-9_-]+)", line)
+        if match:
+            pkg = match.group(1)
+            specifier = line[len(pkg):].lstrip("[]").strip()
+            if specifier and not specifier.startswith("#"):
+                pins[pkg] = specifier
+    return pins
+
+
+def test_shared_package_specifiers_match():
+    """Packages in both requirements files must have identical specifiers."""
+    root_pins = _parse_pip_pins("requirements.txt")
+    lambda_pins = _parse_pip_pins("requirements-lambda.txt")
+
+    shared_packages = set(root_pins.keys()) & set(lambda_pins.keys())
+    mismatches = {
+        pkg: (root_pins[pkg], lambda_pins[pkg])
+        for pkg in shared_packages
+        if root_pins[pkg] != lambda_pins[pkg]
+    }
+
+    assert not mismatches, (
+        f"Package specifier drift between requirements.txt and "
+        f"requirements-lambda.txt: {dict(mismatches)}. Both files must pin "
+        f"shared packages to identical specifiers — drift allows the Lambda "
+        f"image to resolve a different dependency set than local dev "
+        f"(config#2346)."
+    )
