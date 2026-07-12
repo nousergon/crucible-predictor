@@ -150,11 +150,13 @@ canary_accept() {
   return 1
 }
 
-# run_canary_action <function_name> <version> <action> <payload> <expect>
+# run_canary_action <function_name> <version> <action> <payload> [expect]
 #   Invoke a single read-only action via krepis.aws invoke-canary and gate on
-#   its contract. <expect> selects the acceptance mode (see canary_accept):
-#   "statusCode" for the HTTP-shaped predict path, or the required domain key
-#   for a Step-Function gate action.
+#   its contract. [expect] selects the acceptance mode (see canary_accept):
+#   "statusCode" for an HTTP-shaped handler, or the required domain key for a
+#   Step-Function gate action. Defaults to "statusCode" — the historical
+#   universal behavior — so an HTTP-shaped call site may omit it AND a future
+#   4-arg caller cannot trip `set -u` (config: 2026-07-12 regime-canary crash).
 #   Returns: 0 if accepted; 1 if FunctionError or the contract is unmet.
 #   Outputs error details to stdout on failure.
 run_canary_action() {
@@ -162,7 +164,7 @@ run_canary_action() {
   local version="$2"
   local action="$3"
   local payload="$4"
-  local expect="$5"
+  local expect="${5:-statusCode}"
 
   local canary_out
   canary_out=$(mktemp)
@@ -511,11 +513,11 @@ echo "  Found (or freshly created) — updating..."
   echo "==> Running regime canary matrix against :${REGIME_VERSION}..."
   REGIME_CANARY_FAILED=0
 
-  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "dry_run" '{"action": "dry_run"}'; then
+  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "dry_run" '{"action": "dry_run"}' "statusCode"; then
     REGIME_CANARY_FAILED=1
   fi
 
-  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}'; then
+  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}' "statusCode"; then
     REGIME_CANARY_FAILED=1
   fi
 
@@ -611,11 +613,11 @@ echo "  Found (or freshly created) — updating..."
   echo "==> Running regime-eval canary matrix against :${REGIME_EVAL_VERSION}..."
   REGIME_EVAL_CANARY_FAILED=0
 
-  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "dry_run" '{"action": "dry_run"}'; then
+  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "dry_run" '{"action": "dry_run"}' "statusCode"; then
     REGIME_EVAL_CANARY_FAILED=1
   fi
 
-  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}'; then
+  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}' "statusCode"; then
     REGIME_EVAL_CANARY_FAILED=1
   fi
 
