@@ -108,15 +108,61 @@ canary_status_ok() {
   return 1
 }
 
-# run_canary_action <function_name> <version> <action> <payload>
-#   Invoke a single read-only action via krepis.aws invoke-canary.
-#   Returns: 0 if statusCode is allowlisted; 1 if error or bad statusCode.
+# canary_accept <expect> <status> <present_keys>
+#   Central per-action acceptance decision, shared by every canary site. The
+#   handler in this repo emits TWO distinct response contracts, and gating both
+#   on `statusCode` is wrong for one of them:
+#
+#   <expect> = "statusCode"  → HTTP-shaped handler (the default `predict` path
+#              returns {"statusCode": 200, "body": ...}). Accept iff <status> is
+#              in the CANARY_NOOP_STATUSES allowlist (canary_status_ok).
+#
+#   <expect> = any other value → a Step-Function GATE action (check_trading_day,
+#              check_weekly_run_day, check_drift, check_pipeline_contract). These
+#              return a RAW DOMAIN DICT consumed by SF Choice states on named
+#              keys (is_trading_day / has_violation / status …) and deliberately
+#              DO NOT emit a `statusCode` (config#1430/#1824/#1282/#1853). Accept
+#              iff <expect> — the action's declared domain key — is present in
+#              the space-separated <present_keys> of the returned object. Key
+#              presence proves the invoke dispatched to the RIGHT branch and
+#              returned its contract; a broken import / missing branch instead
+#              surfaces as a FunctionError (checked by the caller) or a response
+#              lacking the key. Gating these on `statusCode` checks an invariant
+#              they never satisfy — the 2026-07-12 v351 false-canary-fail that
+#              refused to promote a healthy image (PR #362).
+#
+#   A FunctionError (unhandled exception / broken import) is checked by the
+#   caller BEFORE this and always rejects, in every mode.
+canary_accept() {
+  local expect="$1"
+  local status="$2"
+  local present_keys="$3"
+  if [ "$expect" = "statusCode" ]; then
+    canary_status_ok "$status"
+    return $?
+  fi
+  local k
+  for k in $present_keys; do
+    if [ "$k" = "$expect" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# run_canary_action <function_name> <version> <action> <payload> <expect>
+#   Invoke a single read-only action via krepis.aws invoke-canary and gate on
+#   its contract. <expect> selects the acceptance mode (see canary_accept):
+#   "statusCode" for the HTTP-shaped predict path, or the required domain key
+#   for a Step-Function gate action.
+#   Returns: 0 if accepted; 1 if FunctionError or the contract is unmet.
 #   Outputs error details to stdout on failure.
 run_canary_action() {
   local func_name="$1"
   local version="$2"
   local action="$3"
   local payload="$4"
+  local expect="$5"
 
   local canary_out
   canary_out=$(mktemp)
@@ -132,20 +178,28 @@ run_canary_action() {
   local func_err
   local status
   local err_msg
+  local present_keys
   func_err=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$canary_meta" 2>/dev/null || echo "")
-  status=$(python3 -c "import json; d=json.load(open('$canary_out')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-  err_msg=$(python3 -c "import json; d=json.load(open('$canary_out')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
+  status=$(python3 -c "import json; d=json.load(open('$canary_out')); print(d.get('statusCode', 0) if isinstance(d, dict) else 0)" 2>/dev/null || echo "0")
+  err_msg=$(python3 -c "import json; d=json.load(open('$canary_out')); print((d.get('errorMessage','') or d.get('body','')) if isinstance(d, dict) else '')" 2>/dev/null || echo "")
+  present_keys=$(python3 -c "import json; d=json.load(open('$canary_out')); print(' '.join(d.keys()) if isinstance(d, dict) else '')" 2>/dev/null || echo "")
   rm -f "$canary_out"
 
-  if [ -n "$func_err" ] || ! canary_status_ok "$status"; then
+  if [ -n "$func_err" ] || ! canary_accept "$expect" "$status" "$present_keys"; then
     echo "  ${action}: FAILED"
     echo "    FunctionError: ${func_err:-<none>}"
+    echo "    expect: ${expect}"
     echo "    statusCode: ${status}"
+    echo "    keys: ${present_keys:-<none>}"
     echo "    payload: ${err_msg:-<empty>}"
     return 1
   fi
 
-  echo "  ${action}: OK (status=$status)"
+  if [ "$expect" = "statusCode" ]; then
+    echo "  ${action}: OK (status=$status)"
+  else
+    echo "  ${action}: OK (${expect} present)"
+  fi
   return 0
 }
 
@@ -326,28 +380,31 @@ echo ""
 echo "==> Running canary invocation matrix against :${VERSION}..."
 CANARY_FAILED=0
 
-# Test predict with dry_run
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "predict(dry_run)" '{"dry_run": true}'; then
+# Test predict with dry_run — HTTP-shaped handler, gate on statusCode.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "predict(dry_run)" '{"dry_run": true}' "statusCode"; then
   CANARY_FAILED=1
 fi
 
-# Test check_drift
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action": "check_drift"}'; then
+# Step-Function gate actions below return raw domain dicts (no statusCode);
+# gate each on the presence of the domain key its SF Choice state consumes.
+
+# Test check_drift — drift_detector.check_drift returns {date,status,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action": "check_drift"}' "status"; then
   CANARY_FAILED=1
 fi
 
-# Test check_trading_day
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day"}'; then
+# Test check_trading_day — trading_day_gate returns {is_trading_day,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day"}' "is_trading_day"; then
   CANARY_FAILED=1
 fi
 
-# Test check_weekly_run_day
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}'; then
+# Test check_weekly_run_day — trading_day_gate returns {is_weekly_run_day,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}' "is_weekly_run_day"; then
   CANARY_FAILED=1
 fi
 
-# Test check_pipeline_contract
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract"}'; then
+# Test check_pipeline_contract — returns {has_violation,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract"}' "has_violation"; then
   CANARY_FAILED=1
 fi
 
