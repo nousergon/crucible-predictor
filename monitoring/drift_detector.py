@@ -1,17 +1,19 @@
 """
-Automated drift detection for feature distributions and prediction patterns.
+Automated drift detection for prediction patterns.
 
-Compares today's inference data against training baselines to detect model
-degradation before it affects portfolio performance.
+Compares recent inference output against itself (direction clustering,
+confidence collapse, alpha degeneration) to detect model degradation before
+it affects portfolio performance. Feature-distribution drift (inference-vs-
+training) is a SEPARATE layer owned by ``monitoring/feature_drift.py``
+(``feature_drift_ks``, config#859), which already runs at daily inference
+time — this module deliberately does not duplicate it (config#1853).
 
 Every finding is emitted as a SEVERITY-CLASSIFIED, self-describing alert so an
 operator can judge urgency from the alert alone — no S3 forensics required. Each
 alert carries: a severity (INFO / WARN / CRITICAL), the metric value vs its
 threshold and the distance between them, a TREND (chronic vs acute, derived from
 the recent-days window), a plain-language likely-cause, and a recommended
-action. The detector also records checks it could NOT run (e.g. feature drift
-with no training baseline) under ``skipped_checks`` so a half-dark detector is
-never mistaken for a clean bill of health.
+action.
 
 Usage:
     python -m monitoring.drift_detector                    # check today
@@ -22,7 +24,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
 import os
@@ -36,7 +37,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_BUCKET = "alpha-engine-research"
 
 # Thresholds
-FEATURE_ZSCORE_THRESHOLD = 3.0    # Flag features shifted by 3+ training stdevs
 DIRECTION_CLUSTER_THRESHOLD = 0.80  # >80% same direction = degenerate
 CONFIDENCE_MIN_MEAN = 0.45         # Mean confidence below this = collapsed model
 ALPHA_MIN_STDEV = 0.001            # Alpha stdev below this = degenerate
@@ -100,88 +100,6 @@ def _load_json(s3, bucket: str, key: str) -> dict | None:
         return json.loads(obj["Body"].read())
     except Exception:
         return None
-
-
-def _load_parquet(s3, bucket: str, key: str):
-    try:
-        import pandas as pd
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return pd.read_parquet(io.BytesIO(obj["Body"].read()))
-    except Exception:
-        return None
-
-
-def check_feature_drift(s3, bucket: str, date_str: str) -> list[dict]:
-    """Compare today's feature distributions against the training baseline.
-
-    Returns a list of structured alert dicts (see ``_alert``). The
-    no-baseline-stats case is NOT a silent skip: the caller records it under
-    ``skipped_checks`` (surfaced to the operator) via the sentinel returned in
-    ``check_drift``; here it simply yields no alerts.
-    """
-    alerts: list[dict] = []
-
-    # Load training feature stats
-    stats = _load_json(s3, bucket, "predictor/metrics/training_feature_stats.json")
-    if not stats:
-        logger.warning("No training feature stats found — skipping feature drift check")
-        return alerts
-
-    train_means = np.array(stats["mean"])
-    train_stds = np.array(stats["std"])
-    feature_names = stats["features"]
-
-    # Load today's feature snapshot
-    tech_df = _load_parquet(s3, bucket, f"features/{date_str}/technical.parquet")
-    if tech_df is None or tech_df.empty:
-        alerts.append(_alert(
-            code="feature_snapshot_missing",
-            severity=WARN,
-            headline="Feature snapshot missing",
-            detail=f"no technical feature snapshot for {date_str} — feature drift could not be evaluated",
-            cause="the daily feature snapshot was not written (upstream data/enrich gap)",
-            action="confirm the day's feature pipeline ran; this check is blind until it does",
-            date=date_str,
-        ))
-        return alerts
-
-    # Compare each feature's cross-sectional mean against training distribution
-    drifted = []
-    for i, feat in enumerate(feature_names):
-        if feat not in tech_df.columns:
-            continue
-        if train_stds[i] < 1e-10:
-            continue  # Skip constant features
-        today_mean = tech_df[feat].mean()
-        if np.isnan(today_mean):
-            continue
-        zscore = abs(today_mean - train_means[i]) / train_stds[i]
-        if zscore > FEATURE_ZSCORE_THRESHOLD:
-            drifted.append((feat, round(float(zscore), 2)))
-
-    if drifted:
-        top5 = sorted(drifted, key=lambda x: -x[1])[:5]
-        max_z = top5[0][1]
-        drift_str = ", ".join(f"{f}(z={z})" for f, z in top5)
-        # >5 stdevs on the worst feature is a hard distribution break, not noise.
-        severity = CRITICAL if max_z >= 5.0 else WARN
-        alerts.append(_alert(
-            code="feature_drift",
-            severity=severity,
-            headline="Feature drift",
-            detail=(f"{len(drifted)} feature(s) shifted >{FEATURE_ZSCORE_THRESHOLD:g} "
-                    f"training stdevs (worst z={max_z}) — top: {drift_str}"),
-            cause="today's feature distribution diverged from the training distribution "
-                  "(regime shift, data-vendor change, or a feature-computation bug)",
-            action="inspect the top-z features vs their training stats; a real distribution "
-                   "break means the model is extrapolating and predictions are less trustworthy",
-            n_drifted=len(drifted),
-            max_zscore=max_z,
-            top_features=top5,
-            date=date_str,
-        ))
-
-    return alerts
 
 
 def _daily_confidence_means(recent_preds: list[dict]) -> list[tuple[str, float]]:
@@ -375,31 +293,21 @@ def check_prediction_drift(s3, bucket: str, date_str: str) -> list[dict]:
     return alerts
 
 
-def _detect_skipped_checks(s3, bucket: str) -> list[dict]:
-    """Surface checks that could NOT run, so a half-dark detector is visible.
-
-    Currently: feature drift is skipped whenever the training-feature-stats
-    baseline is absent. Recorded as INFO (visible, no action urgency) rather than
-    flipping ``status`` to alert every run — but it is no longer SILENT."""
-    skipped: list[dict] = []
-    if _load_json(s3, bucket, "predictor/metrics/training_feature_stats.json") is None:
-        skipped.append({
-            "check": "feature_drift",
-            "severity": INFO,
-            "reason": ("no training-feature-stats baseline "
-                       "(predictor/metrics/training_feature_stats.json) — the feature-drift "
-                       "arm did not run; only prediction-pattern drift was evaluated"),
-        })
-    return skipped
-
-
 def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> dict:
     """Run all drift checks. Returns a structured, severity-aware result.
+
+    Prediction-drift only (config#1853) — feature-distribution drift is a
+    separate layer owned by ``monitoring/feature_drift.py``'s
+    ``feature_drift_ks``, which already runs at daily inference time
+    (config#859); duplicating it here would be redundant, not defense in
+    depth.
 
     Backward-compatible: ``alerts`` remains a ``list[str]`` (each a rich,
     self-describing line). New additive fields: ``severity`` (overall max, or
     None when clean), ``alert_details`` (the structured dicts), and
-    ``skipped_checks`` (checks that could not run)."""
+    ``skipped_checks`` (retained in the output shape for compatibility; always
+    empty now that the only check this producer runs is prediction drift,
+    which never conditionally skips)."""
     import boto3
     s3 = boto3.client("s3")
 
@@ -407,9 +315,8 @@ def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> di
         date_str = date.today().isoformat()
 
     details: list[dict] = []
-    details.extend(check_feature_drift(s3, bucket, date_str))
     details.extend(check_prediction_drift(s3, bucket, date_str))
-    skipped = _detect_skipped_checks(s3, bucket)
+    skipped: list[dict] = []
 
     overall_severity = _max_severity([d["severity"] for d in details])
     status = "ok" if not details else "alert"
@@ -440,8 +347,6 @@ def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> di
             log_fn("DRIFT ALERT %s", d["line"])
     else:
         logger.info("No drift detected for %s", date_str)
-    for s in skipped:
-        logger.info("DRIFT CHECK SKIPPED [%s] %s: %s", s["severity"], s["check"], s["reason"])
 
     return result
 

@@ -53,6 +53,8 @@ import logging
 
 import numpy as np
 
+from model.calibrator import derive_direction
+
 log = logging.getLogger(__name__)
 
 
@@ -80,7 +82,7 @@ def _derive(alpha: float, calibrator, label_clip: float) -> dict:
     return {
         "p_up": round(p_up, 4),
         "p_down": round(p_down, 4),
-        "predicted_direction": "UP" if p_up >= 0.5 else "DOWN",
+        "predicted_direction": derive_direction(alpha),
         "prediction_confidence": round(abs(p_up - 0.5) * 2.0, 4),
     }
 

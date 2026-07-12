@@ -52,6 +52,12 @@ COPY model/ model/
 COPY inference/ inference/
 COPY training/ training/
 COPY store/ store/
+# Drift monitoring — inference/handler.py's check_drift action imports
+# monitoring.drift_detector (config#1282, PR #305). Missing this line let
+# the module ship in the repo but not the image: check_drift 500'd with
+# ModuleNotFoundError in prod for every invocation since #305 merged,
+# undetected because deploy.sh's canary only exercises dry_run=true.
+COPY monitoring/ monitoring/
 # Regime substrate (v3) — standalone submodule independent of model/.
 # Same image serves both inference Lambda (CMD=inference.handler.handler)
 # and the regime-substrate Lambda (per-function CMD override =
