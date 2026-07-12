@@ -95,6 +95,13 @@ CALIBRATOR_WEIGHTS_META_KEY = "predictor/weights/meta/isotonic_calibrator.pkl.me
 PREDICTIONS_KEY = "predictor/predictions/{date}.json"
 PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
 
+# Research-free daily inference over the scanner-passing pool (config#2365,
+# champion-loop epic child 1 / config#2364). Sibling artifact to
+# PREDICTIONS_KEY above, produced by inference/research_free_inference.py —
+# see that module's docstring for the full design rationale.
+PREDICTIONS_RESEARCH_FREE_KEY = "predictor/predictions_research_free/{date}.json"
+PREDICTIONS_RESEARCH_FREE_LATEST_KEY = "predictor/predictions_research_free/latest.json"
+
 METRICS_KEY = "predictor/metrics/latest.json"
 
 # ``PRICE_CACHE_KEY`` (was ``"predictor/price_cache/{ticker}.parquet"``) was
