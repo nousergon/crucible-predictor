@@ -28,18 +28,15 @@ import pytest
 DEPLOY_SH = Path(__file__).resolve().parents[1] / "infrastructure" / "deploy.sh"
 
 
-def _canary_status_ok(status: str) -> bool:
-    """Source deploy.sh and run ``canary_status_ok <status>``; return its exit.
+def _source_and_run(call: str, *argv: str) -> bool:
+    """Source deploy.sh (lib-only) and run ``<call>``; return accept/reject.
 
     Exit 0 (accept → promote) maps to True, any non-zero (reject → roll back)
-    maps to False, matching the ``if ! canary_status_ok ...`` use sites.
+    maps to False, matching the ``if ! <helper> ...`` use sites.
     """
-    script = (
-        f'source "{DEPLOY_SH}"\n'
-        'if canary_status_ok "$1"; then exit 0; else exit 1; fi\n'
-    )
+    script = f'source "{DEPLOY_SH}"\n' f"if {call}; then exit 0; else exit 1; fi\n"
     proc = subprocess.run(
-        ["bash", "-c", script, "_", status],
+        ["bash", "-c", script, "_", *argv],
         env={"CANARY_LIB_SOURCE_ONLY": "1", "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
@@ -47,10 +44,20 @@ def _canary_status_ok(status: str) -> bool:
     # Any exit code other than the helper's clean 0/1 means the source step
     # itself blew up — surface it rather than silently treating it as reject.
     assert proc.returncode in (0, 1), (
-        f"unexpected exit {proc.returncode} for status={status!r}: "
+        f"unexpected exit {proc.returncode} for {call} argv={argv!r}: "
         f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
     )
     return proc.returncode == 0
+
+
+def _canary_status_ok(status: str) -> bool:
+    """Source deploy.sh and run ``canary_status_ok <status>``; return its exit."""
+    return _source_and_run('canary_status_ok "$1"', status)
+
+
+def _canary_accept(expect: str, status: str, present_keys: str) -> bool:
+    """Source deploy.sh and run ``canary_accept <expect> <status> <keys>``."""
+    return _source_and_run('canary_accept "$1" "$2" "$3"', expect, status, present_keys)
 
 
 # ── Allowlisted statuses (200 + legitimate no-ops) → accept / promote ────────
@@ -84,3 +91,63 @@ def test_near_miss_codes_rejected(status):
     # Only the exact enumerated strings are no-ops; the allowlist must not
     # widen to "any 2xx" or tolerate stray whitespace.
     assert _canary_status_ok(status) is False
+
+
+# ── canary_accept: per-action acceptance contract (config#2346 / PR #362) ────
+#
+# The handler emits TWO response shapes. `predict` is HTTP-shaped and gates on
+# statusCode; the Step-Function gate actions return raw domain dicts with NO
+# statusCode and gate on the presence of their domain key. Gating a gate action
+# on statusCode was the 2026-07-12 v351 false-canary-fail: a healthy image whose
+# gate actions all returned valid domain dicts (statusCode absent → parsed as 0)
+# was refused promotion.
+
+
+# ── statusCode mode (predict) — unchanged HTTP-shaped semantics ──────────────
+
+@pytest.mark.parametrize("status", ["200", "204", "skipped"])
+def test_accept_statuscode_mode_allowlisted(status):
+    assert _canary_accept("statusCode", status, "statusCode body") is True
+
+
+@pytest.mark.parametrize("status", ["400", "500", "0", ""])
+def test_accept_statuscode_mode_rejects_errors(status):
+    assert _canary_accept("statusCode", status, "") is False
+
+
+# ── domain-key mode (SF gate actions) — the regression this PR fixes ─────────
+
+@pytest.mark.parametrize(
+    "expect,keys",
+    [
+        # Each gate action's real return shape (statusCode deliberately absent).
+        ("is_trading_day", "is_trading_day check_date day_name marker next_trading_day"),
+        ("is_weekly_run_day", "is_weekly_run_day check_date day_name marker reason"),
+        ("status", "date status severity alerts alert_details skipped_checks n_alerts"),
+        ("has_violation", "has_violation reason boundary_count violations"),
+    ],
+)
+def test_accept_domain_key_present_promotes(expect, keys):
+    # A well-formed domain dict WITHOUT statusCode must be accepted — this is
+    # exactly the response that v351 falsely rolled back. statusCode is "0"
+    # (the parser's default for a missing key); it must be ignored in this mode.
+    assert _canary_accept(expect, "0", keys) is True
+
+
+@pytest.mark.parametrize(
+    "expect",
+    ["is_trading_day", "is_weekly_run_day", "status", "has_violation"],
+)
+def test_accept_domain_key_absent_rolls_back(expect):
+    # Missing the declared key (wrong branch / malformed response / empty
+    # payload) must still roll back — key-presence is the wiring invariant.
+    assert _canary_accept(expect, "0", "some other unrelated keys") is False
+    assert _canary_accept(expect, "200", "") is False  # even a 200 can't rescue it
+
+
+def test_domain_mode_ignores_statuscode_allowlist():
+    # A gate action must NOT be accepted merely because statusCode happens to be
+    # allowlisted, nor rejected because it is an error code — the domain key is
+    # the sole criterion in this mode.
+    assert _canary_accept("has_violation", "500", "has_violation reason") is True
+    assert _canary_accept("has_violation", "200", "reason boundary_count") is False
