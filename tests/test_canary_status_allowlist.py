@@ -151,3 +151,19 @@ def test_domain_mode_ignores_statuscode_allowlist():
     # the sole criterion in this mode.
     assert _canary_accept("has_violation", "500", "has_violation reason") is True
     assert _canary_accept("has_violation", "200", "reason boundary_count") is False
+
+
+# ── run_canary_action must not hard-require the <expect> arg (set -u guard) ───
+#
+# deploy.sh runs under `set -euo pipefail`. When run_canary_action gained the
+# 5th <expect> parameter, the HTTP-shaped regime canary call sites still passed
+# only 4 args, so `local expect="$5"` tripped `unbound variable` and crashed the
+# deploy AFTER the (fixed) inference canary had already promoted the alias
+# (2026-07-12 regime-canary crash). The parameter must default so an
+# HTTP-shaped caller may omit it and no 4-arg caller can ever `set -u` fault.
+def test_run_canary_action_defaults_expect_arg():
+    body = DEPLOY_SH.read_text()
+    assert 'local expect="${5:-statusCode}"' in body, (
+        "run_canary_action must default <expect> to statusCode so a 4-arg "
+        "call site cannot trip `set -u` — see the 2026-07-12 regime-canary crash"
+    )
