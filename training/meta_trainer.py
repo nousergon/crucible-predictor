@@ -4304,6 +4304,19 @@ def run_meta_training(
                 # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
                 "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
                 "meta_oos_ic_cpcv_nonlinear": meta_oos_ic_cpcv_nonlinear,
+                # W4 / W4.2 (OBSERVE, config#1994): the generalized per-L1
+                # leave-one-out leak-free meta ΔIC (the W4.2 pruning input) and
+                # the dead-L1 monitor that fuses it with the meta-Ridge
+                # standardized-coef magnitude into per-L1 dead-CANDIDATE flags.
+                # These are computed above and returned in the run result, but
+                # were previously DROPPED from the persisted manifest — so the
+                # observe cohort never actually landed in S3 and the report
+                # card / console could not surface it. Persist them alongside
+                # the sibling observe diagnostics (additive per S3 contract) so
+                # each weekly run records one dead-L1 OBSERVE cohort. Pure
+                # diagnostic: no de-weight/delete, serving L2 untouched.
+                "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+                "dead_l1_observe": dead_l1_observe,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
