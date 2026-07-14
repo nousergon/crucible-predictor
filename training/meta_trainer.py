@@ -107,8 +107,8 @@ def _log_rss(label: str) -> int:
         log.info("RSS %s: %.0f MB", label, rss_mb)
         return int(rss_mb)
     except Exception as exc:  # pragma: no cover — defensive
-        log.debug("RSS profiling unavailable (%s)", exc)
-        return 0
+        log.warning("RSS profiling unavailable (%s) — will filter with peak_rss_mb=-1 sentinel", exc)
+        return -1
 
 
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
@@ -4084,7 +4084,7 @@ def run_meta_training(
                 # variant registers under its own version_id ({label}-{date}-{fp})
                 # — distinct challengers on the leaderboard. Default = base label.
                 "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
-                "peak_rss_mb": peak_rss_mb,
+                "peak_rss_mb": peak_rss_mb if peak_rss_mb >= 0 else None,
                 # Per-regime empirical up-rate of REALIZED canonical alpha
                 # (independent of calibrator) — observability for the
                 # stratified-per-regime gate threshold calibration. See
