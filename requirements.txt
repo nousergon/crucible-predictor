@@ -48,7 +48,7 @@ krepis[flow_doctor]>=0.7.0
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.96.0
 
 # Training dependencies (not needed in Lambda)
-arcticdb>=6.11
+arcticdb>=6.18.7
 catboost>=1.2.0
 optuna>=3.5.0
 pytest>=7.0.0
