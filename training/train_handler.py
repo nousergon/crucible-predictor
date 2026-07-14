@@ -1470,6 +1470,33 @@ def _main_impl(
                 "risk_model_persist failed (non-blocking): %s",
                 _rm_err, exc_info=True,
             )
+            # config#2443 — a swallowed exception here previously left NO
+            # alertable trace: training completes green, the training summary
+            # has no "risk_model" key, and the ARTIFACT_REGISTRY freshness
+            # monitor is a `severity: warning` row on a 10-calendar-day
+            # recency window (config#1297) — it does not page on a single
+            # missed saturday_sf cycle, only flags the dashboard. A whole week
+            # could silently pass with zero human-visible signal. Route the
+            # failure through the same best-effort ops-alert channel
+            # model_zoo.py's rotation alerts use, so an operator actually
+            # sees it. Alert failure must never fail training (mirrors the
+            # try/except posture around every other publish_ops_alert call
+            # site in this repo).
+            try:
+                from ops_alerts import publish_ops_alert
+
+                publish_ops_alert(
+                    message=(
+                        f"risk_model_persist failed for date={date_str} "
+                        f"(non-blocking — training completed normally): "
+                        f"{_rm_err}"
+                    ),
+                    severity="warning",
+                    source="alpha-engine-predictor/training/train_handler.py::risk_model_persist",
+                    dedup_key=f"risk_model_persist_failed_{date_str}",
+                )
+            except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+                log.warning("risk_model_persist: failure alert itself failed", exc_info=True)
 
     # Step 2e: Triple-barrier cutover gate (Stage 3 PR 5 SF wiring).
     # Runs after model upload + training summary so the gate has access
