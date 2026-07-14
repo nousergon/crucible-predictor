@@ -1,0 +1,22 @@
+# Standard fleet Dependabot config (weekly, grouped minor+patch) — alpha-engine-config-I2525
+# Majors ride separate individual PRs deliberately (scrutiny before merge).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
