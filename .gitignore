@@ -70,6 +70,9 @@ config/predictor.yaml
 *.swp
 *.swo
 
+# Local developer instructions (infrastructure/deploy detail — not for public repo)
+CLAUDE.md
+
 # Logs
 *.log
 logs/
