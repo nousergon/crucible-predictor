@@ -73,7 +73,7 @@ jobs:
       # >=0.7.0` floor; setup-python pins the interpreter so the pip install
       # target doesn't drift with GH's ubuntu-latest image updates.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
