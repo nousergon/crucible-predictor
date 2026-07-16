@@ -138,18 +138,20 @@ class TestEmailVetoSingleSourcing:
         subject, _, _ = self._email(self._fixture())
         assert "1 UP / 3 DOWN" in subject
 
-    def test_badge_and_row_tag_follow_gbm_veto(self):
+    def test_slim_email_has_no_per_ticker_veto_display(self):
+        # config#856 slimmed this email: the per-ticker prediction table (and
+        # its per-row gbm_veto badge) moved to the console Predictor page. The
+        # authoritative per-ticker veto-single-sourcing invariant from
+        # config#1815 is now enforced ON THE CONSOLE PAGE (crucible-dashboard
+        # views/7_Predictor.py renders a `Veto` column single-sourced from the
+        # same gbm_veto boolean, guarded by that repo's test). The email keeps
+        # only the aggregate veto count, whose single-sourcing is guarded by
+        # `test_subject_counts_gbm_veto_only` above — so no divergent display
+        # rule can reappear in the email itself.
         _, html, _ = self._email(self._fixture())
-        # Exactly the BLOCKD row carries veto markup; HCONF/LOWCNF render
-        # plain DOWN badges despite satisfying the legacy display rules.
-        # (Scoped to <tr> rows — the footnote legend always contains the
-        # literal "⚠ VETO" string.)
-        rows = html.split("<tr>")
-        vet_row = [r for r in rows if "BLOCKD" in r]
-        assert vet_row and "⚠ VETO" in vet_row[0]
-        for t in ("HCONF", "LOWCNF"):
-            row = [r for r in rows if t in r][0]
-            assert "VETO" not in row
+        for t in ("BLOCKD", "HCONF", "LOWCNF", "WINNER"):
+            assert t not in html
+        assert "⚠ VETO" not in html  # no per-row veto markup inlined anymore
 
     def test_zero_vetoes_when_gbm_veto_all_false(self):
         preds = [p | {"gbm_veto": False} for p in self._fixture()]
