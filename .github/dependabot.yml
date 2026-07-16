@@ -22,12 +22,14 @@ updates:
         update-types:
           - major
 
+  # NOTE: no cooldown here — Dependabot rejects cooldown.semver-major-days for
+  # the github-actions ecosystem (semver cooldown keys are per-ecosystem; pip
+  # supports them, actions does not — validated live 2026-07-16). The majors
+  # group alone carries the I2734 grouping intent for actions.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
-    cooldown:
-      semver-major-days: 30
     groups:
       minor-and-patch:
         update-types:
