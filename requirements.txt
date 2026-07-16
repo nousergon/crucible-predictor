@@ -52,7 +52,7 @@ arcticdb>=6.18.7
 catboost>=1.2.0
 optuna>=4.9.0
 pytest>=9.1.1
-shap>=0.42.0
+shap>=0.52.0
 matplotlib>=3.11.0
 
 # MLP model — only needed when model_type="mlp" (not used in Lambda)
