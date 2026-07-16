@@ -50,7 +50,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https:/
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.18.7
 catboost>=1.2.0
-optuna>=3.5.0
+optuna>=4.9.0
 pytest>=7.0.0
 shap>=0.42.0
 matplotlib>=3.7.0
