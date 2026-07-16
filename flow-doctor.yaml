@@ -32,8 +32,19 @@ notify:
     notify_on: [error, warning]
     notify_on_category: [TRANSIENT, EXTERNAL, INFRA]
 store:
-  type: sqlite
-  path: /tmp/flow_doctor.db
+  # DynamoDB, not ephemeral /tmp SQLite. Each Lambda cold-start/EC2 spot
+  # run is a fresh process, so a /tmp-backed store never sees the prior
+  # invocation's dedup rows — dedup_cooldown_minutes is silently a no-op
+  # and every recurring failure re-alerts from scratch (this exact class
+  # of bug already caused an alert storm elsewhere in the fleet; see
+  # alpha-engine-config#2418, prior fix in nousergon-data). DynamoDB is
+  # shared/durable across processes and instances, so cooldown state
+  # actually persists. Table provisioned out-of-band; runtime role only
+  # needs CRUD (Put/Get/Query/Scan/DescribeTable), not CreateTable — see
+  # infrastructure/iam/alpha-engine-predictor-role.json.
+  type: dynamodb
+  table_name: flow-doctor-store
+  region: us-east-1
 dedup_cooldown_minutes: 60
 dependencies:
   - research-lambda
