@@ -51,7 +51,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https:/
 arcticdb>=6.18.7
 catboost>=1.2.0
 optuna>=4.9.0
-pytest>=7.0.0
+pytest>=9.1.1
 shap>=0.42.0
 matplotlib>=3.11.0
 
