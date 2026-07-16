@@ -82,27 +82,33 @@ class TestBuildPredictorEmail:
         assert "UP" in subject
         assert "DOWN" in subject
 
-    def test_html_contains_tickers(self):
-        """HTML body should contain all ticker names."""
+    def test_html_omits_per_ticker_rows_and_links_to_console(self):
+        """config#856: the per-ticker table moved to the console Predictor
+        page — the slim email must NOT inline ticker rows, and must carry the
+        console deep-link that renders them."""
         from inference.daily_predict import _build_predictor_email
+        from inference.stages.write_output import predictor_report_url
 
         preds = self._make_predictions(3)
         metrics = self._make_metrics()
 
         _, html, _ = _build_predictor_email(preds, metrics, "2024-06-01")
         for p in preds:
-            assert p["ticker"] in html
+            assert p["ticker"] not in html
+        assert predictor_report_url("2024-06-01") in html
 
-    def test_plain_contains_tickers(self):
-        """Plain text body should contain all ticker names."""
+    def test_plain_omits_per_ticker_rows_and_links_to_console(self):
+        """Plain-text counterpart of the slim contract (config#856)."""
         from inference.daily_predict import _build_predictor_email
+        from inference.stages.write_output import predictor_report_url
 
         preds = self._make_predictions(3)
         metrics = self._make_metrics()
 
         _, _, plain = _build_predictor_email(preds, metrics, "2024-06-01")
         for p in preds:
-            assert p["ticker"] in plain
+            assert p["ticker"] not in plain
+        assert predictor_report_url("2024-06-01") in plain
 
     def test_veto_section_appears_for_high_confidence_down(self):
         """Vetoes render from the authoritative gbm_veto boolean (config#1815).
@@ -138,9 +144,13 @@ class TestBuildPredictorEmail:
         subject, html, plain = _build_predictor_email(
             preds, metrics, "2024-06-01", veto_threshold=0.65
         )
-        assert "veto" in subject.lower()
-        assert "VETOME" in html
-        assert "VETO" in plain or "VETOME" in plain
+        # The email surfaces only the aggregate veto COUNT (single-sourced from
+        # gbm_veto); the per-ticker veto badge moved to the console page
+        # (config#856). Exactly one name (VETOME) has gbm_veto=True.
+        assert "1 veto" in subject
+        assert "Vetoes" in html
+        assert "Vetoes: 1" in plain
+        assert "VETOME" not in html  # per-ticker rows are on the console now
 
     def test_empty_predictions(self):
         """Should handle empty prediction list gracefully."""
@@ -152,7 +162,9 @@ class TestBuildPredictorEmail:
         assert "No predictions" in html or "none" in html.lower() or len(html) > 0
 
     def test_with_signals_data(self):
-        """Research section should appear when signals_data is provided."""
+        """The market regime is still surfaced (subject + summary) when
+        signals_data is provided; the full research brief / per-ticker
+        universe moved to the console page (config#856)."""
         from inference.daily_predict import _build_predictor_email
 
         signals = {
@@ -174,12 +186,18 @@ class TestBuildPredictorEmail:
             preds, metrics, "2024-06-01", signals_data=signals
         )
         assert "BULLISH" in subject
-        assert "AAPL" in html
-        assert "Research" in html or "research" in html.lower()
-        assert "AAPL" in plain
+        assert "BULLISH" in html  # regime pill still in the summary
+        # The per-ticker universe (AAPL) is on the console page now, not inlined.
+        assert "AAPL" not in html
 
-    def test_buy_candidates_render_in_research_brief(self):
-        """Buy Candidates section should render and include unscored tickers."""
+    def test_unscored_buy_candidates_surface_in_data_warning(self):
+        """config#856 slimmed this email: the Buy Candidates / research-brief
+        table moved to the console Predictor page. The no-silent-fails
+        invariant this test protects — actionable buy candidates the GBM did
+        NOT score must still reach the inbox, not hide behind the console
+        click — is preserved via the DATA WARNING block (mirroring the EOD
+        email), so TICK2/TICK3 still surface even though the full brief no
+        longer inlines."""
         from inference.daily_predict import _build_predictor_email
 
         # Predictions cover only TICK1 — TICK2/TICK3 are in buy_candidates but unscored
@@ -213,13 +231,17 @@ class TestBuildPredictorEmail:
         subject, html, plain = _build_predictor_email(
             preds, self._make_metrics(), "2024-06-01", signals_data=signals
         )
-        assert "Buy Candidates (3)" in html
-        assert "Buy Candidates (3)" in plain
+        # Unscored buy candidates surface via the DATA WARNING (not the old
+        # inline "Buy Candidates" table, which now lives on the console page).
+        assert "DATA WARNING" in html
+        assert "DATA WARNING" in plain
+        assert "not scored by GBM" in html
+        assert "not scored by GBM" in plain
         assert "TICK2" in html and "TICK3" in html
         assert "TICK2" in plain and "TICK3" in plain
-        assert "NO PRED" in html
-        assert "not scored by GBM" in html
-        assert "[NO PRED]" in plain
+        # The full per-ticker table is gone from the email — TICK1 (which WAS
+        # scored) is not inlined; the console page renders the complete table.
+        assert "TICK1" not in html
 
     def test_missing_ic_metric(self):
         """Should handle missing ic_30d metric without crashing."""
