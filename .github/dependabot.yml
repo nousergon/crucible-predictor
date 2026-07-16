@@ -1,35 +1,31 @@
 # Standard fleet Dependabot config (weekly, grouped minor+patch) — alpha-engine-config-I2525
-# Majors are grouped into a single monthly PR per ecosystem — alpha-engine-config-I2734
+# Majors are surfaced as ONE grouped PR per ecosystem, throttled by a 30-day
+# major-version cooldown — alpha-engine-config-I2734. NOTE: Dependabot requires a
+# unique (package-ecosystem, directory, target-branch) per update config, so the
+# I2734 intent CANNOT be a second per-ecosystem block on its own monthly schedule
+# (that shape is invalid and disables ALL updates for the repo). The `majors`
+# group + `cooldown.semver-major-days: 30` below is the closest legal expression.
 version: 2
 updates:
   - package-ecosystem: pip
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      semver-major-days: 30
     groups:
       minor-and-patch:
         update-types:
           - minor
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - "version-update:semver-major"
-
-  - package-ecosystem: pip
-    directory: "/"
-    schedule:
-      interval: monthly
-    groups:
       majors:
         update-types:
           - major
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - "version-update:semver-minor"
-          - "version-update:semver-patch"
 
+  # NOTE: no cooldown here — Dependabot rejects cooldown.semver-major-days for
+  # the github-actions ecosystem (semver cooldown keys are per-ecosystem; pip
+  # supports them, actions does not — validated live 2026-07-16). The majors
+  # group alone carries the I2734 grouping intent for actions.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
@@ -39,22 +35,6 @@ updates:
         update-types:
           - minor
           - patch
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - "version-update:semver-major"
-
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: monthly
-    groups:
       majors:
         update-types:
           - major
-    ignore:
-      - dependency-name: "*"
-        update-types:
-          - "version-update:semver-minor"
-          - "version-update:semver-patch"
-

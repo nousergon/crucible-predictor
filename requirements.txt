@@ -6,7 +6,7 @@ boto3>=1.26.0
 scipy>=1.18.0
 hmmlearn>=0.3
 tqdm>=4.68.4
-pyarrow>=14.0.0
+pyarrow>=25.0.0
 requests>=2.28.0
 lxml>=4.9.0
 lightgbm>=4.6.0
@@ -51,7 +51,7 @@ nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https:/
 arcticdb>=6.18.7
 catboost>=1.2.0
 optuna>=4.9.0
-pytest>=7.0.0
+pytest>=9.1.1
 shap>=0.42.0
 matplotlib>=3.11.0
 
