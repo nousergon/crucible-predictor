@@ -40,6 +40,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/observe_leaderboard.py": 2,  # observe_leaderboard/{date}.json + latest.json — realized-edge measurement artifact, observe-only, no freshness SLA (config#671/#702 L4539)
     "analysis/triple_barrier_cutover_runner.py": 2,
     "data_manifest.py": 1,
+    "inference/research_free_inference.py": 2,  # predictions_research_free/{date}.json + latest.json — registered as predictor_predictions_research_free in ARTIFACT_REGISTRY.yaml (config#2365, warning severity — no consumer hard-blocked yet, see that row's comment)
     "inference/s3_io.py": 2,
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)
     "model/registry.py": 4,  # lineage write + promote-in-place patch + _patch_stage + L4540 served-identity restamp of live manifest.json (already a registered artifact; L4469; copy_object not counted)
@@ -48,7 +49,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "regime/retrospective_eval_handler.py": 2,
     "regime/substrate.py": 2,
     "training/meta_trainer.py": 7,
-    "training/model_zoo.py": 3,  # G2 live-contract RESTORE (re-puts existing champion keys, not a new artifact) + model_zoo/leaderboard/{date}.json (observe-only, best-effort, no freshness SLA — L4544) + model_zoo/trial_log.json (cumulative trial ledger, observe-only, failure recorded in leaderboard trial_log_status — L4582)
+    "training/model_zoo.py": 4,  # G2 live-contract RESTORE (re-puts existing champion keys, not a new artifact) + model_zoo/leaderboard/{date}.json (observe-only, best-effort, no freshness SLA — L4544) + model_zoo/trial_log.json (cumulative trial ledger, observe-only, failure recorded in leaderboard trial_log_status — L4582) + model_zoo/promotions/{run_date}.json (exactly-once promotion marker, written per rotation run_date, NOT a freshness-SLA artifact — its ABSENCE for a date is the normal not-yet-run state; config#2252)
     "training/risk_model_persist.py": 2,
     "training/train_handler.py": 2,
 }

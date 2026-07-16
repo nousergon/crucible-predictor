@@ -29,6 +29,18 @@ DECLARED_READS = {
     "veto_confidence",
     "regime_veto_enabled", "regime_veto_scale", "regime_veto_cap",
     "regime_forced_bear_enabled", "drawdown_regime_enabled",
+    # Per-sector veto threshold shadow soak (config#921, Brian's ruling
+    # 2026-07-07 "proceed with shadow soak"). Default-off; shadow-only —
+    # never touches the live gbm_veto decision. Producer: crucible-backtester
+    # analysis/veto_analysis.py::apply (gated on veto_sector_shadow_enabled).
+    "veto_sector_shadow_enabled", "per_sector_overrides",
+    # Alpha dead-band veto shadow soak (config#2297, operator ruling
+    # 2026-07-13 "add a dead-band ..., observe-mode first"). Default-off;
+    # shadow-only — never touches the live gbm_veto decision, only the
+    # gbm_veto_shadow_dead_band / alpha_veto_dead_band_epsilon observation
+    # fields. Operator-written (no producer code), same as
+    # regime_veto_enabled et al. above.
+    "veto_dead_band_observe_enabled", "alpha_veto_dead_band",
 }
 
 

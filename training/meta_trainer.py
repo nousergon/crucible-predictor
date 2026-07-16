@@ -107,8 +107,8 @@ def _log_rss(label: str) -> int:
         log.info("RSS %s: %.0f MB", label, rss_mb)
         return int(rss_mb)
     except Exception as exc:  # pragma: no cover — defensive
-        log.debug("RSS profiling unavailable (%s)", exc)
-        return 0
+        log.warning("RSS profiling unavailable (%s) — will filter with peak_rss_mb=-1 sentinel", exc)
+        return -1
 
 
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
@@ -142,10 +142,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     so the autocorrelation contribution is visible.
 
     Strategy: walk the sorted unique dates ascending; greedily keep a date
-    if it's at least ``horizon_trading_days`` calendar days past the most
-    recently kept date. Calendar-day spacing is a good proxy for trading-day
-    spacing at these horizons (5/10/15/21/40/60/90) and avoids needing the
-    NYSE calendar in this hot path. Returns a mask aligned to ``dates``.
+    if it's at least ``horizon_trading_days`` **trading sessions** past the
+    most recently kept date, measured on the NYSE calendar via
+    ``krepis.trading_calendar.count_trading_days``. Trading-day-exact spacing
+    is required here — a calendar-day proxy is NOT acceptable — because the
+    forward-return label these windows must not overlap is itself
+    trading-day-exact (``forward_return_{h}d = close.shift(-h)/close - 1`` is a
+    row-shift on a trading-day-only-indexed series). A calendar-day proxy
+    under-spaces samples at longer horizons (126 calendar days ≈ 90 trading
+    days), letting residual autocorrelation back into exactly the diagnostic
+    built to eliminate it — and it does so worst at the longest horizons,
+    i.e. worst on the 63d/126d points this battery was widened to test
+    (config#937 Step 0 / config#1993 long legs). Returns a mask aligned to
+    ``dates``.
 
     The greedy "keep-if-far-enough" pattern minimizes overlap pessimistically:
     dates dropped because their forward window overlapped with a kept date's
@@ -154,7 +163,12 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     """
     if not dates:
         return []
-    # Convert to pandas Timestamps for comparable arithmetic without losing
+    # Trading-day-exact spacing on the NYSE calendar (config#937 Step 0).
+    # krepis is already a direct fleet dependency; import locally to keep the
+    # calendar off the module-import hot path (mirrors the pandas import below).
+    from krepis.trading_calendar import count_trading_days
+
+    # Convert to pandas Timestamps for stable sorting without losing
     # precision. The training code stores dates as pd.Timestamp objects on
     # rows (per the row construction in Step 6); accept any sortable type.
     import pandas as pd
@@ -163,10 +177,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     sort_order = sorted(range(len(dates_ts)), key=lambda i: dates_ts[i])
     mask = [False] * len(dates_ts)
     last_kept_ts: pd.Timestamp | None = None
-    horizon_delta = pd.Timedelta(days=horizon_trading_days)
     for i in sort_order:
         ts = dates_ts[i]
-        if last_kept_ts is None or (ts - last_kept_ts) >= horizon_delta:
+        # Keep the first date unconditionally; thereafter keep only once at
+        # least ``horizon_trading_days`` NYSE sessions have elapsed since the
+        # last kept date. ``count_trading_days(a, b)`` counts sessions in the
+        # half-open interval [a, b), so an exact-horizon gap (b sitting exactly
+        # h sessions after a) yields h and is kept — matching the prior
+        # boundary-inclusive semantics, now on the trading-day axis.
+        if (
+            last_kept_ts is None
+            or count_trading_days(last_kept_ts.date(), ts.date())
+            >= horizon_trading_days
+        ):
             mask[i] = True
             last_kept_ts = ts
     return mask
@@ -2866,6 +2889,28 @@ def run_meta_training(
         log.warning("W4 per-L1 LOO read failed (OBSERVE, non-fatal): %s", _e)
         meta_oos_ic_leakfree_per_l1_dropout = {"status": "error", "error": str(_e)}
 
+    # (W4.2, config#1994) dead-L1 pruning monitor — OBSERVE-ONLY. Fuses the W4
+    # LOMO leak-free ΔIC (above) with the fitted meta-Ridge's scale-free
+    # standardized coefficient magnitude into a per-L1 dead-CANDIDATE flag, so
+    # per-L1 marginal contribution surfaces on the report card every weekly run.
+    # This is a pure DIAGNOSTIC: it NEVER de-weights/drops/deletes an L1; serving
+    # L2 is untouched. Retirement (reversible de-weight in a shadow lane) is a
+    # separate later step gated on persistence across ≥N weekly cohorts + Shapley
+    # ≤ 0 surviving CSCV/PBO (config#624) — this run contributes ONE cohort.
+    # Ratified observe-only 2026-07-10 (Decision Queue, config#1926).
+    dead_l1_observe: dict = {"status": "not_run"}
+    try:
+        from training.dead_l1_monitor import summarize_dead_l1 as _dead_l1
+
+        dead_l1_observe = _dead_l1(
+            meta_oos_ic_leakfree_per_l1_dropout,
+            meta_model._importance,
+            meta_model._coefficients,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4.2 dead-L1 monitor failed (OBSERVE, non-fatal): %s", _e)
+        dead_l1_observe = {"status": "error", "error": str(_e)}
+
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
     # linear curve_leakfree (W3.2)? Reuses leakfree_horizon_ic_curve with the
@@ -4039,7 +4084,7 @@ def run_meta_training(
                 # variant registers under its own version_id ({label}-{date}-{fp})
                 # — distinct challengers on the leaderboard. Default = base label.
                 "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
-                "peak_rss_mb": peak_rss_mb,
+                "peak_rss_mb": peak_rss_mb if peak_rss_mb >= 0 else None,
                 # Per-regime empirical up-rate of REALIZED canonical alpha
                 # (independent of calibrator) — observability for the
                 # stratified-per-regime gate threshold calibration. See
@@ -4259,6 +4304,19 @@ def run_meta_training(
                 # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
                 "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
                 "meta_oos_ic_cpcv_nonlinear": meta_oos_ic_cpcv_nonlinear,
+                # W4 / W4.2 (OBSERVE, config#1994): the generalized per-L1
+                # leave-one-out leak-free meta ΔIC (the W4.2 pruning input) and
+                # the dead-L1 monitor that fuses it with the meta-Ridge
+                # standardized-coef magnitude into per-L1 dead-CANDIDATE flags.
+                # These are computed above and returned in the run result, but
+                # were previously DROPPED from the persisted manifest — so the
+                # observe cohort never actually landed in S3 and the report
+                # card / console could not surface it. Persist them alongside
+                # the sibling observe diagnostics (additive per S3 contract) so
+                # each weekly run records one dead-L1 OBSERVE cohort. Pure
+                # diagnostic: no de-weight/delete, serving L2 untouched.
+                "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+                "dead_l1_observe": dead_l1_observe,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -4663,6 +4721,12 @@ def run_meta_training(
         # IC — per-feature ΔIC vs the full read is the W4.2 pruning input
         # (which L1s carry leak-free IC). Additive per S3 contract.
         "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+        # W4.2 (config#1994, OBSERVE): dead-L1 pruning monitor — fuses the W4
+        # LOMO ΔIC above with the meta-Ridge standardized coefficient magnitude
+        # into per-L1 dead-CANDIDATE flags. Pure diagnostic: no de-weight/delete,
+        # serving L2 untouched; retirement is a later persistence-gated step
+        # (≥N weekly cohorts + Shapley ≤ 0, config#624). Additive per S3 contract.
+        "dead_l1_observe": dead_l1_observe,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
