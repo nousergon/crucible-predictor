@@ -1,0 +1,11 @@
+# pip-audit ignore list (nousergon/alpha-engine-config#2342)
+# Every entry below MUST carry a dated rationale comment directly above it.
+# No blanket suppression — each accepted advisory is named individually.
+# Format:
+#   # <rationale> — accepted 2026-07-12, revisit <YYYY-MM-DD or "when a fix is released">
+#   <VULN-ID>
+#
+# No entries: `pip-audit` against the full `requirements.txt` install
+# (Python 3.12, matching CI) reported zero known vulnerabilities as of
+# 2026-07-12. This file is intentionally empty and exists so the CI step
+# below has a stable, always-present ignore-list target.
