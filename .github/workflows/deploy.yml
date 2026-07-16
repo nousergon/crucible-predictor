@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout predictor repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: alpha-engine-predictor
 
@@ -41,7 +41,7 @@ jobs:
       # import. Fine-grained PAT with read-only Contents access on
       # alpha-engine-config is stored as ALPHA_ENGINE_CONFIG_TOKEN.
       - name: Checkout alpha-engine-config
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: nousergon/alpha-engine-config
           path: alpha-engine-config
