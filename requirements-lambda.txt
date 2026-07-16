@@ -25,7 +25,7 @@ krepis[flow_doctor]>=0.7.0
 nousergon-lib[arcticdb,flow_doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.96.0
 numpy>=1.24.0,<2
 pandas>=2.0.0,<3
-pyarrow>=14.0.0
+pyarrow>=25.0.0
 yfinance>=0.2.30
 boto3>=1.26.0
 tqdm>=4.68.4
