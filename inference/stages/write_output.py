@@ -1377,6 +1377,51 @@ def run(ctx: PipelineContext) -> None:
             and confidence >= veto_thresh
         )
 
+    # ── Alpha dead-band veto shadow soak (config#2297) ──────────────────────
+    # Brian's ruling (2026-07-13): "add a dead-band (predicted_alpha < -epsilon),
+    # observe-mode first" — log what the dead-band decision WOULD have been
+    # WITHOUT changing the live gbm_veto decision above. The dead-band suppresses
+    # the veto when |predicted_alpha| is below epsilon (noise-level signal).
+    # Incident: veto fired on noise with median predicted_alpha ≈ -0.0004, ~half
+    # the universe landing negative and getting vetoed despite low confidence
+    # (e.g. IBKR -0.04%, COIN -0.07%) while high-research names got blocked.
+    # Default OFF (``veto_dead_band_observe_enabled``). When enabled, reads
+    # ``alpha_veto_dead_band`` epsilon from predictor_params.json (e.g. -0.001).
+    # Observation artifacts: ``gbm_veto_shadow_dead_band`` (boolean — what WOULD
+    # veto) and ``alpha_veto_dead_band_epsilon`` (the epsilon value) on each
+    # prediction. After the observe period, a separate cutover decision promotes
+    # the shadow to live. Re-validates epsilon choice against backtest evidence
+    # (veto_value.json, 21d, n=668 in the issue).
+    params = _load_predictor_params_from_s3(ctx.bucket) or {}
+    if bool(params.get("veto_dead_band_observe_enabled", False)):
+        epsilon = float(params.get("alpha_veto_dead_band", -0.001))
+        n_shadow_vetoes = 0
+        n_shadow_differ = 0
+        for p in ctx.predictions:
+            cr = p.get("combined_rank")
+            alpha = p.get("predicted_alpha", 0) or 0
+            confidence = p.get("prediction_confidence", 0) or 0
+            live_veto = p.get("gbm_veto", False)
+            shadow_veto = (
+                alpha < epsilon
+                and cr is not None
+                and cr > n_preds / 2
+                and confidence >= veto_thresh
+            )
+            p["gbm_veto_shadow_dead_band"] = shadow_veto
+            p["alpha_veto_dead_band_epsilon"] = epsilon
+            if shadow_veto:
+                n_shadow_vetoes += 1
+            if shadow_veto != live_veto:
+                n_shadow_differ += 1
+        if n_shadow_differ > 0:
+            log.info(
+                "Alpha dead-band shadow (config#2297): epsilon=%.6f — "
+                "%d live vetoes, %d shadow vetoes, %d differ",
+                epsilon, sum(1 for p in ctx.predictions if p.get("gbm_veto")),
+                n_shadow_vetoes, n_shadow_differ,
+            )
+
     # ── Per-sector veto threshold shadow soak (config#921) ───────────────────
     # Brian's ruling (2026-07-07, config#921): "proceed with shadow soak" —
     # log/attach what the per-sector-threshold decision WOULD have been
@@ -1390,7 +1435,6 @@ def run(ctx: PipelineContext) -> None:
     # from research's ``signals.json`` universe entries, canonicalized via
     # ``model.research_features.SECTOR_NAME_CANONICAL`` (the same lookup
     # ``extract_research_features`` uses for ``sector_macro_modifier``).
-    params = _load_predictor_params_from_s3(ctx.bucket) or {}
     if bool(params.get("veto_sector_shadow_enabled", False)):
         overrides = params.get("per_sector_overrides") or {}
         if overrides:

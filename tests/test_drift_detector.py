@@ -14,6 +14,7 @@ action). ``check_drift`` keeps ``alerts`` as a backward-compatible list[str]
 """
 
 import json
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -317,6 +318,32 @@ def test_check_drift_swallows_put_object_failure():
     with patch("boto3.client", return_value=fake_s3):
         result = check_drift(bucket="bucket", date_str="2026-04-15")
     assert result["status"] == "alert"  # missing preds → "No recent predictions"
+
+
+def test_check_drift_missing_date_defaults_to_last_closed_trading_day():
+    """alpha-engine-config-I2722 (2026-07-16): check_drift is being re-homed
+    onto a direct EventBridge trigger that can no longer thread
+    $.trading_day_gate.Payload.check_date through the Payload — a missing
+    date_str must resolve via last_closed_trading_day() (NYSE-aware), NOT
+    date.today() (a bare calendar date is not a trade-decision-key axis; see
+    this repo's Date Conventions rule). Uses a Sunday reference so today() and
+    last_closed_trading_day() provably diverge — Sunday's last closed trading
+    day is the preceding Friday."""
+    fake_s3 = _s3_with_routes({
+        "predictor/predictions/2026-04-17.json": ("json", _make_preds(n=5)),
+    })
+    fake_s3.put_object = MagicMock()
+    with patch("boto3.client", return_value=fake_s3), \
+         patch("krepis.trading_calendar.last_closed_trading_day",
+               return_value=date(2026, 4, 17)) as mock_lctd:
+        result = check_drift(bucket="bucket", date_str=None)
+
+    mock_lctd.assert_called_once_with()
+    assert result["date"] == "2026-04-17"
+    assert "2026-04-19" not in result["date"], (
+        "must not fall back to date.today() — that is the trade-decision-key "
+        "bug class this fix closes"
+    )
 
 
 def test_format_alert_report_is_severity_led():
