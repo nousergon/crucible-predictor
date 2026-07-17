@@ -597,25 +597,58 @@ def write_predictions(
     import boto3
     s3 = boto3.client("s3")
 
-    # Write each S3 object independently so partial failures don't block others
-    writes = [
-        (dated_key, predictions_json, "predictions (dated)"),
+    from inference.pipeline import PipelineHardFail
+
+    # Write the primary dated artifact (fail-loud — this is the canonical prediction set)
+    try:
+        _s3_put_json(s3, s3_bucket, dated_key, predictions_json)
+        log.info("Written s3://%s/%s (primary dated artifact)", s3_bucket, dated_key)
+    except Exception as exc:
+        msg = f"S3 write FAILED for primary artifact {dated_key}: {exc}"
+        log.error(msg)
+        # Route through the repo's established ops-alert channel (SNS +
+        # flow-doctor via ops_alerts.publish_ops_alert — same chokepoint
+        # training/train_handler.py's risk_model_persist failure alert
+        # uses, config#2443). The alert call is best-effort and wrapped so
+        # a failure in the alert path itself can never swallow the
+        # PipelineHardFail raise below — the fail-loud contract must hold
+        # even if paging is degraded.
+        try:
+            from ops_alerts import publish_ops_alert
+            publish_ops_alert(
+                message=msg,
+                severity="critical",
+                source="alpha-engine-predictor/inference/stages/write_output.py::write_predictions",
+                dedup_key=f"predictor_s3_dated_write_failed_{date_str}",
+            )
+        except Exception:  # noqa: BLE001 — alert failure must not mask the hard-fail raise
+            log.warning("predictor_s3_dated_write: failure alert itself failed", exc_info=True)
+        raise PipelineHardFail(msg) from exc
+
+    # Write latest.json + metrics (best-effort with alerts on failure)
+    secondary_writes = [
         (latest_key, predictions_json, "predictions (latest)"),
-        (metrics_key, metrics_json, "metrics"),
+        (metrics_key, metrics_json, "metrics (latest)"),
     ]
-    n_ok = 0
-    for key, body, label in writes:
+    for key, body, label in secondary_writes:
         try:
             _s3_put_json(s3, s3_bucket, key, body)
-            log.info("Written s3://%s/%s", s3_bucket, key)
-            n_ok += 1
+            log.info("Written s3://%s/%s (%s)", s3_bucket, key, label)
         except Exception as exc:
-            log.error("S3 write failed for %s: %s", label, exc)
-    if n_ok < len(writes):
-        log.error(
-            "Partial S3 write: %d/%d succeeded. Check IAM permissions for s3://%s",
-            n_ok, len(writes), s3_bucket,
-        )
+            log.error("S3 write failed for %s (%s): %s", label, key, exc)
+            try:
+                from ops_alerts import publish_ops_alert
+                publish_ops_alert(
+                    message=f"S3 write failed for {label} ({key}): {exc}",
+                    severity="warning",
+                    source="alpha-engine-predictor/inference/stages/write_output.py::write_predictions",
+                    dedup_key=f"predictor_s3_secondary_write_failed_{key}_{date_str}",
+                )
+            except Exception:  # noqa: BLE001 — best-effort secondary alert; write already logged
+                log.warning(
+                    "predictor_s3_secondary_write: failure alert itself failed for %s",
+                    label, exc_info=True,
+                )
 
 
 # ── Predictor email ────────────────────────────────────────────────────────────

@@ -60,8 +60,13 @@ class TestWritePredictionsS3:
     @patch.dict("sys.modules", {"boto3": MagicMock()})
     @patch("inference.stages.write_output._s3_put_json", side_effect=Exception("S3 error"))
     def test_handles_write_failure(self, mock_put):
-        # Should not raise — failures are logged but not propagated
-        write_predictions([{"ticker": "AAPL"}], "2026-04-08", "bucket", {})
+        # config#2333: the primary dated-key write is fail-loud — a failure
+        # here must raise PipelineHardFail (superseding the pre-config#2333
+        # "logged but not propagated" contract this test used to assert; see
+        # TestS3WriteFailLoud below for the full fail-loud/best-effort matrix).
+        from inference.pipeline import PipelineHardFail
+        with pytest.raises(PipelineHardFail):
+            write_predictions([{"ticker": "AAPL"}], "2026-04-08", "bucket", {})
 
 
 class TestGetVetoThresholdExtended:
@@ -953,6 +958,66 @@ class TestLoadExecutorParamsForEmailHelper:
             )
         assert "Effective Optimizer Params" not in html
         assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
+
+
+# ── config#2333: S3 write fail-loud on the primary dated artifact ────────
+#
+# The dated predictions/{date}.json key is the canonical prediction set the
+# step function's CheckPredictorCoverage state and the executor both key
+# off of. A silent S3 put failure there used to leave stale data with no
+# signal to the pipeline. This write is now fail-loud (raises
+# PipelineHardFail so the SF Catch fires); latest.json + metrics/latest.json
+# remain best-effort but alert on failure instead of log-only.
+
+
+class TestS3WriteFailLoud:
+    """Test fail-loud on S3 dated-key failures, best-effort on secondary writes."""
+
+    def setup_method(self):
+        """Reset cache state before each test."""
+        wo._predictor_params_cache = None
+        wo._predictor_params_loaded = False
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    def test_dated_key_failure_raises_hardfall(self, mock_put):
+        """Dated predictions write failure must raise PipelineHardFail."""
+        from inference.pipeline import PipelineHardFail
+        # First call (dated) fails, later calls not reached
+        mock_put.side_effect = Exception("S3 connection error")
+        predictions = [{"ticker": "AAPL", "prediction_confidence": 0.75}]
+        with pytest.raises(PipelineHardFail):
+            wo.write_predictions(predictions, "2026-04-08", "bucket", {"model_version": "v1"})
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    @patch("ops_alerts.publish_ops_alert")
+    def test_secondary_writes_failure_alerts_not_raises(self, mock_alert, mock_put):
+        """Latest.json / metrics failures must alert but not raise."""
+        predictions = [{"ticker": "AAPL", "prediction_confidence": 0.75}]
+        # Dated succeeds, latest/metrics fail
+        mock_put.side_effect = [
+            None,  # dated succeeds
+            Exception("IAM denied"),  # latest fails
+            Exception("S3 throttle"),  # metrics fails
+        ]
+        # Should not raise
+        wo.write_predictions(predictions, "2026-04-08", "bucket", {"model_version": "v1"})
+        # Verify ops alerts were published for the two secondary failures
+        assert mock_alert.call_count >= 2
+        for _, kwargs in mock_alert.call_args_list:
+            assert kwargs["severity"] == "warning"
+
+    @patch.dict("sys.modules", {"boto3": MagicMock()})
+    @patch("inference.stages.write_output._s3_put_json")
+    def test_all_writes_succeed_no_alerts(self, mock_put):
+        """When all three writes succeed, no alerts."""
+        mock_put.side_effect = [None, None, None]  # all succeed
+        predictions = [{"ticker": "AAPL"}]
+        with patch("ops_alerts.publish_ops_alert") as alert_spy:
+            wo.write_predictions(predictions, "2026-04-08", "bucket", {})
+            # No alert calls expected on full success
+            alert_spy.assert_not_called()
 
 
 # ── config#856: slim predictor email + console deep-link ────────────────
