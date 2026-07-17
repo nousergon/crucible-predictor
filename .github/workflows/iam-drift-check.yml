@@ -1,0 +1,44 @@
+name: IAM Drift Check
+
+# Catches drift between the codified inline policy under
+# infrastructure/iam/<role>.json and the live AWS role state — the SOTA pattern
+# from crucible-executor extended to the predictor role (alpha-engine-config#2340).
+#
+# Triggers:
+#   - Every PR that touches infrastructure/iam/** (catches a codified change
+#     that forgot to apply, or an apply that forgot to commit, before merge)
+#   - Daily at 09:35 UTC (catches out-of-band manual IAM edits; offset from the
+#     executor repo's 09:30 run to avoid a concurrent OIDC assume pile-up)
+#   - Manual via workflow_dispatch
+#
+# AWS auth: OIDC -> github-actions-iam-drift-check role (read-only:
+# iam:ListRolePolicies + iam:GetRolePolicy, scoped to the codified roles only;
+# the role's iam-readonly.json already grants read on alpha-engine-predictor-role).
+
+on:
+  pull_request:
+    paths:
+      - 'infrastructure/iam/**'
+      - '.github/workflows/iam-drift-check.yml'
+  schedule:
+    - cron: '35 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          aws-region: us-east-1
+
+      - name: Run IAM drift check (codified vs live AWS)
+        run: python3 infrastructure/iam/check-drift.py
