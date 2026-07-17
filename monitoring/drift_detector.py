@@ -307,12 +307,28 @@ def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> di
     None when clean), ``alert_details`` (the structured dicts), and
     ``skipped_checks`` (retained in the output shape for compatibility; always
     empty now that the only check this producer runs is prediction drift,
-    which never conditionally skips)."""
+    which never conditionally skips).
+
+    ``date_str=None`` defaults to ``last_closed_trading_day()`` (NYSE-aware,
+    NOT ``date.today()``) — alpha-engine-config-I2722 (2026-07-16): this
+    handler is being re-homed off ``ne-preopen-trading-pipeline`` onto its own
+    direct EventBridge trigger, which can no longer thread the SF's own
+    ``$.trading_day_gate.Payload.check_date`` through the Payload, so a
+    missing ``date`` must resolve correctly on its own. ``date.today()`` is a
+    bare calendar date — on a weekend/holiday/pre-close weekday it silently
+    scores drift against a day with no predictions yet (or the wrong day
+    entirely), exactly the class of trade-decision-key bug this repo's Date
+    Conventions rule (never ``date.today()`` for trade-decision keys) exists
+    to prevent. See ``~/Development/CLAUDE.md`` "Date Conventions" +
+    ``inference/stages/load_prices.py`` for the same helper's existing use in
+    this repo."""
     import boto3
+    from krepis.trading_calendar import last_closed_trading_day
+
     s3 = boto3.client("s3")
 
     if date_str is None:
-        date_str = date.today().isoformat()
+        date_str = last_closed_trading_day().isoformat()
 
     details: list[dict] = []
     details.extend(check_prediction_drift(s3, bucket, date_str))

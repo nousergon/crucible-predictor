@@ -40,6 +40,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/observe_leaderboard.py": 2,  # observe_leaderboard/{date}.json + latest.json — realized-edge measurement artifact, observe-only, no freshness SLA (config#671/#702 L4539)
     "analysis/triple_barrier_cutover_runner.py": 2,
     "data_manifest.py": 1,
+    "inference/research_free_inference.py": 2,  # predictions_research_free/{date}.json + latest.json — registered as predictor_predictions_research_free in ARTIFACT_REGISTRY.yaml (config#2365, warning severity — no consumer hard-blocked yet, see that row's comment)
     "inference/s3_io.py": 2,
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)
     "model/registry.py": 4,  # lineage write + promote-in-place patch + _patch_stage + L4540 served-identity restamp of live manifest.json (already a registered artifact; L4469; copy_object not counted)

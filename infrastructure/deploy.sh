@@ -108,6 +108,103 @@ canary_status_ok() {
   return 1
 }
 
+# canary_accept <expect> <status> <present_keys>
+#   Central per-action acceptance decision, shared by every canary site. The
+#   handler in this repo emits TWO distinct response contracts, and gating both
+#   on `statusCode` is wrong for one of them:
+#
+#   <expect> = "statusCode"  → HTTP-shaped handler (the default `predict` path
+#              returns {"statusCode": 200, "body": ...}). Accept iff <status> is
+#              in the CANARY_NOOP_STATUSES allowlist (canary_status_ok).
+#
+#   <expect> = any other value → a Step-Function GATE action (check_trading_day,
+#              check_weekly_run_day, check_drift, check_pipeline_contract). These
+#              return a RAW DOMAIN DICT consumed by SF Choice states on named
+#              keys (is_trading_day / has_violation / status …) and deliberately
+#              DO NOT emit a `statusCode` (config#1430/#1824/#1282/#1853). Accept
+#              iff <expect> — the action's declared domain key — is present in
+#              the space-separated <present_keys> of the returned object. Key
+#              presence proves the invoke dispatched to the RIGHT branch and
+#              returned its contract; a broken import / missing branch instead
+#              surfaces as a FunctionError (checked by the caller) or a response
+#              lacking the key. Gating these on `statusCode` checks an invariant
+#              they never satisfy — the 2026-07-12 v351 false-canary-fail that
+#              refused to promote a healthy image (PR #362).
+#
+#   A FunctionError (unhandled exception / broken import) is checked by the
+#   caller BEFORE this and always rejects, in every mode.
+canary_accept() {
+  local expect="$1"
+  local status="$2"
+  local present_keys="$3"
+  if [ "$expect" = "statusCode" ]; then
+    canary_status_ok "$status"
+    return $?
+  fi
+  local k
+  for k in $present_keys; do
+    if [ "$k" = "$expect" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# run_canary_action <function_name> <version> <action> <payload> [expect]
+#   Invoke a single read-only action via krepis.aws invoke-canary and gate on
+#   its contract. [expect] selects the acceptance mode (see canary_accept):
+#   "statusCode" for an HTTP-shaped handler, or the required domain key for a
+#   Step-Function gate action. Defaults to "statusCode" — the historical
+#   universal behavior — so an HTTP-shaped call site may omit it AND a future
+#   4-arg caller cannot trip `set -u` (config: 2026-07-12 regime-canary crash).
+#   Returns: 0 if accepted; 1 if FunctionError or the contract is unmet.
+#   Outputs error details to stdout on failure.
+run_canary_action() {
+  local func_name="$1"
+  local version="$2"
+  local action="$3"
+  local payload="$4"
+  local expect="${5:-statusCode}"
+
+  local canary_out
+  canary_out=$(mktemp)
+  local canary_meta
+  canary_meta=$(python3 -m krepis.aws invoke-canary \
+    --function-name "${func_name}:${version}" \
+    --payload "$payload" \
+    --out "$canary_out" \
+    --region "${AWS_REGION}" \
+    --max-attempts 6 \
+    --label "${func_name}-${action}-canary") || canary_meta=""
+
+  local func_err
+  local status
+  local err_msg
+  local present_keys
+  func_err=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$canary_meta" 2>/dev/null || echo "")
+  status=$(python3 -c "import json; d=json.load(open('$canary_out')); print(d.get('statusCode', 0) if isinstance(d, dict) else 0)" 2>/dev/null || echo "0")
+  err_msg=$(python3 -c "import json; d=json.load(open('$canary_out')); print((d.get('errorMessage','') or d.get('body','')) if isinstance(d, dict) else '')" 2>/dev/null || echo "")
+  present_keys=$(python3 -c "import json; d=json.load(open('$canary_out')); print(' '.join(d.keys()) if isinstance(d, dict) else '')" 2>/dev/null || echo "")
+  rm -f "$canary_out"
+
+  if [ -n "$func_err" ] || ! canary_accept "$expect" "$status" "$present_keys"; then
+    echo "  ${action}: FAILED"
+    echo "    FunctionError: ${func_err:-<none>}"
+    echo "    expect: ${expect}"
+    echo "    statusCode: ${status}"
+    echo "    keys: ${present_keys:-<none>}"
+    echo "    payload: ${err_msg:-<empty>}"
+    return 1
+  fi
+
+  if [ "$expect" = "statusCode" ]; then
+    echo "  ${action}: OK (status=$status)"
+  else
+    echo "  ${action}: OK (${expect} present)"
+  fi
+  return 0
+}
+
 # When sourced for unit testing (tests/test_canary_status_allowlist.py sets
 # CANARY_LIB_SOURCE_ONLY=1), stop here: expose the helper without running the
 # deploy. Placed BEFORE flag parsing so the test can source the script without
@@ -257,11 +354,21 @@ echo "  Published version: ${VERSION}"
 # Invoke the version directly so a broken image cannot reach the live alias.
 # If the canary fails, live keeps pointing at the prior good version.
 #
+# Test multiple read-only handler actions to ensure all wiring is intact:
+#   - predict (action omitted / default) + dry_run
+#   - check_drift (monitoring gate)
+#   - check_trading_day (calendar gate)
+#   - check_weekly_run_day (calendar gate)
+#   - check_pipeline_contract (early validation gate)
+#
+# Each action's wiring is exercised independently. A broken import or a
+# missing handler will surface as FunctionError or statusCode != 200.
+#
 # Invoke via the shared ``krepis.aws invoke-canary`` CLI (config#1494, published
 # in krepis 0.7.0) instead of a bare ``aws lambda invoke``. The CLI retries ONLY
 # on the throttle/concurrency signal with bounded backoff+jitter and writes two
 # streams, exactly as ``aws lambda invoke`` did:
-#   - the response *payload* to --out ($CANARY_OUT)
+#   - the response *payload* to --out
 #   - the invoke API *metadata* JSON (StatusCode / FunctionError / ExecutedVersion)
 #     to stdout
 # Unhandled Lambda exceptions set FunctionError="Unhandled" on the *metadata*
@@ -272,30 +379,47 @@ echo "  Published version: ${VERSION}"
 # error or throttle exhaustion) leaves $CANARY_META empty, so the promote gate
 # below refuses to promote — live stays on the prior good version.
 echo ""
-echo "==> Running canary invocation against :${VERSION} (dry_run=true)..."
-CANARY_OUT=$(mktemp)
-CANARY_META=$(python3 -m krepis.aws invoke-canary \
-  --function-name "${LAMBDA_FUNCTION}:${VERSION}" \
-  --payload '{"dry_run": true}' \
-  --out "$CANARY_OUT" \
-  --region "${AWS_REGION}" \
-  --max-attempts 6 \
-  --label "${LAMBDA_FUNCTION}-canary") || CANARY_META=""
+echo "==> Running canary invocation matrix against :${VERSION}..."
+CANARY_FAILED=0
 
-CANARY_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$CANARY_META" 2>/dev/null || echo "")
-CANARY_STATUS=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-CANARY_ERR_MSG=$(python3 -c "import json; d=json.load(open('$CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
-rm -f "$CANARY_OUT"
+# Test predict with dry_run — HTTP-shaped handler, gate on statusCode.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "predict(dry_run)" '{"dry_run": true}' "statusCode"; then
+  CANARY_FAILED=1
+fi
 
-# Promote on FunctionError-free response whose statusCode is in the
-# canary no-op allowlist (200 / 204 / skipped — see canary_status_ok above);
-# roll back on a genuine error code (400 / 500 / unhandled exception).
-if [ -n "$CANARY_FUNC_ERR" ] || ! canary_status_ok "$CANARY_STATUS"; then
+# Step-Function gate actions below return raw domain dicts (no statusCode);
+# gate each on the presence of the domain key its SF Choice state consumes.
+
+# Test check_drift — drift_detector.check_drift returns {date,status,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action": "check_drift"}' "status"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_trading_day — trading_day_gate returns {is_trading_day,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day"}' "is_trading_day"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_weekly_run_day — trading_day_gate returns {is_weekly_run_day,...}.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}' "is_weekly_run_day"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_pipeline_contract — returns {has_violation,...}. dry_run=true:
+# this deploy-time canary writes/emails nothing, so its image SHA vs live
+# main HEAD is the wrong drift invariant — a merge burst can legitimately
+# advance main between this image's build and this canary's run. The
+# handler threads dry_run into PredictorPreflight.run_for_drift_gate() to
+# skip ONLY the deploy-drift assertion; the contract check itself still
+# runs and fails loud on a genuine violation (config#2731, mirrors the
+# predict(dry_run) fix in config#1073).
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation"; then
+  CANARY_FAILED=1
+fi
+
+if [ "$CANARY_FAILED" = "1" ]; then
   echo ""
-  echo "ERROR: Canary failed — refusing to promote :${VERSION} to live."
-  echo "       FunctionError : ${CANARY_FUNC_ERR:-<none>}"
-  echo "       statusCode    : ${CANARY_STATUS}"
-  echo "       payload       : ${CANARY_ERR_MSG:-<empty>}"
+  echo "ERROR: One or more canary actions failed — refusing to promote :${VERSION} to live."
   echo "       Live alias is unchanged. Investigate logs for function:${LAMBDA_FUNCTION} version ${VERSION}."
   # ROADMAP L221 — independent-channel surveillance per the alpha-engine-data
   # #274 retrospective. ``dedup_key`` collapses an image-wide rebuild that
@@ -306,11 +430,12 @@ if [ -n "$CANARY_FUNC_ERR" ] || ! canary_status_ok "$CANARY_STATUS"; then
     --severity error \
     --source "alpha-engine-predictor/infrastructure/deploy.sh" \
     --dedup-key "canary-fail-${LAMBDA_FUNCTION}-v${VERSION}" \
-    --message "Canary failed — refused to promote ${LAMBDA_FUNCTION}:${VERSION} to live. FunctionError='${CANARY_FUNC_ERR:-<none>}' statusCode=${CANARY_STATUS} payload='${CANARY_ERR_MSG:-<empty>}'. Live alias unchanged." \
+    --message "Canary matrix failed — refused to promote ${LAMBDA_FUNCTION}:${VERSION} to live. See deployment logs for individual action failures. Live alias unchanged." \
     || true
   exit 1
 fi
-echo "  Canary passed (status=$CANARY_STATUS)"
+echo ""
+echo "  Canary matrix passed — all read-only actions functional"
 
 # ── Step 8: Promote version to 'live' (only after canary passes) ─────────────
 echo "==> Updating 'live' alias → version ${VERSION}"
@@ -390,29 +515,22 @@ echo "  Found (or freshly created) — updating..."
   # Canary via the shared krepis.aws invoke-canary CLI (config#1494); metadata
   # JSON (incl. FunctionError) on stdout, payload to --out. Non-zero CLI exit
   # leaves $REGIME_CANARY_META empty → the gate below refuses to promote.
-  echo "==> Running regime canary against :${REGIME_VERSION} (action=dry_run)..."
-  REGIME_CANARY_OUT=$(mktemp)
-  REGIME_CANARY_META=$(python3 -m krepis.aws invoke-canary \
-    --function-name "${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}" \
-    --payload '{"action": "dry_run"}' \
-    --out "$REGIME_CANARY_OUT" \
-    --region "${AWS_REGION}" \
-    --max-attempts 6 \
-    --label "${REGIME_LAMBDA_FUNCTION}-canary") || REGIME_CANARY_META=""
+  # Test both handler actions (produce and dry_run) to ensure regime substrate
+  # wiring is complete before promoting to live.
+  echo "==> Running regime canary matrix against :${REGIME_VERSION}..."
+  REGIME_CANARY_FAILED=0
 
-  REGIME_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_CANARY_META" 2>/dev/null || echo "")
-  REGIME_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-  REGIME_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
-  rm -f "$REGIME_CANARY_OUT"
+  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "dry_run" '{"action": "dry_run"}' "statusCode"; then
+    REGIME_CANARY_FAILED=1
+  fi
 
-  # Same no-op allowlist as the inference canary (200 / 204 / skipped —
-  # see canary_status_ok above); roll back only on a genuine error code.
-  if [ -n "$REGIME_FUNC_ERR" ] || ! canary_status_ok "$REGIME_STATUS"; then
+  if ! run_canary_action "${REGIME_LAMBDA_FUNCTION}" "${REGIME_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}' "statusCode"; then
+    REGIME_CANARY_FAILED=1
+  fi
+
+  if [ "$REGIME_CANARY_FAILED" = "1" ]; then
     echo ""
-    echo "ERROR: Regime canary failed — refusing to promote :${REGIME_VERSION} to live."
-    echo "       FunctionError : ${REGIME_FUNC_ERR:-<none>}"
-    echo "       statusCode    : ${REGIME_STATUS}"
-    echo "       payload       : ${REGIME_ERR_MSG:-<empty>}"
+    echo "ERROR: Regime canary matrix failed — refusing to promote :${REGIME_VERSION} to live."
     echo "       Inference Lambda was already promoted; rollback regime separately if needed."
     # ROADMAP L221 — independent-channel surveillance. ``dedup_key``
     # collapses an image-wide rebuild that breaks N Lambdas' canaries
@@ -424,11 +542,11 @@ echo "  Found (or freshly created) — updating..."
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
       --dedup-key "canary-fail-${REGIME_LAMBDA_FUNCTION}-v${REGIME_VERSION}" \
-      --message "Regime canary failed — refused to promote ${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION} to live. FunctionError='${REGIME_FUNC_ERR:-<none>}' statusCode=${REGIME_STATUS} payload='${REGIME_ERR_MSG:-<empty>}'. NOTE: inference Lambda was already promoted to :${VERSION} — operator may need to rollback inference too if this is an image-wide issue." \
+      --message "Regime canary matrix failed — refused to promote ${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION} to live. See deployment logs for action details. NOTE: inference Lambda was already promoted to :${VERSION} — operator may need to rollback inference too if this is an image-wide issue." \
       || true
     exit 1
   fi
-  echo "  Regime canary passed (status=$REGIME_STATUS)"
+  echo "  Regime canary matrix passed — all actions functional"
 
   aws lambda update-alias \
     --function-name "${REGIME_LAMBDA_FUNCTION}" \
@@ -497,29 +615,22 @@ echo "  Found (or freshly created) — updating..."
   # Canary via the shared krepis.aws invoke-canary CLI (config#1494); metadata
   # JSON (incl. FunctionError) on stdout, payload to --out. Non-zero CLI exit
   # leaves $REGIME_EVAL_CANARY_META empty → the gate below refuses to promote.
-  echo "==> Running regime-eval canary against :${REGIME_EVAL_VERSION} (action=dry_run)..."
-  REGIME_EVAL_CANARY_OUT=$(mktemp)
-  REGIME_EVAL_CANARY_META=$(python3 -m krepis.aws invoke-canary \
-    --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION}" \
-    --payload '{"action": "dry_run"}' \
-    --out "$REGIME_EVAL_CANARY_OUT" \
-    --region "${AWS_REGION}" \
-    --max-attempts 6 \
-    --label "${REGIME_EVAL_LAMBDA_FUNCTION}-canary") || REGIME_EVAL_CANARY_META=""
+  # Test both handler actions (produce and dry_run) to ensure regime-eval wiring
+  # is complete before promoting to live.
+  echo "==> Running regime-eval canary matrix against :${REGIME_EVAL_VERSION}..."
+  REGIME_EVAL_CANARY_FAILED=0
 
-  REGIME_EVAL_FUNC_ERR=$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('FunctionError',''))" "$REGIME_EVAL_CANARY_META" 2>/dev/null || echo "")
-  REGIME_EVAL_STATUS=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('statusCode', 0))" 2>/dev/null || echo "0")
-  REGIME_EVAL_ERR_MSG=$(python3 -c "import json; d=json.load(open('$REGIME_EVAL_CANARY_OUT')); print(d.get('errorMessage','') or d.get('body',''))" 2>/dev/null || echo "")
-  rm -f "$REGIME_EVAL_CANARY_OUT"
+  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "dry_run" '{"action": "dry_run"}' "statusCode"; then
+    REGIME_EVAL_CANARY_FAILED=1
+  fi
 
-  # Same no-op allowlist as the inference + regime canaries (200 / 204 /
-  # skipped — see canary_status_ok above); roll back only on a genuine error.
-  if [ -n "$REGIME_EVAL_FUNC_ERR" ] || ! canary_status_ok "$REGIME_EVAL_STATUS"; then
+  if ! run_canary_action "${REGIME_EVAL_LAMBDA_FUNCTION}" "${REGIME_EVAL_VERSION}" "produce(dry_run_equivalent)" '{"action": "produce"}' "statusCode"; then
+    REGIME_EVAL_CANARY_FAILED=1
+  fi
+
+  if [ "$REGIME_EVAL_CANARY_FAILED" = "1" ]; then
     echo ""
-    echo "ERROR: Regime-eval canary failed — refusing to promote :${REGIME_EVAL_VERSION} to live."
-    echo "       FunctionError : ${REGIME_EVAL_FUNC_ERR:-<none>}"
-    echo "       statusCode    : ${REGIME_EVAL_STATUS}"
-    echo "       payload       : ${REGIME_EVAL_ERR_MSG:-<empty>}"
+    echo "ERROR: Regime-eval canary matrix failed — refusing to promote :${REGIME_EVAL_VERSION} to live."
     echo "       Inference + substrate Lambdas were already promoted; rollback regime-eval separately if needed."
     # ROADMAP L221 — independent-channel surveillance. ``dedup_key``
     # collapses an image-wide rebuild that breaks N Lambdas' canaries
@@ -530,11 +641,11 @@ echo "  Found (or freshly created) — updating..."
       --severity error \
       --source "alpha-engine-predictor/infrastructure/deploy.sh" \
       --dedup-key "canary-fail-${REGIME_EVAL_LAMBDA_FUNCTION}-v${REGIME_EVAL_VERSION}" \
-      --message "Regime-eval canary failed — refused to promote ${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION} to live. FunctionError='${REGIME_EVAL_FUNC_ERR:-<none>}' statusCode=${REGIME_EVAL_STATUS} payload='${REGIME_EVAL_ERR_MSG:-<empty>}'. NOTE: inference (${LAMBDA_FUNCTION}:${VERSION}) + regime (${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}) were already promoted to live — operator may need to rollback all three if this is an image-wide issue." \
+      --message "Regime-eval canary matrix failed — refused to promote ${REGIME_EVAL_LAMBDA_FUNCTION}:${REGIME_EVAL_VERSION} to live. See deployment logs for action details. NOTE: inference (${LAMBDA_FUNCTION}:${VERSION}) + regime (${REGIME_LAMBDA_FUNCTION}:${REGIME_VERSION}) were already promoted to live — operator may need to rollback all three if this is an image-wide issue." \
       || true
     exit 1
   fi
-  echo "  Regime-eval canary passed (status=$REGIME_EVAL_STATUS)"
+  echo "  Regime-eval canary matrix passed — all actions functional"
 
   aws lambda update-alias \
     --function-name "${REGIME_EVAL_LAMBDA_FUNCTION}" \
