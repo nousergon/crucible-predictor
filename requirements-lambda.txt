@@ -38,6 +38,6 @@ scikit-learn>=1.9.0
 # transitively, also needed by regime/bocpd.py for stats.t. Same
 # pin as the project-root requirements.txt (lib-pin-lockstep
 # discipline).
-hmmlearn>=0.3
+hmmlearn>=0.3.3
 pyyaml>=6.0
 arcticdb>=6.18.7
