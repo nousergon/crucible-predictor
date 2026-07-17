@@ -60,8 +60,13 @@ class TestWritePredictionsS3:
     @patch.dict("sys.modules", {"boto3": MagicMock()})
     @patch("inference.stages.write_output._s3_put_json", side_effect=Exception("S3 error"))
     def test_handles_write_failure(self, mock_put):
-        # Should not raise — failures are logged but not propagated
-        write_predictions([{"ticker": "AAPL"}], "2026-04-08", "bucket", {})
+        # config#2333: the primary dated-key write is fail-loud — a failure
+        # here must raise PipelineHardFail (superseding the pre-config#2333
+        # "logged but not propagated" contract this test used to assert; see
+        # TestS3WriteFailLoud below for the full fail-loud/best-effort matrix).
+        from inference.pipeline import PipelineHardFail
+        with pytest.raises(PipelineHardFail):
+            write_predictions([{"ticker": "AAPL"}], "2026-04-08", "bucket", {})
 
 
 class TestGetVetoThresholdExtended:
@@ -915,77 +920,17 @@ class TestEmailGating:
         assert mock_send.called
 
 
-# ── L234: morning email surfaces effective optimizer params ──────────────
+# ── L234: effective-optimizer-params loader (email integration removed) ──
+#
+# config#856 slimmed the predictor email to a summary + console deep-link;
+# the "Effective Optimizer Params" block (ROADMAP L234) no longer renders
+# inline in the email — it's console-page territory now (see
+# _build_predictor_email's docstring). The S3 loader itself is still a
+# working best-effort utility (kept for a future console surfacing), so it
+# is still covered directly here.
 
 
-class TestMorningEmailOptimizerParamsBlock:
-    """ROADMAP L234 morning-email side — the predictor email surfaces
-    the live `config/executor_params.json` block alongside the briefing
-    so the operator sees effective min_score_to_enter /
-    max_position_pct / atr_multiplier without tailing executor.log.
-
-    Best-effort + degrades gracefully on missing artifact.
-    """
-
-    def _build(self, *, bucket=None):
-        # Minimal happy-path inputs that exercise _build_predictor_email.
-        predictions = [
-            {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
-             "predicted_direction": "UP", "prediction_confidence": 0.7,
-             "p_up": 0.65, "p_down": 0.35},
-        ]
-        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
-        return wo._build_predictor_email(
-            predictions, metrics, "2026-05-22",
-            signals_data=None, veto_threshold=0.6, bucket=bucket,
-        )
-
-    def test_no_bucket_skips_block(self):
-        subject, html, plain = self._build(bucket=None)
-        assert "Effective Optimizer Params" not in html
-        assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
-
-    def test_bucket_supplied_but_artifact_missing_silent(self):
-        with patch.object(wo, "_load_executor_params_for_email", return_value=None):
-            subject, html, plain = self._build(bucket="b")
-        assert "Effective Optimizer Params" not in html
-        assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
-
-    def test_artifact_present_surfaces_block(self):
-        fake_params = {
-            "min_score": 65.0,
-            "max_position_pct": 0.10,
-            "atr_multiplier": 2.5,
-            "profit_take_pct": 0.20,
-            "updated_at": "2026-05-23",
-            "best_sharpe": 1.42,
-            "improvement_pct": 0.08,
-            "n_combos_tested": 200,
-        }
-        with patch.object(wo, "_load_executor_params_for_email", return_value=fake_params):
-            subject, html, plain = self._build(bucket="b")
-        # HTML block markers
-        assert "Effective Optimizer Params" in html
-        assert "min_score_to_enter" in html
-        assert "max_position_pct" in html
-        assert "atr_multiplier" in html
-        assert "2026-05-23" in html  # updated_at metadata
-        assert "1.42" in html         # best_sharpe metadata
-        assert "+8.0%" in html        # improvement_pct metadata
-        # Plain text mirror
-        assert "EFFECTIVE OPTIMIZER PARAMS" in plain
-        assert "min_score_to_enter" in plain
-
-    def test_manual_override_flag_surfaces_warning(self):
-        fake_params = {
-            "min_score": 55.0,
-            "manual_override": True,
-        }
-        with patch.object(wo, "_load_executor_params_for_email", return_value=fake_params):
-            subject, html, _plain = self._build(bucket="b")
-        # Warning class present
-        assert "manual override" in html.lower()
-
+class TestLoadExecutorParamsForEmailHelper:
     def test_load_helper_swallows_s3_errors(self):
         """`_load_executor_params_for_email` must not raise — secondary
         observability path; primary briefing path must survive S3
@@ -995,8 +940,37 @@ class TestMorningEmailOptimizerParamsBlock:
             result = wo._load_executor_params_for_email("b")
         assert result is None
 
+    def test_bucket_param_no_longer_surfaces_block_in_email(self):
+        """Regression: the email must NOT inline the Effective Optimizer
+        Params block even when a bucket + fake artifact are supplied — that
+        content moved to the console page (config#856)."""
+        predictions = [
+            {"ticker": "A", "predicted_alpha": 0.01, "combined_rank": 1,
+             "predicted_direction": "UP", "prediction_confidence": 0.7,
+             "p_up": 0.65, "p_down": 0.35},
+        ]
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        fake_params = {"min_score": 65.0, "max_position_pct": 0.10}
+        with patch.object(wo, "_load_executor_params_for_email", return_value=fake_params):
+            _subject, html, plain = wo._build_predictor_email(
+                predictions, metrics, "2026-05-22",
+                signals_data=None, veto_threshold=0.6, bucket="b",
+            )
+        assert "Effective Optimizer Params" not in html
+        assert "EFFECTIVE OPTIMIZER PARAMS" not in plain
 
-class TestS3WriteFail Loud:
+
+# ── config#2333: S3 write fail-loud on the primary dated artifact ────────
+#
+# The dated predictions/{date}.json key is the canonical prediction set the
+# step function's CheckPredictorCoverage state and the executor both key
+# off of. A silent S3 put failure there used to leave stale data with no
+# signal to the pipeline. This write is now fail-loud (raises
+# PipelineHardFail so the SF Catch fires); latest.json + metrics/latest.json
+# remain best-effort but alert on failure instead of log-only.
+
+
+class TestS3WriteFailLoud:
     """Test fail-loud on S3 dated-key failures, best-effort on secondary writes."""
 
     def setup_method(self):
@@ -1017,10 +991,9 @@ class TestS3WriteFail Loud:
 
     @patch.dict("sys.modules", {"boto3": MagicMock()})
     @patch("inference.stages.write_output._s3_put_json")
-    @patch("krepis.alerts.alert")
+    @patch("ops_alerts.publish_ops_alert")
     def test_secondary_writes_failure_alerts_not_raises(self, mock_alert, mock_put):
         """Latest.json / metrics failures must alert but not raise."""
-        from inference.pipeline import PipelineHardFail
         predictions = [{"ticker": "AAPL", "prediction_confidence": 0.75}]
         # Dated succeeds, latest/metrics fail
         mock_put.side_effect = [
@@ -1030,17 +1003,156 @@ class TestS3WriteFail Loud:
         ]
         # Should not raise
         wo.write_predictions(predictions, "2026-04-08", "bucket", {"model_version": "v1"})
-        # Verify alerts were published for the two secondary failures
+        # Verify ops alerts were published for the two secondary failures
         assert mock_alert.call_count >= 2
+        for _, kwargs in mock_alert.call_args_list:
+            assert kwargs["severity"] == "warning"
 
     @patch.dict("sys.modules", {"boto3": MagicMock()})
     @patch("inference.stages.write_output._s3_put_json")
     def test_all_writes_succeed_no_alerts(self, mock_put):
         """When all three writes succeed, no alerts."""
-        from krepis.alerts import alert as mock_alert
         mock_put.side_effect = [None, None, None]  # all succeed
         predictions = [{"ticker": "AAPL"}]
-        with patch("krepis.alerts.alert") as alert_spy:
+        with patch("ops_alerts.publish_ops_alert") as alert_spy:
             wo.write_predictions(predictions, "2026-04-08", "bucket", {})
-            # No alert() calls expected on full success
+            # No alert calls expected on full success
             alert_spy.assert_not_called()
+
+
+# ── config#856: slim predictor email + console deep-link ────────────────
+
+
+class TestPredictorReportUrl:
+    def test_default_base(self):
+        url = wo.predictor_report_url("2026-07-03")
+        assert url.endswith(f"/{wo.PREDICTOR_SLUG}?date=2026-07-03")
+
+    def test_custom_base_override(self):
+        url = wo.predictor_report_url("2026-07-03", "https://stage.example.com/")
+        assert url == f"https://stage.example.com/{wo.PREDICTOR_SLUG}?date=2026-07-03"
+
+
+class TestSlimPredictorEmail:
+    """The slim email is a summary + console deep-link (config#856) — the
+    full per-ticker prediction table, research brief, and effective
+    optimizer params live on the console Predictor page instead."""
+
+    def _preds(self):
+        return [
+            {"ticker": "AAPL", "predicted_alpha": 0.02, "combined_rank": 1,
+             "predicted_direction": "UP", "prediction_confidence": 0.72,
+             "p_up": 0.7, "p_down": 0.3},
+            {"ticker": "XOM", "predicted_alpha": -0.015, "combined_rank": 2,
+             "predicted_direction": "DOWN", "prediction_confidence": 0.68,
+             "p_up": 0.3, "p_down": 0.7},
+        ]
+
+    def test_subject_unchanged_shape(self):
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        subject, _html, _plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03", veto_threshold=0.6,
+        )
+        assert "2026-07-03" in subject
+        assert "1 UP / 1 DOWN" in subject
+
+    def test_body_links_to_console_report(self):
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        _subject, html, plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03", veto_threshold=0.6,
+        )
+        expected = wo.predictor_report_url("2026-07-03")
+        assert expected in html
+        assert expected in plain
+
+    def test_summary_numbers_present(self):
+        metrics = {"model_version": "meta-v3.2", "ic_30d": 0.1234, "inference_mode": "meta"}
+        _subject, html, _plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03", veto_threshold=0.6,
+        )
+        assert "meta-v3.2" in html
+        assert "0.1234" in html
+        assert "UP / DOWN" in html
+
+    def test_no_inline_prediction_table(self):
+        """The slim email must NOT inline the per-ticker prediction table —
+        that's console-page territory now."""
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        _subject, html, _plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03", veto_threshold=0.6,
+        )
+        assert "AAPL" not in html
+        assert "XOM" not in html
+        assert "Res.Cal" not in html  # meta-model column header, no longer rendered
+
+    def test_no_research_brief_inline(self):
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        signals_data = {
+            "market_regime": "bullish",
+            "universe": [{"ticker": "AAPL", "score": 80}],
+            "buy_candidates": [{"ticker": "AAPL", "score": 80, "signal": "ENTER"}],
+        }
+        _subject, html, _plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03",
+            signals_data=signals_data, veto_threshold=0.6,
+        )
+        assert "Buy Candidates" not in html
+        assert "Research Brief" not in html
+        # Market regime is still surfaced in the summary (decision-relevant).
+        assert "BULLISH" in html
+
+    def test_unscored_buy_candidate_warning_still_pushes(self):
+        """A red flag (actionable ticker with no GBM score) must still reach
+        the inbox, not hide behind the console click."""
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        signals_data = {
+            "market_regime": "neutral",
+            "universe": [],
+            "buy_candidates": [{"ticker": "ZZZZ", "score": 90, "signal": "ENTER"}],
+        }
+        _subject, html, plain = wo._build_predictor_email(
+            self._preds(), metrics, "2026-07-03",
+            signals_data=signals_data, veto_threshold=0.6,
+        )
+        assert "DATA WARNING" in html
+        assert "ZZZZ" in html
+        assert "DATA WARNING" in plain
+        assert "ZZZZ" in plain
+
+    def test_veto_count_in_subject_and_summary(self):
+        metrics = {"model_version": "v1", "ic_30d": 0.10, "inference_mode": "meta"}
+        # Veto count is single-sourced from the authoritative gbm_veto boolean
+        # (config#1815) — the only veto the executor acts on — not a display
+        # heuristic. Ticker A is the vetoed name.
+        preds = [
+            {"ticker": "A", "predicted_alpha": -0.01, "combined_rank": 2,
+             "predicted_direction": "DOWN", "prediction_confidence": 0.8,
+             "gbm_veto": True},
+            {"ticker": "B", "predicted_alpha": 0.01, "combined_rank": 1,
+             "predicted_direction": "UP", "prediction_confidence": 0.6,
+             "gbm_veto": False},
+        ]
+        subject, html, _plain = wo._build_predictor_email(
+            preds, metrics, "2026-07-03", veto_threshold=0.6,
+        )
+        assert "1 veto" in subject
+        assert "Vetoes" in html
+
+
+class TestSendPredictorEmailConsoleBaseUrl:
+    def test_console_base_url_passed_through_to_builder(self):
+        captured = {}
+
+        def _fake_build(*args, **kwargs):
+            captured.update(kwargs)
+            return "subj", "<html></html>", "plain"
+
+        with patch.object(wo, "_build_predictor_email", side_effect=_fake_build), \
+                patch("krepis.email_sender.send_email", return_value=True), \
+                patch.object(wo.cfg, "EMAIL_SENDER", "s@x"), \
+                patch.object(wo.cfg, "EMAIL_RECIPIENTS", ["o@x"]):
+            wo.send_predictor_email(
+                [], {"model_version": "v1"}, "2026-07-03",
+                console_base_url="https://stage.example.com",
+            )
+        assert captured.get("console_base_url") == "https://stage.example.com"

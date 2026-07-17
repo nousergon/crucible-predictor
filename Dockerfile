@@ -46,6 +46,14 @@ RUN pip install --no-cache-dir -r requirements-lambda.txt && \
 COPY retry.py .
 COPY data_manifest.py .
 COPY config.py .
+# ops_alerts.py — inference/stages/write_output.py's fail-loud S3-write
+# path (config#2333) deferred-imports ops_alerts.publish_ops_alert to
+# page on primary/secondary predictions-write failures. Same
+# config#1282/PR352 bug class as the monitoring/ comment below: a
+# first-party module reachable from the Lambda entrypoint's import
+# closure but missing its COPY line ModuleNotFoundErrors at runtime,
+# undetected by CI unless caught by test_dockerfile_import_closure.py.
+COPY ops_alerts.py .
 COPY config/ config/
 COPY data/ data/
 COPY model/ model/

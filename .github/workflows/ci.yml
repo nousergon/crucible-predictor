@@ -6,14 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions: {}
+
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -39,12 +41,81 @@ jobs:
           fi
           pip-audit "${IGNORE_ARGS[@]}"
 
+  # Builds the real Lambda image and imports the real entrypoint modules
+  # INSIDE the built container — the ground-truth backstop for the
+  # config#1282/PR352 bug class (`tests/test_dockerfile_handler_import_
+  # completeness.py` and `tests/test_dockerfile_import_closure.py` are
+  # the fast static pre-checks; this is what actually proves the image
+  # can load its own code). A first-party import missing its Dockerfile
+  # COPY line passes both static checks if the walker has a bug, but
+  # CANNOT pass this job — it either resolves at runtime or it doesn't.
+  #
+  # Scoped to the three Lambda CMDs this image actually serves
+  # (infrastructure/deploy.sh): inference.handler, regime.handler,
+  # regime.retrospective_eval_handler. Deliberately does NOT import
+  # training.train_handler — training runs on EC2 spot
+  # (infrastructure/spot_train.sh), not this image, and
+  # requirements-lambda.txt intentionally omits training-only deps
+  # (e.g. risk_model's factor-math extras — see that file's own
+  # comment: "Inference Lambda does NOT import risk_model ... that
+  # runs only in PredictorTraining on EC2"). Importing
+  # training.train_handler here would fail for an unrelated reason
+  # (missing training deps in the lean inference image) and give a
+  # false positive for this job's actual purpose.
+  docker-import-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Mirrors deploy.yml's config staging: config/predictor.yaml is
+      # gitignored (real values live in alpha-engine-config), and the
+      # Dockerfile COPYs config/ verbatim. The sample is sufficient
+      # here because this job only imports the entrypoint modules —
+      # it does not invoke handler() / lambda_handler(), so no
+      # predictor.yaml key needs a real value, only for the file to
+      # exist so nothing FileNotFoundErrors at import time.
+      - name: Set up config for image build
+        run: cp config/predictor.sample.yaml config/predictor.yaml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Build Lambda image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          push: false
+          load: true
+          tags: alpha-engine-predictor:ci
+          platforms: linux/amd64
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Import-walk the built image (inference Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import inference.handler; print('OK: inference.handler')"
+
+      - name: Import-walk the built image (regime substrate Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import regime.handler; print('OK: regime.handler')"
+
+      - name: Import-walk the built image (regime retrospective-eval Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import regime.retrospective_eval_handler; print('OK: regime.retrospective_eval_handler')"
+
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds (mid-fix commits, cross-repo lib-tag merge-order
   # races) stay silent. Reusable workflow + transport in nousergon-lib.
   # See alpha-engine-config#1128.
   notify-main-failure:
-    needs: [test]
+    needs: [test, docker-import-closure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit

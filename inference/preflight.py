@@ -41,24 +41,47 @@ class PredictorPreflight(BasePreflight):
     reaches inference.
     """
 
-    def run_for_drift_gate(self) -> None:
-        """Minimal preflight for ``action=check_deploy_drift`` only.
+    def run_for_drift_gate(self, *, skip_deploy_drift: bool = False) -> None:
+        """Minimal preflight for the SF gate actions + deploy-time canaries.
 
-        The drift-check action is a Step Function gate — its job is to
-        compare the deployed image/SF/CF SHAs to ``origin/main`` HEAD,
-        nothing more. It has no business validating ticker freshness or
-        loading model weights. Running the full preflight here turned a
-        ~3s gate into a ~200s gate (the 2026-05-01 SF timeout cascade)
-        once PR #68 added the universe scan.
+        Used by ``action in (check_deploy_drift, check_lib_pin_drift,
+        check_pipeline_contract)``. Its job is to compare the deployed
+        image/SF/CF SHAs to ``origin/main`` HEAD, nothing more. It has no
+        business validating ticker freshness or loading model weights.
+        Running the full preflight here turned a ~3s gate into a ~200s gate
+        (the 2026-05-01 SF timeout cascade) once PR #68 added the universe
+        scan.
+
+        ``skip_deploy_drift`` — when True, the image-SHA-vs-``origin/main``
+        drift assertion is skipped. Mirrors the knob ``run()`` already has
+        (config#1073) and exists for the SAME reason: a ``dry_run=true``
+        deploy-time canary invocation of ``check_pipeline_contract`` /
+        ``check_lib_pin_drift`` (``infrastructure/deploy.sh``) writes/emails
+        nothing, so asserting its image SHA against live ``main`` HEAD is
+        the wrong invariant — and is a false-failure source during a
+        merge burst, when ``main`` can advance between a deploy's image
+        build and its canary run (config#2731, 2026-07-16).
+
+        Default is ``False`` — unchanged behavior for every other caller:
+          - The dedicated ``check_deploy_drift`` ACTION (the SF's first-state
+            gate) never passes ``skip_deploy_drift`` — it must keep
+            asserting drift unconditionally; that is its entire job.
+          - The Step Function's own (non-canary, no ``dry_run``)
+            pre-spend invocations of ``check_pipeline_contract`` /
+            ``check_lib_pin_drift`` also default to ``False`` — they retain
+            their existing drift belt-and-suspenders.
+          - Only ``infrastructure/deploy.sh``'s ``dry_run=true`` canary
+            invocations of those two actions pass ``skip_deploy_drift=True``.
 
         Strict subset of ``run()``:
           - env vars
           - S3 bucket reachability
-          - image-SHA drift
+          - image-SHA drift (unless skipped)
         """
         self.check_env_vars("AWS_REGION")
         self.check_s3_bucket()
-        self.check_deploy_drift(_PREDICTOR_REPO)
+        if not skip_deploy_drift:
+            self.check_deploy_drift(_PREDICTOR_REPO)
 
     def run(self, *, skip_deploy_drift: bool = False) -> None:
         """Full preflight for ``action=predict`` + ``action=check_coverage``.

@@ -107,8 +107,8 @@ def _log_rss(label: str) -> int:
         log.info("RSS %s: %.0f MB", label, rss_mb)
         return int(rss_mb)
     except Exception as exc:  # pragma: no cover — defensive
-        log.debug("RSS profiling unavailable (%s)", exc)
-        return 0
+        log.warning("RSS profiling unavailable (%s) — will filter with peak_rss_mb=-1 sentinel", exc)
+        return -1
 
 
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
@@ -125,7 +125,24 @@ _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 # rising — that peak is the target horizon for any parallel training
 # stack we build next. If IC continues climbing past 90d we're looking
 # at a multi-month momentum regime and should consider longer still.
-_DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40, 60, 90]
+# The operator-ratified temporal-ensemble ladder (config#937 — 2026-07-09
+# /backlog-triage ruling, restated 2026-07-10): 10/21/42/63/126d. The short end
+# (3-7d) was refuted via #1993's turnover-drag findings; 42/63/126d probe the
+# fundamentals-decay hypothesis for the weekly LLM-research-thesis signal (a
+# materially different question than "is 21d locally optimal"). These are the
+# horizons the Phase-1 observe-only battery + offline blend
+# (analysis/horizon_battery.py) evaluates against the single-21d serving
+# baseline — WITHOUT un-retiring the regression-locked multi-horizon SERVING
+# path (tests/test_v2_inference_path_gone.py); the diagnostic labels + leak-free
+# IC curves are offline-only.
+_ENSEMBLE_HORIZONS = [10, 21, 42, 63, 126]
+
+# config#937 (2026-07-11) additively folds the ratified ensemble ladder above
+# into the diagnostic set so the Phase-1 battery can measure 42/63/126d. The
+# 2026-04-15 horizons (5/15/40/60/90) are RETAINED for diagnostic-curve
+# continuity, so this only WIDENS the observe-only forward-return labels — no
+# existing consumer loses a column.
+_DIAGNOSTIC_HORIZONS = sorted({5, 10, 15, 21, 40, 60, 90, *_ENSEMBLE_HORIZONS})
 
 
 def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bool]:
@@ -4084,7 +4101,7 @@ def run_meta_training(
                 # variant registers under its own version_id ({label}-{date}-{fp})
                 # — distinct challengers on the leaderboard. Default = base label.
                 "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
-                "peak_rss_mb": peak_rss_mb,
+                "peak_rss_mb": peak_rss_mb if peak_rss_mb >= 0 else None,
                 # Per-regime empirical up-rate of REALIZED canonical alpha
                 # (independent of calibrator) — observability for the
                 # stratified-per-regime gate threshold calibration. See
