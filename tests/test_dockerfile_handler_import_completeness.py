@@ -14,6 +14,27 @@ the ``regime/`` module specifically. This test generalizes it: it derives
 the required package set directly from handler.py's imports, so a future
 handler action importing a NEW top-level package fails CI immediately
 instead of shipping a silent 500 to prod.
+
+**Demoted to a fast pre-check (config#2334).** This regex only derives
+DIRECT ``from X import ...`` lines in ``inference/handler.py`` — it is
+blind to ``import X`` style and to TRANSITIVE imports (a package
+imported by a module ``handler.py`` imports, rather than by
+``handler.py`` itself). config#2334 found the exact bug class one hop
+deeper this way (``labeling/``/``risk_model/``, not currently reachable
+— see ``tests/test_dockerfile_import_closure.py``). Two stronger layers
+now sit above this one:
+
+  1. ``tests/test_dockerfile_import_closure.py`` — AST-based, walks the
+     FULL first-party import graph (module scope + deferred) reachable
+     from all three Lambda entrypoints, not just handler.py's direct
+     imports.
+  2. ``.github/workflows/ci.yml``'s ``docker-import-closure`` job —
+     builds the real image and imports the real entrypoint modules
+     inside the built container, the ground-truth runtime check.
+
+This test is kept (not deleted) because it's near-instant and gives a
+precise, minimal repro of the specific historical incident even when
+the broader checks above are being modified.
 """
 from __future__ import annotations
 

@@ -405,8 +405,15 @@ if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" 
   CANARY_FAILED=1
 fi
 
-# Test check_pipeline_contract — returns {has_violation,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract"}' "has_violation"; then
+# Test check_pipeline_contract — returns {has_violation,...}. dry_run=true:
+# this deploy-time canary writes/emails nothing, so its image SHA vs live
+# main HEAD is the wrong drift invariant — a merge burst can legitimately
+# advance main between this image's build and this canary's run. The
+# handler threads dry_run into PredictorPreflight.run_for_drift_gate() to
+# skip ONLY the deploy-drift assertion; the contract check itself still
+# runs and fails loud on a genuine violation (config#2731, mirrors the
+# predict(dry_run) fix in config#1073).
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation"; then
   CANARY_FAILED=1
 fi
 
