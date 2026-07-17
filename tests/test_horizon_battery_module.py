@@ -22,8 +22,11 @@ from analysis.horizon_battery import (
     _fmt_ci,
     _round_or_none,
     compute_horizon_battery,
+    compute_horizon_blend,
+    format_blend_report,
     format_report,
 )
+from training.meta_trainer import _DIAGNOSTIC_HORIZONS, _ENSEMBLE_HORIZONS
 
 
 def _synthetic_oos_rows(n_dates: int = 60, tickers_per_date: int = 20, seed: int = 0):
@@ -49,7 +52,10 @@ def _synthetic_oos_rows(n_dates: int = 60, tickers_per_date: int = 20, seed: int
             actual = sum(row[f] for f in META_FEATURES) * 0.05 + rng.normal(0, 1.5)
             row["actual_fwd"] = float(actual)
             # Multi-horizon labels — noisier at long horizons (more drift).
-            for h in [5, 10, 15, 21, 40, 60, 90]:
+            # Iterate the live diagnostic ladder so the fixture always carries a
+            # column for every horizon the module measures (incl. the config#937
+            # ratified ensemble ladder 42/63/126d).
+            for h in _DIAGNOSTIC_HORIZONS:
                 row[f"actual_fwd_{h}d"] = float(actual + rng.normal(0, 0.3 * h / 5))
             row["date"] = d.strftime("%Y-%m-%d")
             # Override macro_spy_20d_return for regime classification:
@@ -190,3 +196,82 @@ class TestFormatReport:
         rendered = format_report(report)
         # Should render without crashing; "—" or similar for NaN cells.
         assert "90d" in rendered
+
+
+# ── ratified ensemble ladder (config#937) ────────────────────────────────
+
+class TestEnsembleLadder:
+
+    def test_ratified_ladder_is_subset_of_diagnostic(self):
+        # The operator-ratified 10/21/42/63/126d must all be measurable, i.e.
+        # present in the diagnostic ladder that drives OOS-row persistence.
+        assert _ENSEMBLE_HORIZONS == [10, 21, 42, 63, 126]
+        assert set(_ENSEMBLE_HORIZONS).issubset(set(_DIAGNOSTIC_HORIZONS))
+
+    def test_legacy_horizons_retained(self):
+        # Additive: pre-config#937 diagnostic horizons must survive so no
+        # existing consumer loses a forward-return column.
+        for h in (5, 10, 15, 21, 40, 60, 90):
+            assert h in _DIAGNOSTIC_HORIZONS
+
+
+# ── compute_horizon_blend (config#937 Phase 1) ───────────────────────────
+
+class TestComputeHorizonBlend:
+
+    def test_basic_shape(self):
+        df = _synthetic_oos_rows(n_dates=80, tickers_per_date=20, seed=3)
+        report = compute_horizon_blend(df, bootstrap_iter=100, n_cscv_blocks=6)
+        assert report["target_horizon"] == "21d"
+        assert report["ladder"] == [f"{h}d" for h in _ENSEMBLE_HORIZONS]
+        assert "baseline" in report and "blends" in report
+        assert set(report["blends"]) == {"ic_weighted", "ridge_blend"}
+        assert "cscv_pbo" in report
+        # Every ladder member has an IC + a normalized blend weight.
+        assert set(report["members"]) == {f"{h}d" for h in _ENSEMBLE_HORIZONS}
+        wsum = sum(m["blend_weight"] for m in report["members"].values())
+        assert abs(wsum - 1.0) < 1e-6
+
+    def test_uplift_is_ic_minus_baseline(self):
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=18, seed=5)
+        report = compute_horizon_blend(df, bootstrap_iter=80, n_cscv_blocks=6)
+        base = report["baseline"]["ic"]
+        for name in ("ic_weighted", "ridge_blend"):
+            bl = report["blends"][name]
+            if bl["ic"] is not None and base is not None:
+                # uplift rounds the raw diff; ic/base are each pre-rounded to 6dp,
+                # so allow one ULP of rounding slack (max ~1.5e-6).
+                assert abs(bl["uplift_vs_baseline"] - round(bl["ic"] - base, 6)) < 2e-6
+
+    def test_singleton_ladder_blend_equals_baseline(self):
+        # A ladder of only the target horizon must make both blends collapse to
+        # the baseline signal — uplift ≈ 0 (sanity: blending nothing adds nothing).
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=18, seed=9)
+        report = compute_horizon_blend(
+            df, horizons=[21], target_horizon=21,
+            bootstrap_iter=50, n_cscv_blocks=6,
+        )
+        assert report["ladder"] == ["21d"]
+        for name in ("ic_weighted", "ridge_blend"):
+            up = report["blends"][name]["uplift_vs_baseline"]
+            assert up is None or abs(up) < 1e-6
+
+    def test_target_absent_raises(self):
+        df = _synthetic_oos_rows(n_dates=40, tickers_per_date=10)
+        df = df.drop(columns=["actual_fwd_21d"])
+        with pytest.raises(ValueError):
+            compute_horizon_blend(df, target_horizon=21, bootstrap_iter=20)
+
+    def test_pbo_in_unit_interval_or_none(self):
+        df = _synthetic_oos_rows(n_dates=90, tickers_per_date=20, seed=11)
+        report = compute_horizon_blend(df, bootstrap_iter=60, n_cscv_blocks=8)
+        pbo = report["cscv_pbo"].get("pbo")
+        assert pbo is None or (0.0 <= pbo <= 1.0)
+
+    def test_format_blend_report_renders(self):
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=16, seed=13)
+        report = compute_horizon_blend(df, bootstrap_iter=50, n_cscv_blocks=6)
+        rendered = format_blend_report(report)
+        assert "Temporal-ensemble blend" in rendered
+        assert "Baseline" in rendered
+        assert "CSCV/PBO" in rendered
