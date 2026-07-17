@@ -1,9 +1,9 @@
 # Core inference dependencies (Lambda zip deployment)
-numpy>=1.24.0,<2
+numpy>=2.5.1,<3
 pandas>=2.0.0,<3
 yfinance>=0.2.30
 boto3>=1.26.0
-scipy>=1.10.0
+scipy>=1.18.0
 hmmlearn>=0.3.3
 tqdm>=4.68.4
 pyarrow>=25.0.0
@@ -49,10 +49,29 @@ nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https:/
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.18.7
-catboost>=1.2.0
+# Floor bumped >=1.2.0 -> >=1.2.8 (numpy-2 migration, config#2815): catboost
+# 1.2.6/1.2.7 pinned numpy<2.0, incompatible with the numpy>=2.5.1 floor above.
+# >=1.2.0 alone still resolves today (pip picks the newest satisfying release),
+# but leaves the numpy<2-pinned 1.2.6/1.2.7 range reachable under a narrower
+# resolver constraint. 1.2.8 (2025-04-13) is the first release to declare
+# numpy<3.0,>=1.16.0, making numpy-2 compatibility explicit rather than
+# resolver-luck-dependent.
+catboost>=1.2.8
 optuna>=4.9.0
 pytest>=9.1.1
-shap>=0.42.0
+# shap>=0.52.0 is the config#2815 target floor (matches closed dependabot
+# PR#398), but as of 2026-07-17 this repo's install could NOT be validated
+# end-to-end WITH shap present: shap's hard (non-optional) Linux x86_64 dep
+# `numba` caps numpy at <2.5 in every published release through 0.66.0
+# (2026-07-01) — numpy 2.5.0/2.5.1 (the floor above) shipped 2026-06-21 /
+# 2026-07-04, after numba's latest cut. `pip install numpy>=2.5.1,<3
+# shap>=0.52.0` currently hits ResolutionImpossible. shap has zero import
+# sites in this codebase (verified via full-repo grep — no `import shap`,
+# `TreeExplainer`, or `shap_values` call sites; `SHAP_NOISE_THRESHOLD_PCT`
+# in config.py is an unrelated constant name), so nothing here exercises it
+# at runtime, but the pin is kept as instructed pending a maintainer call on
+# whether to drop it outright or wait for numba to raise its numpy ceiling.
+shap>=0.52.0
 matplotlib>=3.11.0
 
 # MLP model — only needed when model_type="mlp" (not used in Lambda)
