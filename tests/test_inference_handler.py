@@ -140,6 +140,134 @@ def test_handler_check_deploy_drift_falls_back_to_env_account(
     )
 
 
+def test_handler_check_deploy_drift_never_receives_skip_even_with_dry_run(
+    stubbed_preflight, monkeypatch,
+):
+    """Hard invariant (config#2731): the dedicated check_deploy_drift ACTION
+    (the SF's first-state gate) must keep asserting drift unconditionally.
+    Even if a caller mistakenly sets dry_run=true alongside this action, the
+    skip must NOT be threaded through — run_for_drift_gate() is called with
+    no kwargs (its default is skip_deploy_drift=False)."""
+    fake_drift = MagicMock()
+    fake_drift.check_deploy_drift = MagicMock(return_value={
+        "upstream_sha": "abc1234567",
+        "sf_sha": "abc1234567",
+        "sf_drift": False,
+        "stack_sha": "abc1234567",
+        "cf_drift": False,
+    })
+    monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
+
+    import inference.handler as h
+    ctx = _fake_context(arn="arn:aws:lambda:us-east-1:123456789012:function:foo")
+    h.handler({"action": "check_deploy_drift", "dry_run": True}, ctx)
+
+    stubbed_preflight.return_value.run_for_drift_gate.assert_called_once_with()
+
+
+# ── action="check_lib_pin_drift" / "check_pipeline_contract" ────────────────
+# (config#2731 — deploy-time canary dry_run must skip ONLY the deploy-drift
+# assertion inside run_for_drift_gate, not the contract/lib-pin check itself,
+# and non-dry_run SF pre-spend invocations must retain drift checking.)
+
+
+def test_handler_check_lib_pin_drift_sf_gate_defaults_drift_on(
+    stubbed_preflight, monkeypatch,
+):
+    """The SF's own pre-spend invocation (no dry_run) retains its existing
+    drift belt-and-suspenders — skip_deploy_drift defaults to False."""
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "has_drift": False, "reason": "in_sync", "pins": {}, "offenders": [],
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    assert result["has_drift"] is False
+    stubbed_preflight.return_value.run_for_drift_gate.assert_called_once_with(
+        skip_deploy_drift=False,
+    )
+
+
+def test_handler_check_lib_pin_drift_canary_dry_run_skips_drift(
+    stubbed_preflight, monkeypatch,
+):
+    """deploy.sh's deploy-time canary invocation (dry_run=true) skips ONLY
+    the deploy-drift assertion — the lib-pin check itself still runs and its
+    result is still returned/validated."""
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "has_drift": False, "reason": "in_sync", "pins": {}, "offenders": [],
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler(
+        {"action": "check_lib_pin_drift", "dry_run": True}, _fake_context(),
+    )
+
+    assert result["has_drift"] is False
+    fake_lpd.check_lib_pin_drift.assert_called_once()
+    stubbed_preflight.return_value.run_for_drift_gate.assert_called_once_with(
+        skip_deploy_drift=True,
+    )
+
+
+def test_handler_check_pipeline_contract_sf_gate_defaults_drift_on(
+    stubbed_preflight, monkeypatch,
+):
+    """The SF's own pre-spend invocation (no dry_run) retains its existing
+    drift belt-and-suspenders — skip_deploy_drift defaults to False."""
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "has_violation": False, "violations": [], "boundary_count": 1,
+        "reason": "in_sync",
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    assert result["has_violation"] is False
+    stubbed_preflight.return_value.run_for_drift_gate.assert_called_once_with(
+        skip_deploy_drift=False,
+    )
+
+
+def test_handler_check_pipeline_contract_canary_dry_run_skips_drift_not_contract(
+    stubbed_preflight, monkeypatch,
+):
+    """The core failure class from config#2731: a deploy-time canary
+    (dry_run=true) invocation of check_pipeline_contract must PASS the
+    drift gate (skip_deploy_drift=True threaded through) while STILL
+    running and honoring the real contract-validation result — a genuine
+    contract violation must still surface, dry_run or not."""
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "has_violation": True,
+        "violations": ["boundaries[0] (id=x) artifact_id='ghost' dangling"],
+        "boundary_count": 1,
+        "reason": "violation_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler(
+        {"action": "check_pipeline_contract", "dry_run": True}, _fake_context(),
+    )
+
+    # Contract check itself is not skipped/short-circuited by dry_run.
+    assert result["has_violation"] is True
+    fake_pcc.check_pipeline_contract.assert_called_once()
+    # Only the deploy-drift assertion inside the preflight is skipped.
+    stubbed_preflight.return_value.run_for_drift_gate.assert_called_once_with(
+        skip_deploy_drift=True,
+    )
+    stubbed_preflight.return_value.run.assert_not_called()
+
+
 # ── action="predict" (default) ─────────────────────────────────────────────
 
 
