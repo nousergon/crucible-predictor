@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
@@ -87,6 +88,14 @@ _LEADERBOARD_PREFIX = "predictor/model_zoo/leaderboard"
 # for DSR deflation (the per-run CPCV n_combos proxy understates the true
 # search breadth once rotations accumulate).
 _TRIAL_LOG_KEY = "predictor/model_zoo/trial_log.json"
+# config#2252 — EXACTLY-ONCE promotion ledger. One durable marker per run_date,
+# written after a rotation's selection/promotion finalizes successfully. A
+# re-execution of the weekly SF predictor branch (watch re-runs) re-enters the
+# rotation/select entrypoints for the SAME run_date; the marker turns that into
+# a VERIFIED no-op (no re-promote, no duplicate digest email) instead of a
+# second identical promotion email. To deliberately re-run a rotation for a
+# date, delete s3://<bucket>/predictor/model_zoo/promotions/<date>.json first.
+_PROMOTIONS_PREFIX = "predictor/model_zoo/promotions"
 
 # Deep-link target for the digest email → console Model Zoo page. The slug is
 # pinned in crucible-dashboard app.py (url_path="model-zoo") and guarded by
@@ -1093,6 +1102,124 @@ def _current_champion_version_id(s3, bucket: str) -> str | None:
     return champs[0].get("version_id") if champs else None
 
 
+class PromotionStateDivergenceError(RuntimeError):
+    """config#2252 — the exactly-once promotion contract was violated: a
+    promotion marker exists for this run_date but the live champion state does
+    NOT match what the marker recorded (or the marker itself is unreadable).
+    This is a divergence needing operator eyes — never a silent re-apply."""
+
+
+def _promotion_marker_key(date_str: str) -> str:
+    return f"{_PROMOTIONS_PREFIX}/{date_str}.json"
+
+
+def _read_promotion_marker(s3, bucket: str, date_str: str) -> dict | None:
+    """Return the exactly-once promotion marker for ``date_str``, or None if it
+    does not exist (the normal first-run case). FAIL LOUD on any error that is
+    not a clean not-found (corrupt JSON, AccessDenied, transport failure): an
+    unreadable marker means idempotency CANNOT be verified, and proceeding
+    blind could re-apply the promotion + duplicate the digest email
+    (config#2252). Recording surface: the raised PromotionStateDivergenceError
+    fails the spot workload / SF state loudly."""
+    key = _promotion_marker_key(date_str)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except KeyError:
+        return None  # test fakes signal a missing key with KeyError
+    except Exception as exc:  # noqa: BLE001 — split not-found from real errors below
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise PromotionStateDivergenceError(
+            f"model_zoo config#2252: promotion marker s3://{bucket}/{key} could "
+            f"not be read (NOT a clean not-found) — refusing to re-run "
+            f"selection blind, a re-apply could duplicate the promotion email: "
+            f"{exc}"
+        ) from exc
+
+
+def _write_promotion_marker(s3, bucket: str, date_str: str,
+                            leaderboard: dict, prior_champ_vid: str | None) -> None:
+    """config#2252 — durably record a successfully-finalized rotation for
+    ``date_str`` so any re-execution is a verified no-op. FAIL LOUD (no
+    try/except): a rotation that cannot record its own completion must not
+    silently allow a future re-run to duplicate the promotion + email — the
+    raise fails this run visibly instead."""
+    promoted = leaderboard.get("promoted")
+    marker = {
+        "schema_version": 1,
+        "run_date": date_str,
+        "mode": leaderboard.get("mode"),
+        "promoted": promoted,
+        "promoted_kind": leaderboard.get("promoted_kind"),
+        "winner_version_id": leaderboard.get("winner_version_id"),
+        "champion_arch_refresh_version_id": leaderboard.get("champion_arch_refresh_version_id"),
+        "prior_champion_version_id": prior_champ_vid,
+        # The registry version_id that should be SERVING after this rotation:
+        # the promoted vid on a cutover, else the (unchanged) prior champion.
+        # This is the field the re-run verification compares against.
+        "champion_version_id_after": promoted if promoted else prior_champ_vid,
+        "live_weights_prefix": "predictor/weights/meta/",
+        "registry_bundle_prefix": f"{_REGISTRY_PREFIX}/{promoted}/" if promoted else None,
+        "decision_summary": {
+            "n_candidates": len(leaderboard.get("candidates") or []),
+            "margin": leaderboard.get("margin"),
+            "promote_min_ic": leaderboard.get("promote_min_ic"),
+            "promotion_baseline_ic": leaderboard.get("promotion_baseline_ic"),
+            "promotion_baseline_source": leaderboard.get("promotion_baseline_source"),
+            "trial_log_status": leaderboard.get("trial_log_status"),
+        },
+        # Wall-clock write time (NOT a trade-decision key — run_date above is
+        # the pipeline's trading_day per DATE_CONVENTIONS).
+        "written_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    key = _promotion_marker_key(date_str)
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(marker, indent=2, default=str).encode(),
+        ContentType="application/json",
+    )
+    log.info("model_zoo config#2252: promotion marker written to s3://%s/%s "
+             "(promoted=%s)", bucket, key, promoted)
+
+
+def _verify_promotion_marker_noop(s3, bucket: str, date_str: str, marker: dict) -> dict:
+    """config#2252 — a marker exists for ``date_str``: verify the live champion
+    matches what the marker recorded, then return a no-op leaderboard (email +
+    all writes suppressed). A MISMATCH raises PromotionStateDivergenceError —
+    someone/something changed the champion since the recorded run (or the
+    recorded promotion never landed), which needs eyes, not a silent
+    re-apply."""
+    expected = marker.get("champion_version_id_after")
+    current = _current_champion_version_id(s3, bucket)
+    if current != expected:
+        raise PromotionStateDivergenceError(
+            f"model_zoo config#2252: promotion marker for {date_str} records "
+            f"champion_version_id_after={expected!r} but the registry's current "
+            f"champion is {current!r} — state diverged since the recorded run; "
+            f"refusing to silently re-apply. Inspect "
+            f"s3://{bucket}/{_promotion_marker_key(date_str)} and the registry; "
+            f"delete the marker ONLY to deliberately re-run this rotation."
+        )
+    log.info(
+        "model_zoo config#2252: promotion already applied for %s — idempotent "
+        "no-op, suppressing email (marker verified: champion=%s, promoted=%s)",
+        date_str, current, marker.get("promoted"),
+    )
+    return {
+        "date": date_str,
+        "mode": marker.get("mode"),
+        "idempotent_noop": True,
+        "candidates": [],
+        "winner_version_id": marker.get("winner_version_id"),
+        "promoted": marker.get("promoted"),
+        "promoted_kind": marker.get("promoted_kind"),
+        "digest_email": "suppressed_idempotent_noop",
+        "promotion_marker_key": _promotion_marker_key(date_str),
+    }
+
+
 def _candidate_by_vid(leaderboard: dict, vid: str) -> dict:
     for c in leaderboard.get("candidates", []):
         if c.get("version_id") == vid:
@@ -1627,6 +1754,15 @@ def run_rotation_and_select(
         except Exception:  # noqa: BLE001
             log.warning("model_zoo: no S3 client — selection limited", exc_info=True)
 
+    # config#2252 — exactly-once guard BEFORE burning a rotation's worth of spot
+    # training: a watch re-run of the weekly SF re-executes this entrypoint for
+    # the same run_date. Marker present + state verified → no-op (no retrain,
+    # no re-promote, no duplicate digest email); state mismatch → raise.
+    if not dry_run and s3 is not None and date_str:
+        _marker = _read_promotion_marker(s3, bucket, date_str)
+        if _marker is not None:
+            return _verify_promotion_marker_noop(s3, bucket, date_str, _marker)
+
     results = train_weekly_rotation(
         bucket, budget=budget, date_str=date_str, dry_run=dry_run,
         specs=specs, train_fn=train_fn, registered_versions=registered_versions, s3=s3,
@@ -1716,6 +1852,17 @@ def select_and_finalize(
         log.info("model_zoo select: dry_run/no-S3 — selection skipped")
         return leaderboard
 
+    # config#2252 — EXACTLY-ONCE-EFFECT guard (the single chokepoint BOTH the
+    # sequential run_rotation_and_select tail AND the parallel select entrypoint
+    # pass through). A marker for this run_date means a prior execution already
+    # finalized selection/promotion and sent the one digest email: verify the
+    # live champion still matches the marker, then no-op — suppressing the
+    # email and ALL writes. A mismatch raises (divergence needs eyes).
+    if date_str:
+        _marker = _read_promotion_marker(s3, bucket, date_str)
+        if _marker is not None:
+            return _verify_promotion_marker_noop(s3, bucket, date_str, _marker)
+
     # PARALLEL path: no in-process trained list → resolve the pool from the
     # registry (every active spec's newest challenger for this date; failed Map
     # iterations are absent, tolerated).
@@ -1785,6 +1932,22 @@ def select_and_finalize(
                 )
 
         _write_leaderboard(s3, bucket, date_str, leaderboard)
+
+        # config#2252 — record this rotation's finalized outcome so any re-run
+        # for the same run_date is a verified no-op (no duplicate email).
+        # Written ONLY when the promote step did not fail: a failed promote
+        # (promote_error above) must stay retryable on a re-run, not be sealed
+        # as done. Marker-write failure RAISES (fail loud, no swallow): a
+        # promotion that can't record itself must not silently allow future
+        # duplicates — the raise fails this run visibly instead.
+        if date_str and "promote_error" not in leaderboard:
+            _write_promotion_marker(s3, bucket, date_str, leaderboard, _prior_champ_vid)
+        elif date_str:
+            log.warning(
+                "model_zoo config#2252: promote FAILED — NOT writing the "
+                "promotion marker for %s so a re-run can retry the promote",
+                date_str,
+            )
 
         # config#671/#673/#1052 — RELATIVE-BEST noise-chasing MONITOR (repurposed from
         # the retired Option-B observe-tier leaderboard). With the relative-best rule a
@@ -1881,7 +2044,10 @@ def run_select_only(
     # produced nothing. Fail loud (CW metric + SNS), distinct from "challengers
     # ran but lost". Skipped on a dry run. The base champion-arch (if present)
     # is itself a candidate, so the alert fires only on a TRULY inert select.
-    if not dry_run and s3 is not None:
+    # config#2252: also skipped on an idempotent no-op re-run — the empty
+    # candidates list there is the SUPPRESSION shape, not an inert rotation
+    # (the first run already emitted the real metric/alerts for this date).
+    if not dry_run and s3 is not None and not leaderboard.get("idempotent_noop"):
         _cands = leaderboard.get("candidates", []) or []
         _n_specs = sum(1 for s in (specs if specs is not None else getattr(cfg, "MODEL_SPECS", []))
                        if s.get("status", "active") == "active" and s.get("id"))
