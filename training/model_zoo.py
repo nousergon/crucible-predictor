@@ -944,6 +944,25 @@ def select_winner(
                 ic_ir_needed = _d.get("ic_ir_needed_for_threshold")
             except Exception:  # noqa: BLE001 — observe-only stat, never blocks ranking
                 log.warning("model_zoo select: dsr_selection failed for %s", vid, exc_info=True)
+        # config#2882 — surface the ArcticDB read-coverage this candidate
+        # trained on. The manifest carries it verbatim from
+        # meta_trainer.run_meta_training (None for a manifest written before
+        # this field existed, or when arctic_coverage wasn't supplied). A True
+        # flag means the candidate's OWN self-reported CPCV IC was computed on
+        # a measurably-incomplete dataset — logged here so a promotion of a
+        # degraded-coverage winner is loud, not silent.
+        data_coverage_degraded = (manifest or {}).get("data_coverage_degraded")
+        arctic_coverage = (manifest or {}).get("arctic_coverage")
+        if data_coverage_degraded:
+            log.warning(
+                "model_zoo select: candidate %s (spec=%s) trained on "
+                "DEGRADED ArcticDB coverage (coverage_ratio=%s) — this "
+                "candidate's self-reported CPCV IC may be understated by a "
+                "starved universe. See data_coverage_degraded on its "
+                "leaderboard entry.",
+                vid, rec.get("spec_id"),
+                (arctic_coverage or {}).get("coverage_ratio"),
+            )
         candidates.append({
             "spec_id": rec.get("spec_id"), "version_id": vid,
             "model_version": rec.get("model_version"),
@@ -951,6 +970,12 @@ def select_winner(
             # the baseline) vs "challenger" (a rotated spec competing against it).
             "group": group,
             "forward_days": fwd, "cpcv_mean_ic": ic, "passes_gate": gate,
+            # config#2882 — ArcticDB coverage this candidate trained on (None
+            # when the manifest predates this field or coverage wasn't
+            # supplied). See the log.warning above for the loud-on-degraded
+            # trace; this is the structured leaderboard-artifact copy.
+            "data_coverage_degraded": data_coverage_degraded,
+            "arctic_coverage_ratio": (arctic_coverage or {}).get("coverage_ratio"),
             # config#671/#673/#1052: the DSR/Sortino gate result, surfaced for
             # OBSERVABILITY (is relative-best promotion chasing a model the absolute
             # gate would reject?) — NOT a promotion blocker. registry_bar likewise.
@@ -1249,6 +1274,21 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
         if dsr is None:
             dsr = win.get("dsr_training")
         dsr_gate = win.get("dsr_gate_pass")
+        # config#2882 — a promotion whose winner trained on measurably-
+        # incomplete ArcticDB coverage must say so IN THE ALERT ITSELF: this
+        # is the completion-notification chokepoint the issue calls out as
+        # currently silent ("nothing in the promoted artifact, the SF
+        # execution, or the completion email indicates the winning model was
+        # trained on a crippled dataset").
+        coverage_line = ""
+        if win.get("data_coverage_degraded"):
+            coverage_line = (
+                f"  ⚠ DATA COVERAGE DEGRADED: this winner trained on ArcticDB "
+                f"coverage_ratio={win.get('arctic_coverage_ratio')} (below "
+                f"arctic_degraded_coverage_ratio) — its self-reported CPCV IC "
+                f"may be understated by a partially-starved universe. "
+                f"config#2882.\n"
+            )
         msg = (
             f"[predictor] Model-zoo AUTO-PROMOTED a new champion ({date_str}).\n"
             f"  {prior_vid or '?'}  →  {winner_vid}  (spec: {spec})\n"
@@ -1257,6 +1297,7 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
             f"  Promotion is on RELATIVE-BEST (beats champion + margin), NOT on DSR. "
             f"DSR={dsr} (absolute-gate pass={dsr_gate}) is observability only — "
             f"config#671/#673/#1052.\n"
+            f"{coverage_line}"
             f"  Inference serves the new champion from the next run; the #237 turnover "
             f"governor caps the first-day book move.\n"
             f"  REVERT (if it misbehaves): {revert}"
@@ -1594,18 +1635,31 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         gate = c.get("passes_gate")
         elig = c.get("eligible")
         reason = c.get("reason", "")
+        # config#2882 — a challenger that trained on degraded ArcticDB
+        # coverage must show it on its OWN digest row: this is the "nothing
+        # in the completion email indicates the winning model was trained on
+        # a crippled dataset" gap the issue calls out.
+        degraded = c.get("data_coverage_degraded")
+        cov_suffix = (
+            f"  [DEGRADED COVERAGE ratio={c.get('arctic_coverage_ratio')}]"
+            if degraded else ""
+        )
         cand_rows_plain.append(
             f"  {str(sid):<18} cpcv={cpcv}  fwd={fwd}  gate={gate}  "
-            f"eligible={elig}  ({reason})"
+            f"eligible={elig}  ({reason}){cov_suffix}"
         )
         row_color = "#2e7d32" if elig else "#888"
+        cov_html = (
+            f' <span style="color:#c62828;font-weight:bold;">DEGRADED COVERAGE '
+            f'(ratio={c.get("arctic_coverage_ratio")})</span>' if degraded else ""
+        )
         cand_rows_html.append(
             f'<tr><td style="padding:2px 8px;font-family:monospace;">{sid}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{cpcv}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{fwd}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{gate}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;color:{row_color};">{elig}</td>'
-            f'<td style="padding:2px 8px;font-family:monospace;">{reason}</td></tr>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{reason}{cov_html}</td></tr>'
         )
     if not challengers:
         cand_rows_plain.append("  (no challenger candidates this rotation)")

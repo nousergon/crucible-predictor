@@ -66,10 +66,13 @@ def test_download_from_arctic_writes_universe_and_macro_parquets(fake_arcticdb, 
 
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path)
+        coverage = download_from_arctic("bucket-x", tmp_path)
 
     # 3 universe + 2 macro = 5 parquet files
-    assert n == 5
+    assert coverage["n_written"] == 5
+    assert coverage["n_expected"] == 5
+    assert coverage["n_failed"] == 0
+    assert coverage["coverage_ratio"] == 1.0
     files = sorted(p.name for p in tmp_path.iterdir())
     assert "AAPL.parquet" in files
     assert "SPY.parquet" in files
@@ -94,14 +97,18 @@ def test_download_from_arctic_skips_empty_dataframes(fake_arcticdb, tmp_path):
 
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path)
+        coverage = download_from_arctic("bucket-x", tmp_path)
 
-    assert n == 1  # only AAPL written
+    assert coverage["n_written"] == 1  # only AAPL written
+    # An empty DataFrame is a valid "no data yet" skip, not a read failure —
+    # it must not count against coverage.
+    assert coverage["n_failed"] == 0
+    assert coverage["n_expected"] == 2
     assert (tmp_path / "AAPL.parquet").exists()
     assert not (tmp_path / "EMPTY.parquet").exists()
 
 
-def test_download_from_arctic_per_ticker_read_failure_continues(fake_arcticdb, tmp_path):
+def test_download_from_arctic_per_ticker_read_failure_continues(fake_arcticdb, tmp_path, caplog):
     arctic_inst = MagicMock()
     fake_arcticdb.Arctic.return_value = arctic_inst
 
@@ -113,15 +120,25 @@ def test_download_from_arctic_per_ticker_read_failure_continues(fake_arcticdb, t
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path)
+        with caplog.at_level("WARNING"):
+            coverage = download_from_arctic("bucket-x", tmp_path)
 
-    # BAD failed, but AAPL + MSFT wrote → n=2
-    assert n == 2
+    # BAD failed, but AAPL + MSFT wrote → n_written=2
+    assert coverage["n_written"] == 2
+    assert coverage["n_expected"] == 3
+    assert coverage["n_failed"] == 1
+    assert coverage["failed_universe"] == ["BAD"]
+    assert coverage["coverage_ratio"] == pytest.approx(2 / 3)
     assert (tmp_path / "AAPL.parquet").exists()
     assert not (tmp_path / "BAD.parquet").exists()
 
+    # config#2882 — the per-ticker swallow must be visible at WARN (default
+    # INFO level), not DEBUG, and must name the ticker + carry the exception.
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("BAD" in r.message and "simulated read failure" in r.message for r in warn_records)
 
-def test_download_from_arctic_macro_read_failure_continues(fake_arcticdb, tmp_path):
+
+def test_download_from_arctic_macro_read_failure_continues(fake_arcticdb, tmp_path, caplog):
     arctic_inst = MagicMock()
     fake_arcticdb.Arctic.return_value = arctic_inst
 
@@ -133,11 +150,82 @@ def test_download_from_arctic_macro_read_failure_continues(fake_arcticdb, tmp_pa
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path)
+        with caplog.at_level("WARNING"):
+            coverage = download_from_arctic("bucket-x", tmp_path)
 
-    assert n == 2  # AAPL + SPY (VIX failed)
+    assert coverage["n_written"] == 2  # AAPL + SPY (VIX failed)
+    assert coverage["n_expected"] == 3
+    assert coverage["n_failed"] == 1
+    assert coverage["failed_macro"] == ["VIX"]
+    assert coverage["coverage_ratio"] == pytest.approx(2 / 3)
     assert (tmp_path / "SPY.parquet").exists()
     assert not (tmp_path / "VIX.parquet").exists()
+
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("VIX" in r.message and "simulated read failure" in r.message for r in warn_records)
+
+
+def test_download_from_arctic_coverage_ratio_partial_failure(fake_arcticdb, tmp_path):
+    """config#2882 — the core acceptance-criteria scenario: N tickers requested,
+    M < N successfully read (M > 0). The coverage ratio must be computed
+    correctly (not just n_files > 0)."""
+    arctic_inst = MagicMock()
+    fake_arcticdb.Arctic.return_value = arctic_inst
+
+    # 10 tickers requested, 3 fail (throttling-style partial loss) → 7/10 read.
+    all_tickers = [f"T{i}" for i in range(10)]
+    bad = set(all_tickers[:3])
+    universe_lib = _mock_library(all_tickers, raise_on=bad)
+    macro_lib = _mock_library([])
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
+
+    fake_s3 = MagicMock()
+    fake_s3.get_object.side_effect = RuntimeError("no sector_map")
+    with patch("boto3.client", return_value=fake_s3):
+        from store.arctic_reader import download_from_arctic
+        coverage = download_from_arctic("bucket-x", tmp_path)
+
+    assert coverage["n_written"] == 7
+    assert coverage["n_expected"] == 10
+    assert coverage["n_failed"] == 3
+    assert coverage["coverage_ratio"] == pytest.approx(0.7)
+    assert sorted(coverage["failed_universe"]) == sorted(bad)
+
+
+def test_download_from_arctic_coverage_ratio_full_success_is_one(fake_arcticdb, tmp_path):
+    arctic_inst = MagicMock()
+    fake_arcticdb.Arctic.return_value = arctic_inst
+    universe_lib = _mock_library(["AAPL", "MSFT"])
+    macro_lib = _mock_library(["SPY"])
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
+
+    fake_s3 = MagicMock()
+    fake_s3.get_object.side_effect = RuntimeError("no sector_map")
+    with patch("boto3.client", return_value=fake_s3):
+        from store.arctic_reader import download_from_arctic
+        coverage = download_from_arctic("bucket-x", tmp_path)
+
+    assert coverage["n_failed"] == 0
+    assert coverage["coverage_ratio"] == 1.0
+
+
+def test_download_from_arctic_coverage_ratio_zero_expected_is_one(fake_arcticdb, tmp_path):
+    """n_expected == 0 (empty universe + macro libs) must not divide-by-zero;
+    "nothing expected" degrades to coverage_ratio=1.0, not NaN/None."""
+    arctic_inst = MagicMock()
+    fake_arcticdb.Arctic.return_value = arctic_inst
+    universe_lib = _mock_library([])
+    macro_lib = _mock_library([])
+    arctic_inst.get_library.side_effect = lambda n, **kwargs: {"universe": universe_lib, "macro": macro_lib}[n]
+
+    fake_s3 = MagicMock()
+    fake_s3.get_object.side_effect = RuntimeError("no sector_map")
+    with patch("boto3.client", return_value=fake_s3):
+        from store.arctic_reader import download_from_arctic
+        coverage = download_from_arctic("bucket-x", tmp_path)
+
+    assert coverage["n_expected"] == 0
+    assert coverage["coverage_ratio"] == 1.0
 
 
 def test_download_from_arctic_progress_log_every_200(fake_arcticdb, tmp_path, caplog):
@@ -154,9 +242,9 @@ def test_download_from_arctic_progress_log_every_200(fake_arcticdb, tmp_path, ca
     with patch("boto3.client", return_value=fake_s3):
         with caplog.at_level("INFO"):
             from store.arctic_reader import download_from_arctic
-            n = download_from_arctic("bucket-x", tmp_path)
+            coverage = download_from_arctic("bucket-x", tmp_path)
 
-    assert n == 420
+    assert coverage["n_written"] == 420
     progress_lines = [r for r in caplog.records if "Written" in r.message and "symbols" in r.message]
     assert len(progress_lines) == 2  # 200/420 and 400/420
 

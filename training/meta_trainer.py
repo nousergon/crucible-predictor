@@ -655,6 +655,32 @@ def select_non_noise_features(
     return keep_idx, keep_names, report
 
 
+def _data_coverage_degraded(arctic_coverage: "dict | None") -> "bool | None":
+    """config#2882 — whether a training run's ArcticDB read coverage fell
+    below ``cfg.ARCTIC_DEGRADED_COVERAGE_RATIO`` (the SOFT floor; the HARD
+    floor, ``cfg.ARCTIC_MIN_COVERAGE_RATIO``, is enforced upstream in
+    train_handler.py before ``run_meta_training`` is ever called — so a run
+    that reaches here has already cleared it, and this can only ever surface
+    the milder "close but not perfect" partial-loss case, never a
+    catastrophic one).
+
+    ``arctic_coverage`` is the coverage dict ``store.arctic_reader.
+    download_from_arctic`` returns (``None`` when the caller didn't supply
+    one — e.g. an injected-data test harness that bypasses ArcticDB
+    entirely). Returns ``None`` in that case (unknown, not "healthy") so a
+    manifest/leaderboard reader can distinguish "coverage wasn't measured"
+    from "coverage was measured and is fine".
+
+    Single chokepoint for both the persisted manifest and the returned
+    result dict, so the two can never disagree.
+    """
+    if arctic_coverage is None:
+        return None
+    import config as cfg
+    degraded_floor = float(getattr(cfg, "ARCTIC_DEGRADED_COVERAGE_RATIO", 0.98))
+    return bool(arctic_coverage["coverage_ratio"] < degraded_floor)
+
+
 def _select_promotion_ic_series(cpcv_meta_ic, leakfree_meta_ic) -> tuple[list, str]:
     """L4565c: choose the IC distribution that feeds the W1.3 promotion battery
     (downside-Sortino + overfit-DSR), preferring the CPCV per-combo `ics`.
@@ -849,6 +875,7 @@ def run_meta_training(
     dry_run: bool = False,
     *,
     io: "TrainingIOSpec | None" = None,
+    arctic_coverage: "dict | None" = None,
 ) -> dict:
     """
     Train all Layer 1 + meta-model, validate with walk-forward, promote to S3.
@@ -869,6 +896,18 @@ def run_meta_training(
         under disjoint ``*_shadow/crsp/`` prefixes, and is hard-blocked from
         ever touching the live champion or the model-zoo pool — see the
         promotion-gate + registry-snapshot guards below.
+    arctic_coverage : dict or None
+        config#2882 — the coverage dict ``store.arctic_reader.download_from_arctic``
+        returned when ``data_dir`` was populated (``n_written``/``n_expected``/
+        ``coverage_ratio``/``n_failed``/...). Purely passed through into the
+        returned result dict (and from there into the S3 manifest) as
+        ``arctic_coverage`` + ``data_coverage_degraded`` so a challenger that
+        trained on a partially-crippled ArcticDB read is flagged in its OWN
+        leaderboard/CPCV artifact — visible to ``model_zoo.select_winner`` (or a
+        human) before/after a promotion, not just in the caller's logs.
+        ``None`` (e.g. an injected-data test harness that bypasses
+        ``download_from_arctic`` entirely) degrades to an absent/None manifest
+        field rather than failing training.
 
     Returns
     -------
@@ -4133,6 +4172,18 @@ def run_meta_training(
                     if cfg.TRAIN_START_DATE is not None else None
                 ),
                 "promoted": promoted,
+                # config#2882 — ArcticDB read-coverage this run trained on.
+                # ``None`` when the caller didn't supply it (e.g. an injected-
+                # data test harness). ``data_coverage_degraded`` is True when
+                # coverage_ratio fell below cfg.ARCTIC_DEGRADED_COVERAGE_RATIO
+                # (but at/above the hard train_handler.py floor, else training
+                # would have already raised before reaching here) — the signal
+                # model_zoo.select_winner threads onto this candidate's
+                # leaderboard entry so a challenger that wins promotion on a
+                # measurably-incomplete dataset is visible in the promoted
+                # artifact, not silently absent from it.
+                "arctic_coverage": arctic_coverage,
+                "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
                 # `date`/`version` above. Equal to this run on a promoting run;
@@ -4637,6 +4688,11 @@ def run_meta_training(
         "model_version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
         "promoted": promoted,
         "promoted_mode": "meta" if promoted else None,
+        # config#2882 — mirrors the manifest fields above (see that comment)
+        # so the training_summary SSOT and email formatter also carry the
+        # data-coverage signal, not only the registry manifest.
+        "arctic_coverage": arctic_coverage,
+        "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,
         "n_val": val_end - n_train,

@@ -481,6 +481,18 @@ def send_training_email(result: dict, date_str: str) -> bool:
         if challenger_registered
         else f"NOT promoted ({_build_failure_reason()}) ✗"
     )
+    # config#2882 — this run's own ArcticDB read-coverage. Surfaced in the
+    # SAME email that reports the IC/promotion verdict, so a degraded-data
+    # training run never looks indistinguishable from a healthy one.
+    data_coverage_degraded = result.get("data_coverage_degraded")
+    arctic_coverage_result = result.get("arctic_coverage") or {}
+    coverage_warning = (
+        f"⚠ DATA COVERAGE DEGRADED (ratio="
+        f"{arctic_coverage_result.get('coverage_ratio')}, "
+        f"{arctic_coverage_result.get('n_written')}/"
+        f"{arctic_coverage_result.get('n_expected')} files) — config#2882\n"
+        if data_coverage_degraded else ""
+    )
     status_str  = "PASS" if passes_ic else "FAIL"
 
     # CatBoost metrics for email
@@ -756,6 +768,15 @@ def send_training_email(result: dict, date_str: str) -> bool:
                                promo_color, promo_label, val_ic, mse_ic, test_ic,
                                rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos) +
 
+        # config#2882 — this run's own ArcticDB read-coverage, so a
+        # degraded-data run is visible in the SAME email as the IC/promotion
+        # verdict, not silently indistinguishable from a healthy run.
+        (
+            f'<p style="background:#fff3e0; padding:6px 10px; font-size:12px; '
+            f'color:#c62828; font-weight:bold;">{coverage_warning.strip()}</p>'
+            if coverage_warning else ""
+        ) +
+
         f'{wf_html}'
 
         + (
@@ -889,6 +910,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f"\n{_research_line}"
             f"\n{_mom_line}"
             f"\nPromotion: {promo_label}\n"
+            f"{coverage_warning}"
             f"{wf_plain}"
         )
         coefs = result.get("meta_coefficients", {})
@@ -921,6 +943,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f"\nPromoted:           {promoted_mode if promoted else ('challenger' if challenger_registered else 'none')}"
             f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
             f"\nPromotion:          {promo_label}\n"
+            f"{coverage_warning}"
             f"{wf_plain}"
             f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
             + f"\n{shap_plain}"
@@ -1359,16 +1382,49 @@ def _main_impl(
     # /tmp, which is empty on a fresh recovery spot, so it must always re-run.
     tmp_cache = Path(tempfile.mkdtemp()) / "cache"
     from store.arctic_reader import download_from_arctic
+    import config as cfg
     log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
     with _maybe_phase(reg, "data_load"):
-        n_files = download_from_arctic(
+        arctic_coverage = download_from_arctic(
             bucket=bucket, local_dir=tmp_cache, universe_lib=io.universe_lib,
         )
+        n_files = arctic_coverage["n_written"]
+        coverage_ratio = arctic_coverage["coverage_ratio"]
         if n_files == 0:
             raise RuntimeError(
                 f"ArcticDB returned zero files for training — "
                 f"universe library is empty or unreachable at bucket={bucket}. "
                 "Check Saturday DataPhase1 + weekly backfill ran cleanly."
+            )
+        # config#2882 — the n_files==0 gate above only catches TOTAL failure.
+        # A partial ArcticDB throttling/connectivity episode (e.g. 850/900
+        # tickers erroring) leaves n_files nonzero-but-crippled, so it's the
+        # coverage RATIO that must gate here — below the hard floor, refuse
+        # to train on a dataset this incomplete rather than let a challenger
+        # self-report a plausible-looking CPCV IC on a starved universe.
+        min_coverage = float(getattr(cfg, "ARCTIC_MIN_COVERAGE_RATIO", 0.5))
+        if coverage_ratio < min_coverage:
+            raise RuntimeError(
+                f"ArcticDB coverage {coverage_ratio:.4f} "
+                f"({n_files}/{arctic_coverage['n_expected']} files) is below "
+                f"the hard floor arctic_min_coverage_ratio={min_coverage} — "
+                "refusing to train on a dataset this incomplete. "
+                f"failed_universe={len(arctic_coverage['failed_universe'])} "
+                f"failed_macro={len(arctic_coverage['failed_macro'])}. "
+                "Check for an ArcticDB throttling/connectivity episode "
+                "(see WARN-level per-ticker/per-series read failures above)."
+            )
+        degraded_floor = float(getattr(cfg, "ARCTIC_DEGRADED_COVERAGE_RATIO", 0.98))
+        data_coverage_degraded = coverage_ratio < degraded_floor
+        if data_coverage_degraded:
+            log.warning(
+                "ArcticDB coverage %.4f (%d/%d files) is below the degraded "
+                "floor arctic_degraded_coverage_ratio=%s — training proceeds "
+                "(above the hard floor) but this run is flagged "
+                "data_coverage_degraded=True in its training summary/manifest "
+                "so ModelZoo select_winner (or a human) can see it before "
+                "trusting a promotion.",
+                coverage_ratio, n_files, arctic_coverage["n_expected"], degraded_floor,
             )
 
     # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).
@@ -1393,7 +1449,7 @@ def _main_impl(
     def _train_and_summarize() -> dict:
         _r = run_meta_training(
             data_dir=str(tmp_cache), bucket=bucket, date_str=date_str, dry_run=dry_run,
-            io=io,
+            io=io, arctic_coverage=arctic_coverage,
         )
         # Slim cache write + feature-store registry upload are handled by
         # alpha-engine-data (Phase 1) — nothing to do here.

@@ -61,9 +61,11 @@ def test_default_reads_universe_library(fake_arcticdb, tmp_path):
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path)  # default universe_lib
+        coverage = download_from_arctic("bucket-x", tmp_path)  # default universe_lib
 
-    assert n == 3  # 2 universe + 1 macro
+    assert coverage["n_written"] == 3  # 2 universe + 1 macro
+    assert coverage["n_expected"] == 3
+    assert coverage["coverage_ratio"] == 1.0
     assert "universe" in requested
     assert "universe_crsp" not in requested
     assert "macro" in requested
@@ -86,9 +88,11 @@ def test_shadow_reads_universe_crsp_library(fake_arcticdb, tmp_path):
     fake_s3.get_object.side_effect = RuntimeError("no sector_map")
     with patch("boto3.client", return_value=fake_s3):
         from store.arctic_reader import download_from_arctic
-        n = download_from_arctic("bucket-x", tmp_path, universe_lib="universe_crsp")
+        coverage = download_from_arctic("bucket-x", tmp_path, universe_lib="universe_crsp")
 
-    assert n == 4  # 3 crsp universe + 1 macro
+    assert coverage["n_written"] == 4  # 3 crsp universe + 1 macro
+    assert coverage["n_expected"] == 4
+    assert coverage["coverage_ratio"] == 1.0
     assert "universe_crsp" in requested
     assert "universe" not in requested  # never touches the live universe lib
     assert "macro" in requested

@@ -650,6 +650,28 @@ MODEL_ZOO_PROMOTE_MIN_IC = float(_cfg.get("model_zoo_promote_min_ic", 0.0))
 # public DSR/selection claim must clear.
 MODEL_ZOO_PBO_TARGET = float(_cfg.get("model_zoo_pbo_target", 0.2))
 
+# config#2882 — ArcticDB read-coverage gates. store/arctic_reader.py now
+# returns a coverage dict (n_written/n_expected/coverage_ratio) instead of a
+# bare file count, so a PARTIAL read-failure episode (throttling/connectivity/
+# corrupted symbols) is measurable, not just a total-failure n_files==0 trip.
+#
+# ARCTIC_MIN_COVERAGE_RATIO is the HARD FLOOR: below this, train_handler.py
+# raises and the run never reaches training (catastrophic partial loss, e.g.
+# the 850/900-tickers-erroring scenario from the issue — n_files was nonzero
+# so the old gate never tripped). Conservative default (well below normal
+# day-to-day noise) so a routine handful of delisted/corrupted symbols never
+# false-positives; tune down only with a concrete false-positive incident.
+ARCTIC_MIN_COVERAGE_RATIO = float(_cfg.get("arctic_min_coverage_ratio", 0.5))
+# ARCTIC_DEGRADED_COVERAGE_RATIO is the SOFT floor: below this (but at/above
+# the hard floor) training proceeds, but the run is marked
+# data_coverage_degraded=True in its own training_summary/manifest — which
+# model_zoo.select_winner threads onto the candidate's leaderboard entry so a
+# challenger that wins promotion on a measurably-incomplete dataset is
+# visible in the leaderboard/CPCV artifact BEFORE a human (or a future
+# automated gate) trusts the win, rather than the promoted artifact carrying
+# no trace of the data loss at all.
+ARCTIC_DEGRADED_COVERAGE_RATIO = float(_cfg.get("arctic_degraded_coverage_ratio", 0.98))
+
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the
 # shadow runner re-scores the SAME prices/universe with each registered
