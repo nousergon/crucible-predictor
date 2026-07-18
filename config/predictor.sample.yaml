@@ -293,6 +293,16 @@ model_zoo_promote_min_ic: 0.0
 #                                       # safety rails = promotion alert w/ revert cmd
 #                                       # + #237 turnover governor + one-command revert.
 
+# config#2882 — ArcticDB read-coverage gates (store/arctic_reader.py). Below
+# arctic_min_coverage_ratio, train_handler.py raises before training starts
+# (catastrophic partial data loss — n_files was nonzero so the old
+# n_files==0 gate never caught it). Below arctic_degraded_coverage_ratio (but
+# at/above the hard floor), training proceeds but the run + its leaderboard
+# candidate are marked data_coverage_degraded=True so a challenger that wins
+# ModelZoo promotion on incomplete data is visible before/after promotion.
+arctic_min_coverage_ratio: 0.5
+arctic_degraded_coverage_ratio: 0.98
+
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:
   rsi_period: 14                   # RSI lookback period
