@@ -363,6 +363,113 @@ def _paired_uplift_ci_by_date(blend, baseline, target, mask, dates,
     return lo, hi
 
 
+def _fit_horizon_members(df, horizons: list[int]) -> dict:
+    """Fit a per-horizon Ridge member over the OOS rows; return raw predictions.
+
+    One member per horizon in ``horizons`` with ``actual_fwd_{h}d`` present and
+    >=50 finite labels (others are dropped, matching the pre-existing
+    ``compute_horizon_blend`` gate). Shared by ``compute_horizon_blend``
+    (which z-scores these for IC-weighting) and
+    ``persist_horizon_prediction_panels`` (config#1993, which persists them
+    raw — top-quantile ranking is scale-invariant).
+
+    Returns ``{horizon: np.ndarray}``, predictions aligned to ``df``'s row
+    order (same convention the caller already relies on for ``df["date"]``/
+    ``df["ticker"]`` zipping).
+    """
+    import numpy as np
+    from model.meta_model import MetaModel, META_FEATURES
+
+    X = df[META_FEATURES].to_numpy(dtype=np.float32)
+    members: dict[int, np.ndarray] = {}
+    for h in horizons:
+        col = f"actual_fwd_{h}d"
+        if col not in df.columns:
+            log.warning("Column %s absent — dropping horizon %dd", col, h)
+            continue
+        y_h = df[col].to_numpy(dtype=np.float64)
+        if np.isfinite(y_h).sum() < 50:
+            log.warning("Horizon %dd has <50 finite labels — dropping", h)
+            continue
+        model = MetaModel(alpha=1.0)
+        model.fit(X, y_h, feature_names=META_FEATURES)
+        members[h] = model.predict(X).ravel().astype(np.float64)
+    return members
+
+
+PREDICTION_PANELS_PREFIX = "predictor/diagnostics/horizon_predictions/"
+
+
+def persist_horizon_prediction_panels(
+    df,
+    horizons: list[int] | None = None,
+    bucket: str = None,
+    date: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Persist per-horizon predicted-alpha panels for the W3.3 double-sort (config#1993).
+
+    Fits the same per-horizon Ridge members ``compute_horizon_blend`` uses
+    (raw, not z-scored — top-quantile book construction is scale-invariant)
+    and writes a tidy long-format parquet ``{date, ticker, horizon,
+    predicted_alpha}`` to
+    ``s3://{bucket}/predictor/diagnostics/horizon_predictions/{date|latest}.parquet``.
+
+    This is the upstream substrate ``crucible-backtester``'s
+    ``analysis.double_sort.compute_double_sort`` consumes (its docstring:
+    "produced upstream by the predictor's horizon battery") — that module
+    expects ``{horizon: {date: {ticker: alpha}}}``, which is this parquet
+    reshaped (one ``groupby("horizon")`` + nested pivot) by the consumer.
+
+    OBSERVE-only (ARCHITECTURE.md §14(e)): does not touch the serving path,
+    does not gate anything. ``dry_run=True`` skips the S3 write and returns
+    the row count/shape for local verification.
+    """
+    import io
+
+    import numpy as np
+    import pandas as pd
+
+    bucket = bucket or cfg.S3_BUCKET
+    horizons = horizons or list(_ENSEMBLE_HORIZONS)
+    members = _fit_horizon_members(df, horizons)
+    if not members:
+        return {"status": "no_usable_horizons", "horizons_requested": horizons}
+
+    dates = df["date"].tolist()
+    tickers = df["ticker"].tolist()
+    rows = []
+    for h, arr in members.items():
+        for dt, tk, a in zip(dates, tickers, arr):
+            if np.isfinite(a):
+                rows.append((dt, tk, h, float(a)))
+    panel_df = pd.DataFrame(
+        rows, columns=["date", "ticker", "horizon", "predicted_alpha"]
+    )
+    key = f"{PREDICTION_PANELS_PREFIX}{'latest' if date is None else date}.parquet"
+
+    result = {
+        "status": "dry_run" if dry_run else "ok",
+        "n_rows": int(len(panel_df)),
+        "horizons": sorted(members),
+        "bucket": bucket,
+        "key": key,
+    }
+    if dry_run:
+        return result
+
+    import boto3
+
+    buf = io.BytesIO()
+    panel_df.to_parquet(buf, index=False)
+    boto3.client("s3").put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    log.info(
+        "Persisted %d prediction-panel rows (%d horizons) to s3://%s/%s",
+        len(panel_df), len(members), bucket, key,
+    )
+    return result
+
+
 def compute_horizon_blend(
     df,
     horizons: list[int] | None = None,
@@ -392,7 +499,6 @@ def compute_horizon_blend(
     Returns a JSON-friendly dict; see ``format_blend_report`` for the layout.
     """
     import numpy as np
-    from model.meta_model import MetaModel, META_FEATURES
     from nousergon_lib.quant.stats.pbo import cscv_pbo
 
     horizons = horizons or list(_ENSEMBLE_HORIZONS)
@@ -407,30 +513,17 @@ def compute_horizon_blend(
             f"ladder (train must re-persist with _ENSEMBLE_HORIZONS present)."
         )
 
-    X = df[META_FEATURES].to_numpy(dtype=np.float32)
     y_target = df[target_col].to_numpy(dtype=np.float64)
     tmask = np.isfinite(y_target)
     dates = df["date"].tolist()
 
     # Per-horizon member signals (z-scored so IC-weighting is scale-free).
-    members: dict[int, np.ndarray] = {}
-    member_ic: dict[int, float] = {}
-    usable: list[int] = []
-    for h in horizons:
-        col = f"actual_fwd_{h}d"
-        if col not in df.columns:
-            log.warning("Column %s absent — dropping horizon %dd from blend", col, h)
-            continue
-        y_h = df[col].to_numpy(dtype=np.float64)
-        if np.isfinite(y_h).sum() < 50:
-            log.warning("Horizon %dd has <50 finite labels — dropping from blend", h)
-            continue
-        model = MetaModel(alpha=1.0)
-        model.fit(X, y_h, feature_names=META_FEATURES)
-        p = _zscore(model.predict(X).ravel())
-        members[h] = p
-        member_ic[h] = _spearman_ic(p, y_target, tmask)
-        usable.append(h)
+    raw_members = _fit_horizon_members(df, horizons)
+    members: dict[int, np.ndarray] = {h: _zscore(p) for h, p in raw_members.items()}
+    member_ic: dict[int, float] = {
+        h: _spearman_ic(p, y_target, tmask) for h, p in members.items()
+    }
+    usable: list[int] = [h for h in horizons if h in members]
 
     if target_horizon not in members:
         raise ValueError(
@@ -662,6 +755,19 @@ def main():
         help="Blend target horizon (the serving canonical the blend must beat). "
              "Default: 21. Only used with --blend.",
     )
+    parser.add_argument(
+        "--persist-panels", action="store_true",
+        help="Persist per-horizon predicted-alpha panels to "
+             f"s3://<bucket>/{PREDICTION_PANELS_PREFIX}<date|latest>.parquet "
+             "for crucible-backtester's double-sort study (config#1993). "
+             "Does not gate/change the serving path. Mutually exclusive with "
+             "--blend / the default IC-curve report.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="With --persist-panels, fit the members and report shape without "
+             "writing to S3.",
+    )
     args = parser.parse_args()
 
     horizons = None
@@ -672,6 +778,17 @@ def main():
     if df is None or len(df) == 0:
         log.error("No OOS rows available — exiting with nonzero status.")
         sys.exit(1)
+
+    if args.persist_panels:
+        result = persist_horizon_prediction_panels(
+            df, horizons=horizons, bucket=args.bucket, date=args.date,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(result, indent=2))
+        if args.output:
+            with open(args.output, "w") as f:
+                json.dump(result, f, indent=2)
+        return
 
     if args.blend:
         report = compute_horizon_blend(

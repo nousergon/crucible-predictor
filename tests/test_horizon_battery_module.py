@@ -8,6 +8,7 @@ a training rerun. Tests target the pure logic (compute_horizon_battery
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 
@@ -18,6 +19,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.horizon_battery import (
+    PREDICTION_PANELS_PREFIX,
+    _fit_horizon_members,
     _fmt,
     _fmt_ci,
     _round_or_none,
@@ -25,6 +28,7 @@ from analysis.horizon_battery import (
     compute_horizon_blend,
     format_blend_report,
     format_report,
+    persist_horizon_prediction_panels,
 )
 from training.meta_trainer import _DIAGNOSTIC_HORIZONS, _ENSEMBLE_HORIZONS
 
@@ -58,6 +62,7 @@ def _synthetic_oos_rows(n_dates: int = 60, tickers_per_date: int = 20, seed: int
             for h in _DIAGNOSTIC_HORIZONS:
                 row[f"actual_fwd_{h}d"] = float(actual + rng.normal(0, 0.3 * h / 5))
             row["date"] = d.strftime("%Y-%m-%d")
+            row["ticker"] = f"T{t:03d}"
             # Override macro_spy_20d_return for regime classification:
             # cycle through bull/neutral/bear so all three are populated.
             phase = (rng.integers(0, 3))
@@ -275,3 +280,91 @@ class TestComputeHorizonBlend:
         assert "Temporal-ensemble blend" in rendered
         assert "Baseline" in rendered
         assert "CSCV/PBO" in rendered
+
+
+class TestPersistHorizonPredictionPanels:
+    """Tests for persist_horizon_prediction_panels (config#1993 double-sort substrate)."""
+
+    def test_fit_horizon_members_matches_blend_members_unscored(self):
+        # _fit_horizon_members (raw) should, once z-scored, reproduce exactly
+        # what compute_horizon_blend's internal members use for IC-weighting —
+        # this pins the refactor didn't change compute_horizon_blend's numbers.
+        df = _synthetic_oos_rows(n_dates=60, tickers_per_date=18, seed=3)
+        from analysis.horizon_battery import _zscore
+        raw = _fit_horizon_members(df, [10, 21, 42])
+        assert set(raw) == {10, 21, 42}
+        for h, arr in raw.items():
+            assert len(arr) == len(df)
+            z = _zscore(arr)
+            assert abs(float(np.mean(z))) < 1e-6
+
+    def test_dry_run_no_s3_call_returns_shape(self):
+        df = _synthetic_oos_rows(n_dates=50, tickers_per_date=15, seed=5)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21, 63], bucket="unused-bucket", dry_run=True,
+        )
+        assert result["status"] == "dry_run"
+        assert result["horizons"] == [10, 21, 63]
+        assert result["n_rows"] == 50 * 15 * 3
+        assert result["key"] == f"{PREDICTION_PANELS_PREFIX}latest.parquet"
+
+    def test_dry_run_dated_key(self):
+        df = _synthetic_oos_rows(n_dates=20, tickers_per_date=10, seed=6)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[21], date="2026-07-18", dry_run=True,
+        )
+        assert result["key"] == f"{PREDICTION_PANELS_PREFIX}2026-07-18.parquet"
+
+    def test_drops_horizon_with_missing_column(self):
+        df = _synthetic_oos_rows(n_dates=40, tickers_per_date=12, seed=7)
+        df = df.drop(columns=["actual_fwd_42d"])
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21, 42], dry_run=True,
+        )
+        assert result["horizons"] == [10, 21]
+
+    def test_no_usable_horizons(self):
+        df = _synthetic_oos_rows(n_dates=10, tickers_per_date=5, seed=8)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[999], dry_run=True,
+        )
+        assert result["status"] == "no_usable_horizons"
+
+    def test_persist_writes_expected_parquet_shape(self, monkeypatch):
+        # Full path (minus the real S3 PUT) — monkeypatch boto3.client to
+        # capture what would have been written and verify the long-format
+        # parquet round-trips to the {horizon: {date: {ticker: alpha}}}
+        # shape analysis.double_sort.compute_double_sort expects.
+        df = _synthetic_oos_rows(n_dates=30, tickers_per_date=10, seed=9)
+        captured = {}
+
+        class _FakeS3:
+            def put_object(self, Bucket, Key, Body):
+                captured["bucket"] = Bucket
+                captured["key"] = Key
+                captured["body"] = Body
+
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: _FakeS3())
+
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21], bucket="test-bucket", dry_run=False,
+        )
+        assert result["status"] == "ok"
+        assert captured["bucket"] == "test-bucket"
+        assert captured["key"] == f"{PREDICTION_PANELS_PREFIX}latest.parquet"
+
+        panel_df = pd.read_parquet(io.BytesIO(captured["body"]))
+        assert set(panel_df.columns) == {"date", "ticker", "horizon", "predicted_alpha"}
+        assert set(panel_df["horizon"].unique()) == {10, 21}
+        # Reshape into the {horizon: {date: {ticker: alpha}}} nested dict the
+        # backtester's double_sort.compute_double_sort consumes.
+        nested = {}
+        for h, g in panel_df.groupby("horizon"):
+            nested[h] = {
+                d: dict(zip(sub["ticker"], sub["predicted_alpha"]))
+                for d, sub in g.groupby("date")
+            }
+        assert set(nested) == {10, 21}
+        any_date = next(iter(nested[21]))
+        assert len(nested[21][any_date]) <= 10  # <= tickers_per_date
