@@ -1,0 +1,29 @@
+name: Gitleaks scan
+
+# Thin caller — all scan behavior lives in the reusable workflow. Edit it
+# there, not here: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml
+#
+# GATED on nousergon-lib PR#228 merging first (config-I3005) — until then,
+# `uses:` below resolves against nousergon-lib@main which doesn't have the
+# file yet, so this check will fail/error. That is EXPECTED and BY DESIGN
+# (gate:dependency). Once PR#228 merges, re-run this workflow (Actions tab
+# -> re-run failed jobs, or push a new commit) to pick it up and go green.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Monday 06:00 UTC — 2h ahead of the config-I2528 fleet security-alert
+    # sweep (Mon 08:00 UTC) so a fresh finding registers as a code-scanning
+    # alert before the sweep enumerates alerts for the week.
+    - cron: "0 6 * * MON"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    uses: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml@main
+    secrets: inherit
