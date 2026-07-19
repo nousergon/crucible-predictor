@@ -38,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # every new producer addition. Captured 2026-05-27.
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "analysis/observe_leaderboard.py": 2,  # observe_leaderboard/{date}.json + latest.json — realized-edge measurement artifact, observe-only, no freshness SLA (config#671/#702 L4539)
+    "analysis/horizon_battery.py": 1,  # predictor/diagnostics/horizon_predictions/{date|latest}.parquet — config#1993 double-sort substrate, manual --persist-panels CLI flag only (no SF cadence); grandfathered in ARTIFACT_REGISTRY.yaml (ad-hoc research)
     "analysis/triple_barrier_cutover_runner.py": 2,
     "data_manifest.py": 1,
     "inference/research_free_inference.py": 2,  # predictions_research_free/{date}.json + latest.json — registered as predictor_predictions_research_free in ARTIFACT_REGISTRY.yaml (config#2365, warning severity — no consumer hard-blocked yet, see that row's comment)
