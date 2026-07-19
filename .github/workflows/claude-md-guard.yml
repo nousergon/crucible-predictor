@@ -1,0 +1,18 @@
+name: CLAUDE.md guard
+
+# Fails CI if CLAUDE.md is ever committed to this (public) repo. CLAUDE.md
+# is deliberately gitignored/untracked fleet-wide (2026-03-22 decision) --
+# it carries infra/IP-structure detail that must not be public. Logic
+# lives in the fleet chokepoint: nousergon-lib claude-md-guard.yml.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  claude-md-untracked:
+    uses: nousergon/nousergon-lib/.github/workflows/claude-md-guard.yml@main
