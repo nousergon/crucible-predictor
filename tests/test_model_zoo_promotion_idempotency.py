@@ -278,6 +278,9 @@ def test_marker_write_failure_raises(monkeypatch):
 def test_no_marker_written_when_promote_fails(monkeypatch):
     run, promotes, s3, sent, _ = _select_fixture(
         monkeypatch, auto_promote=True, promote_boom=True)
+    promote_failed = []
+    monkeypatch.setattr(mz, "_alert_promote_failure",
+                        lambda b, d, vid, kind, exc: promote_failed.append((vid, kind)))
     board = run()
     assert board["promoted"] is None
     assert "promote_error" in board
@@ -285,6 +288,21 @@ def test_no_marker_written_when_promote_fails(monkeypatch):
     assert _MARKER_KEY not in s3.puts, (
         "a FAILED promote must not seal the run_date — a re-run has to retry")
     assert sent == [_DATE]                       # the failure run still reports
+    # config#2870: a promote_to_champion exception must not go silent — the
+    # only prior trace was board["promote_error"], persisted to S3 and never
+    # surfaced to an operator.
+    assert promote_failed == [("resid-v", "challenger")]
+
+
+def test_promote_failure_alert_not_fired_on_success(monkeypatch):
+    run, promotes, _, _, _ = _select_fixture(monkeypatch, auto_promote=True)
+    promote_failed = []
+    monkeypatch.setattr(mz, "_alert_promote_failure",
+                        lambda b, d, vid, kind, exc: promote_failed.append((vid, kind)))
+    board = run()
+    assert board["promoted"] == "resid-v"
+    assert promotes == ["resid-v"]
+    assert promote_failed == []
 
 
 # ── run_rotation_and_select no-ops BEFORE re-training ────────────────────────
