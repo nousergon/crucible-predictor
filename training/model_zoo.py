@@ -1383,6 +1383,42 @@ def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) ->
         log.warning("model_zoo: inert-rotation alert failed", exc_info=True)
 
 
+def _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc) -> None:
+    """config#2870 (no-silent-fails): ``promote_to_champion`` raised — the
+    rotation ran and picked a winner/refresh, but the live champion did NOT
+    advance. Distinct from ``_alert_inert_rotation`` (nothing trained at all):
+    here the pool produced a promotable candidate and the PROMOTE step itself
+    failed. Prior to this alert the only trace was ``leaderboard["promote_error"]``
+    (persisted to S3, never surfaced to an operator) — a swallowed exception
+    here was the exact "ran but promoted nothing, with zero positive
+    confirmation" gap config#2870 named. WARN + SNS; never raises (observability
+    off a path whose failure is already recorded in the leaderboard)."""
+    msg = (
+        f"[predictor] Model-zoo PROMOTE FAILED ({date_str}) — the champion did "
+        f"NOT advance this rotation.\n"
+        f"  attempted: {promote_kind or '?'} {promote_vid}\n"
+        f"  error: {exc}\n"
+        f"  Live weights (predictor/weights/meta/meta_model.pkl) are UNCHANGED — "
+        f"Monday inference will serve last week's champion. This is retryable "
+        f"(config#2252: no promotion marker was written) but requires an "
+        f"operator to investigate + re-run the promote."
+    )
+    log.warning(
+        "model_zoo config#2870: PROMOTE FAILED for %s %s: %s",
+        promote_kind, promote_vid, exc, exc_info=True,
+    )
+    try:
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
+            message=msg, severity="critical",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_promote_failed_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: promote-failure alert failed", exc_info=True)
+
+
 def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> None:
     """Observe-mode: a challenger beat the champion but auto-promote is OFF — a
     low-priority (info) heads-up so the operator reviews the leaderboard + can
@@ -1970,6 +2006,7 @@ def select_and_finalize(
                 leaderboard["promoted"] = None
                 leaderboard["promote_error"] = str(exc)
                 log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", promote_vid, exc, exc_info=True)
+                _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc)
         else:
             leaderboard["promoted"] = None
             if promote_vid:
