@@ -2302,6 +2302,15 @@ def run_meta_training(
             r.get("date")
             for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
         ]
+        # config#2889: ticker ids aligned row-for-row with meta_X/meta_y/
+        # _meta_dates, carried through cpcv_meta_oos_ic so its held-out test
+        # predictions can be independently rejoined to score_performance_outcomes
+        # (see the second-opinion block below) instead of trusting this same
+        # trainer's own meta_y for both training AND self-grading.
+        _meta_tickers = [
+            r.get("ticker")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
 
         def _meta_fit_predict(_Xtr, _ytr, _Xte):
             _m = MetaModel(alpha=1.0)
@@ -2348,6 +2357,8 @@ def run_meta_training(
             embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
             n_groups=getattr(cfg, "WF_CPCV_N_GROUPS", 6),
             k_test=getattr(cfg, "WF_CPCV_K_TEST", 2),
+            row_ids=_meta_tickers,
+            return_preds=True,
         )
         log.info(
             "W1.2 CPCV meta OOS IC (OBSERVE, NOT gated): mean=%s std=%s "
@@ -2359,6 +2370,36 @@ def run_meta_training(
             cpcv_meta_ic.get("n_combos"), cpcv_meta_ic.get("n_backtest_paths"),
             cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
         )
+        # config#2889 (Brian's 2026-07-18 Decision Queue Option-B ruling): an
+        # INDEPENDENT second-party IC recomputation from realized outcomes, so
+        # the promotion gate + report-card grade no longer rest on ONE
+        # self-reported number. Pop the CPCV OOS predictions (not JSON-
+        # serializable) and rejoin them against a FRESH read of
+        # score_performance_outcomes — bypassing meta_y entirely — via a
+        # completely separate code path from the CV mechanics above.
+        _cpcv_oos_preds = cpcv_meta_ic.pop("_oos_preds", None)
+        cpcv_meta_ic.pop("_oos_true", None)  # unused: re-derived independently below
+        _cpcv_oos_dates = cpcv_meta_ic.pop("_oos_dates", None)
+        _cpcv_oos_ids = cpcv_meta_ic.pop("_oos_ids", None)
+        try:
+            from training.realized_ic_second_opinion import compute_second_opinion_ic
+            cpcv_meta_ic["second_opinion"] = compute_second_opinion_ic(
+                _cpcv_oos_preds, _cpcv_oos_ids, _cpcv_oos_dates,
+                db_path=db_tmp, horizon_days=cfg.FORWARD_DAYS,
+            )
+            log.info(
+                "config#2889 second-opinion IC: %s",
+                cpcv_meta_ic["second_opinion"],
+            )
+        except Exception:  # noqa: BLE001 — the second opinion is a corroborating
+            # signal computed AFTER the real CPCV number above; its own failure
+            # must never fail training (select_winner treats a missing second
+            # opinion as non-blocking — see evaluate_second_opinion_gate).
+            log.warning("config#2889 second-opinion IC computation failed", exc_info=True)
+            cpcv_meta_ic["second_opinion"] = {
+                "status": "unavailable", "second_opinion_ic": None,
+                "n_oos_rows": None, "n_matched": None, "match_rate": None,
+            }
 
         # W1.3 (L4469, OBSERVE): TWO lenses on the leak-free per-date IC series.
         # (1) DOWNSIDE-AWARE PERFORMANCE — Sortino-of-IC + CVaR-of-IC, matching

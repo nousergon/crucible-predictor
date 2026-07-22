@@ -633,6 +633,23 @@ def assert_model_specs_loaded() -> None:
 MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
     "MODEL_ZOO_AUTO_PROMOTE_WINNER", _cfg.get("model_zoo_auto_promote_winner", False)
 )
+# config#2889 — independent second-party IC recomputation from realized outcomes
+# (Brian's 2026-07-18 Decision Queue Option-B ruling). The self-reported CPCV mean
+# IC drives BOTH promotion and the report-card grade with no independent check; a
+# labeling/CV-computation bug would propagate uncaught into both. training/
+# meta_trainer.py now recomputes an independent second-opinion IC from a fresh
+# read of score_performance_outcomes (bypassing the trainer's own meta_y array)
+# and stashes it on the manifest; model_zoo.py::select_winner always SURFACES a
+# divergence verdict per candidate. OBSERVE-FIRST (same rollout pattern as
+# MODEL_ZOO_AUTO_PROMOTE_WINNER above): with this False (default), a diverging
+# second opinion is logged loud + visible on the leaderboard but does not block
+# promotion; flip True (yaml or env) once a few weeks of real second-opinion
+# numbers have been observed to confirm the divergence heuristic itself isn't
+# false-positive-prone.
+MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE = _flag_env_or_yaml(
+    "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE",
+    _cfg.get("model_zoo_second_opinion_gate_enforce", False),
+)
 # CPCV mean-IC margin a challenger must beat the champion by to be selected.
 MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
 # config#671/#673/#1052 — RELATIVE-BEST promotion: the absolute DSR-0.95 hurdle is
