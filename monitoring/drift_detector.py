@@ -293,8 +293,20 @@ def check_prediction_drift(s3, bucket: str, date_str: str) -> list[dict]:
     return alerts
 
 
-def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> dict:
+def check_drift(
+    bucket: str = DEFAULT_BUCKET,
+    date_str: str | None = None,
+    dry_run: bool = False,
+) -> dict:
     """Run all drift checks. Returns a structured, severity-aware result.
+
+    ``dry_run=True`` skips the S3 write of ``drift_{date}.json`` — added so
+    the deploy-time canary (``infrastructure/deploy.sh``, action=check_drift)
+    can exercise this action's full read path without overwriting the real
+    EOD SF's artifact for the current trading day on every deploy (the
+    canary invokes a freshly-published, not-yet-live version; it has no
+    business mutating production state). The genuine EOD SF invocation never
+    passes dry_run, so its write behavior is unchanged (config#3025 dim8).
 
     Prediction-drift only (config#1853) — feature-distribution drift is a
     separate layer owned by ``monitoring/feature_drift.py``'s
@@ -346,16 +358,17 @@ def check_drift(bucket: str = DEFAULT_BUCKET, date_str: str | None = None) -> di
         "n_alerts": len(details),
     }
 
-    # Write results to S3
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=f"predictor/metrics/drift_{date_str}.json",
-            Body=json.dumps(result, indent=2).encode(),
-            ContentType="application/json",
-        )
-    except Exception as e:
-        logger.warning("Drift results S3 write failed: %s", e)
+    # Write results to S3 (skipped in dry_run — see docstring)
+    if not dry_run:
+        try:
+            s3.put_object(
+                Bucket=bucket,
+                Key=f"predictor/metrics/drift_{date_str}.json",
+                Body=json.dumps(result, indent=2).encode(),
+                ContentType="application/json",
+            )
+        except Exception as e:
+            logger.warning("Drift results S3 write failed: %s", e)
 
     if details:
         for d in details:

@@ -360,9 +360,21 @@ echo "  Published version: ${VERSION}"
 #   - check_trading_day (calendar gate)
 #   - check_weekly_run_day (calendar gate)
 #   - check_pipeline_contract (early validation gate)
+#   - check_coverage (SF coverage-gap Choice state)
+#   - check_lib_pin_drift (Saturday SF early gate)
 #
 # Each action's wiring is exercised independently. A broken import or a
 # missing handler will surface as FunctionError or statusCode != 200.
+#
+# Deliberately NOT in this matrix:
+#   - train: deprecated no-op (returns a static 400 before touching any
+#     dependency), nothing for a canary to catch.
+#   - check_deploy_drift: its entire job is comparing THIS build's own baked
+#     GIT_SHA against origin/main HEAD — for a deploy-time canary that
+#     relationship is true by construction (this image was just built from
+#     the commit that triggered this workflow run), so it would never catch
+#     a real regression here, only add a redundant GitHub API round-trip.
+#     It runs for real as the weekday SF's first state, against live.
 #
 # Invoke via the shared ``krepis.aws invoke-canary`` CLI (config#1494, published
 # in krepis 0.7.0) instead of a bare ``aws lambda invoke``. The CLI retries ONLY
@@ -391,7 +403,14 @@ fi
 # gate each on the presence of the domain key its SF Choice state consumes.
 
 # Test check_drift — drift_detector.check_drift returns {date,status,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action": "check_drift"}' "status"; then
+# dry_run=true: check_drift unconditionally writes predictor/metrics/
+# drift_{date}.json for the current trading day; without dry_run every
+# deploy would overwrite that day's real EOD-SF-produced artifact with a
+# canary re-run (config#3025 dim8). The handler threads dry_run into
+# drift_detector.check_drift() to skip ONLY the S3 write — the read path
+# (S3 GETs, drift computation) still runs, so a broken import or query
+# still surfaces here.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action": "check_drift", "dry_run": true}' "status"; then
   CANARY_FAILED=1
 fi
 
@@ -414,6 +433,24 @@ fi
 # runs and fails loud on a genuine violation (config#2731, mirrors the
 # predict(dry_run) fix in config#1073).
 if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_coverage — coverage_check.compute_coverage_delta returns
+# {n_buy_candidates,n_predictions,missing_count,missing_tickers}. Read-only
+# (two S3 GETs); no dry_run needed. Omit `date` so it reads today's
+# artifacts, mirroring how the weekday SF's coverage-gap Choice state calls
+# it with no explicit date.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_coverage" '{"action": "check_coverage"}' "missing_count"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_lib_pin_drift — lib_pin_drift.check_lib_pin_drift returns
+# {has_drift,reason,pins,offenders}. Read-only (GitHub raw-content GETs of
+# each Saturday-SF repo's requirements file); no dry_run needed, and it
+# fails open on a fetch/parse miss so a transient GitHub hiccup cannot
+# false-fail this canary.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift"; then
   CANARY_FAILED=1
 fi
 

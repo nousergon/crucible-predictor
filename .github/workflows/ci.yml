@@ -41,6 +41,42 @@ jobs:
           fi
           pip-audit "${IGNORE_ARGS[@]}"
 
+  # Installs requirements.txt and requirements-lambda.txt into two separate
+  # clean venvs and diffs the RESOLVED versions of packages shared between
+  # them. test_lib_pin_lockstep.py (in the `test` job above) already catches
+  # specifier-TEXT drift; this catches the residual gap where identical
+  # specifier text still resolves to different transitive versions once the
+  # surrounding package set diverges between the two files (config#3025
+  # dim6 — the docker-import-closure job below installs
+  # requirements-lambda.txt too, but only proves it installs cleanly, not
+  # that it matches requirements.txt's resolution).
+  lambda-requirements-lockstep:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Resolve requirements.txt into a clean venv
+        run: |
+          python -m venv /tmp/venv-root
+          /tmp/venv-root/bin/pip install --upgrade pip -q
+          /tmp/venv-root/bin/pip install -r requirements.txt -q
+          /tmp/venv-root/bin/pip freeze > /tmp/root-freeze.txt
+
+      - name: Resolve requirements-lambda.txt into a clean venv
+        run: |
+          python -m venv /tmp/venv-lambda
+          /tmp/venv-lambda/bin/pip install --upgrade pip -q
+          /tmp/venv-lambda/bin/pip install -r requirements-lambda.txt -q
+          /tmp/venv-lambda/bin/pip freeze > /tmp/lambda-freeze.txt
+
+      - name: Diff resolved versions for shared packages
+        run: python3 scripts/check_requirements_resolved_lockstep.py /tmp/root-freeze.txt /tmp/lambda-freeze.txt
+
   # Builds the real Lambda image and imports the real entrypoint modules
   # INSIDE the built container — the ground-truth backstop for the
   # config#1282/PR352 bug class (`tests/test_dockerfile_handler_import_
@@ -115,7 +151,7 @@ jobs:
   # races) stay silent. Reusable workflow + transport in nousergon-lib.
   # See alpha-engine-config#1128.
   notify-main-failure:
-    needs: [test, docker-import-closure]
+    needs: [test, lambda-requirements-lockstep, docker-import-closure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit
