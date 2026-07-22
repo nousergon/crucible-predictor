@@ -83,9 +83,27 @@ def test_handler_check_drift_writes_artifact(stubbed_preflight, monkeypatch):
     fake_dd.check_drift.assert_called_once()
     call_kwargs = fake_dd.check_drift.call_args.kwargs
     assert call_kwargs["date_str"] == "2026-06-26"
+    assert call_kwargs["dry_run"] is False
     # Light preflight: env + S3 only, no full predict bootstrap, no drift gate.
     stubbed_preflight.return_value.check_env_vars.assert_called_once_with("AWS_REGION")
     stubbed_preflight.return_value.check_s3_bucket.assert_called_once()
+
+
+def test_handler_check_drift_dry_run_threaded_to_check_drift(
+    stubbed_preflight, monkeypatch,
+):
+    """The deploy-time canary invokes check_drift with dry_run=true so it
+    doesn't overwrite the real EOD-SF-produced drift_{date}.json on every
+    deploy (config#3025 dim8) — the handler must thread that flag through."""
+    fake_dd = MagicMock()
+    fake_dd.check_drift = MagicMock(return_value={"date": "2026-06-26", "status": "ok"})
+    monkeypatch.setitem(sys.modules, "monitoring.drift_detector", fake_dd)
+
+    import inference.handler as h
+    h.handler({"action": "check_drift", "dry_run": True}, _fake_context())
+
+    call_kwargs = fake_dd.check_drift.call_args.kwargs
+    assert call_kwargs["dry_run"] is True
     stubbed_preflight.return_value.run.assert_not_called()
     stubbed_preflight.return_value.run_for_drift_gate.assert_not_called()
 
@@ -295,6 +313,45 @@ def test_handler_predict_default_path_invokes_main(
         stubbed_preflight.return_value.run.call_args.kwargs["skip_deploy_drift"]
         is False
     )
+
+
+def test_handler_predict_dry_run_skips_heartbeat_write(
+    stubbed_preflight, monkeypatch,
+):
+    """dry_run's contract is "no S3 writes" — the deploy canary invokes
+    predict(dry_run=true) and must not leave any S3 side effect, including
+    the flow-doctor heartbeat (config#3025 dim8)."""
+    fake_daily = MagicMock()
+    fake_daily.main = MagicMock()
+    monkeypatch.setitem(sys.modules, "inference.daily_predict", fake_daily)
+
+    fake_fd = MagicMock()
+    fake_krepis_logging = MagicMock(get_flow_doctor=MagicMock(return_value=fake_fd))
+    monkeypatch.setitem(sys.modules, "krepis.logging", fake_krepis_logging)
+
+    import inference.handler as h
+    result = h.handler({"date": "2026-04-15", "dry_run": True}, _fake_context())
+
+    assert result["statusCode"] == 200
+    fake_fd.emit_heartbeat.assert_not_called()
+
+
+def test_handler_predict_non_dry_run_writes_heartbeat(
+    stubbed_preflight, monkeypatch,
+):
+    fake_daily = MagicMock()
+    fake_daily.main = MagicMock()
+    monkeypatch.setitem(sys.modules, "inference.daily_predict", fake_daily)
+
+    fake_fd = MagicMock()
+    fake_krepis_logging = MagicMock(get_flow_doctor=MagicMock(return_value=fake_fd))
+    monkeypatch.setitem(sys.modules, "krepis.logging", fake_krepis_logging)
+
+    import inference.handler as h
+    result = h.handler({"date": "2026-04-15"}, _fake_context())
+
+    assert result["statusCode"] == 200
+    fake_fd.emit_heartbeat.assert_called_once()
 
 
 def test_handler_predict_supplemental_tickers_split_csv(

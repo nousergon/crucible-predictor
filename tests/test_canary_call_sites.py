@@ -51,6 +51,8 @@ SF_GATE_ACTION_EXPECT_KEY = {
     "check_trading_day": "is_trading_day",
     "check_weekly_run_day": "is_weekly_run_day",
     "check_pipeline_contract": "has_violation",
+    "check_coverage": "missing_count",
+    "check_lib_pin_drift": "has_drift",
 }
 
 _BARE_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -110,10 +112,12 @@ def _live_call_sites() -> list[list[str]]:
 
 
 def test_deploy_sh_has_the_expected_call_sites():
-    # 5 inference (predict + 4 SF-gate) + 2 regime + 2 regime-eval, per the
-    # issue's own "Approach" anchor. A count drift means a site was added or
-    # removed without updating this suite's assumptions.
-    assert len(_live_call_sites()) == 9
+    # 7 inference (predict + 6 SF-gate) + 2 regime + 2 regime-eval. config#3025
+    # dim8 added check_coverage + check_lib_pin_drift to the inference matrix
+    # (previously excluded with no documented rationale), bringing inference
+    # from 5 to 7 sites. A count drift means a site was added or removed
+    # without updating this suite's assumptions.
+    assert len(_live_call_sites()) == 11
 
 
 @pytest.mark.parametrize("args", _live_call_sites(), ids=lambda a: a[2])

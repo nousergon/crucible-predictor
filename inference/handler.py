@@ -247,7 +247,7 @@ def handler(event: dict, context) -> dict:
     # propagates so the SF Catch sees a true failure.
     if action == "check_drift":
         from monitoring.drift_detector import check_drift
-        result = check_drift(bucket=bucket, date_str=date_str)
+        result = check_drift(bucket=bucket, date_str=date_str, dry_run=dry_run)
         log.info(
             "Drift check %s: status=%s severity=%s n_alerts=%d → drift_%s.json",
             result["date"], result["status"], result.get("severity"),
@@ -342,10 +342,16 @@ def handler(event: dict, context) -> dict:
     # independently and emit_heartbeat only exists in flow-doctor >=0.6.2, so a
     # version-skewed lib pin would AttributeError at end-of-run without the
     # hasattr check (mirrors flow-doctor's own soft-fail philosophy).
-    from krepis.logging import get_flow_doctor
-    fd = get_flow_doctor()
-    if fd and hasattr(fd, "emit_heartbeat"):
-        fd.emit_heartbeat(bucket=bucket)
+    # dry_run also skips the write: dry_run's whole contract (and the
+    # deploy-time canary's, which invokes action=predict with dry_run=true)
+    # is "no S3 writes, no email" — an unconditional heartbeat PUT here broke
+    # that contract silently and made the deploy canary a non-read-only
+    # action (config#3025 dim8).
+    if not dry_run:
+        from krepis.logging import get_flow_doctor
+        fd = get_flow_doctor()
+        if fd and hasattr(fd, "emit_heartbeat"):
+            fd.emit_heartbeat(bucket=bucket)
 
     return {
         "statusCode": 200,

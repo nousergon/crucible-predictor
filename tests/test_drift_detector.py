@@ -282,6 +282,28 @@ def test_check_drift_ok_when_no_alerts():
     assert args["Key"] == "predictor/metrics/drift_2026-04-15.json"
 
 
+def test_check_drift_dry_run_skips_s3_write():
+    """dry_run=True must not overwrite the real EOD-SF-produced
+    drift_{date}.json — added so the deploy-time canary can exercise this
+    action's read path without a production side effect (config#3025 dim8)."""
+    rng = np.random.default_rng(11)
+    preds = _make_preds(
+        directions=list(rng.choice(["UP", "DOWN"], 30)),
+        confidences=list(rng.uniform(0.55, 0.85, 30)),
+        alphas=list(rng.normal(0.0, 0.02, 30)),
+        n=30,
+    )
+    fake_s3 = _s3_with_routes({
+        "predictor/predictions/2026-04-15.json": ("json", preds),
+    })
+    fake_s3.put_object = MagicMock()
+    with patch("boto3.client", return_value=fake_s3):
+        result = check_drift(bucket="bucket", date_str="2026-04-15", dry_run=True)
+
+    assert result["status"] == "ok"
+    fake_s3.put_object.assert_not_called()
+
+
 def test_check_drift_alert_status_and_severity():
     preds = _make_preds(directions=["UP"] * 20)  # 100% clustering → WARN single-day
     fake_s3 = _s3_with_routes({
