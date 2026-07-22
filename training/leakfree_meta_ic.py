@@ -275,6 +275,8 @@ def cpcv_meta_oos_ic(
     n_groups: int = 6,
     k_test: int = 2,
     min_train: int = 50,
+    row_ids=None,
+    return_preds: bool = False,
 ) -> dict:
     """Combinatorial purged CV (López de Prado Ch. 12) — W1.2 (L4469, OBSERVE).
 
@@ -290,6 +292,18 @@ def cpcv_meta_oos_ic(
     summary stats) — the single-path walk-forward (``leakfree_meta_oos_ic``)
     tests one easily-overfit path; CPCV gives a distribution, which is the input
     to W1.3's Deflated-Sharpe / PBO promotion gate. OBSERVE ONLY.
+
+    ``row_ids`` (config#2889, W5-style capture): an optional array aligned
+    row-for-row with ``meta_X``/``meta_y``/``row_dates`` (e.g. ticker symbols).
+    When ``return_preds`` is True, every test-fold ``(pred, true, date, id)``
+    tuple across ALL combos is stacked and attached as ``_oos_preds`` /
+    ``_oos_true`` / ``_oos_dates`` / ``_oos_ids`` (numpy arrays / list; NOT
+    JSON-serializable) so a caller can independently rejoin the held-out
+    predictions against a ground truth OTHER than this call's own ``meta_y``
+    — e.g. ``predictor/validation/realized_ic_second_opinion.py``'s fresh read
+    of ``score_performance_outcomes``. The caller must ``pop`` these before the
+    dict reaches the manifest. A row can appear in multiple test combos
+    (CPCV's combos overlap) — expected, not deduplicated.
     """
     # L4488a: embargo defaults to the label horizon — the overlapping-label
     # embargo that closes the after-test-boundary leak for interior test groups
@@ -300,22 +314,33 @@ def cpcv_meta_oos_ic(
     meta_X = np.asarray(meta_X, dtype=float)
     meta_y = np.asarray(meta_y, dtype=float)
     row_dates = np.asarray(row_dates)
+    row_ids_arr = np.asarray(row_ids) if row_ids is not None else None
     uniq = sorted({d for d in row_dates.tolist() if d is not None})
     n = len(uniq)
     groups = _contiguous_groups(n, n_groups)
     if len(groups) < k_test + 1:
-        return {
+        result = {
             "status": "insufficient_groups",
             "n_groups": len(groups),
             "ics": [],
             "mean_ic": float("nan"),
         }
+        if return_preds:
+            result["_oos_preds"] = np.array([], dtype=float)
+            result["_oos_true"] = np.array([], dtype=float)
+            result["_oos_dates"] = np.array([])
+            result["_oos_ids"] = np.array([]) if row_ids_arr is not None else None
+        return result
 
     date_to_idx = {d: i for i, d in enumerate(uniq)}
     row_idx = np.array([date_to_idx.get(d, -1) for d in row_dates.tolist()])
 
     ics: list[float] = []
     n_attempted = 0
+    oos_pred: list[float] = []
+    oos_true: list[float] = []
+    oos_date: list = []
+    oos_id: list = []
     for test_combo in combinations(range(len(groups)), k_test):
         excluded = np.zeros(n, dtype=bool)
         test_idx_set = np.zeros(n, dtype=bool)
@@ -339,15 +364,27 @@ def cpcv_meta_oos_ic(
         ic, _ = cross_sectional_rank_ic(preds, meta_y[te_mask], row_dates[te_mask])
         if np.isfinite(ic):
             ics.append(float(ic))
+        if return_preds:
+            oos_pred.extend(preds.tolist())
+            oos_true.extend(meta_y[te_mask].tolist())
+            oos_date.extend(row_dates[te_mask].tolist())
+            if row_ids_arr is not None:
+                oos_id.extend(row_ids_arr[te_mask].tolist())
 
     if not ics:
-        return {
+        result = {
             "status": "no_valid_combos",
             "n_groups": len(groups),
             "n_attempted": n_attempted,
             "ics": [],
             "mean_ic": float("nan"),
         }
+        if return_preds:
+            result["_oos_preds"] = np.asarray(oos_pred, dtype=float)
+            result["_oos_true"] = np.asarray(oos_true, dtype=float)
+            result["_oos_dates"] = np.asarray(oos_date)
+            result["_oos_ids"] = np.asarray(oos_id) if row_ids_arr is not None else None
+        return result
 
     arr = np.asarray(ics, dtype=float)
     # LdP backtest-path count φ = (k / N) · C(N, k).
@@ -356,7 +393,7 @@ def cpcv_meta_oos_ic(
     def _r(v):
         return round(float(v), 6) if np.isfinite(v) else float("nan")
 
-    return {
+    result = {
         "status": "ok",
         "n_groups": len(groups),
         "k_test": k_test,
@@ -374,6 +411,12 @@ def cpcv_meta_oos_ic(
         "frac_positive": _r(float((arr > 0).mean())),
         "ics": [_r(x) for x in ics],
     }
+    if return_preds:
+        result["_oos_preds"] = np.asarray(oos_pred, dtype=float)
+        result["_oos_true"] = np.asarray(oos_true, dtype=float)
+        result["_oos_dates"] = np.asarray(oos_date)
+        result["_oos_ids"] = np.asarray(oos_id) if row_ids_arr is not None else None
+    return result
 
 
 def leakfree_horizon_ic_curve(

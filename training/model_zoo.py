@@ -820,6 +820,15 @@ def select_winner(
     if margin is None:
         margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
     min_ic = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0))
+    # config#2889 (Brian's 2026-07-18 Decision Queue Option-B ruling):
+    # OBSERVE-FIRST, same rollout pattern as MODEL_ZOO_AUTO_PROMOTE_WINNER.
+    # False (default): every candidate's second-opinion verdict is always
+    # computed + surfaced (leaderboard + loud log on divergence) but never
+    # blocks. True: a diverging second opinion makes the candidate ineligible.
+    enforce_second_opinion = bool(
+        getattr(cfg, "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE", False)
+    )
+    from training.realized_ic_second_opinion import evaluate_second_opinion_gate
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
     # Its CPCV mean IC is a STALE last-promoted snapshot (a prior vintage), so it
@@ -902,6 +911,24 @@ def select_winner(
         #   IC <= positive floor   → below_floor (best-of-N noise is not edge)
         #   IC <  baseline+margin  → below_champion_arch_plus_margin
         #   else                   → eligible (PROMOTES — DSR is not consulted)
+        # config#2889: independent second-party IC recomputation verdict for
+        # this candidate — ALWAYS computed (observability), only gates
+        # eligibility when MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE is True. See
+        # training/realized_ic_second_opinion.py for the corroborate/diverge
+        # logic; the second_opinion dict itself was computed independently by
+        # meta_trainer at training time (fresh score_performance_outcomes
+        # read, bypassing meta_y) and travels here verbatim on the manifest.
+        _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
+        second_opinion = _cpcv.get("second_opinion") or {}
+        so_verdict = evaluate_second_opinion_gate(ic, second_opinion)
+        if so_verdict.get("divergence_detected"):
+            log.warning(
+                "model_zoo select: config#2889 SECOND-OPINION DIVERGENCE for "
+                "%s (spec=%s): %s (enforce=%s)",
+                vid, rec.get("spec_id"), so_verdict.get("reason"),
+                enforce_second_opinion,
+            )
+
         group = "champion_arch" if is_champ_arch else "challenger"
         if is_champ_arch:
             eligible, reason = False, "champion_arch_baseline"
@@ -913,6 +940,8 @@ def select_winner(
             eligible, reason = False, "below_floor"
         elif baseline_ic is not None and ic < baseline_ic + margin:
             eligible, reason = False, "below_champion_arch_plus_margin"
+        elif enforce_second_opinion and so_verdict.get("divergence_detected"):
+            eligible, reason = False, "second_opinion_diverges"
         else:
             eligible, reason = True, "eligible"
         # L4582(b): re-deflate this candidate's CPCV IC series by the CUMULATIVE
@@ -927,7 +956,6 @@ def select_winner(
         dsr_selection = None
         dsr_selection_n_eff = None
         ic_ir_needed = None
-        _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
         _ics = _cpcv.get("ics") or []
         _n_paths = _cpcv.get("n_backtest_paths")
         if _ics and n_trials_cumulative:
@@ -992,6 +1020,12 @@ def select_winner(
             # series of that independent length needs to clear the full DSR bar.
             "dsr_selection_n_eff": dsr_selection_n_eff,
             "ic_ir_needed_for_full_bar": ic_ir_needed,
+            # config#2889: independent second-party IC recomputation verdict.
+            "second_opinion_ic": second_opinion.get("second_opinion_ic"),
+            "second_opinion_status": second_opinion.get("status"),
+            "second_opinion_divergence": so_verdict.get("divergence_detected"),
+            "second_opinion_reason": so_verdict.get("reason"),
+            "second_opinion_gate_enforced": enforce_second_opinion,
             "eligible": eligible, "reason": reason,
         })
 
