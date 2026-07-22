@@ -1,0 +1,20 @@
+name: Gate Label Guard
+
+# Structural enforcement of the gate:* draft-PR discipline (config#2002) —
+# fails while ANY gate:* label is attached to this PR. Required status
+# check on main branch protection so a gated PR structurally cannot merge,
+# even if flipped to ready for review by mistake or by an automated actor
+# (incident precedent: nousergon-data-PR643, 2026-07-05, config#1446/#1464).
+# Logic lives in the fleet chokepoint: nousergon-lib gate-label-guard.yml.
+# Rollout: config-I3491.
+
+on:
+  pull_request:
+    types: [opened, reopened, labeled, unlabeled, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  gate-label-guard:
+    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@main
