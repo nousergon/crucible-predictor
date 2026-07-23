@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools"]
+
+[project]
+name = "crucible-predictor"
+dynamic = ["version"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", ".venv/*", "venv/*"]
+
+[tool.coverage.report]
+# Ratchet floor — placeholder. Full suite could not be measured on this ARM runner
+# (arcticdb has no ARM Linux wheel). Raise to the actual measured value once CI
+# has run on an x86_64 runner and confirmed the real coverage level.
+# CI excludes: --ignore=tests/test_inference.py --ignore=tests/test_model.py
+fail_under = 0

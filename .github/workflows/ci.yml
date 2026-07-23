@@ -23,12 +23,13 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest-cov
 
       - name: Set up config
         run: cp config/predictor.sample.yaml config/predictor.yaml
 
       - name: Run tests
-        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py
+        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py --cov=. --cov-report=term-missing
 
       - name: Security audit
         run: |
