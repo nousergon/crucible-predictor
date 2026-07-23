@@ -30,7 +30,7 @@ yfinance>=0.2.30
 boto3>=1.26.0
 tqdm>=4.68.4
 requests>=2.28.0
-lxml>=4.9.0
+lxml>=6.1.1
 lightgbm>=4.6.0
 # Floor bumped >=1.2.0 -> >=1.2.8 in lockstep with requirements.txt (numpy-2
 # migration, config#2815): catboost 1.2.6/1.2.7 pinned numpy<2.0.
