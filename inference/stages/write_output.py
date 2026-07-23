@@ -47,6 +47,32 @@ _PREDICTOR_PARAMS_CACHE_PATH = Path(
     os.environ.get("PREDICTOR_PARAMS_CACHE", "/tmp/predictor_params_cache.json")
 )
 
+# config#2891: the Saturday Evaluator (backtester veto_analysis.apply) writes
+# config/predictor_params.json weekly; a silently-failed or stalled write
+# leaves this cold-start reading an arbitrarily old veto threshold with no
+# signal. WARN (never block inference) once the pointer is older than 2
+# weekly cycles — mirrors ARTIFACT_REGISTRY.yaml's own default
+# grace_period_cycles=2 for the central config_predictor_params freshness-
+# monitor row this assertion complements as an independent consumer-side
+# signal (config#1724 doctrine), not a replacement for it.
+_PREDICTOR_PARAMS_STALE_HOURS = 24 * 7 * 2
+
+
+def _check_predictor_params_staleness(last_modified: Optional[datetime]) -> None:
+    """Best-effort WARN when ``last_modified`` is older than
+    ``_PREDICTOR_PARAMS_STALE_HOURS``. Never raises, never blocks inference."""
+    if last_modified is None:
+        return
+    age_hours = (datetime.now(timezone.utc) - last_modified).total_seconds() / 3600.0
+    if age_hours > _PREDICTOR_PARAMS_STALE_HOURS:
+        log.error(
+            "STALE config/predictor_params.json: last modified %.1fh ago "
+            "(> %dh / 2 weekly cycles) — the Saturday Evaluator may have "
+            "silently failed or stalled; predictor may be running on a "
+            "stale veto threshold (config#2891)",
+            age_hours, _PREDICTOR_PARAMS_STALE_HOURS,
+        )
+
 
 def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
     """Read config/predictor_params.json from S3. Cache per cold-start.
@@ -64,6 +90,7 @@ def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
         import boto3
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=s3_bucket, Key="config/predictor_params.json")
+        _check_predictor_params_staleness(obj.get("LastModified"))
         data = json.loads(obj["Body"].read())
         if "veto_confidence" in data:
             _predictor_params_cache = data
