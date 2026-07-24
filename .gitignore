@@ -72,6 +72,7 @@ config/predictor.yaml
 
 # Local developer instructions (infrastructure/deploy detail — not for public repo)
 CLAUDE.md
+AGENTS.md
 
 # Logs
 *.log
