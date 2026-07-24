@@ -99,7 +99,7 @@ jobs:
 
       - name: Append to system-wide deploy changelog
         if: always()
-        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@765aa682f6c5b7e1e5fc241c7bac1e9e0d6ca326  # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
@@ -109,5 +109,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@6c4bdb834f0869efc5de3166b285a812053ea709  # main
     secrets: inherit
