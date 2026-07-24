@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import datetime
@@ -11,6 +10,7 @@ from typing import Optional
 
 import config as cfg
 from inference.pipeline import PipelineContext
+from nousergon_lib.signals import fallback_research_date_keys, try_read_s3_json
 
 log = logging.getLogger(__name__)
 
@@ -31,46 +31,6 @@ _CANONICAL_SIGNALS_MACRO_FIELDS = (
 )
 
 
-def _signals_fallback_keys(date_str: str) -> list[str]:
-    """Return S3 keys to try in priority order:
-    today's signals → prior 5 weekdays' signals → signals/latest.json.
-
-    Mirrors `compute_coverage_delta`'s lookup chain so the predictor's
-    weekday paths and the executor's coverage gate agree on which
-    research snapshot is current.
-    """
-    from datetime import date as _date, timedelta as _td
-
-    keys: list[str] = []
-    try:
-        start = _date.fromisoformat(date_str)
-        for days_back in range(6):
-            candidate = start - _td(days=days_back)
-            if candidate.weekday() >= 5:
-                continue
-            keys.append(f"signals/{candidate}/signals.json")
-    except Exception:
-        pass
-    keys.append("signals/latest.json")
-    return keys
-
-
-def _read_s3_signals_payload(s3, bucket: str, key: str) -> dict | None:
-    """Read a single S3 signals key. Return None on miss/permission/parse
-    error so callers can walk to the next key in the fallback chain."""
-    from botocore.exceptions import ClientError
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read().decode("utf-8"))
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "AccessDenied", "403", "404"):
-            return None
-        raise
-    except Exception:
-        return None
-
-
 def _load_signals_payload_with_fallback(
     s3, bucket: str, date_str: str
 ) -> dict:
@@ -78,34 +38,41 @@ def _load_signals_payload_with_fallback(
     chain. Empty dict if nothing resolves — callers must tolerate.
 
     Brief regime defect (2026-05-11): population/latest.json carries a
-    `market_regime` value that drifts from `signals/latest.json` (two
+    ``market_regime`` value that drifts from ``signals/latest.json`` (two
     research producers, no shared source of truth — population's writer
     today serves the pre-critic regime; signals.json carries the post-
     critic value). Without falling back to signals.json on weekday runs
     when today's daily snapshot doesn't exist yet, the predictor's
     morning brief displays the pre-critic regime, and downstream
     consumers (regime-conditional veto thresholds, sector_modifiers
-    used for sector-by-sector boost) see drift. This helper exists so
-    every load path in the file shares one fallback chain.
+    used for sector-by-sector boost) see drift.
+
+    Uses the shared :func:`nousergon_lib.signals.fallback_research_date_keys`
+    and :func:`load_json_with_fallback` (consolidated from the 3x-duplicated
+    local implementations in alpha-engine-config#3284).
     """
-    for key in _signals_fallback_keys(date_str):
-        payload = _read_s3_signals_payload(s3, bucket, key)
-        if payload:
-            return payload
-    return {}
+    from nousergon_lib.signals import load_json_with_fallback
+
+    payload = load_json_with_fallback(
+        s3, bucket, fallback_research_date_keys(date_str)
+    )
+    return payload if payload is not None else {}
 
 
 def _read_buy_candidates_from_signals(
     s3, bucket: str, date_str: str
 ) -> list[str]:
-    """Read research's `buy_candidates` ticker list from signals.
+    """Read research's ``buy_candidates`` ticker list from signals.
 
-    Walks the same fallback chain `compute_coverage_delta` uses so weekday
-    runs see Saturday's signals. Returns an empty list on any failure or
-    empty payload — the caller treats that as "no candidates to union".
+    Walks the same fallback chain the coverage gate uses so weekday runs
+    see Saturday's signals. Returns an empty list on any failure or empty
+    payload — the caller treats that as "no candidates to union".
+
+    Uses the shared :func:`nousergon_lib.signals.fallback_research_date_keys`
+    and :func:`try_read_s3_json` (alpha-engine-config#3284).
     """
-    for key in _signals_fallback_keys(date_str):
-        payload = _read_s3_signals_payload(s3, bucket, key)
+    for key in fallback_research_date_keys(date_str):
+        payload = try_read_s3_json(s3, bucket, key)
         if payload is None:
             continue
         candidates = payload.get("buy_candidates") or []
