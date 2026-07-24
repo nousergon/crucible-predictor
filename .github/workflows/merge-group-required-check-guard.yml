@@ -1,0 +1,30 @@
+name: Merge-group required-check guard
+
+# Validates that every required status check has a workflow with
+# merge_group: {types: [checks_requested]} in its on: block.
+# Without this, the merge queue permanently deadlocks — the required
+# context never reports on merge_group events.
+#
+# This guard is NOT a required check itself (self-referential).
+# It runs advisory on PRs/pushes touching .github/workflows/.
+#
+# Logic lives in the fleet chokepoint:
+#   nousergon-lib merge-group-required-check-guard.yml
+# Rollout: config-I3682.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    uses: nousergon/nousergon-lib/.github/workflows/merge-group-required-check-guard.yml@main
