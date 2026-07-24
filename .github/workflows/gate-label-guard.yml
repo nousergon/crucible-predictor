@@ -7,14 +7,26 @@ name: Gate Label Guard
 # (incident precedent: nousergon-data-PR643, 2026-07-05, config#1446/#1464).
 # Logic lives in the fleet chokepoint: nousergon-lib gate-label-guard.yml.
 # Rollout: config-I3491.
+#
+# Uses @v1 (tagged 2026-07-24 at nousergon-lib@6c4bdb8): GITHUB_EVENT_PATH
+# fix — never toJson(github.event) in env:. Tags are resolved at runtime
+# (unlike branch refs, which GitHub caches), so fixes propagate immediately.
+#
+# pull-requests: read is REQUIRED — the reusable workflow declares it at the
+# top level and GitHub Actions rejects the call at parse time if the caller
+# doesn't grant it (startup_failure, zero jobs, zero logs; 2026-07-24 incident
+# across executor/predictor/research — config-I3491 follow-up).
 
 on:
   pull_request:
     types: [opened, reopened, labeled, unlabeled, ready_for_review, synchronize]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gate-label-guard:
-    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/gate-label-guard.yml@v1
