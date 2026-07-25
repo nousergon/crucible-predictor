@@ -368,3 +368,54 @@ class TestPersistHorizonPredictionPanels:
         assert set(nested) == {10, 21}
         any_date = next(iter(nested[21]))
         assert len(nested[21][any_date]) <= 10  # <= tickers_per_date
+
+
+# ── main() CLI guard (§119 rule 1) ────────────────────────────────────
+
+class TestMainCLIGuard:
+    """Tests for horizon_battery.main() CLI entry point guards.
+
+    Coverage for the success path (rows loaded -> normal exit) and the
+    failure path (empty/no rows -> exit 1) — the two states the
+    ``sys.exit(1)`` guard at line 780 can reach.
+    """
+
+    def test_success_path_returns_normally(self, monkeypatch):
+        """Mock load_oos_rows with valid data — guard passes, no SystemExit."""
+        from analysis.horizon_battery import main
+
+        df = _synthetic_oos_rows(n_dates=10, tickers_per_date=5)
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: df,
+        )
+        main()  # must not raise
+
+    def test_none_rows_exits_with_code_1(self, monkeypatch):
+        """Mock load_oos_rows returns None — verifies SystemExit(1)."""
+        import pytest
+        from analysis.horizon_battery import main
+
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: None,
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+
+    def test_empty_df_exits_with_code_1(self, monkeypatch):
+        """Mock load_oos_rows returns empty DataFrame — verifies SystemExit(1)."""
+        import pytest
+        from analysis.horizon_battery import main
+
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: pd.DataFrame(),
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
