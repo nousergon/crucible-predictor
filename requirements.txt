@@ -63,7 +63,7 @@ pytest>=9.1.1
 # in this codebase, and its hard `numba` dep caps numpy <2.5 in every release
 # through 0.66.0, unresolvable against the numpy>=2.5.1 floor above. Re-add
 # only alongside an actual call site, once numba supports the numpy floor.
-matplotlib>=3.11.0
+matplotlib>=3.11.1
 
 # MLP model — only needed when model_type="mlp" (not used in Lambda)
 # torch>=2.0.0
