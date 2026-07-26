@@ -91,6 +91,16 @@ if [ -n "${PREDICTOR_DEFER_TRAINING_EMAIL:-}" ]; then
 else
   DEFER_EMAIL_EXPORT=""
 fi
+# krepis 0.18.8+ fleet §116 rule 6: --correlation-id (or $RUN_TOKEN) is required.
+# The dashboard box now sets RUN_TOKEN via systemd; forward it to every spot-side
+# heredoc so krepis calls on the spot instance pick it up automatically.
+if [ -n "${RUN_TOKEN:-}" ]; then
+  RUN_TOKEN_EXPORT="export RUN_TOKEN=${RUN_TOKEN}"$'\n'
+else
+  # Fallback: if RUN_TOKEN is somehow unset (e.g. a developer running spot_train.sh
+  # directly), derive one from the experiment id + UTC date so the spot doesn't fail.
+  RUN_TOKEN_EXPORT="export RUN_TOKEN=spot-${ALPHA_ENGINE_EXPERIMENT_ID:-default}-$(date -u +%Y%m%d)"$'\n'
+fi
 # Capacity-resilient instance-type fallback set (2026-05-22 incident:
 # spot launches in single-AZ subnet-e07166ec/us-east-1f hit
 # InsufficientInstanceCapacity). Order = preference; the lib CLI tries
@@ -609,7 +619,7 @@ if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ] && [ "$MODE" 
   echo "═══════════════════════════════════════════════════════════════"
   echo "  SMOKE TEST (dry_run=True)"
   echo "═══════════════════════════════════════════════════════════════"
-  run_ssm "smoke" "$(cat <<'SMOKE'
+  run_ssm "smoke" "${RUN_TOKEN_EXPORT}$(cat <<'SMOKE'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
@@ -721,7 +731,7 @@ if [ "$MODE" = "model-zoo-weekly" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   echo "  MODEL-ZOO WEEKLY ROTATION + SELECT (observe-first by default)"
   echo "═══════════════════════════════════════════════════════════════"
-  run_ssm "model-zoo-weekly" "$(cat <<'ZOO'
+  run_ssm "model-zoo-weekly" "${RUN_TOKEN_EXPORT}$(cat <<'ZOO'
 set -eo pipefail
 # config#1066 — pin ALPHA_ENGINE_EXPERIMENT_ID so config.py loads the staged
 # experiment-package yaml, MODEL_SPECS populates, and the rotation trains
@@ -828,7 +838,7 @@ if [ "$MODE" = "model-zoo-spec" ]; then
   # Interpolating export prefix so the quoted heredoc body (which must stay
   # paren/apostrophe-free per the bash 3.2 note) reads the spec id from the env.
   MZ_SPEC_EXPORT="export MODEL_ZOO_SPEC_ID=${MODEL_ZOO_SPEC_ID}"$'\n'
-  run_ssm "model-zoo-spec" "${MZ_SPEC_EXPORT}$(cat <<'ZOOSPEC'
+  run_ssm "model-zoo-spec" "${RUN_TOKEN_EXPORT}${MZ_SPEC_EXPORT}$(cat <<'ZOOSPEC'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
@@ -904,7 +914,7 @@ if [ "$MODE" = "model-zoo-select" ]; then
   echo "═══════════════════════════════════════════════════════════════"
   echo "  MODEL-ZOO SELECT (observe-first by default)"
   echo "═══════════════════════════════════════════════════════════════"
-  run_ssm "model-zoo-select" "$(cat <<'ZOOSEL'
+  run_ssm "model-zoo-select" "${RUN_TOKEN_EXPORT}$(cat <<'ZOOSEL'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
@@ -977,7 +987,7 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
-run_ssm "full-training" "${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT}$(cat <<'TRAIN'
+run_ssm "full-training" "${RUN_TOKEN_EXPORT}${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT}$(cat <<'TRAIN'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
