@@ -448,6 +448,23 @@ done
 # (no-op on Success). Per-repo subprefix discriminates cascade A
 # (ae-data) + cascade B (ae-backtester) sibling writes — lib's
 # {date}.json key shape would otherwise clobber within a shared prefix.
+# S116 rule 5: heartbeat pid for in-phase progress signals (krepis.heartbeat).
+# Start via _heartbeat_start before each long-run_ssm call; stop via _heartbeat_stop
+# after the phase completes or in the cleanup EXIT trap.
+_HEARTBEAT_PID=""
+_heartbeat_stop() {
+  if [ -n "$_HEARTBEAT_PID" ]; then
+    kill "$_HEARTBEAT_PID" 2>/dev/null || true
+    _HEARTBEAT_PID=""
+  fi
+}
+_heartbeat_start() {
+  _heartbeat_stop
+  local _slug="$1" _interval="${2:-300}"
+  "$LIB_PYTHON" -m krepis.heartbeat emit --slug "$_slug" --interval "$_interval" &
+  _HEARTBEAT_PID=$!
+}
+
 run_ssm() {
   local description="$1" script="$2" timeout_s="${3:-3600}"
   printf '%s' "$script" | "$LIB_PYTHON" -m krepis.ssm_dispatcher run \
@@ -987,6 +1004,7 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════"
 echo "  FULL TRAINING (dry_run=False)"
 echo "═══════════════════════════════════════════════════════════════"
+  _heartbeat_start "spot-full-training" 300
 run_ssm "full-training" "${RUN_TOKEN_EXPORT}${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT}$(cat <<'TRAIN'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
@@ -1061,6 +1079,7 @@ echo "════════════════════════�
 echo "  Training complete."
 echo "═══════════════════════════════════════════════════════════════"
 
+_heartbeat_stop
 # CloudWatch heartbeat on successful completion (unchanged).
 aws cloudwatch put-metric-data \
   --namespace "AlphaEngine" \
