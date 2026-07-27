@@ -16,6 +16,7 @@ import pandas as pd
 
 import config as cfg
 from inference.level_neutralization import apply_cross_sectional_neutralization
+from model.calibrator import derive_direction
 from inference.pipeline import PipelineContext, PipelineAbort
 from model.momentum_scorer import predict_dict as _momentum_scorer_predict_dict
 from model.stance_classifier import classify_stance
@@ -608,6 +609,19 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # config#859: collect per-ticker META_FEATURES rows for the feature-drift
     # KS test (computed post-loop, fail-soft).
     drift_feature_rows: list = []
+    # config#1684 (ARCHITECTURE.md §61 experiment/observe fail-hard doctrine):
+    # the observe-only parallel-calibration fields below (expected_move_macro_aug,
+    # expected_move_risk_aug, meta_alpha_tb, barrier_win_prob, p_up_platt) each
+    # ride as null on a per-ticker predict/calibrate exception. Those are OBSERVE
+    # producers under the no-silent-fails doctrine, and they run BEFORE the
+    # canonical predictions persist — so per §61 they must NOT hard-raise (an
+    # observe failure cannot be allowed to abort the safety-critical prediction
+    # run), but the silent DEBUG-log-and-null posture is exactly the carve-out
+    # §61 forbids: it erodes the variant_cutover_gate / calibration soak evidence
+    # these fields exist to accrue, invisibly, for weeks. Accumulate per-field
+    # failures here and route ONE deduped alarmed alert (SNS + flow-doctor, a
+    # surface with a consumer) after the loop — the §61 carve-out (b).
+    _observe_calib_failures: dict[str, list[str]] = {}
     for ticker in ctx.tickers:
         latest = precomputed.get(ticker)
         if latest is None:
@@ -693,6 +707,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                         "(parallel observe-only, non-blocking): %s",
                         ticker, e,
                     )
+                    _observe_calib_failures.setdefault(
+                        "expected_move_macro_aug", []).append(ticker)
 
         # Stage 2b parallel observation: risk-augmented vol GBM. Same
         # pattern as macro-aug — None when the aug GBM isn't loaded or
@@ -714,6 +730,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
                         "(parallel observe-only, non-blocking): %s",
                         ticker, e,
                     )
+                    _observe_calib_failures.setdefault(
+                        "expected_move_risk_aug", []).append(ticker)
 
         # Layer 1C: Research calibrator + research-feature extraction
         # Centralized in ``model.research_features.extract_research_features``
@@ -841,6 +859,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             except Exception as _e:
                 log.debug("meta_alpha_tb predict failed for %s: %s", ticker, _e)
                 meta_alpha_tb = None
+                _observe_calib_failures.setdefault(
+                    "meta_alpha_tb", []).append(ticker)
 
         # Task B (observe-only): calibrated P(up barrier before down) from the
         # same META_FEATURES vector. Runs after the canonical alpha is computed
@@ -854,6 +874,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             except Exception as _e:
                 log.debug("barrier_win_prob predict failed for %s: %s", ticker, _e)
                 barrier_win_prob = None
+                _observe_calib_failures.setdefault(
+                    "barrier_win_prob", []).append(ticker)
 
         # Calibrated confidence. Confidence semantics: |p_up - 0.5| * 2 — see
         # model/calibrator.calibrate_prediction docstring for the rationale
@@ -868,7 +890,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         else:
             p_up = float(np.clip(0.5 + alpha / (2.0 * max_r), 0.0, 1.0))
             p_down = 1.0 - p_up
-            predicted_direction = "UP" if p_up >= 0.5 else "DOWN"
+            predicted_direction = derive_direction(alpha)
             confidence = abs(p_up - 0.5) * 2.0
 
         # Shadow (Platt) calibration — OBSERVE-ONLY parallel p_up (config#1176).
@@ -889,6 +911,8 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             except Exception as _e:
                 log.debug("p_up_platt shadow calibrate failed for %s: %s", ticker, _e)
                 p_up_platt = None
+                _observe_calib_failures.setdefault(
+                    "p_up_platt", []).append(ticker)
 
         result = {
             "ticker": ticker,
@@ -1034,6 +1058,44 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     # than a steady 0 stream.
     _emit_nan_feature_tickers_metric(ctx.n_nan_imputed_tickers)
 
+    # config#1684 / ARCHITECTURE.md §61: surface any observe-only calibration
+    # evidence gaps accrued this run on an ALARMED surface (SNS + flow-doctor),
+    # not a DEBUG log nobody reads. Deduped by the set of affected fields so a
+    # recurring gap doesn't storm across runs but a NEW failing field still
+    # pages. Non-blocking: the canonical predictions are already built; a
+    # failure to *send* this observe-evidence alert must not itself abort the
+    # safety-critical inference run (that would invert the priority §61 sets).
+    if _observe_calib_failures:
+        _total = sum(len(tks) for tks in _observe_calib_failures.values())
+        _summary = "\n".join(
+            f"  - {field}: {len(tks)} ticker(s) (e.g. {', '.join(tks[:3])})"
+            for field, tks in sorted(_observe_calib_failures.items())
+        )
+        _fields = sorted(_observe_calib_failures)
+        try:
+            from ops_alerts import publish_ops_alert
+
+            publish_ops_alert(
+                f"Predictor observe-calibration evidence gaps "
+                f"({_total} per-ticker failures across {len(_fields)} field(s))\n"
+                f"{_summary}\n\n"
+                "These are OBSERVE-ONLY parallel fields (variant_cutover_gate / "
+                "calibration-method soak comparison); the canonical prediction "
+                "path is unaffected. But silent per-ticker gaps erode exactly the "
+                "soak evidence these fields exist to accrue — surfacing here per "
+                "the experiment/observe fail-hard doctrine (ARCHITECTURE.md §61, "
+                "config#1684/#1176).",
+                severity="warning",
+                source="predictor.inference.observe_calibration",
+                dedup_key="predictor-observe-calib-gaps-" + "-".join(_fields),
+            )
+        except Exception as _alert_exc:
+            log.warning(
+                "Failed to publish observe-calibration-gap alert "
+                "(%d failures across %s): %s",
+                _total, _fields, _alert_exc,
+            )
+
 
 _MIN_UNIQUE_P_UP_BINS = 3
 """Variance-fallback threshold for the calibrator-active branch of
@@ -1133,12 +1195,8 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         a = p.get("predicted_alpha", 0) or 0
         p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
         p_down = 1.0 - p_up
-        if a >= 0:
-            direction = "UP"
-            confidence = p_up
-        else:
-            direction = "DOWN"
-            confidence = p_down
+        direction = derive_direction(a)
+        confidence = p_up if direction == "UP" else p_down
         p["p_up"] = round(p_up, 4)
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction

@@ -44,14 +44,28 @@ RUN pip install --no-cache-dir -r requirements-lambda.txt && \
 
 # Copy application code
 COPY retry.py .
-COPY health_status.py .
+COPY data_manifest.py .
 COPY config.py .
+# ops_alerts.py — inference/stages/write_output.py's fail-loud S3-write
+# path (config#2333) deferred-imports ops_alerts.publish_ops_alert to
+# page on primary/secondary predictions-write failures. Same
+# config#1282/PR352 bug class as the monitoring/ comment below: a
+# first-party module reachable from the Lambda entrypoint's import
+# closure but missing its COPY line ModuleNotFoundErrors at runtime,
+# undetected by CI unless caught by test_dockerfile_import_closure.py.
+COPY ops_alerts.py .
 COPY config/ config/
 COPY data/ data/
 COPY model/ model/
 COPY inference/ inference/
 COPY training/ training/
 COPY store/ store/
+# Drift monitoring — inference/handler.py's check_drift action imports
+# monitoring.drift_detector (config#1282, PR #305). Missing this line let
+# the module ship in the repo but not the image: check_drift 500'd with
+# ModuleNotFoundError in prod for every invocation since #305 merged,
+# undetected because deploy.sh's canary only exercises dry_run=true.
+COPY monitoring/ monitoring/
 # Regime substrate (v3) — standalone submodule independent of model/.
 # Same image serves both inference Lambda (CMD=inference.handler.handler)
 # and the regime-substrate Lambda (per-function CMD override =

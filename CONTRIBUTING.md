@@ -23,3 +23,22 @@ contribute under these terms, please open an issue instead of a pull request.
 
 Issues and discussions are welcome. Substantial changes should start as an
 issue before any code is written.
+
+
+## Date-axis review chokepoint (nousergon/alpha-engine-config#1613)
+
+This repo consumes `krepis.dates` (`now_dual()` / `.trading_day` /
+`last_closed_trading_day` / `session_for_timestamp`) and/or
+`krepis.trading_calendar` (`session_date()`). Two axes exist and must not be
+conflated:
+
+- **knowledge axis** (`trading_day`, via `now_dual()`) — the last CLOSED
+  NYSE session; correct for anything computed FROM data (predictions,
+  signals, features, eval joins, freshness checks).
+- **event axis** (`session_date()`) — the session a physical event belongs
+  to (fills, NAV marks, account snapshots).
+
+See the `krepis/dates.py` module docstring for the full doctrine and
+nousergon/alpha-engine-config#1610 / #1613 for the ratifying fleet audit.
+When reviewing a PR that adds a new date-axis callsite, classify it against
+this doctrine before approving.

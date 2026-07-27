@@ -107,8 +107,8 @@ def _log_rss(label: str) -> int:
         log.info("RSS %s: %.0f MB", label, rss_mb)
         return int(rss_mb)
     except Exception as exc:  # pragma: no cover — defensive
-        log.debug("RSS profiling unavailable (%s)", exc)
-        return 0
+        log.warning("RSS profiling unavailable (%s) — will filter with peak_rss_mb=-1 sentinel", exc)
+        return -1
 
 
 _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
@@ -125,7 +125,24 @@ _MOMENTUM_PARAMS_S3_KEY = "config/predictor_momentum_params.json"
 # rising — that peak is the target horizon for any parallel training
 # stack we build next. If IC continues climbing past 90d we're looking
 # at a multi-month momentum regime and should consider longer still.
-_DIAGNOSTIC_HORIZONS = [5, 10, 15, 21, 40, 60, 90]
+# The operator-ratified temporal-ensemble ladder (config#937 — 2026-07-09
+# /backlog-triage ruling, restated 2026-07-10): 10/21/42/63/126d. The short end
+# (3-7d) was refuted via #1993's turnover-drag findings; 42/63/126d probe the
+# fundamentals-decay hypothesis for the weekly LLM-research-thesis signal (a
+# materially different question than "is 21d locally optimal"). These are the
+# horizons the Phase-1 observe-only battery + offline blend
+# (analysis/horizon_battery.py) evaluates against the single-21d serving
+# baseline — WITHOUT un-retiring the regression-locked multi-horizon SERVING
+# path (tests/test_v2_inference_path_gone.py); the diagnostic labels + leak-free
+# IC curves are offline-only.
+_ENSEMBLE_HORIZONS = [10, 21, 42, 63, 126]
+
+# config#937 (2026-07-11) additively folds the ratified ensemble ladder above
+# into the diagnostic set so the Phase-1 battery can measure 42/63/126d. The
+# 2026-04-15 horizons (5/15/40/60/90) are RETAINED for diagnostic-curve
+# continuity, so this only WIDENS the observe-only forward-return labels — no
+# existing consumer loses a column.
+_DIAGNOSTIC_HORIZONS = sorted({5, 10, 15, 21, 40, 60, 90, *_ENSEMBLE_HORIZONS})
 
 
 def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bool]:
@@ -142,10 +159,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     so the autocorrelation contribution is visible.
 
     Strategy: walk the sorted unique dates ascending; greedily keep a date
-    if it's at least ``horizon_trading_days`` calendar days past the most
-    recently kept date. Calendar-day spacing is a good proxy for trading-day
-    spacing at these horizons (5/10/15/21/40/60/90) and avoids needing the
-    NYSE calendar in this hot path. Returns a mask aligned to ``dates``.
+    if it's at least ``horizon_trading_days`` **trading sessions** past the
+    most recently kept date, measured on the NYSE calendar via
+    ``krepis.trading_calendar.count_trading_days``. Trading-day-exact spacing
+    is required here — a calendar-day proxy is NOT acceptable — because the
+    forward-return label these windows must not overlap is itself
+    trading-day-exact (``forward_return_{h}d = close.shift(-h)/close - 1`` is a
+    row-shift on a trading-day-only-indexed series). A calendar-day proxy
+    under-spaces samples at longer horizons (126 calendar days ≈ 90 trading
+    days), letting residual autocorrelation back into exactly the diagnostic
+    built to eliminate it — and it does so worst at the longest horizons,
+    i.e. worst on the 63d/126d points this battery was widened to test
+    (config#937 Step 0 / config#1993 long legs). Returns a mask aligned to
+    ``dates``.
 
     The greedy "keep-if-far-enough" pattern minimizes overlap pessimistically:
     dates dropped because their forward window overlapped with a kept date's
@@ -154,7 +180,12 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     """
     if not dates:
         return []
-    # Convert to pandas Timestamps for comparable arithmetic without losing
+    # Trading-day-exact spacing on the NYSE calendar (config#937 Step 0).
+    # krepis is already a direct fleet dependency; import locally to keep the
+    # calendar off the module-import hot path (mirrors the pandas import below).
+    from krepis.trading_calendar import count_trading_days
+
+    # Convert to pandas Timestamps for stable sorting without losing
     # precision. The training code stores dates as pd.Timestamp objects on
     # rows (per the row construction in Step 6); accept any sortable type.
     import pandas as pd
@@ -163,10 +194,19 @@ def _nonoverlapping_date_mask(dates: list, horizon_trading_days: int) -> list[bo
     sort_order = sorted(range(len(dates_ts)), key=lambda i: dates_ts[i])
     mask = [False] * len(dates_ts)
     last_kept_ts: pd.Timestamp | None = None
-    horizon_delta = pd.Timedelta(days=horizon_trading_days)
     for i in sort_order:
         ts = dates_ts[i]
-        if last_kept_ts is None or (ts - last_kept_ts) >= horizon_delta:
+        # Keep the first date unconditionally; thereafter keep only once at
+        # least ``horizon_trading_days`` NYSE sessions have elapsed since the
+        # last kept date. ``count_trading_days(a, b)`` counts sessions in the
+        # half-open interval [a, b), so an exact-horizon gap (b sitting exactly
+        # h sessions after a) yields h and is kept — matching the prior
+        # boundary-inclusive semantics, now on the trading-day axis.
+        if (
+            last_kept_ts is None
+            or count_trading_days(last_kept_ts.date(), ts.date())
+            >= horizon_trading_days
+        ):
             mask[i] = True
             last_kept_ts = ts
     return mask
@@ -615,6 +655,32 @@ def select_non_noise_features(
     return keep_idx, keep_names, report
 
 
+def _data_coverage_degraded(arctic_coverage: "dict | None") -> "bool | None":
+    """config#2882 — whether a training run's ArcticDB read coverage fell
+    below ``cfg.ARCTIC_DEGRADED_COVERAGE_RATIO`` (the SOFT floor; the HARD
+    floor, ``cfg.ARCTIC_MIN_COVERAGE_RATIO``, is enforced upstream in
+    train_handler.py before ``run_meta_training`` is ever called — so a run
+    that reaches here has already cleared it, and this can only ever surface
+    the milder "close but not perfect" partial-loss case, never a
+    catastrophic one).
+
+    ``arctic_coverage`` is the coverage dict ``store.arctic_reader.
+    download_from_arctic`` returns (``None`` when the caller didn't supply
+    one — e.g. an injected-data test harness that bypasses ArcticDB
+    entirely). Returns ``None`` in that case (unknown, not "healthy") so a
+    manifest/leaderboard reader can distinguish "coverage wasn't measured"
+    from "coverage was measured and is fine".
+
+    Single chokepoint for both the persisted manifest and the returned
+    result dict, so the two can never disagree.
+    """
+    if arctic_coverage is None:
+        return None
+    import config as cfg
+    degraded_floor = float(getattr(cfg, "ARCTIC_DEGRADED_COVERAGE_RATIO", 0.98))
+    return bool(arctic_coverage["coverage_ratio"] < degraded_floor)
+
+
 def _select_promotion_ic_series(cpcv_meta_ic, leakfree_meta_ic) -> tuple[list, str]:
     """L4565c: choose the IC distribution that feeds the W1.3 promotion battery
     (downside-Sortino + overfit-DSR), preferring the CPCV per-combo `ics`.
@@ -809,6 +875,7 @@ def run_meta_training(
     dry_run: bool = False,
     *,
     io: "TrainingIOSpec | None" = None,
+    arctic_coverage: "dict | None" = None,
 ) -> dict:
     """
     Train all Layer 1 + meta-model, validate with walk-forward, promote to S3.
@@ -829,6 +896,18 @@ def run_meta_training(
         under disjoint ``*_shadow/crsp/`` prefixes, and is hard-blocked from
         ever touching the live champion or the model-zoo pool — see the
         promotion-gate + registry-snapshot guards below.
+    arctic_coverage : dict or None
+        config#2882 — the coverage dict ``store.arctic_reader.download_from_arctic``
+        returned when ``data_dir`` was populated (``n_written``/``n_expected``/
+        ``coverage_ratio``/``n_failed``/...). Purely passed through into the
+        returned result dict (and from there into the S3 manifest) as
+        ``arctic_coverage`` + ``data_coverage_degraded`` so a challenger that
+        trained on a partially-crippled ArcticDB read is flagged in its OWN
+        leaderboard/CPCV artifact — visible to ``model_zoo.select_winner`` (or a
+        human) before/after a promotion, not just in the caller's logs.
+        ``None`` (e.g. an injected-data test harness that bypasses
+        ``download_from_arctic`` entirely) degrades to an absent/None manifest
+        field rather than failing training.
 
     Returns
     -------
@@ -2223,6 +2302,15 @@ def run_meta_training(
             r.get("date")
             for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
         ]
+        # config#2889: ticker ids aligned row-for-row with meta_X/meta_y/
+        # _meta_dates, carried through cpcv_meta_oos_ic so its held-out test
+        # predictions can be independently rejoined to score_performance_outcomes
+        # (see the second-opinion block below) instead of trusting this same
+        # trainer's own meta_y for both training AND self-grading.
+        _meta_tickers = [
+            r.get("ticker")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
 
         def _meta_fit_predict(_Xtr, _ytr, _Xte):
             _m = MetaModel(alpha=1.0)
@@ -2269,6 +2357,8 @@ def run_meta_training(
             embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
             n_groups=getattr(cfg, "WF_CPCV_N_GROUPS", 6),
             k_test=getattr(cfg, "WF_CPCV_K_TEST", 2),
+            row_ids=_meta_tickers,
+            return_preds=True,
         )
         log.info(
             "W1.2 CPCV meta OOS IC (OBSERVE, NOT gated): mean=%s std=%s "
@@ -2280,6 +2370,36 @@ def run_meta_training(
             cpcv_meta_ic.get("n_combos"), cpcv_meta_ic.get("n_backtest_paths"),
             cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
         )
+        # config#2889 (Brian's 2026-07-18 Decision Queue Option-B ruling): an
+        # INDEPENDENT second-party IC recomputation from realized outcomes, so
+        # the promotion gate + report-card grade no longer rest on ONE
+        # self-reported number. Pop the CPCV OOS predictions (not JSON-
+        # serializable) and rejoin them against a FRESH read of
+        # score_performance_outcomes — bypassing meta_y entirely — via a
+        # completely separate code path from the CV mechanics above.
+        _cpcv_oos_preds = cpcv_meta_ic.pop("_oos_preds", None)
+        cpcv_meta_ic.pop("_oos_true", None)  # unused: re-derived independently below
+        _cpcv_oos_dates = cpcv_meta_ic.pop("_oos_dates", None)
+        _cpcv_oos_ids = cpcv_meta_ic.pop("_oos_ids", None)
+        try:
+            from training.realized_ic_second_opinion import compute_second_opinion_ic
+            cpcv_meta_ic["second_opinion"] = compute_second_opinion_ic(
+                _cpcv_oos_preds, _cpcv_oos_ids, _cpcv_oos_dates,
+                db_path=db_tmp, horizon_days=cfg.FORWARD_DAYS,
+            )
+            log.info(
+                "config#2889 second-opinion IC: %s",
+                cpcv_meta_ic["second_opinion"],
+            )
+        except Exception:  # noqa: BLE001 — the second opinion is a corroborating
+            # signal computed AFTER the real CPCV number above; its own failure
+            # must never fail training (select_winner treats a missing second
+            # opinion as non-blocking — see evaluate_second_opinion_gate).
+            log.warning("config#2889 second-opinion IC computation failed", exc_info=True)
+            cpcv_meta_ic["second_opinion"] = {
+                "status": "unavailable", "second_opinion_ic": None,
+                "n_oos_rows": None, "n_matched": None, "match_rate": None,
+            }
 
         # W1.3 (L4469, OBSERVE): TWO lenses on the leak-free per-date IC series.
         # (1) DOWNSIDE-AWARE PERFORMANCE — Sortino-of-IC + CVaR-of-IC, matching
@@ -2865,6 +2985,28 @@ def run_meta_training(
     except Exception as _e:  # observe-only diagnostic must never fail training
         log.warning("W4 per-L1 LOO read failed (OBSERVE, non-fatal): %s", _e)
         meta_oos_ic_leakfree_per_l1_dropout = {"status": "error", "error": str(_e)}
+
+    # (W4.2, config#1994) dead-L1 pruning monitor — OBSERVE-ONLY. Fuses the W4
+    # LOMO leak-free ΔIC (above) with the fitted meta-Ridge's scale-free
+    # standardized coefficient magnitude into a per-L1 dead-CANDIDATE flag, so
+    # per-L1 marginal contribution surfaces on the report card every weekly run.
+    # This is a pure DIAGNOSTIC: it NEVER de-weights/drops/deletes an L1; serving
+    # L2 is untouched. Retirement (reversible de-weight in a shadow lane) is a
+    # separate later step gated on persistence across ≥N weekly cohorts + Shapley
+    # ≤ 0 surviving CSCV/PBO (config#624) — this run contributes ONE cohort.
+    # Ratified observe-only 2026-07-10 (Decision Queue, config#1926).
+    dead_l1_observe: dict = {"status": "not_run"}
+    try:
+        from training.dead_l1_monitor import summarize_dead_l1 as _dead_l1
+
+        dead_l1_observe = _dead_l1(
+            meta_oos_ic_leakfree_per_l1_dropout,
+            meta_model._importance,
+            meta_model._coefficients,
+        )
+    except Exception as _e:  # observe-only diagnostic must never fail training
+        log.warning("W4.2 dead-L1 monitor failed (OBSERVE, non-fatal): %s", _e)
+        dead_l1_observe = {"status": "error", "error": str(_e)}
 
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
@@ -4039,7 +4181,7 @@ def run_meta_training(
                 # variant registers under its own version_id ({label}-{date}-{fp})
                 # — distinct challengers on the leaderboard. Default = base label.
                 "version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
-                "peak_rss_mb": peak_rss_mb,
+                "peak_rss_mb": peak_rss_mb if peak_rss_mb >= 0 else None,
                 # Per-regime empirical up-rate of REALIZED canonical alpha
                 # (independent of calibrator) — observability for the
                 # stratified-per-regime gate threshold calibration. See
@@ -4071,6 +4213,18 @@ def run_meta_training(
                     if cfg.TRAIN_START_DATE is not None else None
                 ),
                 "promoted": promoted,
+                # config#2882 — ArcticDB read-coverage this run trained on.
+                # ``None`` when the caller didn't supply it (e.g. an injected-
+                # data test harness). ``data_coverage_degraded`` is True when
+                # coverage_ratio fell below cfg.ARCTIC_DEGRADED_COVERAGE_RATIO
+                # (but at/above the hard train_handler.py floor, else training
+                # would have already raised before reaching here) — the signal
+                # model_zoo.select_winner threads onto this candidate's
+                # leaderboard entry so a challenger that wins promotion on a
+                # measurably-incomplete dataset is visible in the promoted
+                # artifact, not silently absent from it.
+                "arctic_coverage": arctic_coverage,
+                "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
                 # `date`/`version` above. Equal to this run on a promoting run;
@@ -4259,6 +4413,19 @@ def run_meta_training(
                 # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC.
                 "meta_oos_ic_leakfree_nonlinear": meta_oos_ic_leakfree_nonlinear,
                 "meta_oos_ic_cpcv_nonlinear": meta_oos_ic_cpcv_nonlinear,
+                # W4 / W4.2 (OBSERVE, config#1994): the generalized per-L1
+                # leave-one-out leak-free meta ΔIC (the W4.2 pruning input) and
+                # the dead-L1 monitor that fuses it with the meta-Ridge
+                # standardized-coef magnitude into per-L1 dead-CANDIDATE flags.
+                # These are computed above and returned in the run result, but
+                # were previously DROPPED from the persisted manifest — so the
+                # observe cohort never actually landed in S3 and the report
+                # card / console could not surface it. Persist them alongside
+                # the sibling observe diagnostics (additive per S3 contract) so
+                # each weekly run records one dead-L1 OBSERVE cohort. Pure
+                # diagnostic: no de-weight/delete, serving L2 untouched.
+                "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+                "dead_l1_observe": dead_l1_observe,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
@@ -4325,6 +4492,39 @@ def run_meta_training(
                     else {}
                 ),
             }
+            # alpha-engine-config#969: tag every scalar IC field the manifest
+            # emits with its methodological reliability (leak-free vs
+            # in-sample/overlapping-pooled) so the report-card evaluator can
+            # pass ``reliability=`` into ``build_metric`` and the Director
+            # digest can flag an inflated IC before acting on it. Additive
+            # top-level key per the S3 contract-safety rule (no existing field
+            # is renamed/removed). The classification is a PRODUCER contract —
+            # the producer knows how each number was computed; the consumer
+            # only reads this map. See training/ic_reliability.py.
+            from training.ic_reliability import build_ic_reliability_map
+            # The IC field names the manifest exposes and/or the evaluator
+            # grades. Nested-dict ICs (walk_forward.*_median_ic,
+            # meta_l1_standalone_alpha_ic, meta_model_oos_ic_cpcv) are keyed by
+            # the field name each downstream metric derives from.
+            _ic_field_names = [
+                # leak-free / OOS reads (→ high)
+                "meta_model_oos_ic_cpcv",
+                "meta_model_oos_ic_leakfree",
+                "momentum_median_ic",
+                "volatility_median_ic",
+                "residual_momentum_median_ic",
+                "residual_momentum_leakfree_oos_ic",
+                "meta_l1_standalone_alpha_ic",
+                "meta_oos_ic_leakfree_no_expected_move",
+                "meta_oos_ic_leakfree_post2020",
+                "meta_oos_ic_leakfree_nonlinear",
+                "meta_oos_ic_cpcv_nonlinear",
+                # in-sample / overlapping-pooled / split-only reads (→ low)
+                "meta_model_ic",
+                "meta_model_in_sample_ic",
+                "meta_model_oos_ic",
+            ]
+            manifest["ic_reliability"] = build_ic_reliability_map(_ic_field_names)
             s3_up.put_object(
                 Bucket=bucket, Key=manifest_key,
                 Body=json.dumps(manifest, indent=2).encode(),
@@ -4502,16 +4702,47 @@ def run_meta_training(
         mom_test_ic, vol_test_ic, meta_model._val_ic, promoted, elapsed_s,
     )
 
+    # ── L1 dead-component alert (config#1815) ────────────────────────────────
+    # A component at/below the IC floor keeps feeding L2 silently: the blend
+    # gate deliberately doesn't block on a weak base (see the composite-gate
+    # design note), so a dead L1 previously surfaced only DAYS later as a
+    # report-card RED (momentum test IC 0.002 / OOS −0.011 shipped promoted
+    # on 2026-07-03 with zero training-time signal). Alert-only, fail-loud at
+    # the chokepoint: log.error (flow-doctor escalation surface) + manifest
+    # field consumers/email can render. Blocking changes require replay
+    # evidence per the operational-gates discipline — tracked in config#1815.
+    l1_components_below_ic_floor = {
+        name: round(ic, 6)
+        for name, ic in (("momentum", mom_test_ic), ("volatility", vol_test_ic))
+        if ic is not None and ic <= cfg.L1_COMPONENT_IC_ALERT_FLOOR
+    }
+    if l1_components_below_ic_floor:
+        log.error(
+            "L1 component(s) at/below the IC alert floor (%.3f): %s — the "
+            "ensemble blend can mask a dead component (config#1815). "
+            "Promotion is NOT blocked (alert-only by design); investigate "
+            "the component's features/recipe before the next training run.",
+            cfg.L1_COMPONENT_IC_ALERT_FLOOR, l1_components_below_ic_floor,
+        )
+
     return {
         "model_version": getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),  # L4488c spec label
         "promoted": promoted,
         "promoted_mode": "meta" if promoted else None,
+        # config#2882 — mirrors the manifest fields above (see that comment)
+        # so the training_summary SSOT and email formatter also carry the
+        # data-coverage signal, not only the registry manifest.
+        "arctic_coverage": arctic_coverage,
+        "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,
         "n_val": val_end - n_train,
         "n_test": N - val_end,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
+        # config#1815: components at/below cfg.L1_COMPONENT_IC_ALERT_FLOOR —
+        # {} when all healthy. Alert surface, not a promotion input.
+        "l1_components_below_ic_floor": l1_components_below_ic_floor,
         # regime_* fields removed from result dict 2026-04-16 (Tier 0 model
         # retired). Email formatter and downstream consumers must not expect
         # regime_accuracy / regime_oos_* keys; they will be restored when the
@@ -4604,6 +4835,12 @@ def run_meta_training(
         # IC — per-feature ΔIC vs the full read is the W4.2 pruning input
         # (which L1s carry leak-free IC). Additive per S3 contract.
         "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
+        # W4.2 (config#1994, OBSERVE): dead-L1 pruning monitor — fuses the W4
+        # LOMO ΔIC above with the meta-Ridge standardized coefficient magnitude
+        # into per-L1 dead-CANDIDATE flags. Pure diagnostic: no de-weight/delete,
+        # serving L2 untouched; retirement is a later persistence-gated step
+        # (≥N weekly cohorts + Shapley ≤ 0, config#624). Additive per S3 contract.
+        "dead_l1_observe": dead_l1_observe,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.

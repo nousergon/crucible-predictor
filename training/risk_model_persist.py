@@ -18,13 +18,34 @@ changes make backtester regressions untraceable. C.2b ships the
 weekly persistence so by the time C.3 reads ``risk_model/{date}/``,
 there are ≥4 weeks of F + D accumulated.
 
-**Graceful degradation.** The 8 factor-loading ``*_zscore`` columns
+**Graceful degradation.** The factor-loading ``*_zscore`` columns
 shipped 2026-05-26 evening in alpha-engine-data #324 — older universe-
 library rows don't carry them. The builder is best-effort: if zero
 loading columns are present in the local cache, it returns
 ``status=skipped`` with a clear reason rather than producing an
 all-NaN F. The Saturday SF will start emitting real F + D once a
 weeks' worth of post-#324 universe data exists.
+
+**config#1765 — ``roe_zscore`` dropped from the loading set (7-factor,
+was 8).** Live ArcticDB shows ``roe_zscore`` all-NaN across the
+universe: ``features/cross_sectional.py::apply_factor_zscores``
+correctly degenerates a cross-sectional z-score to all-NaN when its
+source column has (near-)zero MAD — and live ``roe`` IS degenerate,
+clip-saturated at its ``[-1, 1]`` bound for ~98% of the universe (root
+cause: alpha-engine-data's Finnhub collector, ``collectors/
+fundamentals.py::_fetch_single_ticker``, clips ``roeTTM``/``roeRfy``
+assuming Finnhub returns a 0-1 fraction; live payloads show percentage
+units instead, e.g. 62 meaning 62% rather than 0.62 — same saturation
+pattern hits ``gross_margin`` and several Growth/Stewardship fields).
+That is a data-quality bug in the collector, not a wiring gap — the
+S3 archive → ``daily_append``/``backfill`` → ArcticDB path for ``roe``
+is otherwise correctly plumbed end-to-end. Fixing the collector's unit
+scaling needs live Finnhub-payload validation this repo can't perform
+in isolation, so ``roe_zscore`` is deferred out of the pinned set here
+until that lands (tracked in alpha-engine-data — see SCHEMA.md's
+Factor loadings section for the matching note). Re-adding it back to
+``FACTOR_LOADING_COLUMNS`` is a one-line change once the source `roe`
+column is a real, non-degenerate cross-section again.
 """
 
 from __future__ import annotations
@@ -45,7 +66,14 @@ log = logging.getLogger(__name__)
 # Pinned factor-loading column registry. Mirrors the
 # alpha-engine-data ``features/registry.py`` ``factor_loading``
 # entries (PR #324). Order is the canonical Barra-style factor order:
-# momentum → return → beta → idio_vol → realized_vol → dist_high → value → quality.
+# momentum → return → beta → idio_vol → realized_vol → dist_high → value.
+#
+# ``roe_zscore`` (the QUALITY loading) is deliberately EXCLUDED — see
+# the config#1765 module-docstring note above. Source `roe` is clip-
+# saturated live (a Finnhub collector unit-scaling bug in alpha-engine-
+# data, not a wiring gap), which makes the cross-sectional z-score
+# degenerate (all-NaN) for every date. Re-add once alpha-engine-data
+# fixes the collector and `roe` is a real, non-degenerate cross-section.
 FACTOR_LOADING_COLUMNS: tuple[str, ...] = (
     "momentum_20d_zscore",
     "return_60d_zscore",
@@ -54,14 +82,13 @@ FACTOR_LOADING_COLUMNS: tuple[str, ...] = (
     "realized_vol_63d_zscore",
     "dist_from_52w_high_zscore",
     "pe_ratio_zscore",
-    "roe_zscore",
 )
 
 # Minimum data thresholds before we attempt the F+D build. If fewer
 # tickers carry loading columns, the cross-sectional regression at
-# each date will be rank-deficient (K=8 + intercept needs >>9 obs to
-# be meaningful). 30 is the same floor risk_model.estimate_factor_
-# covariance defaults to for cov_obs.
+# each date will be rank-deficient (K=len(FACTOR_LOADING_COLUMNS) + intercept
+# needs >>K+1 obs to be meaningful). 30 is the same floor
+# risk_model.estimate_factor_covariance defaults to for cov_obs.
 _MIN_TICKERS_WITH_LOADINGS = 30
 _MIN_DATES_WITH_RETURNS = 60
 

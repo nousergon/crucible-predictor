@@ -95,6 +95,13 @@ CALIBRATOR_WEIGHTS_META_KEY = "predictor/weights/meta/isotonic_calibrator.pkl.me
 PREDICTIONS_KEY = "predictor/predictions/{date}.json"
 PREDICTIONS_LATEST_KEY = "predictor/predictions/latest.json"
 
+# Research-free daily inference over the scanner-passing pool (config#2365,
+# champion-loop epic child 1 / config#2364). Sibling artifact to
+# PREDICTIONS_KEY above, produced by inference/research_free_inference.py —
+# see that module's docstring for the full design rationale.
+PREDICTIONS_RESEARCH_FREE_KEY = "predictor/predictions_research_free/{date}.json"
+PREDICTIONS_RESEARCH_FREE_LATEST_KEY = "predictor/predictions_research_free/latest.json"
+
 METRICS_KEY = "predictor/metrics/latest.json"
 
 # ``PRICE_CACHE_KEY`` (was ``"predictor/price_cache/{ticker}.parquet"``) was
@@ -169,8 +176,19 @@ FEATURES = [
     "gross_margin",              # Gross profit / revenue (0-1)
     "roe",                       # Return on equity (decimal)
     "current_ratio",             # Current ratio / 3, normalized
+    # config#939 — feature gaps: VWAP divergence, buying/selling pressure,
+    # credit spreads. Mirrors data/feature_engineer.py::compute_features()
+    # (alpha-engine-data PR — nousergon-data#688). NOTE: this FEATURES list
+    # was already stale relative to feature_engineer.FEATURES before this
+    # change (missing avg_volume_20d_raw + the entire v3.1/v3.2/W2/factor-
+    # loading tranche, ~31 entries) — these 3 are appended in the same
+    # already-stale style rather than attempting to backfill the pre-
+    # existing gap, which is out of scope here.
+    "vwap_divergence_pct",       # (Close - VWAP) / VWAP, decimal pct
+    "cmf_20_ratio",               # Chaikin Money Flow (20d), bounded ~[-1, 1]
+    "hy_oas_credit_spread_pct",   # FRED HYOAS (BAMLH0A0HYM2), percent — macro
 ]
-N_FEATURES = 53
+N_FEATURES = 56
 
 # Macro features — identical across all tickers on a given day, cannot predict
 # cross-sectional alpha.  Excluded from GBM training/inference but kept in
@@ -179,6 +197,15 @@ MACRO_FEATURES = {
     "vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d", "oil_mom_5d",
     "vix_term_slope",      # market-wide: identical across tickers → constant after rank norm
     "xsect_dispersion",    # market-wide: identical across tickers → constant after rank norm
+    # config#939 — hy_oas_credit_spread_pct is per_ticker=False in the
+    # nousergon-data registry (registry.py CATALOG group="macro") — same
+    # value across every ticker on a given date, so it belongs here for
+    # the same reason vix_level/yield_10y/etc. do. NOT to be confused with
+    # model/regime_predictor.py's separate "hy_oas_level" /
+    # "hy_oas_change_21d" regime-substrate feature family (own source,
+    # own namespace via cfg.MACRO_NORM_FEATURES) — deliberately different
+    # name to avoid colliding with that existing pair.
+    "hy_oas_credit_spread_pct",
 }
 
 # Fundamental features — computed and stored in feature store but excluded from
@@ -190,7 +217,7 @@ _FUNDAMENTAL_EXCLUDE = {
 }
 
 GBM_FEATURES = [f for f in FEATURES if f not in MACRO_FEATURES and f not in _FUNDAMENTAL_EXCLUDE]
-N_GBM_FEATURES = len(GBM_FEATURES)  # 38 (31 technical + 7 alternative)
+N_GBM_FEATURES = len(GBM_FEATURES)  # 40 (33 technical + 7 alternative) — config#939 added 2 (vwap_divergence_pct, cmf_20_ratio); hy_oas_credit_spread_pct is macro-excluded
 
 # ── Model architecture hyperparameters ───────────────────────────────────────
 _model_cfg = _cfg["model"]
@@ -369,6 +396,15 @@ WF_DSR_REGISTRY_THRESHOLD = _wf_cfg.get("dsr_registry_threshold", 0.80)
 WF_SORTINO_IC_THRESHOLD = _wf_cfg.get("sortino_ic_threshold", 0.0)
 WF_MIN_FOLDS_POSITIVE = _wf_cfg.get("min_folds_positive", 0.60)
 WF_MEDIAN_IC_GATE = _wf_cfg.get("median_ic_gate", 0.02)
+
+# config#1815: training-time L1-component IC alert floor. A component whose
+# held-out test IC is at/below this floor is flagged LOUDLY at the training
+# chokepoint (log.error + manifest `l1_components_below_ic_floor` + email
+# surfacing) instead of surfacing days later as a report-card RED. Alert-only
+# by design: blend promotion deliberately does NOT block on a weak base (see
+# the design note above the composite gate) — changing blocking behavior
+# requires replay evidence per the operational-gates discipline.
+L1_COMPONENT_IC_ALERT_FLOOR = float(os.environ.get("L1_COMPONENT_IC_ALERT_FLOOR", "0.0"))
 
 # Audit Phase 2a output-distribution gate (2026-05-07). When True, a
 # calibrator-output-shape check is added to the promotion gate alongside
@@ -597,6 +633,23 @@ def assert_model_specs_loaded() -> None:
 MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
     "MODEL_ZOO_AUTO_PROMOTE_WINNER", _cfg.get("model_zoo_auto_promote_winner", False)
 )
+# config#2889 — independent second-party IC recomputation from realized outcomes
+# (Brian's 2026-07-18 Decision Queue Option-B ruling). The self-reported CPCV mean
+# IC drives BOTH promotion and the report-card grade with no independent check; a
+# labeling/CV-computation bug would propagate uncaught into both. training/
+# meta_trainer.py now recomputes an independent second-opinion IC from a fresh
+# read of score_performance_outcomes (bypassing the trainer's own meta_y array)
+# and stashes it on the manifest; model_zoo.py::select_winner always SURFACES a
+# divergence verdict per candidate. OBSERVE-FIRST (same rollout pattern as
+# MODEL_ZOO_AUTO_PROMOTE_WINNER above): with this False (default), a diverging
+# second opinion is logged loud + visible on the leaderboard but does not block
+# promotion; flip True (yaml or env) once a few weeks of real second-opinion
+# numbers have been observed to confirm the divergence heuristic itself isn't
+# false-positive-prone.
+MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE = _flag_env_or_yaml(
+    "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE",
+    _cfg.get("model_zoo_second_opinion_gate_enforce", False),
+)
 # CPCV mean-IC margin a challenger must beat the champion by to be selected.
 MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
 # config#671/#673/#1052 — RELATIVE-BEST promotion: the absolute DSR-0.95 hurdle is
@@ -613,6 +666,28 @@ MODEL_ZOO_PROMOTE_MIN_IC = float(_cfg.get("model_zoo_promote_min_ic", 0.0))
 # OBSERVE-only — logged to the leaderboard, not gating; <0.2 is the bar any
 # public DSR/selection claim must clear.
 MODEL_ZOO_PBO_TARGET = float(_cfg.get("model_zoo_pbo_target", 0.2))
+
+# config#2882 — ArcticDB read-coverage gates. store/arctic_reader.py now
+# returns a coverage dict (n_written/n_expected/coverage_ratio) instead of a
+# bare file count, so a PARTIAL read-failure episode (throttling/connectivity/
+# corrupted symbols) is measurable, not just a total-failure n_files==0 trip.
+#
+# ARCTIC_MIN_COVERAGE_RATIO is the HARD FLOOR: below this, train_handler.py
+# raises and the run never reaches training (catastrophic partial loss, e.g.
+# the 850/900-tickers-erroring scenario from the issue — n_files was nonzero
+# so the old gate never tripped). Conservative default (well below normal
+# day-to-day noise) so a routine handful of delisted/corrupted symbols never
+# false-positives; tune down only with a concrete false-positive incident.
+ARCTIC_MIN_COVERAGE_RATIO = float(_cfg.get("arctic_min_coverage_ratio", 0.5))
+# ARCTIC_DEGRADED_COVERAGE_RATIO is the SOFT floor: below this (but at/above
+# the hard floor) training proceeds, but the run is marked
+# data_coverage_degraded=True in its own training_summary/manifest — which
+# model_zoo.select_winner threads onto the candidate's leaderboard entry so a
+# challenger that wins promotion on a measurably-incomplete dataset is
+# visible in the leaderboard/CPCV artifact BEFORE a human (or a future
+# automated gate) trusts the win, rather than the promoted artifact carrying
+# no trace of the data loss at all.
+ARCTIC_DEGRADED_COVERAGE_RATIO = float(_cfg.get("arctic_degraded_coverage_ratio", 0.98))
 
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the

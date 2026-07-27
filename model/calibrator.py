@@ -30,6 +30,26 @@ from nousergon_lib.quant.stats.calibration import (
 log = logging.getLogger(__name__)
 
 
+def derive_direction(alpha: float | None) -> str:
+    """Binary predicted direction = the SIGN of the predicted alpha.
+
+    config#1815 (2026-07-06): the single source of truth for
+    ``predicted_direction`` across every derivation site (calibrator,
+    linear fallback, cross-sectional rescale, level-neutralization).
+    Direction is the model's cross-sectional opinion — NOT
+    ``p_up >= 0.5``, because the isotonic p_up is a calibrated
+    P(beat market) whose 0.5-crossing sits away from α=0 under an
+    asymmetric realized base rate (~60% of names underperform SPY at
+    the 21d horizon). Argmaxing it produced the all-UP/all-DOWN
+    headline flips (24:2 → 2:26) and positive-α-but-DOWN rows.
+
+    Binary by construction: FLAT is not a class (ratified 2026-07-06;
+    ``p_flat`` remains as a permanently-0.0 additive-schema shadow).
+    α == 0 / None maps to DOWN — no opinion is not a buy thesis.
+    """
+    return "UP" if (alpha or 0.0) > 0 else "DOWN"
+
+
 class PlattCalibrator:
     """Calibrate raw GBM alpha scores to P(direction=UP)."""
 
@@ -150,6 +170,13 @@ class PlattCalibrator:
 
         Falls back to linear calibration if not fitted.
 
+        Direction semantics (config#1815, 2026-07-06): ``predicted_direction``
+        comes from :func:`derive_direction` — the SIGN of the raw alpha, not
+        ``p_up >= 0.5``. p_up keeps its honest base-rate-aware
+        P(beat market) semantics for calibration/veto consumers; direction
+        no longer argmaxes it (see derive_direction docstring for the
+        incident this closes).
+
         Confidence semantics: ``|p_up - 0.5| * 2`` — distance from coin-flip on
         [0, 1]. At p_up=0.5 the model has no opinion → confidence=0.0; at
         p_up=1.0 or 0.0 the model is certain → confidence=1.0. Pre-2026-05-12
@@ -166,7 +193,7 @@ class PlattCalibrator:
             p_up = float(np.clip(0.5 + alpha / (2.0 * label_clip), 0.0, 1.0))
 
         p_down = 1.0 - p_up
-        direction = "UP" if p_up >= 0.5 else "DOWN"
+        direction = derive_direction(raw_alpha)
         confidence = abs(p_up - 0.5) * 2.0
 
         return {

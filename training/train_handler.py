@@ -481,6 +481,18 @@ def send_training_email(result: dict, date_str: str) -> bool:
         if challenger_registered
         else f"NOT promoted ({_build_failure_reason()}) ✗"
     )
+    # config#2882 — this run's own ArcticDB read-coverage. Surfaced in the
+    # SAME email that reports the IC/promotion verdict, so a degraded-data
+    # training run never looks indistinguishable from a healthy one.
+    data_coverage_degraded = result.get("data_coverage_degraded")
+    arctic_coverage_result = result.get("arctic_coverage") or {}
+    coverage_warning = (
+        f"⚠ DATA COVERAGE DEGRADED (ratio="
+        f"{arctic_coverage_result.get('coverage_ratio')}, "
+        f"{arctic_coverage_result.get('n_written')}/"
+        f"{arctic_coverage_result.get('n_expected')} files) — config#2882\n"
+        if data_coverage_degraded else ""
+    )
     status_str  = "PASS" if passes_ic else "FAIL"
 
     # CatBoost metrics for email
@@ -756,6 +768,15 @@ def send_training_email(result: dict, date_str: str) -> bool:
                                promo_color, promo_label, val_ic, mse_ic, test_ic,
                                rank_ic, ensemble_ic, ensemble_on, ic_ir, ic_pos) +
 
+        # config#2882 — this run's own ArcticDB read-coverage, so a
+        # degraded-data run is visible in the SAME email as the IC/promotion
+        # verdict, not silently indistinguishable from a healthy run.
+        (
+            f'<p style="background:#fff3e0; padding:6px 10px; font-size:12px; '
+            f'color:#c62828; font-weight:bold;">{coverage_warning.strip()}</p>'
+            if coverage_warning else ""
+        ) +
+
         f'{wf_html}'
 
         + (
@@ -889,6 +910,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f"\n{_research_line}"
             f"\n{_mom_line}"
             f"\nPromotion: {promo_label}\n"
+            f"{coverage_warning}"
             f"{wf_plain}"
         )
         coefs = result.get("meta_coefficients", {})
@@ -921,6 +943,7 @@ def send_training_email(result: dict, date_str: str) -> bool:
             f"\nPromoted:           {promoted_mode if promoted else ('challenger' if challenger_registered else 'none')}"
             f"\nIC IR:              {ic_ir:.3f} ({ic_pos}/20 positive)"
             f"\nPromotion:          {promo_label}\n"
+            f"{coverage_warning}"
             f"{wf_plain}"
             f"\nTop features: " + ", ".join(r["feature"] for r in top10[:5])
             + f"\n{shap_plain}"
@@ -1359,16 +1382,49 @@ def _main_impl(
     # /tmp, which is empty on a fresh recovery spot, so it must always re-run.
     tmp_cache = Path(tempfile.mkdtemp()) / "cache"
     from store.arctic_reader import download_from_arctic
+    import config as cfg
     log.info("[data_source=arcticdb] Loading universe from ArcticDB...")
     with _maybe_phase(reg, "data_load"):
-        n_files = download_from_arctic(
+        arctic_coverage = download_from_arctic(
             bucket=bucket, local_dir=tmp_cache, universe_lib=io.universe_lib,
         )
+        n_files = arctic_coverage["n_written"]
+        coverage_ratio = arctic_coverage["coverage_ratio"]
         if n_files == 0:
             raise RuntimeError(
                 f"ArcticDB returned zero files for training — "
                 f"universe library is empty or unreachable at bucket={bucket}. "
                 "Check Saturday DataPhase1 + weekly backfill ran cleanly."
+            )
+        # config#2882 — the n_files==0 gate above only catches TOTAL failure.
+        # A partial ArcticDB throttling/connectivity episode (e.g. 850/900
+        # tickers erroring) leaves n_files nonzero-but-crippled, so it's the
+        # coverage RATIO that must gate here — below the hard floor, refuse
+        # to train on a dataset this incomplete rather than let a challenger
+        # self-report a plausible-looking CPCV IC on a starved universe.
+        min_coverage = float(getattr(cfg, "ARCTIC_MIN_COVERAGE_RATIO", 0.5))
+        if coverage_ratio < min_coverage:
+            raise RuntimeError(
+                f"ArcticDB coverage {coverage_ratio:.4f} "
+                f"({n_files}/{arctic_coverage['n_expected']} files) is below "
+                f"the hard floor arctic_min_coverage_ratio={min_coverage} — "
+                "refusing to train on a dataset this incomplete. "
+                f"failed_universe={len(arctic_coverage['failed_universe'])} "
+                f"failed_macro={len(arctic_coverage['failed_macro'])}. "
+                "Check for an ArcticDB throttling/connectivity episode "
+                "(see WARN-level per-ticker/per-series read failures above)."
+            )
+        degraded_floor = float(getattr(cfg, "ARCTIC_DEGRADED_COVERAGE_RATIO", 0.98))
+        data_coverage_degraded = coverage_ratio < degraded_floor
+        if data_coverage_degraded:
+            log.warning(
+                "ArcticDB coverage %.4f (%d/%d files) is below the degraded "
+                "floor arctic_degraded_coverage_ratio=%s — training proceeds "
+                "(above the hard floor) but this run is flagged "
+                "data_coverage_degraded=True in its training summary/manifest "
+                "so ModelZoo select_winner (or a human) can see it before "
+                "trusting a promotion.",
+                coverage_ratio, n_files, arctic_coverage["n_expected"], degraded_floor,
             )
 
     # Step 1b: Price cache refresh now handled by alpha-engine-data (Phase 1).
@@ -1393,7 +1449,7 @@ def _main_impl(
     def _train_and_summarize() -> dict:
         _r = run_meta_training(
             data_dir=str(tmp_cache), bucket=bucket, date_str=date_str, dry_run=dry_run,
-            io=io,
+            io=io, arctic_coverage=arctic_coverage,
         )
         # Slim cache write + feature-store registry upload are handled by
         # alpha-engine-data (Phase 1) — nothing to do here.
@@ -1470,6 +1526,33 @@ def _main_impl(
                 "risk_model_persist failed (non-blocking): %s",
                 _rm_err, exc_info=True,
             )
+            # config#2443 — a swallowed exception here previously left NO
+            # alertable trace: training completes green, the training summary
+            # has no "risk_model" key, and the ARTIFACT_REGISTRY freshness
+            # monitor is a `severity: warning` row on a 10-calendar-day
+            # recency window (config#1297) — it does not page on a single
+            # missed saturday_sf cycle, only flags the dashboard. A whole week
+            # could silently pass with zero human-visible signal. Route the
+            # failure through the same best-effort ops-alert channel
+            # model_zoo.py's rotation alerts use, so an operator actually
+            # sees it. Alert failure must never fail training (mirrors the
+            # try/except posture around every other publish_ops_alert call
+            # site in this repo).
+            try:
+                from ops_alerts import publish_ops_alert
+
+                publish_ops_alert(
+                    message=(
+                        f"risk_model_persist failed for date={date_str} "
+                        f"(non-blocking — training completed normally): "
+                        f"{_rm_err}"
+                    ),
+                    severity="warning",
+                    source="alpha-engine-predictor/training/train_handler.py::risk_model_persist",
+                    dedup_key=f"risk_model_persist_failed_{date_str}",
+                )
+            except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+                log.warning("risk_model_persist: failure alert itself failed", exc_info=True)
 
     # Step 2e: Triple-barrier cutover gate (Stage 3 PR 5 SF wiring).
     # Runs after model upload + training summary so the gate has access
@@ -1544,11 +1627,12 @@ def _main_impl(
     # Step 4: Health status
     if not dry_run:
         try:
-            from health_status import write_health
+            from nousergon_lib.health import Deliverable, write_health
             write_health(
-                bucket=bucket,
                 module_name="predictor_training",
-                status="ok",
+                deliverables=[
+                    Deliverable(name="training_run", required=True, produced=True),
+                ],
                 run_date=date_str,
                 duration_seconds=result.get("train_time_seconds", 0),
                 summary={
@@ -1558,13 +1642,14 @@ def _main_impl(
                     "slim_cache_tickers": result.get("slim_cache_tickers"),
                     "slim_cache_failed": result.get("slim_cache_failed", 0),
                 },
+                bucket=bucket,
             )
         except Exception as _he:
             log.warning("Health status write failed: %s", _he)
 
         # Data manifest
         try:
-            from health_status import write_data_manifest
+            from data_manifest import write_data_manifest
             write_data_manifest(
                 bucket=bucket,
                 module_name="predictor_training",

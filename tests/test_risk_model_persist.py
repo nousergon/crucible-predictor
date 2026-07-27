@@ -42,7 +42,7 @@ def _write_synthetic_ticker(
     include_loadings: bool = True,
 ) -> None:
     """Write a synthetic per-ticker parquet with OHLCV + (optionally)
-    the 8 factor-loading columns."""
+    the factor-loading columns (``FACTOR_LOADING_COLUMNS``)."""
     n = len(dates)
     close = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, size=n)))
     cols = {
@@ -153,6 +153,98 @@ class TestSparseDataSkipPaths:
         )
         assert result["status"] == "skipped"
         assert "0 tickers carry all" in result["reason"]
+
+
+# ── config#1765: roe_zscore excluded from the pinned set ────────────────
+
+
+class TestRoeZscoreExcluded:
+    """alpha-engine-config#1765 — ``roe_zscore`` is dropped from
+    ``FACTOR_LOADING_COLUMNS`` (7-factor set, was 8). Root cause: live
+    ``roe`` is clip-saturated (a Finnhub-collector unit-scaling bug in
+    alpha-engine-data), which makes ``apply_factor_zscores`` degenerate
+    the whole ``roe_zscore`` cross-section to all-NaN — a real-universe
+    Arctic download would otherwise never satisfy the all-8-non-NaN
+    per-row gate in ``_load_universe_panels``. These tests pin the
+    7-factor set and confirm the persist path succeeds WITHOUT
+    ``roe_zscore``, i.e. without any manual column patching."""
+
+    def test_roe_zscore_not_in_pinned_columns(self):
+        assert "roe_zscore" not in FACTOR_LOADING_COLUMNS
+        assert len(FACTOR_LOADING_COLUMNS) == 7
+
+    def test_succeeds_on_7_factor_universe_without_roe_zscore(self, tmp_path):
+        """A universe cache that ONLY carries the 7 pinned loading columns
+        (mirrors live ArcticDB post-#1765: roe_zscore genuinely absent/
+        all-NaN, never written) must still reach status=ok — the exact
+        ``build_and_persist_risk_model`` closes-when in the issue."""
+        rng = np.random.default_rng(7)
+        data_dir = tmp_path / "seven_factor"
+        data_dir.mkdir()
+        dates = pd.date_range("2026-01-01", periods=80, freq="D")
+        for i in range(40):
+            n = len(dates)
+            close = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, size=n)))
+            cols = {
+                "Open": close, "High": close * 1.005, "Low": close * 0.995,
+                "Close": close,
+                "Volume": rng.integers(1_000_000, 10_000_000, size=n),
+                "VWAP": close,
+                "source": ["yfinance"] * n,
+            }
+            # Only the 7 pinned columns — no roe_zscore at all, and no
+            # NaN-only stand-in either (simulates a cache that never
+            # wrote the degenerate column in the first place).
+            for col in FACTOR_LOADING_COLUMNS:
+                cols[col] = rng.normal(0, 1, size=n)
+            pd.DataFrame(cols, index=dates).to_parquet(
+                data_dir / f"TICK{i:02d}.parquet", engine="pyarrow",
+            )
+        result = build_and_persist_risk_model(
+            data_dir=data_dir,
+            bucket="alpha-engine-research",
+            date_str="2026-07-04",
+            s3_client=MagicMock(),
+        )
+        assert result["status"] == "ok"
+        assert result["n_tickers"] >= 30
+        # F is (K+1)x(K+1): build_factor_risk_model prepends an intercept
+        # ("market") factor column ahead of the K=7 pinned loadings.
+        F_rows, F_cols = result["F_shape"]
+        assert F_rows == F_cols == len(FACTOR_LOADING_COLUMNS) + 1
+
+    def test_all_nan_roe_zscore_column_does_not_block_persist(self, tmp_path):
+        """Belt-and-suspenders: even if a ticker's parquet DOES still
+        carry a (degenerate, all-NaN) ``roe_zscore`` column left over
+        from a prior write, it's simply ignored — the pinned 7-column
+        set is drawn explicitly and extra columns are never read."""
+        rng = np.random.default_rng(8)
+        data_dir = tmp_path / "stale_roe_column"
+        data_dir.mkdir()
+        dates = pd.date_range("2026-01-01", periods=80, freq="D")
+        for i in range(40):
+            n = len(dates)
+            close = 100.0 * np.exp(np.cumsum(rng.normal(0, 0.01, size=n)))
+            cols = {
+                "Open": close, "High": close * 1.005, "Low": close * 0.995,
+                "Close": close,
+                "Volume": rng.integers(1_000_000, 10_000_000, size=n),
+                "VWAP": close,
+                "source": ["yfinance"] * n,
+            }
+            for col in FACTOR_LOADING_COLUMNS:
+                cols[col] = rng.normal(0, 1, size=n)
+            cols["roe_zscore"] = np.nan  # degenerate leftover, all-NaN
+            pd.DataFrame(cols, index=dates).to_parquet(
+                data_dir / f"TICK{i:02d}.parquet", engine="pyarrow",
+            )
+        result = build_and_persist_risk_model(
+            data_dir=data_dir,
+            bucket="alpha-engine-research",
+            date_str="2026-07-04",
+            s3_client=MagicMock(),
+        )
+        assert result["status"] == "ok"
 
 
 # ── Happy path ──────────────────────────────────────────────────────────

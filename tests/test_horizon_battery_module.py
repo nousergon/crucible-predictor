@@ -8,6 +8,7 @@ a training rerun. Tests target the pure logic (compute_horizon_battery
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 
@@ -18,12 +19,18 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.horizon_battery import (
+    PREDICTION_PANELS_PREFIX,
+    _fit_horizon_members,
     _fmt,
     _fmt_ci,
     _round_or_none,
     compute_horizon_battery,
+    compute_horizon_blend,
+    format_blend_report,
     format_report,
+    persist_horizon_prediction_panels,
 )
+from training.meta_trainer import _DIAGNOSTIC_HORIZONS, _ENSEMBLE_HORIZONS
 
 
 def _synthetic_oos_rows(n_dates: int = 60, tickers_per_date: int = 20, seed: int = 0):
@@ -49,9 +56,13 @@ def _synthetic_oos_rows(n_dates: int = 60, tickers_per_date: int = 20, seed: int
             actual = sum(row[f] for f in META_FEATURES) * 0.05 + rng.normal(0, 1.5)
             row["actual_fwd"] = float(actual)
             # Multi-horizon labels — noisier at long horizons (more drift).
-            for h in [5, 10, 15, 21, 40, 60, 90]:
+            # Iterate the live diagnostic ladder so the fixture always carries a
+            # column for every horizon the module measures (incl. the config#937
+            # ratified ensemble ladder 42/63/126d).
+            for h in _DIAGNOSTIC_HORIZONS:
                 row[f"actual_fwd_{h}d"] = float(actual + rng.normal(0, 0.3 * h / 5))
             row["date"] = d.strftime("%Y-%m-%d")
+            row["ticker"] = f"T{t:03d}"
             # Override macro_spy_20d_return for regime classification:
             # cycle through bull/neutral/bear so all three are populated.
             phase = (rng.integers(0, 3))
@@ -190,3 +201,221 @@ class TestFormatReport:
         rendered = format_report(report)
         # Should render without crashing; "—" or similar for NaN cells.
         assert "90d" in rendered
+
+
+# ── ratified ensemble ladder (config#937) ────────────────────────────────
+
+class TestEnsembleLadder:
+
+    def test_ratified_ladder_is_subset_of_diagnostic(self):
+        # The operator-ratified 10/21/42/63/126d must all be measurable, i.e.
+        # present in the diagnostic ladder that drives OOS-row persistence.
+        assert _ENSEMBLE_HORIZONS == [10, 21, 42, 63, 126]
+        assert set(_ENSEMBLE_HORIZONS).issubset(set(_DIAGNOSTIC_HORIZONS))
+
+    def test_legacy_horizons_retained(self):
+        # Additive: pre-config#937 diagnostic horizons must survive so no
+        # existing consumer loses a forward-return column.
+        for h in (5, 10, 15, 21, 40, 60, 90):
+            assert h in _DIAGNOSTIC_HORIZONS
+
+
+# ── compute_horizon_blend (config#937 Phase 1) ───────────────────────────
+
+class TestComputeHorizonBlend:
+
+    def test_basic_shape(self):
+        df = _synthetic_oos_rows(n_dates=80, tickers_per_date=20, seed=3)
+        report = compute_horizon_blend(df, bootstrap_iter=100, n_cscv_blocks=6)
+        assert report["target_horizon"] == "21d"
+        assert report["ladder"] == [f"{h}d" for h in _ENSEMBLE_HORIZONS]
+        assert "baseline" in report and "blends" in report
+        assert set(report["blends"]) == {"ic_weighted", "ridge_blend"}
+        assert "cscv_pbo" in report
+        # Every ladder member has an IC + a normalized blend weight.
+        assert set(report["members"]) == {f"{h}d" for h in _ENSEMBLE_HORIZONS}
+        wsum = sum(m["blend_weight"] for m in report["members"].values())
+        assert abs(wsum - 1.0) < 1e-6
+
+    def test_uplift_is_ic_minus_baseline(self):
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=18, seed=5)
+        report = compute_horizon_blend(df, bootstrap_iter=80, n_cscv_blocks=6)
+        base = report["baseline"]["ic"]
+        for name in ("ic_weighted", "ridge_blend"):
+            bl = report["blends"][name]
+            if bl["ic"] is not None and base is not None:
+                # uplift rounds the raw diff; ic/base are each pre-rounded to 6dp,
+                # so allow one ULP of rounding slack (max ~1.5e-6).
+                assert abs(bl["uplift_vs_baseline"] - round(bl["ic"] - base, 6)) < 2e-6
+
+    def test_singleton_ladder_blend_equals_baseline(self):
+        # A ladder of only the target horizon must make both blends collapse to
+        # the baseline signal — uplift ≈ 0 (sanity: blending nothing adds nothing).
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=18, seed=9)
+        report = compute_horizon_blend(
+            df, horizons=[21], target_horizon=21,
+            bootstrap_iter=50, n_cscv_blocks=6,
+        )
+        assert report["ladder"] == ["21d"]
+        for name in ("ic_weighted", "ridge_blend"):
+            up = report["blends"][name]["uplift_vs_baseline"]
+            assert up is None or abs(up) < 1e-6
+
+    def test_target_absent_raises(self):
+        df = _synthetic_oos_rows(n_dates=40, tickers_per_date=10)
+        df = df.drop(columns=["actual_fwd_21d"])
+        with pytest.raises(ValueError):
+            compute_horizon_blend(df, target_horizon=21, bootstrap_iter=20)
+
+    def test_pbo_in_unit_interval_or_none(self):
+        df = _synthetic_oos_rows(n_dates=90, tickers_per_date=20, seed=11)
+        report = compute_horizon_blend(df, bootstrap_iter=60, n_cscv_blocks=8)
+        pbo = report["cscv_pbo"].get("pbo")
+        assert pbo is None or (0.0 <= pbo <= 1.0)
+
+    def test_format_blend_report_renders(self):
+        df = _synthetic_oos_rows(n_dates=70, tickers_per_date=16, seed=13)
+        report = compute_horizon_blend(df, bootstrap_iter=50, n_cscv_blocks=6)
+        rendered = format_blend_report(report)
+        assert "Temporal-ensemble blend" in rendered
+        assert "Baseline" in rendered
+        assert "CSCV/PBO" in rendered
+
+
+class TestPersistHorizonPredictionPanels:
+    """Tests for persist_horizon_prediction_panels (config#1993 double-sort substrate)."""
+
+    def test_fit_horizon_members_matches_blend_members_unscored(self):
+        # _fit_horizon_members (raw) should, once z-scored, reproduce exactly
+        # what compute_horizon_blend's internal members use for IC-weighting —
+        # this pins the refactor didn't change compute_horizon_blend's numbers.
+        df = _synthetic_oos_rows(n_dates=60, tickers_per_date=18, seed=3)
+        from analysis.horizon_battery import _zscore
+        raw = _fit_horizon_members(df, [10, 21, 42])
+        assert set(raw) == {10, 21, 42}
+        for h, arr in raw.items():
+            assert len(arr) == len(df)
+            z = _zscore(arr)
+            assert abs(float(np.mean(z))) < 1e-6
+
+    def test_dry_run_no_s3_call_returns_shape(self):
+        df = _synthetic_oos_rows(n_dates=50, tickers_per_date=15, seed=5)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21, 63], bucket="unused-bucket", dry_run=True,
+        )
+        assert result["status"] == "dry_run"
+        assert result["horizons"] == [10, 21, 63]
+        assert result["n_rows"] == 50 * 15 * 3
+        assert result["key"] == f"{PREDICTION_PANELS_PREFIX}latest.parquet"
+
+    def test_dry_run_dated_key(self):
+        df = _synthetic_oos_rows(n_dates=20, tickers_per_date=10, seed=6)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[21], date="2026-07-18", dry_run=True,
+        )
+        assert result["key"] == f"{PREDICTION_PANELS_PREFIX}2026-07-18.parquet"
+
+    def test_drops_horizon_with_missing_column(self):
+        df = _synthetic_oos_rows(n_dates=40, tickers_per_date=12, seed=7)
+        df = df.drop(columns=["actual_fwd_42d"])
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21, 42], dry_run=True,
+        )
+        assert result["horizons"] == [10, 21]
+
+    def test_no_usable_horizons(self):
+        df = _synthetic_oos_rows(n_dates=10, tickers_per_date=5, seed=8)
+        result = persist_horizon_prediction_panels(
+            df, horizons=[999], dry_run=True,
+        )
+        assert result["status"] == "no_usable_horizons"
+
+    def test_persist_writes_expected_parquet_shape(self, monkeypatch):
+        # Full path (minus the real S3 PUT) — monkeypatch boto3.client to
+        # capture what would have been written and verify the long-format
+        # parquet round-trips to the {horizon: {date: {ticker: alpha}}}
+        # shape analysis.double_sort.compute_double_sort expects.
+        df = _synthetic_oos_rows(n_dates=30, tickers_per_date=10, seed=9)
+        captured = {}
+
+        class _FakeS3:
+            def put_object(self, Bucket, Key, Body):
+                captured["bucket"] = Bucket
+                captured["key"] = Key
+                captured["body"] = Body
+
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: _FakeS3())
+
+        result = persist_horizon_prediction_panels(
+            df, horizons=[10, 21], bucket="test-bucket", dry_run=False,
+        )
+        assert result["status"] == "ok"
+        assert captured["bucket"] == "test-bucket"
+        assert captured["key"] == f"{PREDICTION_PANELS_PREFIX}latest.parquet"
+
+        panel_df = pd.read_parquet(io.BytesIO(captured["body"]))
+        assert set(panel_df.columns) == {"date", "ticker", "horizon", "predicted_alpha"}
+        assert set(panel_df["horizon"].unique()) == {10, 21}
+        # Reshape into the {horizon: {date: {ticker: alpha}}} nested dict the
+        # backtester's double_sort.compute_double_sort consumes.
+        nested = {}
+        for h, g in panel_df.groupby("horizon"):
+            nested[h] = {
+                d: dict(zip(sub["ticker"], sub["predicted_alpha"]))
+                for d, sub in g.groupby("date")
+            }
+        assert set(nested) == {10, 21}
+        any_date = next(iter(nested[21]))
+        assert len(nested[21][any_date]) <= 10  # <= tickers_per_date
+
+
+# ── main() CLI guard (§119 rule 1) ────────────────────────────────────
+
+class TestMainCLIGuard:
+    """Tests for horizon_battery.main() CLI entry point guards.
+
+    Coverage for the success path (rows loaded -> normal exit) and the
+    failure path (empty/no rows -> exit 1) — the two states the
+    ``sys.exit(1)`` guard at line 780 can reach.
+    """
+
+    def test_success_path_returns_normally(self, monkeypatch):
+        """Mock load_oos_rows with valid data — guard passes, no SystemExit."""
+        from analysis.horizon_battery import main
+
+        df = _synthetic_oos_rows(n_dates=10, tickers_per_date=5)
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: df,
+        )
+        main()  # must not raise
+
+    def test_none_rows_exits_with_code_1(self, monkeypatch):
+        """Mock load_oos_rows returns None — verifies SystemExit(1)."""
+        import pytest
+        from analysis.horizon_battery import main
+
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: None,
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1
+
+    def test_empty_df_exits_with_code_1(self, monkeypatch):
+        """Mock load_oos_rows returns empty DataFrame — verifies SystemExit(1)."""
+        import pytest
+        from analysis.horizon_battery import main
+
+        monkeypatch.setattr("sys.argv", ["horizon_battery"])
+        monkeypatch.setattr(
+            "analysis.horizon_battery.load_oos_rows",
+            lambda bucket=None, date=None: pd.DataFrame(),
+        )
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 1

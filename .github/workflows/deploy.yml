@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout predictor repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           path: alpha-engine-predictor
 
@@ -41,26 +41,26 @@ jobs:
       # import. Fine-grained PAT with read-only Contents access on
       # alpha-engine-config is stored as ALPHA_ENGINE_CONFIG_TOKEN.
       - name: Checkout alpha-engine-config
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           repository: nousergon/alpha-engine-config
           path: alpha-engine-config
           token: ${{ secrets.ALPHA_ENGINE_CONFIG_TOKEN }}
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
           aws-region: us-east-1
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64  # v2
 
       # deploy.sh's canary + alert steps run `python3 -m krepis.aws` /
       # `python3 -m krepis.alerts` directly on THIS runner (not inside the
@@ -73,7 +73,7 @@ jobs:
       # >=0.7.0` floor; setup-python pins the interpreter so the pip install
       # target doesn't drift with GH's ubuntu-latest image updates.
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
 
@@ -99,7 +99,7 @@ jobs:
 
       - name: Append to system-wide deploy changelog
         if: always()
-        uses: nousergon/nousergon-docs/.github/actions/append-changelog@main
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@765aa682f6c5b7e1e5fc241c7bac1e9e0d6ca326  # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
           deploy_workflow: deploy.yml
@@ -109,5 +109,5 @@ jobs:
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@6c4bdb834f0869efc5de3166b285a812053ea709  # main
     secrets: inherit

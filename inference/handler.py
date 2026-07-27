@@ -28,12 +28,23 @@ training exceeding Lambda's 15-minute timeout.
     the prior on-box SSM trading_calendar check whose stdout was unreliably
     captured on a cold-booted instance (config#1430).
 
+  action == "check_weekly_run_day":
+    Weekly-SF run-day gate (pure calendar, no preflight; config#1824).
+    Returns {is_weekly_run_day, check_date, day_name, marker, ...} — true
+    iff the date is one calendar day after the LAST trading session of its
+    Mon-Fri week (normally Saturday; Friday/Thursday on holiday-shortened
+    weeks). Lets the weekly pipeline's THU-SAT cron self-select the single
+    correct firing.
+
   action == "check_pipeline_contract":
     Validate PIPELINE_CONTRACT.yaml's self-consistency + every artifact_id ∈
     ARTIFACT_REGISTRY.yaml, fetched from GitHub raw. Used by the Saturday Step
     Function as an early pre-spend gate (mirrors check_lib_pin_drift) so a
     contract break halts before any spot launch. Fail-open on a fetch/parse
-    miss; halts only on a confirmed structural violation.
+    miss; halts only on a confirmed structural violation. Also invoked as a
+    deploy-time canary (infrastructure/deploy.sh) with dry_run=true, which
+    skips only the preflight's deploy-drift assertion (not the contract
+    check itself) — see PredictorPreflight.run_for_drift_gate (config#2731).
 
   action == "train":
     DEPRECATED — returns error directing to spot_train.sh.
@@ -131,6 +142,18 @@ def handler(event: dict, context) -> dict:
         )
         return _r
 
+    # ── Weekly run-day gate (weekly SF THU-SAT cron self-selection) ─────────
+    # Same zero-infra posture as check_trading_day (config#1824).
+    if event.get("action") == "check_weekly_run_day":
+        from inference.trading_day_gate import check_weekly_run_day
+        _r = check_weekly_run_day(event.get("date"))
+        log.info(
+            "Weekly run-day gate: %s (%s) -> %s%s",
+            _r["check_date"], _r["day_name"], _r["marker"],
+            "" if _r["is_weekly_run_day"] else f" ({_r.get('reason')})",
+        )
+        return _r
+
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
     # before loading models or touching inference. See PR #5 and
     # inference/preflight.py.
@@ -150,14 +173,24 @@ def handler(event: dict, context) -> dict:
     # (dry_run=false) and the SF drift gate below are unaffected.
     _dry_run = bool(event.get("dry_run", False))
     _pf = PredictorPreflight(bucket=_bucket)
-    if _action in (
-        "check_deploy_drift",
-        "check_lib_pin_drift",
-        "check_pipeline_contract",
-    ):
-        # All three are lightweight pre-spend SF gates (GitHub reads only) — run
-        # the minimal preflight, not the full predictor bootstrap.
+    if _action == "check_deploy_drift":
+        # The dedicated SF first-state gate. Its entire job is to assert
+        # image/SF/CF drift vs origin/main HEAD unconditionally — never
+        # thread a dry_run skip into this action's path (config#2731).
         _pf.run_for_drift_gate()
+    elif _action in ("check_lib_pin_drift", "check_pipeline_contract"):
+        # Both are lightweight pre-spend SF gates (GitHub reads only) — run
+        # the minimal preflight, not the full predictor bootstrap. Two
+        # distinct call contexts reach this branch:
+        #   - The Step Function's own pre-spend invocation (no dry_run) —
+        #     retains its existing drift belt-and-suspenders, unchanged.
+        #   - infrastructure/deploy.sh's deploy-time canary invocation
+        #     (dry_run=true) — writes/emails nothing, so (exactly like the
+        #     predict(dry_run) canary fixed by config#1073) asserting its
+        #     image SHA against live main HEAD is the wrong invariant and a
+        #     false-failure source during a merge burst (config#2731,
+        #     2026-07-16). Only THIS dry_run=true path skips drift.
+        _pf.run_for_drift_gate(skip_deploy_drift=_dry_run)
     elif _action == "check_drift":
         # Drift detection is a post-inference monitoring step: it reads the
         # day's predictions/features and writes drift_{date}.json. It needs env
@@ -214,7 +247,7 @@ def handler(event: dict, context) -> dict:
     # propagates so the SF Catch sees a true failure.
     if action == "check_drift":
         from monitoring.drift_detector import check_drift
-        result = check_drift(bucket=bucket, date_str=date_str)
+        result = check_drift(bucket=bucket, date_str=date_str, dry_run=dry_run)
         log.info(
             "Drift check %s: status=%s severity=%s n_alerts=%d → drift_%s.json",
             result["date"], result["status"], result.get("severity"),
@@ -297,6 +330,29 @@ def handler(event: dict, context) -> dict:
         explicit_tickers=explicit_tickers,
     )
     log.info("Predictor Lambda completed successfully")
+
+    # ── Flow-doctor end-of-run heartbeat (config#646) ───────────────────────
+    # Write the flow's end-of-run status() snapshot to the research bucket so
+    # the dashboard System Health consumer can read it from
+    # s3://alpha-engine-research/_flow_doctor/heartbeat/predictor/{date}.json.
+    # `bucket` resolves to alpha-engine-research (S3_BUCKET default set above).
+    # emit_heartbeat soft-fails (returns None, never raises), so the run's
+    # success is unaffected by a heartbeat write miss.
+    # Guard on the method's presence too: the producing repos deploy
+    # independently and emit_heartbeat only exists in flow-doctor >=0.6.2, so a
+    # version-skewed lib pin would AttributeError at end-of-run without the
+    # hasattr check (mirrors flow-doctor's own soft-fail philosophy).
+    # dry_run also skips the write: dry_run's whole contract (and the
+    # deploy-time canary's, which invokes action=predict with dry_run=true)
+    # is "no S3 writes, no email" — an unconditional heartbeat PUT here broke
+    # that contract silently and made the deploy canary a non-read-only
+    # action (config#3025 dim8).
+    if not dry_run:
+        from krepis.logging import get_flow_doctor
+        fd = get_flow_doctor()
+        if fd and hasattr(fd, "emit_heartbeat"):
+            fd.emit_heartbeat(bucket=bucket)
+
     return {
         "statusCode": 200,
         "body": (

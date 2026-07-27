@@ -6,14 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+permissions: {}
+
 jobs:
   test:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -21,24 +23,136 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest-cov
 
       - name: Set up config
         run: cp config/predictor.sample.yaml config/predictor.yaml
 
       - name: Run tests
-        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py
+        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py --cov=. --cov-report=term-missing
 
       - name: Security audit
         run: |
           pip install pip-audit
-          pip-audit || true
+          IGNORE_ARGS=()
+          if [ -f .github/pip-audit-ignore.txt ]; then
+            while IFS= read -r vuln_id; do
+              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
+            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
+          fi
+          pip-audit "${IGNORE_ARGS[@]}"
+
+  # Installs requirements.txt and requirements-lambda.txt into two separate
+  # clean venvs and diffs the RESOLVED versions of packages shared between
+  # them. test_lib_pin_lockstep.py (in the `test` job above) already catches
+  # specifier-TEXT drift; this catches the residual gap where identical
+  # specifier text still resolves to different transitive versions once the
+  # surrounding package set diverges between the two files (config#3025
+  # dim6 — the docker-import-closure job below installs
+  # requirements-lambda.txt too, but only proves it installs cleanly, not
+  # that it matches requirements.txt's resolution).
+  lambda-requirements-lockstep:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Resolve requirements.txt into a clean venv
+        run: |
+          python -m venv /tmp/venv-root
+          /tmp/venv-root/bin/pip install --upgrade pip -q
+          /tmp/venv-root/bin/pip install -r requirements.txt -q
+          /tmp/venv-root/bin/pip freeze > /tmp/root-freeze.txt
+
+      - name: Resolve requirements-lambda.txt into a clean venv
+        run: |
+          python -m venv /tmp/venv-lambda
+          /tmp/venv-lambda/bin/pip install --upgrade pip -q
+          /tmp/venv-lambda/bin/pip install -r requirements-lambda.txt -q
+          /tmp/venv-lambda/bin/pip freeze > /tmp/lambda-freeze.txt
+
+      - name: Diff resolved versions for shared packages
+        run: python3 scripts/check_requirements_resolved_lockstep.py /tmp/root-freeze.txt /tmp/lambda-freeze.txt
+
+  # Builds the real Lambda image and imports the real entrypoint modules
+  # INSIDE the built container — the ground-truth backstop for the
+  # config#1282/PR352 bug class (`tests/test_dockerfile_handler_import_
+  # completeness.py` and `tests/test_dockerfile_import_closure.py` are
+  # the fast static pre-checks; this is what actually proves the image
+  # can load its own code). A first-party import missing its Dockerfile
+  # COPY line passes both static checks if the walker has a bug, but
+  # CANNOT pass this job — it either resolves at runtime or it doesn't.
+  #
+  # Scoped to the three Lambda CMDs this image actually serves
+  # (infrastructure/deploy.sh): inference.handler, regime.handler,
+  # regime.retrospective_eval_handler. Deliberately does NOT import
+  # training.train_handler — training runs on EC2 spot
+  # (infrastructure/spot_train.sh), not this image, and
+  # requirements-lambda.txt intentionally omits training-only deps
+  # (e.g. risk_model's factor-math extras — see that file's own
+  # comment: "Inference Lambda does NOT import risk_model ... that
+  # runs only in PredictorTraining on EC2"). Importing
+  # training.train_handler here would fail for an unrelated reason
+  # (missing training deps in the lean inference image) and give a
+  # false positive for this job's actual purpose.
+  docker-import-closure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Mirrors deploy.yml's config staging: config/predictor.yaml is
+      # gitignored (real values live in alpha-engine-config), and the
+      # Dockerfile COPYs config/ verbatim. The sample is sufficient
+      # here because this job only imports the entrypoint modules —
+      # it does not invoke handler() / lambda_handler(), so no
+      # predictor.yaml key needs a real value, only for the file to
+      # exist so nothing FileNotFoundErrors at import time.
+      - name: Set up config for image build
+        run: cp config/predictor.sample.yaml config/predictor.yaml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build Lambda image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: alpha-engine-predictor:ci
+          platforms: linux/amd64
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Import-walk the built image (inference Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import inference.handler; print('OK: inference.handler')"
+
+      - name: Import-walk the built image (regime substrate Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import regime.handler; print('OK: regime.handler')"
+
+      - name: Import-walk the built image (regime retrospective-eval Lambda)
+        run: |
+          docker run --rm --entrypoint python alpha-engine-predictor:ci \
+            -c "import regime.retrospective_eval_handler; print('OK: regime.retrospective_eval_handler')"
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds (mid-fix commits, cross-repo lib-tag merge-order
   # races) stay silent. Reusable workflow + transport in nousergon-lib.
   # See alpha-engine-config#1128.
   notify-main-failure:
-    needs: [test]
+    needs: [test, lambda-requirements-lockstep, docker-import-closure]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
     secrets: inherit

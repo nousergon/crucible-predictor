@@ -12,7 +12,20 @@ downstream pipeline finds everything it expects.
 Usage:
     from store.arctic_reader import download_from_arctic
 
-    n_files = download_from_arctic(bucket, local_dir)
+    coverage = download_from_arctic(bucket, local_dir)
+    n_files = coverage["n_written"]
+
+config#2882 — per-ticker/per-macro-series read failures used to be swallowed
+at DEBUG (invisible at default INFO logging) with no record of HOW MANY
+reads failed. A partial ArcticDB throttling/connectivity episode could
+silently drop most of the universe while still returning a nonzero
+``n_files``, so the only downstream gate (``n_files == 0``) never tripped —
+a challenger could train on a crippled dataset, self-report a plausible
+CPCV IC on the reduced data it saw, and still win weekly ModelZoo
+promotion. Failures are now logged at WARN (ticker/series id + exception)
+and the return value is a coverage dict — ``n_written`` (back-compat count),
+``n_expected`` (symbols listed), ``n_failed``, and ``coverage_ratio`` — so
+callers can gate on PARTIAL loss, not just total loss.
 """
 
 from __future__ import annotations
@@ -34,7 +47,7 @@ def download_from_arctic(
     bucket: str,
     local_dir: str | os.PathLike,
     universe_lib: str = "universe",
-) -> int:
+) -> dict:
     """
     Read all universe + macro symbols from ArcticDB and write as parquets
     to local_dir, matching the legacy per-ticker OHLCV parquet format
@@ -58,7 +71,22 @@ def download_from_arctic(
         under the SAME column names). The macro library is always ``"macro"``
         regardless of basis.
 
-    Returns the number of files written.
+    Returns
+    -------
+    dict with:
+      ``n_written``       : total parquet files written (universe + macro) —
+                             same count the pre-config#2882 int return gave.
+      ``n_expected``      : total symbols listed (universe + macro) BEFORE
+                             any read attempt — the coverage denominator.
+      ``n_failed``        : symbols whose ArcticDB read raised (universe +
+                             macro combined); empty-dataframe skips are NOT
+                             counted as failures (that's valid "no data yet"
+                             for a new listing, not a read error).
+      ``coverage_ratio``  : ``n_written / n_expected`` (``1.0`` when
+                             ``n_expected == 0`` — nothing was expected, so
+                             nothing was missed).
+      ``failed_universe`` : list of universe tickers whose read raised.
+      ``failed_macro``    : list of macro series whose read raised.
     """
     t0 = time.time()
     local_dir = str(local_dir)
@@ -83,6 +111,8 @@ def download_from_arctic(
     macro_lib = open_macro_lib(bucket)
 
     n_written = 0
+    failed_universe: list[str] = []
+    failed_macro: list[str] = []
 
     # Write stock tickers from universe library
     symbols = universe.list_symbols()
@@ -100,13 +130,19 @@ def download_from_arctic(
             df.to_parquet(out_path, engine="pyarrow", compression="snappy")
             n_written += 1
         except Exception as exc:
-            log.debug("Failed to read %s: %s", ticker, exc)
+            # config#2882 — WARN (not DEBUG): a partial read-failure episode
+            # (throttling/connectivity/corrupted symbol) must be visible at
+            # default INFO-level logging, not require a DEBUG-level re-run to
+            # even notice data was silently dropped.
+            failed_universe.append(ticker)
+            log.warning("Failed to read ticker %s from ArcticDB: %s", ticker, exc)
 
         if (i + 1) % 200 == 0:
             log.info("  Written %d/%d symbols", i + 1, len(symbols))
 
     # Write macro series from macro library
-    for key in macro_lib.list_symbols():
+    macro_symbols = macro_lib.list_symbols()
+    for key in macro_symbols:
         try:
             df = macro_lib.read(key).data
             if df.empty:
@@ -115,7 +151,9 @@ def download_from_arctic(
             df.to_parquet(out_path, engine="pyarrow", compression="snappy")
             n_written += 1
         except Exception as exc:
-            log.debug("Failed to read macro %s: %s", key, exc)
+            # config#2882 — WARN, see above.
+            failed_macro.append(key)
+            log.warning("Failed to read macro series %s from ArcticDB: %s", key, exc)
 
     # Write sector_map.json from S3 (not stored in ArcticDB)
     try:
@@ -130,9 +168,32 @@ def download_from_arctic(
     except Exception as exc:
         log.warning("Failed to load sector_map.json from S3: %s", exc)
 
+    n_expected = len(symbols) + len(macro_symbols)
+    n_failed = len(failed_universe) + len(failed_macro)
+    # n_expected == 0 → nothing was asked for, so nothing was missed (ratio
+    # 1.0, not a divide-by-zero / NaN that a downstream threshold check would
+    # have to special-case).
+    coverage_ratio = (n_written / n_expected) if n_expected > 0 else 1.0
+
     elapsed = time.time() - t0
     log.info(
-        "[data_source=arcticdb] Cache populated in %.1fs: %d files written to %s",
-        elapsed, n_written, local_dir,
+        "[data_source=arcticdb] Cache populated in %.1fs: %d/%d files written "
+        "(coverage=%.4f, failed=%d) to %s",
+        elapsed, n_written, n_expected, coverage_ratio, n_failed, local_dir,
     )
-    return n_written
+    if n_failed:
+        log.warning(
+            "[data_source=arcticdb] %d/%d symbol reads failed this run "
+            "(coverage=%.4f) — universe_failed=%d macro_failed=%d. See WARN "
+            "lines above for the individual ticker/series + exception.",
+            n_failed, n_expected, coverage_ratio,
+            len(failed_universe), len(failed_macro),
+        )
+    return {
+        "n_written": n_written,
+        "n_expected": n_expected,
+        "n_failed": n_failed,
+        "coverage_ratio": coverage_ratio,
+        "failed_universe": failed_universe,
+        "failed_macro": failed_macro,
+    }

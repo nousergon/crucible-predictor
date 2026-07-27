@@ -36,6 +36,7 @@ import json
 import logging
 import math
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Structured logging + flow-doctor singleton via alpha-engine-lib (shared
@@ -87,6 +88,14 @@ _LEADERBOARD_PREFIX = "predictor/model_zoo/leaderboard"
 # for DSR deflation (the per-run CPCV n_combos proxy understates the true
 # search breadth once rotations accumulate).
 _TRIAL_LOG_KEY = "predictor/model_zoo/trial_log.json"
+# config#2252 — EXACTLY-ONCE promotion ledger. One durable marker per run_date,
+# written after a rotation's selection/promotion finalizes successfully. A
+# re-execution of the weekly SF predictor branch (watch re-runs) re-enters the
+# rotation/select entrypoints for the SAME run_date; the marker turns that into
+# a VERIFIED no-op (no re-promote, no duplicate digest email) instead of a
+# second identical promotion email. To deliberately re-run a rotation for a
+# date, delete s3://<bucket>/predictor/model_zoo/promotions/<date>.json first.
+_PROMOTIONS_PREFIX = "predictor/model_zoo/promotions"
 
 # Deep-link target for the digest email → console Model Zoo page. The slug is
 # pinned in crucible-dashboard app.py (url_path="model-zoo") and guarded by
@@ -811,6 +820,15 @@ def select_winner(
     if margin is None:
         margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
     min_ic = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0))
+    # config#2889 (Brian's 2026-07-18 Decision Queue Option-B ruling):
+    # OBSERVE-FIRST, same rollout pattern as MODEL_ZOO_AUTO_PROMOTE_WINNER.
+    # False (default): every candidate's second-opinion verdict is always
+    # computed + surfaced (leaderboard + loud log on divergence) but never
+    # blocks. True: a diverging second opinion makes the candidate ineligible.
+    enforce_second_opinion = bool(
+        getattr(cfg, "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE", False)
+    )
+    from training.realized_ic_second_opinion import evaluate_second_opinion_gate
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
     # Its CPCV mean IC is a STALE last-promoted snapshot (a prior vintage), so it
@@ -893,6 +911,24 @@ def select_winner(
         #   IC <= positive floor   → below_floor (best-of-N noise is not edge)
         #   IC <  baseline+margin  → below_champion_arch_plus_margin
         #   else                   → eligible (PROMOTES — DSR is not consulted)
+        # config#2889: independent second-party IC recomputation verdict for
+        # this candidate — ALWAYS computed (observability), only gates
+        # eligibility when MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE is True. See
+        # training/realized_ic_second_opinion.py for the corroborate/diverge
+        # logic; the second_opinion dict itself was computed independently by
+        # meta_trainer at training time (fresh score_performance_outcomes
+        # read, bypassing meta_y) and travels here verbatim on the manifest.
+        _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
+        second_opinion = _cpcv.get("second_opinion") or {}
+        so_verdict = evaluate_second_opinion_gate(ic, second_opinion)
+        if so_verdict.get("divergence_detected"):
+            log.warning(
+                "model_zoo select: config#2889 SECOND-OPINION DIVERGENCE for "
+                "%s (spec=%s): %s (enforce=%s)",
+                vid, rec.get("spec_id"), so_verdict.get("reason"),
+                enforce_second_opinion,
+            )
+
         group = "champion_arch" if is_champ_arch else "challenger"
         if is_champ_arch:
             eligible, reason = False, "champion_arch_baseline"
@@ -904,6 +940,8 @@ def select_winner(
             eligible, reason = False, "below_floor"
         elif baseline_ic is not None and ic < baseline_ic + margin:
             eligible, reason = False, "below_champion_arch_plus_margin"
+        elif enforce_second_opinion and so_verdict.get("divergence_detected"):
+            eligible, reason = False, "second_opinion_diverges"
         else:
             eligible, reason = True, "eligible"
         # L4582(b): re-deflate this candidate's CPCV IC series by the CUMULATIVE
@@ -918,7 +956,6 @@ def select_winner(
         dsr_selection = None
         dsr_selection_n_eff = None
         ic_ir_needed = None
-        _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
         _ics = _cpcv.get("ics") or []
         _n_paths = _cpcv.get("n_backtest_paths")
         if _ics and n_trials_cumulative:
@@ -935,6 +972,25 @@ def select_winner(
                 ic_ir_needed = _d.get("ic_ir_needed_for_threshold")
             except Exception:  # noqa: BLE001 — observe-only stat, never blocks ranking
                 log.warning("model_zoo select: dsr_selection failed for %s", vid, exc_info=True)
+        # config#2882 — surface the ArcticDB read-coverage this candidate
+        # trained on. The manifest carries it verbatim from
+        # meta_trainer.run_meta_training (None for a manifest written before
+        # this field existed, or when arctic_coverage wasn't supplied). A True
+        # flag means the candidate's OWN self-reported CPCV IC was computed on
+        # a measurably-incomplete dataset — logged here so a promotion of a
+        # degraded-coverage winner is loud, not silent.
+        data_coverage_degraded = (manifest or {}).get("data_coverage_degraded")
+        arctic_coverage = (manifest or {}).get("arctic_coverage")
+        if data_coverage_degraded:
+            log.warning(
+                "model_zoo select: candidate %s (spec=%s) trained on "
+                "DEGRADED ArcticDB coverage (coverage_ratio=%s) — this "
+                "candidate's self-reported CPCV IC may be understated by a "
+                "starved universe. See data_coverage_degraded on its "
+                "leaderboard entry.",
+                vid, rec.get("spec_id"),
+                (arctic_coverage or {}).get("coverage_ratio"),
+            )
         candidates.append({
             "spec_id": rec.get("spec_id"), "version_id": vid,
             "model_version": rec.get("model_version"),
@@ -942,6 +998,12 @@ def select_winner(
             # the baseline) vs "challenger" (a rotated spec competing against it).
             "group": group,
             "forward_days": fwd, "cpcv_mean_ic": ic, "passes_gate": gate,
+            # config#2882 — ArcticDB coverage this candidate trained on (None
+            # when the manifest predates this field or coverage wasn't
+            # supplied). See the log.warning above for the loud-on-degraded
+            # trace; this is the structured leaderboard-artifact copy.
+            "data_coverage_degraded": data_coverage_degraded,
+            "arctic_coverage_ratio": (arctic_coverage or {}).get("coverage_ratio"),
             # config#671/#673/#1052: the DSR/Sortino gate result, surfaced for
             # OBSERVABILITY (is relative-best promotion chasing a model the absolute
             # gate would reject?) — NOT a promotion blocker. registry_bar likewise.
@@ -958,6 +1020,12 @@ def select_winner(
             # series of that independent length needs to clear the full DSR bar.
             "dsr_selection_n_eff": dsr_selection_n_eff,
             "ic_ir_needed_for_full_bar": ic_ir_needed,
+            # config#2889: independent second-party IC recomputation verdict.
+            "second_opinion_ic": second_opinion.get("second_opinion_ic"),
+            "second_opinion_status": second_opinion.get("status"),
+            "second_opinion_divergence": so_verdict.get("divergence_detected"),
+            "second_opinion_reason": so_verdict.get("reason"),
+            "second_opinion_gate_enforced": enforce_second_opinion,
             "eligible": eligible, "reason": reason,
         })
 
@@ -1093,6 +1161,124 @@ def _current_champion_version_id(s3, bucket: str) -> str | None:
     return champs[0].get("version_id") if champs else None
 
 
+class PromotionStateDivergenceError(RuntimeError):
+    """config#2252 — the exactly-once promotion contract was violated: a
+    promotion marker exists for this run_date but the live champion state does
+    NOT match what the marker recorded (or the marker itself is unreadable).
+    This is a divergence needing operator eyes — never a silent re-apply."""
+
+
+def _promotion_marker_key(date_str: str) -> str:
+    return f"{_PROMOTIONS_PREFIX}/{date_str}.json"
+
+
+def _read_promotion_marker(s3, bucket: str, date_str: str) -> dict | None:
+    """Return the exactly-once promotion marker for ``date_str``, or None if it
+    does not exist (the normal first-run case). FAIL LOUD on any error that is
+    not a clean not-found (corrupt JSON, AccessDenied, transport failure): an
+    unreadable marker means idempotency CANNOT be verified, and proceeding
+    blind could re-apply the promotion + duplicate the digest email
+    (config#2252). Recording surface: the raised PromotionStateDivergenceError
+    fails the spot workload / SF state loudly."""
+    key = _promotion_marker_key(date_str)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read())
+    except KeyError:
+        return None  # test fakes signal a missing key with KeyError
+    except Exception as exc:  # noqa: BLE001 — split not-found from real errors below
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise PromotionStateDivergenceError(
+            f"model_zoo config#2252: promotion marker s3://{bucket}/{key} could "
+            f"not be read (NOT a clean not-found) — refusing to re-run "
+            f"selection blind, a re-apply could duplicate the promotion email: "
+            f"{exc}"
+        ) from exc
+
+
+def _write_promotion_marker(s3, bucket: str, date_str: str,
+                            leaderboard: dict, prior_champ_vid: str | None) -> None:
+    """config#2252 — durably record a successfully-finalized rotation for
+    ``date_str`` so any re-execution is a verified no-op. FAIL LOUD (no
+    try/except): a rotation that cannot record its own completion must not
+    silently allow a future re-run to duplicate the promotion + email — the
+    raise fails this run visibly instead."""
+    promoted = leaderboard.get("promoted")
+    marker = {
+        "schema_version": 1,
+        "run_date": date_str,
+        "mode": leaderboard.get("mode"),
+        "promoted": promoted,
+        "promoted_kind": leaderboard.get("promoted_kind"),
+        "winner_version_id": leaderboard.get("winner_version_id"),
+        "champion_arch_refresh_version_id": leaderboard.get("champion_arch_refresh_version_id"),
+        "prior_champion_version_id": prior_champ_vid,
+        # The registry version_id that should be SERVING after this rotation:
+        # the promoted vid on a cutover, else the (unchanged) prior champion.
+        # This is the field the re-run verification compares against.
+        "champion_version_id_after": promoted if promoted else prior_champ_vid,
+        "live_weights_prefix": "predictor/weights/meta/",
+        "registry_bundle_prefix": f"{_REGISTRY_PREFIX}/{promoted}/" if promoted else None,
+        "decision_summary": {
+            "n_candidates": len(leaderboard.get("candidates") or []),
+            "margin": leaderboard.get("margin"),
+            "promote_min_ic": leaderboard.get("promote_min_ic"),
+            "promotion_baseline_ic": leaderboard.get("promotion_baseline_ic"),
+            "promotion_baseline_source": leaderboard.get("promotion_baseline_source"),
+            "trial_log_status": leaderboard.get("trial_log_status"),
+        },
+        # Wall-clock write time (NOT a trade-decision key — run_date above is
+        # the pipeline's trading_day per DATE_CONVENTIONS).
+        "written_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    key = _promotion_marker_key(date_str)
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(marker, indent=2, default=str).encode(),
+        ContentType="application/json",
+    )
+    log.info("model_zoo config#2252: promotion marker written to s3://%s/%s "
+             "(promoted=%s)", bucket, key, promoted)
+
+
+def _verify_promotion_marker_noop(s3, bucket: str, date_str: str, marker: dict) -> dict:
+    """config#2252 — a marker exists for ``date_str``: verify the live champion
+    matches what the marker recorded, then return a no-op leaderboard (email +
+    all writes suppressed). A MISMATCH raises PromotionStateDivergenceError —
+    someone/something changed the champion since the recorded run (or the
+    recorded promotion never landed), which needs eyes, not a silent
+    re-apply."""
+    expected = marker.get("champion_version_id_after")
+    current = _current_champion_version_id(s3, bucket)
+    if current != expected:
+        raise PromotionStateDivergenceError(
+            f"model_zoo config#2252: promotion marker for {date_str} records "
+            f"champion_version_id_after={expected!r} but the registry's current "
+            f"champion is {current!r} — state diverged since the recorded run; "
+            f"refusing to silently re-apply. Inspect "
+            f"s3://{bucket}/{_promotion_marker_key(date_str)} and the registry; "
+            f"delete the marker ONLY to deliberately re-run this rotation."
+        )
+    log.info(
+        "model_zoo config#2252: promotion already applied for %s — idempotent "
+        "no-op, suppressing email (marker verified: champion=%s, promoted=%s)",
+        date_str, current, marker.get("promoted"),
+    )
+    return {
+        "date": date_str,
+        "mode": marker.get("mode"),
+        "idempotent_noop": True,
+        "candidates": [],
+        "winner_version_id": marker.get("winner_version_id"),
+        "promoted": marker.get("promoted"),
+        "promoted_kind": marker.get("promoted_kind"),
+        "digest_email": "suppressed_idempotent_noop",
+        "promotion_marker_key": _promotion_marker_key(date_str),
+    }
+
+
 def _candidate_by_vid(leaderboard: dict, vid: str) -> dict:
     for c in leaderboard.get("candidates", []):
         if c.get("version_id") == vid:
@@ -1122,6 +1308,21 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
         if dsr is None:
             dsr = win.get("dsr_training")
         dsr_gate = win.get("dsr_gate_pass")
+        # config#2882 — a promotion whose winner trained on measurably-
+        # incomplete ArcticDB coverage must say so IN THE ALERT ITSELF: this
+        # is the completion-notification chokepoint the issue calls out as
+        # currently silent ("nothing in the promoted artifact, the SF
+        # execution, or the completion email indicates the winning model was
+        # trained on a crippled dataset").
+        coverage_line = ""
+        if win.get("data_coverage_degraded"):
+            coverage_line = (
+                f"  ⚠ DATA COVERAGE DEGRADED: this winner trained on ArcticDB "
+                f"coverage_ratio={win.get('arctic_coverage_ratio')} (below "
+                f"arctic_degraded_coverage_ratio) — its self-reported CPCV IC "
+                f"may be understated by a partially-starved universe. "
+                f"config#2882.\n"
+            )
         msg = (
             f"[predictor] Model-zoo AUTO-PROMOTED a new champion ({date_str}).\n"
             f"  {prior_vid or '?'}  →  {winner_vid}  (spec: {spec})\n"
@@ -1130,12 +1331,14 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
             f"  Promotion is on RELATIVE-BEST (beats champion + margin), NOT on DSR. "
             f"DSR={dsr} (absolute-gate pass={dsr_gate}) is observability only — "
             f"config#671/#673/#1052.\n"
+            f"{coverage_line}"
             f"  Inference serves the new champion from the next run; the #237 turnover "
             f"governor caps the first-day book move.\n"
             f"  REVERT (if it misbehaves): {revert}"
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_promote_{date_str}",
@@ -1203,14 +1406,51 @@ def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) ->
         cfg_path, exp_id,
     )
     try:
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_inert_{date_str}",
         )
     except Exception:  # noqa: BLE001 — alert failure must not fail the SF
         log.warning("model_zoo: inert-rotation alert failed", exc_info=True)
+
+
+def _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc) -> None:
+    """config#2870 (no-silent-fails): ``promote_to_champion`` raised — the
+    rotation ran and picked a winner/refresh, but the live champion did NOT
+    advance. Distinct from ``_alert_inert_rotation`` (nothing trained at all):
+    here the pool produced a promotable candidate and the PROMOTE step itself
+    failed. Prior to this alert the only trace was ``leaderboard["promote_error"]``
+    (persisted to S3, never surfaced to an operator) — a swallowed exception
+    here was the exact "ran but promoted nothing, with zero positive
+    confirmation" gap config#2870 named. WARN + SNS; never raises (observability
+    off a path whose failure is already recorded in the leaderboard)."""
+    msg = (
+        f"[predictor] Model-zoo PROMOTE FAILED ({date_str}) — the champion did "
+        f"NOT advance this rotation.\n"
+        f"  attempted: {promote_kind or '?'} {promote_vid}\n"
+        f"  error: {exc}\n"
+        f"  Live weights (predictor/weights/meta/meta_model.pkl) are UNCHANGED — "
+        f"Monday inference will serve last week's champion. This is retryable "
+        f"(config#2252: no promotion marker was written) but requires an "
+        f"operator to investigate + re-run the promote."
+    )
+    log.warning(
+        "model_zoo config#2870: PROMOTE FAILED for %s %s: %s",
+        promote_kind, promote_vid, exc, exc_info=True,
+    )
+    try:
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
+            message=msg, severity="critical",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_promote_failed_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: promote-failure alert failed", exc_info=True)
 
 
 def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> None:
@@ -1227,8 +1467,9 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
             f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
             f"`python -m model.registry --bucket {bucket} --promote {winner_vid}`."
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="info",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_observe_{date_str}",
@@ -1269,8 +1510,9 @@ def _alert_champion_chasing_noise(bucket, date_str, monitor) -> None:
             f"  Detail: predictor/model_zoo/observe_leaderboard/{date_str}.json "
             f"(kind=champion_realized_monitor)."
         )
-        from krepis import alerts as _alerts
-        _alerts.publish(
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
             message=msg, severity="warning",
             source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_champion_chasing_noise_{date_str}",
@@ -1463,18 +1705,31 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         gate = c.get("passes_gate")
         elig = c.get("eligible")
         reason = c.get("reason", "")
+        # config#2882 — a challenger that trained on degraded ArcticDB
+        # coverage must show it on its OWN digest row: this is the "nothing
+        # in the completion email indicates the winning model was trained on
+        # a crippled dataset" gap the issue calls out.
+        degraded = c.get("data_coverage_degraded")
+        cov_suffix = (
+            f"  [DEGRADED COVERAGE ratio={c.get('arctic_coverage_ratio')}]"
+            if degraded else ""
+        )
         cand_rows_plain.append(
             f"  {str(sid):<18} cpcv={cpcv}  fwd={fwd}  gate={gate}  "
-            f"eligible={elig}  ({reason})"
+            f"eligible={elig}  ({reason}){cov_suffix}"
         )
         row_color = "#2e7d32" if elig else "#888"
+        cov_html = (
+            f' <span style="color:#c62828;font-weight:bold;">DEGRADED COVERAGE '
+            f'(ratio={c.get("arctic_coverage_ratio")})</span>' if degraded else ""
+        )
         cand_rows_html.append(
             f'<tr><td style="padding:2px 8px;font-family:monospace;">{sid}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{cpcv}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{fwd}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;">{gate}</td>'
             f'<td style="padding:2px 8px;font-family:monospace;color:{row_color};">{elig}</td>'
-            f'<td style="padding:2px 8px;font-family:monospace;">{reason}</td></tr>'
+            f'<td style="padding:2px 8px;font-family:monospace;">{reason}{cov_html}</td></tr>'
         )
     if not challengers:
         cand_rows_plain.append("  (no challenger candidates this rotation)")
@@ -1623,6 +1878,15 @@ def run_rotation_and_select(
         except Exception:  # noqa: BLE001
             log.warning("model_zoo: no S3 client — selection limited", exc_info=True)
 
+    # config#2252 — exactly-once guard BEFORE burning a rotation's worth of spot
+    # training: a watch re-run of the weekly SF re-executes this entrypoint for
+    # the same run_date. Marker present + state verified → no-op (no retrain,
+    # no re-promote, no duplicate digest email); state mismatch → raise.
+    if not dry_run and s3 is not None and date_str:
+        _marker = _read_promotion_marker(s3, bucket, date_str)
+        if _marker is not None:
+            return _verify_promotion_marker_noop(s3, bucket, date_str, _marker)
+
     results = train_weekly_rotation(
         bucket, budget=budget, date_str=date_str, dry_run=dry_run,
         specs=specs, train_fn=train_fn, registered_versions=registered_versions, s3=s3,
@@ -1712,6 +1976,17 @@ def select_and_finalize(
         log.info("model_zoo select: dry_run/no-S3 — selection skipped")
         return leaderboard
 
+    # config#2252 — EXACTLY-ONCE-EFFECT guard (the single chokepoint BOTH the
+    # sequential run_rotation_and_select tail AND the parallel select entrypoint
+    # pass through). A marker for this run_date means a prior execution already
+    # finalized selection/promotion and sent the one digest email: verify the
+    # live champion still matches the marker, then no-op — suppressing the
+    # email and ALL writes. A mismatch raises (divergence needs eyes).
+    if date_str:
+        _marker = _read_promotion_marker(s3, bucket, date_str)
+        if _marker is not None:
+            return _verify_promotion_marker_noop(s3, bucket, date_str, _marker)
+
     # PARALLEL path: no in-process trained list → resolve the pool from the
     # registry (every active spec's newest challenger for this date; failed Map
     # iterations are absent, tolerated).
@@ -1765,6 +2040,7 @@ def select_and_finalize(
                 leaderboard["promoted"] = None
                 leaderboard["promote_error"] = str(exc)
                 log.warning("model_zoo CUTOVER: promote of %s FAILED: %s", promote_vid, exc, exc_info=True)
+                _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc)
         else:
             leaderboard["promoted"] = None
             if promote_vid:
@@ -1781,6 +2057,22 @@ def select_and_finalize(
                 )
 
         _write_leaderboard(s3, bucket, date_str, leaderboard)
+
+        # config#2252 — record this rotation's finalized outcome so any re-run
+        # for the same run_date is a verified no-op (no duplicate email).
+        # Written ONLY when the promote step did not fail: a failed promote
+        # (promote_error above) must stay retryable on a re-run, not be sealed
+        # as done. Marker-write failure RAISES (fail loud, no swallow): a
+        # promotion that can't record itself must not silently allow future
+        # duplicates — the raise fails this run visibly instead.
+        if date_str and "promote_error" not in leaderboard:
+            _write_promotion_marker(s3, bucket, date_str, leaderboard, _prior_champ_vid)
+        elif date_str:
+            log.warning(
+                "model_zoo config#2252: promote FAILED — NOT writing the "
+                "promotion marker for %s so a re-run can retry the promote",
+                date_str,
+            )
 
         # config#671/#673/#1052 — RELATIVE-BEST noise-chasing MONITOR (repurposed from
         # the retired Option-B observe-tier leaderboard). With the relative-best rule a
@@ -1877,7 +2169,10 @@ def run_select_only(
     # produced nothing. Fail loud (CW metric + SNS), distinct from "challengers
     # ran but lost". Skipped on a dry run. The base champion-arch (if present)
     # is itself a candidate, so the alert fires only on a TRULY inert select.
-    if not dry_run and s3 is not None:
+    # config#2252: also skipped on an idempotent no-op re-run — the empty
+    # candidates list there is the SUPPRESSION shape, not an inert rotation
+    # (the first run already emitted the real metric/alerts for this date).
+    if not dry_run and s3 is not None and not leaderboard.get("idempotent_noop"):
         _cands = leaderboard.get("candidates", []) or []
         _n_specs = sum(1 for s in (specs if specs is not None else getattr(cfg, "MODEL_SPECS", []))
                        if s.get("status", "active") == "active" and s.get("id"))

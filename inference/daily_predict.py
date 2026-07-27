@@ -302,8 +302,8 @@ if __name__ == "__main__":
 
         # Stub health write
         try:
-            import health_status
-            health_status.write_health = lambda *a, **k: None
+            import nousergon_lib.health as _health
+            _health.write_health = lambda *a, **k: None
         except Exception:
             pass
 
