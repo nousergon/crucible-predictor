@@ -1,0 +1,23 @@
+name: Gitleaks scan
+
+# Thin caller — all scan behavior lives in the reusable workflow. Edit it
+# there, not here: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Monday 06:00 UTC — 2h ahead of the config-I2528 fleet security-alert
+    # sweep (Mon 08:00 UTC) so a fresh finding registers as a code-scanning
+    # alert before the sweep enumerates alerts for the week.
+    - cron: "0 6 * * MON"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  gitleaks:
+    uses: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml@5568eca3ccc66f82d51c073f5dad1d5ebe7bd59c
+    secrets: inherit
