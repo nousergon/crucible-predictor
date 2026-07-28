@@ -261,10 +261,18 @@ def resolve_universe_from_membership(
 ) -> tuple[dict[str, str], dict]:
     """``({ticker: source}, membership_artifact)`` for ``date_str``.
 
-    Universe = the membership artifact's designated predictor cut (today the
-    scanner's ~60-name gate cut) ∪ currently-held names. ``buy_candidates`` are
-    unioned by the caller from signals, preserving the existing coverage-gap
-    contract with the Step Function.
+    Universe = the membership artifact's designated predictor cut ∪ currently-held
+    names. ``buy_candidates`` are unioned by the caller from signals, preserving
+    the existing coverage-gap contract with the Step Function.
+
+    The ``source`` value for a cut member is the CUT'S OWN NAME, not a fixed
+    literal. Which cut feeds inference is a producer-side decision expressed in
+    ``predictor_universe_cut`` (alpha-engine-config-I4818), so a hardcoded label
+    here goes stale the moment that field changes — as it did when the champion
+    moved to ``attractiveness_top_20`` (alpha-engine-config-I4983) and every
+    attractiveness-selected name was still annotated ``"scanner_candidate"`` in
+    ``predictions/{date}.json``. Naming the cut keeps the annotation true by
+    construction rather than by remembering to update it.
 
     Raises ``UniverseResolutionError`` when no membership artifact within
     ``MEMBERSHIP_MAX_AGE_DAYS`` resolves, or when the artifact names a cut it
@@ -288,7 +296,9 @@ def resolve_universe_from_membership(
             "unknown universe"
         )
 
-    sources = {t: "scanner_candidate" for t in tickers}
+    # ``cut_name`` is guaranteed a real string here: a missing/unknown name
+    # resolves to an empty cut, which the guard above already raised on.
+    sources = {t: cut_name for t in tickers}
     for t in _read_holdings(s3, bucket):
         sources[t] = "both" if t in sources else "held"
 
@@ -392,7 +402,8 @@ def load_watchlist(
     Returns
     -------
     tickers : Deduplicated, sorted list of tickers.
-    sources : Dict mapping ticker → "scanner_candidate" | "held" | "buy_candidate"
+    sources : Dict mapping ticker → <predictor_universe_cut name> | "held"
+              | "buy_candidate" | "both"
               | "both" (S3 path), or "population" | "tracked" (local-file path).
     data    : Raw JSON payload (signals) for the morning brief / macro context.
     """

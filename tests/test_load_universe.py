@@ -160,7 +160,10 @@ class TestLoadWatchlistAutoResolvesMembership:
                 "auto", s3_bucket="b", date_str="2026-07-27",
             )
         assert set(tickers) == {"AAPL", "MSFT", "NVDA"}
-        assert sources["AAPL"] == "scanner_candidate"
+        # The source label is the CUT'S NAME, not a fixed literal — a
+        # hardcoded label went stale the moment predictor_universe_cut
+        # moved to attractiveness_top_20 (alpha-engine-config-I4983).
+        assert sources["AAPL"] == "scanner_candidates"
 
     def test_population_latest_is_never_read(self):
         # The whole point of I4818: even when a (stale) population artifact is
@@ -343,3 +346,46 @@ class TestGetUniverseTickersFallback:
             tickers, data = get_universe_tickers("b", date_str="2026-05-11")
         assert tickers == _FALLBACK_TICKERS
         assert data == {}
+
+
+class TestSourceLabelTracksTheCut:
+    """alpha-engine-config-I4983 — the annotation must name the cut that
+    actually resolved.
+
+    Before this, `resolve_universe_from_membership` hardcoded
+    `"scanner_candidate"`. When the champion moved to `attractiveness_top_20`,
+    every attractiveness-selected name was still annotated as a scanner
+    candidate in `predictions/{date}.json` — an artifact stating something
+    false about its own provenance. Fails against the pre-fix implementation.
+    """
+
+    def test_label_is_the_resolved_cut_name(self):
+        membership = {
+            "run_date": "2026-07-27",
+            "predictor_universe_cut": "attractiveness_top_20",
+            "cuts": {
+                "attractiveness_top_20": {
+                    "basis": "attractiveness_rank",
+                    "size": 2,
+                    "tickers": ["AAPL", "MSFT"],
+                },
+                "scanner_candidates": {
+                    "basis": "scanner_gate",
+                    "size": 1,
+                    "tickers": ["ZZZZ"],
+                },
+            },
+        }
+        s3 = _mock_s3_with_keys({"universe_membership/latest.json": membership})
+        with patch("boto3.client", return_value=s3):
+            tickers, sources, _ = load_watchlist(
+                "auto", s3_bucket="b", date_str="2026-07-27",
+            )
+
+        assert set(tickers) == {"AAPL", "MSFT"}
+        assert sources["AAPL"] == "attractiveness_top_20"
+        assert sources["MSFT"] == "attractiveness_top_20"
+        assert "scanner_candidate" not in set(sources.values()), (
+            "the resolved cut was attractiveness_top_20, but a name is still "
+            "annotated as a scanner candidate"
+        )
