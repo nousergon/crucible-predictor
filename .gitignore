@@ -91,3 +91,8 @@ htmlcov/
 .gitleaks.toml
 
 .gitleaksbaseline.json
+
+# Agent instruction file — local-only, same rule as CLAUDE.md above.
+# Symlinked in from the private nous-ergon-ops/agent-instructions/; its very
+# path reveals private repo structure, so it must never be tracked here.
+AGENTS.md
