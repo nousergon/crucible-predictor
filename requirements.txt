@@ -44,7 +44,12 @@ setuptools>=83.0.0
 # `aws lambda invoke`. The invoke is now LOAD-BEARING, so krepis must be
 # importable in the deploy environment — this floor makes it a hard dep. Kept
 # in lockstep with requirements-lambda.txt.
-krepis[flow_doctor]>=0.7.0
+# Pinned explicitly (config-#4999): both requirements files must resolve to the
+# SAME krepis version, otherwise lambda-requirements-lockstep reds on unrelated
+# PRs when a floating floor (>=0.7.0) resolves differently across the two
+# diverging package sets. Dependabot covers both files (confirmed: PR 418
+# updated both in lockstep), so future bumps stay in sync automatically.
+krepis[flow_doctor]==0.21.0
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.5
 
 # Training dependencies (not needed in Lambda)
