@@ -1,0 +1,16 @@
+# Ownership of record for this repository.
+#
+# Required of EVERY repo, public and private, by repository-baseline-policy.md
+# §3.3. Measured 2026-07-30: 0 of 26 active repos had one — the only clause in
+# that policy at zero.
+#
+# This file gates nothing today: `require_code_owner_reviews` is off across the
+# fleet, so it adds no review requirement. That is the point. Its value is that
+# ownership is RECORDED before the day it is needed — a second contributor, an
+# agent asking who reviews a change, or an incident needing an owner. Each of
+# those is a day when writing it down is too late to help.
+#
+# A pattern matching nothing, or an owner who does not exist, is worse than an
+# absent file: it asserts an owner and delivers none.
+
+* @cipher813
