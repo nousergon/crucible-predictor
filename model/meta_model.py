@@ -73,7 +73,14 @@ META_FEATURES = [
     # substrate Lambda writes to substrate.json composite.intensity_z;
     # consistency by construction since both paths read the same
     # macro inputs through ``regime.composite``.
-    "regime_intensity_z",
+    # Rung 1 extraction features (alpha-engine-config#3080) — populated by the
+    # single-shot triggered extraction agent from SEC filings / transcripts.
+    # Observe-only in shadow (OBSERVE pre-registration ratified 2026-07-20);
+    # values default to 0.0 (neutral/absent) when the extraction pipeline has
+    # not yet emitted for a given ticker/date.
+    "guidance_direction",         # categorical: raised/lowered/maintained/none
+    "risk_factor_count_delta_raw",  # int delta vs prior comparable filing
+    "management_tone_zscore",     # float z-score of management tone [-3, 3]
 ]
 
 # The research-derived meta-features — populated from the weekly signals.json
