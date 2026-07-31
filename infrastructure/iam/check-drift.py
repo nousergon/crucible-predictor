@@ -24,13 +24,24 @@ Any drift exits non-zero. A genuine AWS CLI/auth failure exits 2 (distinct from
 "drift found" = 1), so an OIDC/permission problem is never silently read as
 "clean".
 
-Usage:
-  ./infrastructure/iam/check-drift.py            # check every codified role
-  ./infrastructure/iam/check-drift.py --role R   # check one role
+--pr-diff-aware mode (alpha-engine-config#3492): when this flag is set, the
+check reads `git diff --name-only origin/main...HEAD -- infrastructure/iam/` to
+identify which role policies THIS PR itself is changing. Drift on those policies
+is expected — the PR's new codified JSON deliberately differs from live AWS
+(because `apply.sh` hasn't run yet) and that is NOT a defect. The check reports
+it as "[EXPECTED]" and exits 0. Drift on policies the PR does NOT touch is still
+a hard failure — that IS an out-of-band live edit that the PR shouldn't silently
+absorb. This prevents the structural circularity where every IAM-change PR
+produces a red check indistinguishable from genuine operational drift, forcing a
+human `gate:decision` ruling for what is mechanically the exact purpose of the PR
+(config#3492).
 
-Requires AWS creds with iam:ListRolePolicies + iam:GetRolePolicy on the codified
-roles. Locally: any admin profile. In CI: the OIDC role
-github-actions-iam-drift-check (read-only, scoped to the codified roles only).
+Usage:
+  ./infrastructure/iam/check-drift.py                     # check every codified role
+  ./infrastructure/iam/check-drift.py --role R            # check one role
+  ./infrastructure/iam/check-drift.py --pr-diff-aware     # PR mode: soft-warn on
+                                                          #   expected drift, hard-fail
+                                                          #   on unexpected drift
 """
 
 from __future__ import annotations
@@ -42,6 +53,32 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
+REPO_ROOT = SCRIPT_DIR.parent.parent
+
+
+def _pr_changed_role_names() -> set[str]:
+    """Return the set of role names (stem of .json files) that this PR's diff
+    touches under infrastructure/iam/.  Falls back to an empty set if the git
+    command fails (no origin/main, shallow clone, etc.) — an empty set means
+    "treat every finding as real drift," which is the safe default."""
+    try:
+        result = subprocess.run(
+            [
+                "git", "diff", "--name-only",
+                "origin/main...HEAD", "--", "infrastructure/iam/",
+            ],
+            capture_output=True, text=True, check=False,
+            cwd=REPO_ROOT,
+        )
+        if result.returncode != 0:
+            return set()
+        return {
+            Path(line).stem
+            for line in result.stdout.strip().split("\n")
+            if line.endswith(".json")
+        }
+    except Exception:
+        return set()
 
 
 def derive_policy_name(role: str) -> str:
@@ -123,6 +160,17 @@ def main() -> int:
     parser.add_argument(
         "--role", help="Check one role (default: every codified role)"
     )
+    parser.add_argument(
+        "--pr-diff-aware",
+        action="store_true",
+        help=(
+            "PR mode: drift on roles this PR's diff touches is expected "
+            "(reported as [EXPECTED], exits 0); drift on untouched roles "
+            "is a hard failure (exits 1). Prevents the structural "
+            "circularity where IAM-change PRs produce red checks by "
+            "construction (config#3492)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.role:
@@ -138,15 +186,42 @@ def main() -> int:
               "nothing to check.")
         return 0
 
-    total_findings: list[str] = []
-    for role_file in role_files:
-        total_findings.extend(_check_role(role_file))
+    changed_roles: set[str] = _pr_changed_role_names() if args.pr_diff_aware else set()
 
-    if total_findings:
-        print(f"IAM drift detected ({len(total_findings)} finding(s)):")
-        for f in total_findings:
+    expected_findings: list[str] = []
+    unexpected_findings: list[str] = []
+    for role_file in role_files:
+        findings = _check_role(role_file)
+        if not findings:
+            continue
+        if role_file.stem in changed_roles:
+            expected_findings.extend(findings)
+        else:
+            unexpected_findings.extend(findings)
+
+    if expected_findings:
+        print(
+            f"IAM drift on PR-changed roles — EXPECTED "
+            f"({len(expected_findings)} finding(s)):"
+        )
+        for f in expected_findings:
+            print(f"  - [EXPECTED] {f}")
+
+    if unexpected_findings:
+        print(
+            f"IAM drift on UNTOUCHED roles — UNEXPECTED "
+            f"({len(unexpected_findings)} finding(s)):"
+        )
+        for f in unexpected_findings:
             print(f"  - {f}")
         return 1
+
+    if expected_findings:
+        print(
+            "All IAM drift is on PR-changed roles (expected — apply.sh will "
+            "reconcile post-merge). No unexpected out-of-band drift."
+        )
+        return 0
 
     role_names = ", ".join(f.stem for f in role_files)
     print(f"OK: no IAM drift for {role_names}")
