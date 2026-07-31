@@ -74,6 +74,14 @@ META_FEATURES = [
     # consistency by construction since both paths read the same
     # macro inputs through ``regime.composite``.
     "regime_intensity_z",
+    # Rung 1 (alpha-engine-config#3080): extraction-agent META_FEATURES from
+    # triggered-ticker filing/transcript analysis. Three typed fields emitted
+    # by the single-shot extraction agent in crucible-research. Feature
+    # accrual is shadow-only until the pre-registered promotion threshold
+    # clears. Zeroed at inference via RESEARCH_META_FEATURES when absent.
+    "guidance_direction",
+    "risk_factor_count_delta_raw",
+    "management_tone_zscore",
 ]
 
 # The research-derived meta-features — populated from the weekly signals.json
@@ -89,6 +97,13 @@ RESEARCH_META_FEATURES = [
     "research_composite_score",
     "research_conviction",
     "sector_macro_modifier",
+    # Rung 1 (alpha-engine-config#3080): extraction-agent META_FEATURES from
+    # triggered-ticker filing/transcript analysis. Populated asynchronously
+    # by the weekly SF's extraction-agent state; zeroed when absent (the
+    # fail-soft contract — an extraction failure never blocks live signals).
+    "guidance_direction",
+    "risk_factor_count_delta_raw",
+    "management_tone_zscore",
 ]
 
 # Directional meta-features eligible for the L4565 standardize+winsorize
