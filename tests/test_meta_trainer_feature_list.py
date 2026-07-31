@@ -137,11 +137,11 @@ class TestFeatureListSchemaShape:
     def test_l2_features_match_meta_features(self):
         out = self._build()
         assert out["l2_features"] == list(META_FEATURES)
-        # Canonical META_FEATURES has 13 entries today (6 stack-output
+        # Canonical META_FEATURES has 16 entries today (6 stack-output
         # features + 6 raw macros + 1 regime-derived intensity_z added
-        # in regime-v3 Stage D, 2026-05-14). Pin to catch silent
-        # extensions.
-        assert len(out["l2_features"]) == 13
+        # in regime-v3 Stage D, 2026-05-14 + 3 Rung-1 extraction features
+        # added in config#3080). Pin to catch silent extensions.
+        assert len(out["l2_features"]) == 16
 
     def test_momentum_features_match_deterministic_formula(self):
         # Mirrors ``model.momentum_scorer.predict_array``'s consumed
