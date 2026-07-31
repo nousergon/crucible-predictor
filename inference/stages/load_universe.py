@@ -11,6 +11,7 @@ from typing import Optional
 
 import config as cfg
 from inference.pipeline import PipelineContext
+from nousergon_lib.signals import fallback_research_date_keys, try_read_s3_json
 
 log = logging.getLogger(__name__)
 
@@ -24,44 +25,11 @@ _FALLBACK_TICKERS = [
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _signals_fallback_keys(date_str: str) -> list[str]:
-    """Return S3 keys to try in priority order:
-    today's signals → prior 5 weekdays' signals → signals/latest.json.
-
-    Mirrors `compute_coverage_delta`'s lookup chain so the predictor's
-    weekday paths and the executor's coverage gate agree on which
-    research snapshot is current.
-    """
-    from datetime import date as _date, timedelta as _td
-
-    keys: list[str] = []
-    try:
-        start = _date.fromisoformat(date_str)
-        for days_back in range(6):
-            candidate = start - _td(days=days_back)
-            if candidate.weekday() >= 5:
-                continue
-            keys.append(f"signals/{candidate}/signals.json")
-    except Exception:
-        pass
-    keys.append("signals/latest.json")
-    return keys
-
-
-def _read_s3_signals_payload(s3, bucket: str, key: str) -> dict | None:
-    """Read a single S3 signals key. Return None on miss/permission/parse
-    error so callers can walk to the next key in the fallback chain."""
-    from botocore.exceptions import ClientError
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        return json.loads(obj["Body"].read().decode("utf-8"))
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "AccessDenied", "403", "404"):
-            return None
-        raise
-    except Exception:
-        return None
+_CANONICAL_SIGNALS_MACRO_FIELDS = (
+    "market_regime",
+    "sector_modifiers",
+    "sector_ratings",
+)
 
 
 def _load_signals_payload_with_fallback(
@@ -71,34 +39,41 @@ def _load_signals_payload_with_fallback(
     chain. Empty dict if nothing resolves — callers must tolerate.
 
     Brief regime defect (2026-05-11): population/latest.json carries a
-    `market_regime` value that drifts from `signals/latest.json` (two
+    ``market_regime`` value that drifts from ``signals/latest.json`` (two
     research producers, no shared source of truth — population's writer
     today serves the pre-critic regime; signals.json carries the post-
     critic value). Without falling back to signals.json on weekday runs
     when today's daily snapshot doesn't exist yet, the predictor's
     morning brief displays the pre-critic regime, and downstream
     consumers (regime-conditional veto thresholds, sector_modifiers
-    used for sector-by-sector boost) see drift. This helper exists so
-    every load path in the file shares one fallback chain.
+    used for sector-by-sector boost) see drift.
+
+    Uses the shared :func:`nousergon_lib.signals.fallback_research_date_keys`
+    and :func:`load_json_with_fallback` (consolidated from the 3x-duplicated
+    local implementations in alpha-engine-config#3284).
     """
-    for key in _signals_fallback_keys(date_str):
-        payload = _read_s3_signals_payload(s3, bucket, key)
-        if payload:
-            return payload
-    return {}
+    from nousergon_lib.signals import load_json_with_fallback
+
+    payload = load_json_with_fallback(
+        s3, bucket, fallback_research_date_keys(date_str)
+    )
+    return payload if payload is not None else {}
 
 
 def _read_buy_candidates_from_signals(
     s3, bucket: str, date_str: str
 ) -> list[str]:
-    """Read research's `buy_candidates` ticker list from signals.
+    """Read research's ``buy_candidates`` ticker list from signals.
 
-    Walks the same fallback chain `compute_coverage_delta` uses so weekday
-    runs see Saturday's signals. Returns an empty list on any failure or
-    empty payload — the caller treats that as "no candidates to union".
+    Walks the same fallback chain the coverage gate uses so weekday runs
+    see Saturday's signals. Returns an empty list on any failure or empty
+    payload — the caller treats that as "no candidates to union".
+
+    Uses the shared :func:`nousergon_lib.signals.fallback_research_date_keys`
+    and :func:`try_read_s3_json` (alpha-engine-config#3284).
     """
-    for key in _signals_fallback_keys(date_str):
-        payload = _read_s3_signals_payload(s3, bucket, key)
+    for key in fallback_research_date_keys(date_str):
+        payload = try_read_s3_json(s3, bucket, key)
         if payload is None:
             continue
         candidates = payload.get("buy_candidates") or []
@@ -115,208 +90,28 @@ def _read_buy_candidates_from_signals(
     return []
 
 
-# ── Universe membership resolution (alpha-engine-config-I4818) ───────────────
-#
-# The daily scoring universe resolves from the versioned membership artifact
-# crucible-research's Scanner publishes each weekly cycle
-# (``universe_membership/{date}/membership.json``), NOT from
-# ``population/latest.json``.
-#
-# History that produced this contract: the population artifact's sole producer
-# (the multi-agent research graph's ``archive_writer``) was retired with the
-# research state, and nothing repointed this consumer. ``load_watchlist`` kept
-# reading ``population/latest.json`` successfully — the read never failed, the
-# file simply stopped changing — so the predictor scored a FROZEN 2026-07-10
-# list of 25 names for three weekly cycles while every daily run looked green.
-# The lesson encoded below: a universe read must fail on STALENESS, not just on
-# absence. An artifact that resolves fine but describes a dead cycle is the
-# failure mode, and it is invisible to any liveness check that only asks
-# "did the read succeed?".
+def _merge_canonical_macro_into(
+    data: dict, signals_payload: dict
+) -> dict:
+    """Overlay canonical macro fields (market_regime, sector_modifiers,
+    sector_ratings) from signals.json onto a payload that lacks them or
+    holds drift. Returns ``data`` mutated in place for caller chaining.
 
-# Maximum age of the membership artifact before the predictor refuses to run.
-# The producer's cadence is weekly (Saturday), so a healthy Friday read is at
-# most 6 days old; 10 gives one weekend of slack for a delayed weekly SF while
-# still catching a genuinely dead producer inside one cycle.
-MEMBERSHIP_MAX_AGE_DAYS = 10
+    Canonical source: research's macro_agent writes the post-critic
+    regime to signals.json on Saturday runs. population/latest.json is
+    written by a separate producer that today does not propagate the
+    critic-revised regime nor sector_modifiers, so weekday morning
+    briefs render whichever value population happens to carry.
 
-_MEMBERSHIP_LATEST_KEY = "universe_membership/latest.json"
-
-
-def _membership_dated_key(date_str: str) -> str:
-    return f"universe_membership/{date_str}/membership.json"
-
-
-class UniverseResolutionError(RuntimeError):
-    """Raised when no sufficiently fresh universe membership can be resolved.
-
-    Deliberately fatal. Scoring an unknown or stale universe silently produces
-    a normal-looking predictions file for the wrong names, which the executor
-    then trades on — strictly worse than a red run (feedback_no_silent_fails).
+    Overlay semantics: signals fields with a non-None value win. A
+    None / missing key in signals leaves whatever was on the population
+    payload intact — never blank out a real value with absence.
     """
-
-
-def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
-    """Resolve the freshest membership artifact, or None.
-
-    Chain: ``latest.json`` first (the producer's own pointer), then dated keys
-    walked backwards up to ``MEMBERSHIP_MAX_AGE_DAYS``. The dated walk is not
-    redundant belt-and-braces — it makes resolution independent of a single
-    mutable pointer, so a pointer that fails to update (or has not been written
-    yet, as during the artifact's own rollout) degrades to "slightly older
-    membership" rather than to a hard outage.
-
-    Staleness is judged on the artifact's own ``run_date``, never on S3
-    LastModified: a re-upload of an old cycle must not read as fresh.
-    """
-    from datetime import date as _date, timedelta as _td
-
-    candidates: list[dict] = []
-    latest = _read_s3_signals_payload(s3, bucket, _MEMBERSHIP_LATEST_KEY)
-    if latest:
-        candidates.append(latest)
-
-    try:
-        start = _date.fromisoformat(date_str)
-    except Exception:
-        start = None
-    if start is not None:
-        for days_back in range(MEMBERSHIP_MAX_AGE_DAYS + 1):
-            probe = start - _td(days=days_back)
-            payload = _read_s3_signals_payload(
-                s3, bucket, _membership_dated_key(str(probe))
-            )
-            if payload:
-                candidates.append(payload)
-                break
-
-    fresh: dict | None = None
-    for payload in candidates:
-        run_date = payload.get("run_date")
-        if not run_date:
-            continue
-        try:
-            age = (_date.fromisoformat(date_str) - _date.fromisoformat(run_date)).days
-        except Exception:
-            continue
-        if age > MEMBERSHIP_MAX_AGE_DAYS:
-            log.warning(
-                "Universe membership %s is %d days old (limit %d) — rejecting",
-                run_date, age, MEMBERSHIP_MAX_AGE_DAYS,
-            )
-            continue
-        if fresh is None or run_date > fresh.get("run_date", ""):
-            fresh = payload
-    return fresh
-
-
-def _read_holdings(s3, bucket: str) -> set[str]:
-    """Currently-held tickers from the executor's published EOD surface
-    (``trades/eod_pnl.csv``, last row's ``positions_snapshot``).
-
-    Unioned into the scoring universe so a held name is never scored blind: the
-    scanner cut is forward-looking (what to buy) and can legitimately drop a
-    name the book still holds, but the executor needs a prediction to decide
-    whether to keep holding it.
-
-    Fail-soft by design — the holdings union WIDENS the universe, so an
-    unreadable book yields a narrower-but-valid run rather than no run. The
-    narrowing is logged, and the cut itself (the load-bearing part) still comes
-    from the membership artifact, which is NOT fail-soft.
-    """
-    import csv
-    import io as _io
-
-    try:
-        obj = s3.get_object(Bucket=bucket, Key="trades/eod_pnl.csv")
-        rows = list(csv.DictReader(_io.StringIO(obj["Body"].read().decode("utf-8"))))
-    except Exception as exc:  # noqa: BLE001 — see docstring; widening input only
-        log.warning(
-            "Holdings union: trades/eod_pnl.csv unreadable (%s) — universe will "
-            "not include held names not already in the scanner cut", exc,
-        )
-        return set()
-    if not rows:
-        return set()
-    snapshot_raw = rows[-1].get("positions_snapshot")
-    if not snapshot_raw:
-        return set()
-    try:
-        snapshot = json.loads(snapshot_raw)
-    except Exception as exc:  # noqa: BLE001 — see docstring
-        log.warning("Holdings union: positions_snapshot unparseable (%s)", exc)
-        return set()
-    if isinstance(snapshot, dict):
-        return {str(t).upper() for t in snapshot}
-    if isinstance(snapshot, list):
-        return {
-            str(p.get("ticker") or p.get("symbol") or "").upper()
-            for p in snapshot
-            if isinstance(p, dict)
-        } - {""}
-    return set()
-
-
-def resolve_universe_from_membership(
-    s3, bucket: str, date_str: str
-) -> tuple[dict[str, str], dict]:
-    """``({ticker: source}, membership_artifact)`` for ``date_str``.
-
-    Universe = the membership artifact's designated predictor cut ∪ currently-held
-    names. ``buy_candidates`` are unioned by the caller from signals, preserving
-    the existing coverage-gap contract with the Step Function.
-
-    The ``source`` value for a cut member is the CUT'S OWN NAME, not a fixed
-    literal. Which cut feeds inference is a producer-side decision expressed in
-    ``predictor_universe_cut`` (alpha-engine-config-I4818), so a hardcoded label
-    here goes stale the moment that field changes — as it did when the champion
-    moved to ``attractiveness_top_20`` (alpha-engine-config-I4983) and every
-    attractiveness-selected name was still annotated ``"scanner_candidate"`` in
-    ``predictions/{date}.json``. Naming the cut keeps the annotation true by
-    construction rather than by remembering to update it.
-
-    Raises ``UniverseResolutionError`` when no membership artifact within
-    ``MEMBERSHIP_MAX_AGE_DAYS`` resolves, or when the artifact names a cut it
-    does not contain.
-    """
-    membership = _read_membership(s3, bucket, date_str)
-    if not membership:
-        raise UniverseResolutionError(
-            f"no universe membership artifact within {MEMBERSHIP_MAX_AGE_DAYS} "
-            f"days of {date_str} (looked at {_MEMBERSHIP_LATEST_KEY} and dated "
-            "keys). The weekly Scanner publishes it — check the weekly SF."
-        )
-
-    cut_name = membership.get("predictor_universe_cut")
-    cut = (membership.get("cuts") or {}).get(cut_name) or {}
-    tickers = [str(t).upper() for t in (cut.get("tickers") or [])]
-    if not tickers:
-        raise UniverseResolutionError(
-            f"universe membership {membership.get('run_date')} names cut "
-            f"{cut_name!r} but it is empty or absent — refusing to score an "
-            "unknown universe"
-        )
-
-    # ``cut_name`` is guaranteed a real string here: a missing/unknown name
-    # resolves to an empty cut, which the guard above already raised on.
-    sources = {t: cut_name for t in tickers}
-    for t in _read_holdings(s3, bucket):
-        sources[t] = "both" if t in sources else "held"
-
-    log.info(
-        "Universe: %d tickers from membership %s (cut=%s: %d, held: %d)",
-        len(sources), membership.get("run_date"), cut_name, len(tickers),
-        sum(1 for v in sources.values() if v in ("held", "both")),
-    )
-    return sources, membership
-
-
-# ``_merge_canonical_macro_into`` was REMOVED with I4818. It existed to reconcile
-# two producers of the same macro fields — population/latest.json (pre-critic
-# regime) and signals.json (post-critic) — after the 2026-05-11 "Market Regime:
-# NEUTRAL" brief defect. With population/ no longer read, signals.json is the
-# sole source of macro context and there is nothing left to overlay. Deleting it
-# rather than leaving it unused is deliberate: a dormant merge helper invites a
-# future caller to reintroduce exactly the multi-writer drift it was patching.
+    for field in _CANONICAL_SIGNALS_MACRO_FIELDS:
+        value = signals_payload.get(field)
+        if value is not None:
+            data[field] = value
+    return data
 
 
 # ── Universe functions (migrated from daily_predict.py) ──────────────────────
@@ -378,22 +173,13 @@ def load_watchlist(
     """
     Build a focused prediction universe from Research's population or signals.
 
-    Resolution for ``path="auto"`` (alpha-engine-config-I4818):
-      1. universe_membership/{latest|date}/membership.json — the versioned cut
-         contract published by the weekly Scanner. Its designated predictor cut
-         ∪ held positions ∪ signals.buy_candidates IS the universe. Fails LOUD
-         (``UniverseResolutionError``) when absent or staler than
-         ``MEMBERSHIP_MAX_AGE_DAYS`` — see the module-level contract note.
-      2. signals/{date}/signals.json — read for macro context (regime, sector
-         modifiers) and buy_candidates only; NOT as a universe fallback.
-
-    ``population/latest.json`` is no longer read. Its producer was retired with
-    the multi-agent research graph, and reading it kept the predictor pinned to
-    a frozen 2026-07-10 universe for three weekly cycles.
+    Priority order for ``path="auto"``:
+      1. population/latest.json  — new population-based architecture
+      2. signals/{date}/signals.json  — legacy fallback
 
     Parameters
     ----------
-    path      : "auto" → resolve from S3 (membership + signals).
+    path      : "auto" → fetch from S3 (population first, then signals).
                 Any other string → local file path to signals.json or
                 population.json for offline / dry-run use.
     s3_bucket : S3 bucket name. Required when path="auto".
@@ -402,10 +188,8 @@ def load_watchlist(
     Returns
     -------
     tickers : Deduplicated, sorted list of tickers.
-    sources : Dict mapping ticker → <predictor_universe_cut name> | "held"
-              | "buy_candidate" | "both"
-              | "both" (S3 path), or "population" | "tracked" (local-file path).
-    data    : Raw JSON payload (signals) for the morning brief / macro context.
+    sources : Dict mapping ticker → "population" | "tracked" | "buy_candidate" | "both".
+    data    : Raw JSON payload (population or signals).
     """
     if date_str is None:
         date_str = datetime.now().strftime("%Y-%m-%d")
@@ -420,61 +204,114 @@ def load_watchlist(
         import boto3
         s3 = boto3.client("s3")
 
-        # Universe = membership artifact's predictor cut ∪ held ∪ buy_candidates.
-        # UniverseResolutionError propagates deliberately: no fallback universe
-        # exists that is better than failing (see the contract note above).
-        sources, membership = resolve_universe_from_membership(s3, s3_bucket, date_str)
+        # Try population/latest.json first (new architecture)
+        try:
+            obj = s3.get_object(Bucket=s3_bucket, Key="population/latest.json")
+            data = json.loads(obj["Body"].read().decode("utf-8"))
+            pop_tickers = [p["ticker"] for p in data.get("population", []) if "ticker" in p]
+            if pop_tickers:
+                sources = {t.upper(): "population" for t in pop_tickers}
+                # Union research's signals.buy_candidates so the main pass
+                # scores them inline. Without this, any buy_candidate not in
+                # the predictor's population required a second supplemental
+                # Lambda invocation via the Step Function's coverage-gap
+                # Choice state — fragile for manual recovery (the operator
+                # must remember the second call) and adds latency to the
+                # weekday SF (~+30s per cold-start). The supplemental path
+                # remains in place as a safety net for races (signals
+                # updated between this read and check_coverage), but on the
+                # happy path it now sees `has_gap=False` and never fires.
+                # See 2026-04-27 incident — manual recovery was blocked by
+                # the executor's coverage-gap gate after the SF aborted on
+                # the MorningEnrich SSM TimedOut, requiring a second hand-
+                # crafted Lambda invoke for the 6 missing buy_candidates.
+                buy_tickers = _read_buy_candidates_from_signals(
+                    s3, s3_bucket, date_str
+                )
+                if buy_tickers:
+                    new_tickers = []
+                    for t in buy_tickers:
+                        u = t.upper()
+                        if u in sources:
+                            sources[u] = "both"
+                        else:
+                            sources[u] = "buy_candidate"
+                            new_tickers.append(u)
+                    log.info(
+                        "Watchlist: unioned %d buy_candidates from signals "
+                        "(%d new beyond population)",
+                        len(buy_tickers), len(new_tickers),
+                    )
+                # Overlay canonical macro fields from signals.json so the
+                # morning brief / veto-threshold logic see the post-critic
+                # regime that research's macro_agent wrote, not whatever
+                # population/latest.json's writer happened to ship. See
+                # _merge_canonical_macro_into for the multi-writer history.
+                signals_payload = _load_signals_payload_with_fallback(
+                    s3, s3_bucket, date_str
+                )
+                if signals_payload:
+                    pre = data.get("market_regime")
+                    _merge_canonical_macro_into(data, signals_payload)
+                    post = data.get("market_regime")
+                    if pre != post:
+                        log.info(
+                            "Watchlist: overlaid market_regime from signals "
+                            "(population had %r → signals has %r)", pre, post,
+                        )
+                tickers = sorted(sources.keys())
+                log.info(
+                    "Watchlist: loaded %d tickers from population/latest.json"
+                    " (+ buy_candidates union)",
+                    len(tickers),
+                )
+                return tickers, sources, data
+        except Exception as exc:
+            log.info("population/latest.json not available (%s), falling back to signals.json", exc)
 
-        # Union research's signals.buy_candidates so the main pass scores them
-        # inline. Without this, any buy_candidate outside the predictor's
-        # universe required a second supplemental Lambda invocation via the
-        # Step Function's coverage-gap Choice state — fragile for manual
-        # recovery (the operator must remember the second call) and adds
-        # latency to the weekday SF (~+30s per cold-start). The supplemental
-        # path remains in place as a safety net for races (signals updated
-        # between this read and check_coverage), but on the happy path it now
-        # sees `has_gap=False` and never fires. See 2026-04-27 incident —
-        # manual recovery was blocked by the executor's coverage-gap gate
-        # after the SF aborted on the MorningEnrich SSM TimedOut, requiring a
-        # second hand-crafted Lambda invoke for the 6 missing buy_candidates.
-        buy_tickers = _read_buy_candidates_from_signals(s3, s3_bucket, date_str)
-        if buy_tickers:
-            new_tickers = []
-            for t in buy_tickers:
-                u = t.upper()
-                if u in sources:
-                    sources[u] = "both"
+        # Fallback: signals/{date}/signals.json with date lookback
+        # Walk back up to 5 calendar days (skipping weekends) to find the
+        # most recent signals — mirrors executor's read_signals_with_fallback.
+        from datetime import date as _date, timedelta as _td
+        from botocore.exceptions import ClientError
+
+        start = _date.fromisoformat(date_str)
+        max_lookback = 5
+        tried: list[str] = []
+
+        for days_back in range(max_lookback + 1):
+            candidate = start - _td(days=days_back)
+            if candidate.weekday() >= 5:  # skip Saturday/Sunday
+                continue
+            signals_key = f"signals/{candidate}/signals.json"
+            try:
+                obj = s3.get_object(Bucket=s3_bucket, Key=signals_key)
+                data = json.loads(obj["Body"].read().decode("utf-8"))
+                if days_back > 0:
+                    log.warning(
+                        "Watchlist: no signals for %s — using %s (%d day(s) old). Tried: %s",
+                        start, candidate, days_back, tried,
+                    )
                 else:
-                    sources[u] = "buy_candidate"
-                    new_tickers.append(u)
-            log.info(
-                "Watchlist: unioned %d buy_candidates from signals "
-                "(%d new beyond the membership cut)",
-                len(buy_tickers), len(new_tickers),
+                    log.info("Watchlist: loaded signals from s3://%s/%s", s3_bucket, signals_key)
+                break
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("NoSuchKey", "AccessDenied", "403"):
+                    log.info("No signals for %s (%s), looking further back...", candidate, code)
+                    tried.append(str(candidate))
+                    continue
+                raise
+            except Exception as exc:
+                log.info("Error reading signals for %s: %s", candidate, exc)
+                tried.append(str(candidate))
+                continue
+        else:
+            raise RuntimeError(
+                f"No signals found within {max_lookback} days of {start}. "
+                f"Dates tried: {tried}. Ensure research pipeline ran recently, "
+                "or provide a local path: --watchlist /path/to/signals.json"
             )
-
-        # signals.json supplies the macro context the morning brief and the
-        # regime-conditional veto threshold read (market_regime,
-        # sector_ratings, sector_modifiers). The membership artifact carries
-        # membership only — deliberately, so the two producers cannot drift on
-        # a shared field (see the 2026-05-11 multi-writer note below).
-        data = _load_signals_payload_with_fallback(s3, s3_bucket, date_str) or {}
-        if not data:
-            log.warning(
-                "Watchlist: no signals payload resolved for %s — universe is "
-                "intact (membership-sourced) but the morning brief will omit "
-                "macro context", date_str,
-            )
-        data["universe_membership_run_date"] = membership.get("run_date")
-
-        tickers = sorted(sources.keys())
-        log.info(
-            "Watchlist: %d tickers from universe membership %s "
-            "(+ holdings + buy_candidates union)",
-            len(tickers), membership.get("run_date"),
-        )
-        return tickers, sources, data
-
     else:
         local_path = Path(path)
         if not local_path.exists():
@@ -534,17 +371,16 @@ def run(ctx: PipelineContext) -> None:
         # same fallback chain `compute_coverage_delta` uses so the brief
         # renders on weekday re-invokes.
         from inference.coverage_check import _read_s3_json
-        # population/latest.json dropped from this chain with I4818 — its
-        # producer is retired, so it can only ever contribute a stale regime.
         ctx.signals_data = (
-            _read_s3_json(ctx.bucket, f"signals/{ctx.date_str}/signals.json")
+            _read_s3_json(ctx.bucket, "population/latest.json")
+            or _read_s3_json(ctx.bucket, f"signals/{ctx.date_str}/signals.json")
             or _read_s3_json(ctx.bucket, "signals/latest.json")
             or {}
         )
         if not ctx.signals_data:
             log.warning(
-                "Supplemental mode: no signals payload found (signals/%s, "
-                "signals/latest both empty) — email will omit the "
+                "Supplemental mode: no signals payload found (population/latest, "
+                "signals/%s, signals/latest all empty) — email will omit the "
                 "Research Brief", ctx.date_str,
             )
         # Annotate sources from signals_data when possible
