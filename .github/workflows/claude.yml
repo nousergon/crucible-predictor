@@ -36,5 +36,5 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
-    uses: nousergon/crucible-dashboard/.github/workflows/claude-assistant.yml@main
+    uses: nousergon/crucible-dashboard/.github/workflows/claude-assistant.yml@0ed63e95f8ca28c74bcfd1e92c221cb49d8efaf3
     secrets: inherit
