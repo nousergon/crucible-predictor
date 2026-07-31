@@ -1,0 +1,41 @@
+name: IAM Drift Post-Merge Apply
+
+# Reconciles codified IAM against live AWS AFTER an IAM PR merges
+# (config#3495). The PR-triggered drift check is structurally guaranteed
+# red pre-merge — the codified state is ahead of live AWS and apply.sh
+# hasn't run yet. This workflow runs once the PR merges: apply drifted
+# roles via apply.sh, re-check, fail only on residual (real, unexpected)
+# drift.
+#
+# Calls the nousergon-lib reusable workflow (iam-drift-post-merge.yml),
+# the same fleet primitive crucible-executor uses.  The reusable workflow
+# checks out the merge commit (never the PR head) so fork PRs cannot
+# smuggle a modified check-drift.py into this run.
+#
+# This repo has one IAM role (alpha-engine-predictor-role), a flat-file
+# convention (one .json per role with a single inline policy), and its
+# own check-drift.py with --post-merge mode (mirrors crucible-executor's
+# config#3495 reference pattern, config#3495 sub-issue #3696).
+
+on:
+  pull_request_target:
+    types: [closed]
+    paths:
+      - 'infrastructure/iam/**'
+      - '.github/workflows/iam-drift-post-merge.yml'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  post-merge-apply:
+    if: github.event.pull_request.merged == true
+    uses: nousergon/nousergon-lib/.github/workflows/iam-drift-post-merge.yml@main
+    with:
+      # WRITE-scoped OIDC role for crucible-predictor's IAM auto-apply.
+      # gated until this role exists in AWS (config#3495 sub-issue #3696,
+      # deliverable 4 — may be superseded by config-I4924's single
+      # generalised apply identity for the whole IAM tree).
+      oidc-role-arn: arn:aws:iam::711398986525:role/github-actions-iam-drift-apply
+      check-script-path: infrastructure/iam/check-drift.py
