@@ -5,11 +5,15 @@ name: IAM Drift Check
 # from crucible-executor extended to the predictor role (alpha-engine-config#2340).
 #
 # Triggers:
-#   - Every PR that touches infrastructure/iam/** (catches a codified change
-#     that forgot to apply, or an apply that forgot to commit, before merge)
+#   - Every PR that touches infrastructure/iam/** — in --pr-diff-aware mode:
+#     drift on roles the PR itself is changing is EXPECTED (the codified JSON
+#     deliberately differs from live AWS until apply.sh runs post-merge;
+#     alpha-engine-config#3492); drift on roles the PR does NOT touch is a hard
+#     failure (out-of-band live edit).
 #   - Daily at 09:35 UTC (catches out-of-band manual IAM edits; offset from the
-#     executor repo's 09:30 run to avoid a concurrent OIDC assume pile-up)
-#   - Manual via workflow_dispatch
+#     executor repo's 09:30 run to avoid a concurrent OIDC assume pile-up) —
+#     full hard-fail mode.
+#   - Manual via workflow_dispatch — full hard-fail mode.
 #
 # AWS auth: OIDC -> github-actions-iam-drift-check role (read-only:
 # iam:ListRolePolicies + iam:GetRolePolicy, scoped to the codified roles only;
@@ -33,6 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0  # needed for git diff origin/main...HEAD in --pr-diff-aware mode
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
@@ -41,4 +47,11 @@ jobs:
           aws-region: us-east-1
 
       - name: Run IAM drift check (codified vs live AWS)
-        run: python3 infrastructure/iam/check-drift.py
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          if [ "$IS_PR" = "true" ]; then
+            python3 infrastructure/iam/check-drift.py --pr-diff-aware
+          else
+            python3 infrastructure/iam/check-drift.py
+          fi
