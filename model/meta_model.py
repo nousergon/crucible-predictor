@@ -106,6 +106,28 @@ RESEARCH_META_FEATURES = [
     "management_tone_zscore",
 ]
 
+# The value a RESEARCH_META_FEATURE takes when its producer has not emitted it.
+# Single source for the fail-soft contract, so training and inference cannot
+# drift: inference zeroes these via RESEARCH_META_FEATURES
+# (``inference/research_free_inference.py``), the research-free training branch
+# already builds ``{f: 0.0 for f in RESEARCH_META_FEATURES}``
+# (``training/meta_trainer.py``), and the meta_X_all row build reads this.
+#
+# It applies ONLY to this list. A core meta-feature (momentum_score,
+# expected_move, regime_intensity_z, …) missing from a row is a contract
+# breach and must still raise — see alpha-engine-config-I5949, where a blanket
+# default would have converted exactly that class into a champion silently
+# trained on zeros.
+#
+# NOTE (alpha-engine-config-I5818): ``guidance_direction`` is CATEGORICAL and
+# its declared absent-value neutral is the string ``"none"``. 0.0 is the
+# correct value while the producer is absent — it is what inference feeds, so
+# train and serve agree — but there is no numeric encoding for the categorical
+# yet. When the crucible-research Rung-1 producer lands it must emit a numeric
+# encoding, or this column enters a float matrix as a string and breaks the
+# build. Do not treat 0.0 as that encoding.
+RESEARCH_META_NEUTRAL = 0.0
+
 # Directional meta-features eligible for the L4565 standardize+winsorize
 # transform (the SOTA signal-level combine). These are the TICKER-VARYING
 # directional signals: standardizing them puts every signal on a comparable
