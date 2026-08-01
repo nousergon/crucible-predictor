@@ -15,4 +15,4 @@ permissions:
 
 jobs:
   claude-md-untracked:
-    uses: nousergon/nousergon-lib/.github/workflows/claude-md-guard.yml@main
+    uses: nousergon/nousergon-lib/.github/workflows/claude-md-guard.yml@62597e550c08c0b7a7fe0af490cb141e344061b3
