@@ -2170,7 +2170,13 @@ def run_meta_training(
         len(oos_meta_rows), _resid_mom_enabled, _momentum_l1_in_meta,
         _expected_move_in_meta, _research_features_in_meta, _meta_standardize,
     )
-    meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
+    # r.get(f, 0.0) — not r[f] — because RESEARCH_META_FEATURES (guidance_direction,
+    # risk_factor_count_delta_raw, management_tone_zscore) are populated by the
+    # crucible-research Rung-1 extraction agent, which may not have deployed yet
+    # when the meta-feature registration lands in predictor.  The fail-soft contract
+    # (zero when absent) is documented in META_FEATURES / RESEARCH_META_FEATURES;
+    # a KeyError on a direct r[f] index violates that contract and crashes training.
+    meta_X_all = np.array([[r.get(f, 0.0) for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
