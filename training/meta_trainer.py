@@ -868,6 +868,67 @@ def _build_signals_lookup_by_test_date(
     return lookup
 
 
+def build_meta_matrix(oos_meta_rows, train_meta_features):
+    """Build the meta-model design matrix, fail-soft ONLY where a contract says so.
+
+    Fail-soft applies to ``RESEARCH_META_FEATURES`` and nothing else. That
+    family is populated by the crucible-research Rung-1 extraction agent, which
+    can legitimately lag the predictor-side registration — the declared
+    fail-soft contract, which inference already honours by zeroing the same
+    columns. Every other meta-feature keeps a direct ``r[f]`` index: its absence
+    is an upstream contract breach, and defaulting it would train a champion on
+    zeros and report success. A blanket ``r.get(f, 0.0)`` over all of
+    ``TRAIN_META_FEATURES`` is the fail-loud rule inverted — the direct index is
+    the guard that caught ``predictor#438``'s missing producer within one run of
+    the merge (alpha-engine-config-I5949).
+
+    Defaulting is reported at WARNING. A silently all-zero column is
+    indistinguishable from a genuinely neutral one, so an absent producer would
+    otherwise stay invisible for as long as it took someone to look
+    (overseer-policy §7 — a component reporting nothing when healthy cannot be
+    told apart from a dead one).
+
+    Extracted from ``run_meta_training`` so the contract tests exercise THIS
+    function rather than a reconstruction of it — a test that reimplements the
+    production expression proves only that the test agrees with itself
+    (overseer-policy invariant 13).
+
+    Args:
+        oos_meta_rows: the OOS meta rows, each a dict of feature -> value.
+        train_meta_features: ordered feature names forming the matrix columns.
+
+    Returns:
+        ``np.ndarray`` of shape ``(len(oos_meta_rows), len(train_meta_features))``.
+
+    Raises:
+        KeyError: a non-research meta-feature is absent from a row.
+    """
+    from model.meta_model import RESEARCH_META_FEATURES, RESEARCH_META_NEUTRAL
+
+    soft = frozenset(RESEARCH_META_FEATURES)
+    matrix = np.array([
+        [
+            (r.get(f, RESEARCH_META_NEUTRAL) if f in soft else r[f])
+            for f in train_meta_features
+        ]
+        for r in oos_meta_rows
+    ])
+
+    total = len(oos_meta_rows)
+    for f in (x for x in train_meta_features if x in soft):
+        missing = sum(1 for r in oos_meta_rows if f not in r)
+        if missing:
+            log.warning(
+                "meta-feature %r absent from %d/%d OOS rows (%.1f%%) — defaulted "
+                "to %s under the RESEARCH_META_FEATURES fail-soft contract. At "
+                "100%% the producer has not deployed and the column carries no "
+                "information (alpha-engine-config-I5949).",
+                f, missing, total, 100.0 * missing / max(total, 1),
+                RESEARCH_META_NEUTRAL,
+            )
+    return matrix
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -923,6 +984,7 @@ def run_meta_training(
     from model.regime_predictor import RegimePredictor
     from model.research_calibrator import ResearchCalibrator
     from model.meta_model import MetaModel, META_FEATURES, MACRO_FEATURE_META_MAP
+    from model.meta_model import RESEARCH_META_FEATURES, RESEARCH_META_NEUTRAL
     from model.research_gbm import RESEARCH_GBM_FEATURES
 
     start_ts = datetime.now(timezone.utc)
@@ -1872,8 +1934,12 @@ def run_meta_training(
                     # They are EXCLUDED from TRAIN_META_FEATURES so they never
                     # enter meta_X; the zeros only satisfy incidental row reads.
                     # The row is RETAINED — no snapshot dependency.
-                    from model.meta_model import RESEARCH_META_FEATURES
-                    research_features = {f: 0.0 for f in RESEARCH_META_FEATURES}
+                    # RESEARCH_META_NEUTRAL, not a literal 0.0 — the fail-soft
+                    # value is declared once in meta_model so this branch, the
+                    # meta_X_all row build and inference cannot drift apart.
+                    research_features = {
+                        f: RESEARCH_META_NEUTRAL for f in RESEARCH_META_FEATURES
+                    }
 
                 row = {
                     "momentum_score": float(mom_preds[local_idx]),
@@ -2170,7 +2236,7 @@ def run_meta_training(
         len(oos_meta_rows), _resid_mom_enabled, _momentum_l1_in_meta,
         _expected_move_in_meta, _research_features_in_meta, _meta_standardize,
     )
-    meta_X_all = np.array([[r[f] for f in TRAIN_META_FEATURES] for r in oos_meta_rows])
+    meta_X_all = build_meta_matrix(oos_meta_rows, TRAIN_META_FEATURES)
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
