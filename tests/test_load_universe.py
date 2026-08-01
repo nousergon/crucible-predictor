@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from inference.stages.load_universe import (
-    UniverseResolutionError,
     get_universe_tickers,
     load_watchlist,
 )
@@ -80,25 +79,16 @@ class TestLoadWatchlistLocal:
             load_watchlist("auto")
 
 
-# ── 2026-04-27: main pass auto-includes signals.buy_candidates ──────────────
+# ── shared S3 mock ───────────────────────────────────────────────────────────
 
 
-def _mock_s3_with_keys(payloads_by_key: dict[str, dict], eod_csv: str | None = None):
+def _mock_s3_with_keys(payloads_by_key: dict[str, dict]):
     """Build a MagicMock boto3 s3 client whose get_object returns the given
     JSON payloads keyed by S3 Key. Missing keys raise NoSuchKey ClientError.
-
-    ``eod_csv`` serves trades/eod_pnl.csv (raw CSV text) for the holdings union.
     """
     from botocore.exceptions import ClientError
 
     def get_object(Bucket, Key):
-        if Key == "trades/eod_pnl.csv":
-            if eod_csv is None:
-                raise ClientError(
-                    {"Error": {"Code": "NoSuchKey", "Message": "missing"}},
-                    "GetObject",
-                )
-            return {"Body": io.BytesIO(eod_csv.encode("utf-8"))}
         payload = payloads_by_key.get(Key)
         if payload is None:
             raise ClientError(
@@ -113,99 +103,38 @@ def _mock_s3_with_keys(payloads_by_key: dict[str, dict], eod_csv: str | None = N
     return s3
 
 
-def _membership(cut_tickers, run_date: str = "2026-07-24") -> dict:
-    """A universe_membership artifact whose predictor cut is ``cut_tickers``."""
-    return {
-        "schema_version": 1,
-        "run_date": run_date,
-        "predictor_universe_cut": "scanner_candidates",
-        "cuts": {
-            "scanner_candidates": {
-                "basis": "scanner_gate",
-                "size": len(cut_tickers),
-                "tickers": sorted(cut_tickers),
-                "source": f"candidates/{run_date}/candidates.json::scanner_tickers",
-            },
-        },
-        "ranks": {t: {"attractiveness_rank": i + 1, "attractiveness_score": 90.0 - i}
-                  for i, t in enumerate(sorted(cut_tickers))},
-    }
+# ── auto path: population-first resolution (alpha-engine-config#3284) ────────
 
 
-def _eod_csv(positions: dict) -> str:
-    """A minimal trades/eod_pnl.csv whose last row carries ``positions``."""
-    snapshot = json.dumps(positions).replace('"', '""')
-    return (
-        "date,portfolio_nav,positions_snapshot\n"
-        f'2026-07-24,100000,"{snapshot}"\n'
-    )
-
-
-class TestLoadWatchlistAutoResolvesMembership:
-    """The universe resolves from the versioned membership artifact
-    (alpha-engine-config-I4818), NOT from population/latest.json.
-
-    Regression being pinned: population/latest.json's producer was retired with
-    the multi-agent research graph. The read kept SUCCEEDING against a file that
-    had stopped changing, so the predictor scored a frozen 2026-07-10 list of 25
-    names for three weekly cycles with every daily run green.
+class TestLoadWatchlistAutoResolvesPopulation:
+    """The universe resolves from population/latest.json first, with
+    signals.json providing buy_candidates union + macro field overlay.
+    Falls back to the signals chain when population is unavailable.
     """
 
-    def test_universe_is_the_named_predictor_cut(self):
+    def test_population_is_primary_source(self):
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL", "MSFT", "NVDA"]),
+            "population/latest.json": {
+                "population": [
+                    {"ticker": "AAPL", "sector": "Technology"},
+                    {"ticker": "MSFT", "sector": "Technology"},
+                    {"ticker": "NVDA", "sector": "Technology"},
+                ],
+            },
         })
         with patch("boto3.client", return_value=s3):
             tickers, sources, _ = load_watchlist(
                 "auto", s3_bucket="b", date_str="2026-07-27",
             )
         assert set(tickers) == {"AAPL", "MSFT", "NVDA"}
-        # The source label is the CUT'S NAME, not a fixed literal — a
-        # hardcoded label went stale the moment predictor_universe_cut
-        # moved to attractiveness_top_20 (alpha-engine-config-I4983).
-        assert sources["AAPL"] == "scanner_candidates"
-
-    def test_population_latest_is_never_read(self):
-        # The whole point of I4818: even when a (stale) population artifact is
-        # sitting right there, it must not contribute a single ticker.
-        s3 = _mock_s3_with_keys({
-            "population/latest.json": {"population": [{"ticker": "STALE"}]},
-            "universe_membership/latest.json": _membership(["AAPL"]),
-        })
-        with patch("boto3.client", return_value=s3):
-            tickers, _, _ = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-        assert "STALE" not in tickers
-        assert set(tickers) == {"AAPL"}
-        for call in s3.get_object.call_args_list:
-            assert call.kwargs.get("Key") != "population/latest.json"
-
-    def test_holdings_are_unioned_so_held_names_are_never_scored_blind(self):
-        s3 = _mock_s3_with_keys(
-            {"universe_membership/latest.json": _membership(["AAPL"])},
-            eod_csv=_eod_csv({"HELD": {"shares": 10}, "AAPL": {"shares": 5}}),
-        )
-        with patch("boto3.client", return_value=s3):
-            tickers, sources, _ = load_watchlist(
-                "auto", s3_bucket="b", date_str="2026-07-27",
-            )
-        assert set(tickers) == {"AAPL", "HELD"}
-        assert sources["HELD"] == "held"
-        assert sources["AAPL"] == "both"      # in the cut AND held
-
-    def test_unreadable_holdings_narrow_the_universe_but_do_not_fail(self):
-        # Holdings only WIDEN the universe, so an unreadable book yields a
-        # narrower-but-valid run. The load-bearing part (the cut) still came
-        # from the membership artifact.
-        s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL"]),
-        })
-        with patch("boto3.client", return_value=s3):
-            tickers, _, _ = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-        assert tickers == ["AAPL"]
+        assert sources["AAPL"] == "population"
+        assert sources["MSFT"] == "population"
 
     def test_buy_candidates_are_unioned(self):
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL", "MSFT"]),
+            "population/latest.json": {
+                "population": [{"ticker": "AAPL"}, {"ticker": "MSFT"}],
+            },
             "signals/2026-07-27/signals.json": {
                 "buy_candidates": [{"ticker": "ABT"}, {"ticker": "AAPL"}],
             },
@@ -216,12 +145,17 @@ class TestLoadWatchlistAutoResolvesMembership:
             )
         assert set(tickers) == {"AAPL", "MSFT", "ABT"}
         assert sources["ABT"] == "buy_candidate"
+        # AAPL is in both population and buy_candidates
         assert sources["AAPL"] == "both"
 
     def test_buy_candidates_as_bare_strings(self):
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL"]),
-            "signals/2026-07-27/signals.json": {"buy_candidates": ["abt", "DVA"]},
+            "population/latest.json": {
+                "population": [{"ticker": "AAPL"}],
+            },
+            "signals/2026-07-27/signals.json": {
+                "buy_candidates": ["abt", "DVA"],
+            },
         })
         with patch("boto3.client", return_value=s3):
             tickers, sources, _ = load_watchlist(
@@ -230,91 +164,104 @@ class TestLoadWatchlistAutoResolvesMembership:
         assert {"ABT", "DVA"} <= set(tickers)
         assert sources["ABT"] == "buy_candidate"
 
-    def test_macro_context_comes_from_signals(self):
-        # signals.json is now the SOLE macro producer the predictor reads —
-        # the population overlay that reconciled two producers is gone.
+    def test_macro_context_overlaid_from_signals(self):
+        # signals.json is the canonical source for market_regime /
+        # sector_modifiers — the population writer may carry drift.
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL"]),
+            "population/latest.json": {
+                "population": [{"ticker": "AAPL"}],
+                "market_regime": "stale_regime",
+            },
             "signals/2026-07-27/signals.json": {
                 "market_regime": "bull",
                 "sector_modifiers": {"Technology": 1.1},
             },
         })
         with patch("boto3.client", return_value=s3):
-            _, _, data = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+            _, _, data = load_watchlist(
+                "auto", s3_bucket="b", date_str="2026-07-27",
+            )
+        # signals value wins over population's stale value
         assert data["market_regime"] == "bull"
         assert data["sector_modifiers"] == {"Technology": 1.1}
-        # The resolved cycle is stamped on the payload so the morning brief and
-        # any postmortem can see WHICH membership produced the day's universe.
-        assert data["universe_membership_run_date"] == "2026-07-24"
 
-    def test_missing_signals_leaves_universe_intact(self):
-        # No signals anywhere: the brief loses macro context, but the universe
-        # is membership-sourced and therefore unaffected.
+    def test_missing_signals_leaves_population_intact(self):
+        # No signals anywhere: the brief loses macro context, but the
+        # universe is population-sourced and therefore unaffected.
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL", "MSFT"]),
+            "population/latest.json": {
+                "population": [{"ticker": "AAPL"}, {"ticker": "MSFT"}],
+            },
         })
         with patch("boto3.client", return_value=s3):
             tickers, _, data = load_watchlist(
                 "auto", s3_bucket="b", date_str="2026-07-27",
             )
         assert set(tickers) == {"AAPL", "MSFT"}
-        assert data["universe_membership_run_date"] == "2026-07-24"
 
-
-class TestLoadWatchlistFailsOnStaleOrMissingMembership:
-    """Staleness must be fatal. This is the actual I4818 defect: the artifact
-    resolved fine, it just described a dead cycle — invisible to any check that
-    only asks whether the read succeeded."""
-
-    def test_stale_membership_raises(self):
+    def test_falls_back_to_signals_when_population_missing(self):
+        # population/latest.json doesn't exist → falls back to signals chain.
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["AAPL"], run_date="2026-07-10"),
+            "signals/2026-07-27/signals.json": {
+                "universe": [
+                    {"ticker": "AAPL", "score": 85},
+                    {"ticker": "MSFT", "score": 78},
+                ],
+            },
         })
         with patch("boto3.client", return_value=s3):
-            with pytest.raises(UniverseResolutionError, match="no universe membership"):
-                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+            tickers, sources, _ = load_watchlist(
+                "auto", s3_bucket="b", date_str="2026-07-27",
+            )
+        assert set(tickers) == {"AAPL", "MSFT"}
+        assert sources["AAPL"] == "tracked"
 
-    def test_missing_membership_raises(self):
-        s3 = _mock_s3_with_keys({})
-        with patch("boto3.client", return_value=s3):
-            with pytest.raises(UniverseResolutionError, match="no universe membership"):
-                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-
-    def test_empty_named_cut_raises_rather_than_scoring_nothing(self):
-        empty = _membership([])
-        s3 = _mock_s3_with_keys({"universe_membership/latest.json": empty})
-        with patch("boto3.client", return_value=s3):
-            with pytest.raises(UniverseResolutionError, match="empty or absent"):
-                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-
-    def test_cut_named_but_absent_raises(self):
-        broken = _membership(["AAPL"])
-        broken["predictor_universe_cut"] = "a_cut_that_does_not_exist"
-        s3 = _mock_s3_with_keys({"universe_membership/latest.json": broken})
-        with patch("boto3.client", return_value=s3):
-            with pytest.raises(UniverseResolutionError, match="empty or absent"):
-                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-
-    def test_dated_key_used_when_latest_pointer_is_absent(self):
-        # Resolution must not depend on a single mutable pointer — a latest.json
-        # that was never written (as during this artifact's own rollout) must
-        # degrade to the most recent dated cycle, not to an outage.
+    def test_signals_fallback_walks_back_through_weekdays(self):
+        # Today's signals key doesn't exist, but Friday's does.
+        # 2026-07-28 is Tuesday → fallback walks: Tue, Mon, Fri.
         s3 = _mock_s3_with_keys({
-            "universe_membership/2026-07-24/membership.json": _membership(["AAPL"]),
+            "signals/2026-07-24/signals.json": {  # Friday
+                "universe": [{"ticker": "AAPL"}],
+            },
         })
         with patch("boto3.client", return_value=s3):
-            tickers, _, _ = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+            tickers, sources, _ = load_watchlist(
+                "auto", s3_bucket="b", date_str="2026-07-28",
+            )
         assert tickers == ["AAPL"]
 
-    def test_freshest_wins_when_pointer_lags_dated_key(self):
+
+class TestLoadWatchlistFailsWhenNoSourceAvailable:
+    """When neither population nor signals resolves, the run must fail
+    loudly rather than scoring a silently-wrong universe."""
+
+    def test_raises_when_both_population_and_signals_missing(self):
+        s3 = _mock_s3_with_keys({})
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(RuntimeError, match="No signals found"):
+                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+
+
+class TestSourceLabelIsPopulation:
+    """alpha-engine-config#3284 — when population/latest.json resolves,
+    the source label is ``"population"``, matching the artifact read."""
+
+    def test_source_label_is_population(self):
         s3 = _mock_s3_with_keys({
-            "universe_membership/latest.json": _membership(["OLD"], run_date="2026-07-20"),
-            "universe_membership/2026-07-24/membership.json": _membership(["NEW"]),
+            "population/latest.json": {
+                "population": [
+                    {"ticker": "AAPL"},
+                    {"ticker": "MSFT"},
+                ],
+            },
         })
         with patch("boto3.client", return_value=s3):
-            tickers, _, _ = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
-        assert tickers == ["NEW"]
+            tickers, sources, _ = load_watchlist(
+                "auto", s3_bucket="b", date_str="2026-07-27",
+            )
+        assert set(tickers) == {"AAPL", "MSFT"}
+        assert sources["AAPL"] == "population"
+        assert sources["MSFT"] == "population"
 
 
 class TestGetUniverseTickersFallback:
@@ -346,46 +293,3 @@ class TestGetUniverseTickersFallback:
             tickers, data = get_universe_tickers("b", date_str="2026-05-11")
         assert tickers == _FALLBACK_TICKERS
         assert data == {}
-
-
-class TestSourceLabelTracksTheCut:
-    """alpha-engine-config-I4983 — the annotation must name the cut that
-    actually resolved.
-
-    Before this, `resolve_universe_from_membership` hardcoded
-    `"scanner_candidate"`. When the champion moved to `attractiveness_top_20`,
-    every attractiveness-selected name was still annotated as a scanner
-    candidate in `predictions/{date}.json` — an artifact stating something
-    false about its own provenance. Fails against the pre-fix implementation.
-    """
-
-    def test_label_is_the_resolved_cut_name(self):
-        membership = {
-            "run_date": "2026-07-27",
-            "predictor_universe_cut": "attractiveness_top_20",
-            "cuts": {
-                "attractiveness_top_20": {
-                    "basis": "attractiveness_rank",
-                    "size": 2,
-                    "tickers": ["AAPL", "MSFT"],
-                },
-                "scanner_candidates": {
-                    "basis": "scanner_gate",
-                    "size": 1,
-                    "tickers": ["ZZZZ"],
-                },
-            },
-        }
-        s3 = _mock_s3_with_keys({"universe_membership/latest.json": membership})
-        with patch("boto3.client", return_value=s3):
-            tickers, sources, _ = load_watchlist(
-                "auto", s3_bucket="b", date_str="2026-07-27",
-            )
-
-        assert set(tickers) == {"AAPL", "MSFT"}
-        assert sources["AAPL"] == "attractiveness_top_20"
-        assert sources["MSFT"] == "attractiveness_top_20"
-        assert "scanner_candidate" not in set(sources.values()), (
-            "the resolved cut was attractiveness_top_20, but a name is still "
-            "annotated as a scanner candidate"
-        )
