@@ -74,6 +74,14 @@ META_FEATURES = [
     # consistency by construction since both paths read the same
     # macro inputs through ``regime.composite``.
     "regime_intensity_z",
+    # Rung 1 (alpha-engine-config#3080): extraction-agent META_FEATURES from
+    # triggered-ticker filing/transcript analysis. Three typed fields emitted
+    # by the single-shot extraction agent in crucible-research. Feature
+    # accrual is shadow-only until the pre-registered promotion threshold
+    # clears. Zeroed at inference via RESEARCH_META_FEATURES when absent.
+    "guidance_direction",
+    "risk_factor_count_delta_raw",
+    "management_tone_zscore",
 ]
 
 # The research-derived meta-features — populated from the weekly signals.json
@@ -89,7 +97,36 @@ RESEARCH_META_FEATURES = [
     "research_composite_score",
     "research_conviction",
     "sector_macro_modifier",
+    # Rung 1 (alpha-engine-config#3080): extraction-agent META_FEATURES from
+    # triggered-ticker filing/transcript analysis. Populated asynchronously
+    # by the weekly SF's extraction-agent state; zeroed when absent (the
+    # fail-soft contract — an extraction failure never blocks live signals).
+    "guidance_direction",
+    "risk_factor_count_delta_raw",
+    "management_tone_zscore",
 ]
+
+# The value a RESEARCH_META_FEATURE takes when its producer has not emitted it.
+# Single source for the fail-soft contract, so training and inference cannot
+# drift: inference zeroes these via RESEARCH_META_FEATURES
+# (``inference/research_free_inference.py``), the research-free training branch
+# already builds ``{f: 0.0 for f in RESEARCH_META_FEATURES}``
+# (``training/meta_trainer.py``), and the meta_X_all row build reads this.
+#
+# It applies ONLY to this list. A core meta-feature (momentum_score,
+# expected_move, regime_intensity_z, …) missing from a row is a contract
+# breach and must still raise — see alpha-engine-config-I5949, where a blanket
+# default would have converted exactly that class into a champion silently
+# trained on zeros.
+#
+# NOTE (alpha-engine-config-I5818): ``guidance_direction`` is CATEGORICAL and
+# its declared absent-value neutral is the string ``"none"``. 0.0 is the
+# correct value while the producer is absent — it is what inference feeds, so
+# train and serve agree — but there is no numeric encoding for the categorical
+# yet. When the crucible-research Rung-1 producer lands it must emit a numeric
+# encoding, or this column enters a float matrix as a string and breaks the
+# build. Do not treat 0.0 as that encoding.
+RESEARCH_META_NEUTRAL = 0.0
 
 # Directional meta-features eligible for the L4565 standardize+winsorize
 # transform (the SOTA signal-level combine). These are the TICKER-VARYING

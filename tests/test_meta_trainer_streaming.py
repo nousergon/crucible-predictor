@@ -227,14 +227,22 @@ class TestStreamingBehavior:
 
         Symptom in production: 1,755,798 rows walked, 0 kept, hard-fail.
         Fix: wrap sorted dates in ``pd.DatetimeIndex(...).tolist()``.
+
+        pandas 3.0 switched ``to_numpy()`` to ``datetime64[us]``, so bare
+        ``.tolist()`` returns ``datetime.datetime`` objects (ISO ``str()``
+        with '-') rather than nanosecond ints — the 19-digit-int failure mode
+        is gone. The wrap stays: it still normalises to the ``pd.Timestamp``
+        list the downstream consumers expect. This assertion now guards the
+        invariant that matters — the string form is ISO, never an int-string.
         """
         dates = pd.to_datetime(["2026-01-05", "2026-01-07", "2026-01-09"]).to_numpy()
-        # Bare .tolist() — what we accidentally shipped in PR #57
+        # Bare .tolist() — what we accidentally shipped in PR #57. Under
+        # pandas >= 3.0 this returns datetime.datetime, not ints; the string
+        # form must always carry '-' (ISO) so the bisect can't see int strings.
         bare_list = dates.tolist()
-        assert all(isinstance(d, int) for d in bare_list), (
-            "Bare .tolist() on datetime64[ns] should return ints — if this "
-            "test starts failing, numpy's behavior changed and the wrap "
-            "below may no longer be necessary."
+        assert all("-" in str(d) for d in bare_list), (
+            "Bare .tolist() on datetime64 must produce ISO strings (with '-') "
+            "so the signals_lookup bisect never compares 19-digit int strings."
         )
         # Fixed path — what the trainer must use
         fixed_list = pd.DatetimeIndex(dates).tolist()

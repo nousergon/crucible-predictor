@@ -28,7 +28,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 # (config#1245 / #1172). Accept either spelling across the crossing; the
 # version-equality assertion below is the load-bearing part.
 _LIB_PIN_RE = re.compile(
-    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+"
+    r"https://github\.com/nousergon/nousergon-lib@"
+    r"((?:v[0-9]+\.[0-9]+\.[0-9]+)|(?:[0-9a-f]{40}))"
 )
 
 
@@ -37,21 +39,22 @@ def _read_lib_pin(filename: str) -> str:
     match = _LIB_PIN_RE.search(text)
     assert match is not None, (
         f"could not find alpha-engine-lib pin in {filename} — the regex "
-        f"expects ``alpha-engine-lib[extras] @ git+https://.../alpha-engine-lib@vX.Y.Z``"
+        f"expects ``alpha-engine-lib[extras] @ git+https://.../alpha-engine-lib@vX.Y.Z`` "
+        f"or ``...@<commit-hash>``"
     )
     return match.group(1)
 
 
 def test_requirements_and_lambda_pins_match():
-    """Both files must pin alpha-engine-lib to the same tag."""
+    """Both files must pin alpha-engine-lib to the same tag or commit."""
     root_pin = _read_lib_pin("requirements.txt")
     lambda_pin = _read_lib_pin("requirements-lambda.txt")
     assert root_pin == lambda_pin, (
         f"alpha-engine-lib pin drift: requirements.txt={root_pin!r} but "
         f"requirements-lambda.txt={lambda_pin!r}. Both files must pin to "
-        f"the same tag — they're two views of the same dependency graph. "
-        f"Drift broke the predictor canary on 2026-05-12 (PR #147 / hotfix "
-        f"fix/lambda-lib-pin-v0.12.0)."
+        f"the same tag or commit — they're two views of the same dependency "
+        f"graph. Drift broke the predictor canary on 2026-05-12 (PR #147 / "
+        f"hotfix fix/lambda-lib-pin-v0.12.0)."
     )
 
 

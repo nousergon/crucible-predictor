@@ -41,12 +41,11 @@ class TestMetaFeaturesSchema:
         assert "regime_intensity_z" in META_FEATURES
 
     def test_regime_intensity_z_is_last_feature(self):
-        """Stage D adds intensity_z as the trailing META_FEATURE so the
-        column ordering of older deployed weights stays valid for the
-        first N-1 features (Ridge re-fit catches up on next training).
-        Pinning the position prevents an accidental insertion in the
-        middle that would silently re-order weights."""
-        assert META_FEATURES[-1] == "regime_intensity_z"
+        """Stage D added intensity_z as the trailing META_FEATURE; config#3080
+        subsequently appended 3 Rung-1 extraction features after it. Pinning
+        the last position prevents an accidental insertion in the middle that
+        would silently re-order deployed model weights."""
+        assert META_FEATURES[-1] == "management_tone_zscore"
 
     def test_regime_derived_map_wires_intensity_z(self):
         """The source column on regime_features_df is ``intensity_z``
