@@ -41,5 +41,5 @@ scikit-learn>=1.9.0
 # pin as the project-root requirements.txt (lib-pin-lockstep
 # discipline).
 hmmlearn>=0.3.3
-pyyaml>=6.0
+pyyaml>=6.0.3
 arcticdb>=6.20.0
