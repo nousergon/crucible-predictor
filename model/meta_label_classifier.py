@@ -20,7 +20,12 @@ flips (Task B2). Mirrors the ``meta_model_tb`` observe-only lifecycle.
 
 Interface deliberately mirrors ``model.meta_model.MetaModel`` (fit / predict /
 predict_single / is_fitted / metrics / save / load) so the training and
-inference plumbing treat it the same way.
+inference plumbing treat it the same way. Persistence now also mirrors
+MetaModel's v2+ pickle contract (alpha-engine-config#3116 fix): feature_names
+are embedded in the pickle alongside the fitted estimator so load() is
+sidecar-independent, with a fallback to the legacy sidecar-read behavior for
+pre-existing pickles and a loud fail on a feature-count mismatch. See the
+``_PICKLE_SCHEMA`` docstring on the class below for the full history.
 """
 
 from __future__ import annotations
@@ -157,11 +162,37 @@ class MetaLabelClassifier:
             "feature_names": self._feature_names,
         }
 
+    # Pickle payload schema. v2 mirrors ``model.meta_model.MetaModel``'s v2+
+    # contract: the load-bearing ``feature_names`` list travels INSIDE the
+    # pickle next to the fitted estimator, so loading is sidecar-independent.
+    # Before this, save() pickled the bare ``CalibratedClassifierCV`` and
+    # load() read feature_names from the external ``.pkl.meta.json`` sidecar
+    # only. The training pipeline persists this classifier via a generic
+    # models-dict loop (``model.save(local_path)`` in
+    # ``training/meta_trainer.py``) that always rewrites a fresh sidecar
+    # alongside a freshly-promoted .pkl — but the sidecar and the live-serving
+    # .pkl are two independently-writable S3 objects, and nothing enforced
+    # them staying in lockstep. A stale sidecar (observed: 2026-05-30, 13
+    # names) next to a retrained 16-feature estimator fed a 13-column input
+    # vector into a classifier expecting 16, raising ``X has 13 features, but
+    # LogisticRegression is expecting 16`` on every inference call — 100%
+    # null ``barrier_win_prob`` since 2026-07-20 (alpha-engine-config#3116).
+    # Embedding feature_names in the pickle closes that gap the same way
+    # L4543 closed it for MetaModel.
+    _PICKLE_SCHEMA = 2
+
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump(self._model, f)
+            pickle.dump(
+                {
+                    "_meta_label_classifier_schema": self._PICKLE_SCHEMA,
+                    "model": self._model,
+                    "feature_names": list(self._feature_names),
+                },
+                f,
+            )
         Path(str(path) + ".meta.json").write_text(json.dumps(self.metrics(), indent=2))
         log.info("MetaLabelClassifier saved to %s (AUC=%.4f)", path, self._auc)
 
@@ -170,7 +201,27 @@ class MetaLabelClassifier:
         path = Path(path)
         clf = cls()
         with open(path, "rb") as f:
-            clf._model = pickle.load(f)
+            obj = pickle.load(f)
+        # v2+ payload: feature_names embedded with the estimator (load-bearing,
+        # sidecar-independent). Legacy payload: a bare estimator → feature_names
+        # come from the sidecar, exactly as before this fix — old artifacts
+        # already in S3 must keep loading without a retrain.
+        embedded_names = False
+        if isinstance(obj, dict) and obj.get("_meta_label_classifier_schema"):
+            clf._model = obj["model"]
+            clf._feature_names = list(obj.get("feature_names") or [])
+            embedded_names = bool(clf._feature_names)
+        else:
+            clf._model = obj
+            log.warning(
+                "MetaLabelClassifier.load: %s is a legacy pre-embedded-names "
+                "pickle — feature_names will be sourced from the "
+                ".meta.json sidecar, which can silently drift from the "
+                "trained estimator (alpha-engine-config#3116). The next "
+                "training run re-saves in the embedded-names format and "
+                "clears this warning.",
+                path,
+            )
         clf._fitted = True
         meta_path = Path(str(path) + ".meta.json")
         if meta_path.exists():
@@ -179,9 +230,34 @@ class MetaLabelClassifier:
             clf._auc = meta.get("auc", 0.0)
             clf._brier = meta.get("brier", 0.0)
             clf._base_rate = meta.get("base_rate", 0.5)
-            clf._feature_names = meta.get("feature_names", []) or []
+            # Sidecar feature_names is the source ONLY for legacy pickles that
+            # didn't embed them — never override the embedded (authoritative)
+            # order, mirroring MetaModel.load's contract.
+            if not embedded_names:
+                clf._feature_names = meta.get("feature_names", []) or []
+
+        # Count guard: fail loud AT LOAD TIME when the persisted feature
+        # schema doesn't match what the fitted estimator actually expects,
+        # rather than deferring to sklearn's own "X has N features, but
+        # LogisticRegression is expecting M" error inside predict_proba on
+        # the first inference call. This is exactly the failure mode named
+        # in alpha-engine-config#3116 — surfacing it here gives a clear
+        # diagnostic naming both counts and the artifact path, instead of a
+        # null prediction or a bare sklearn stack trace at inference time.
+        expected = getattr(clf._model, "n_features_in_", None)
+        if expected is not None and clf._feature_names and len(clf._feature_names) != expected:
+            raise ValueError(
+                f"MetaLabelClassifier.load: {path} — persisted feature_names "
+                f"has {len(clf._feature_names)} entries but the fitted "
+                f"estimator expects {expected} features (embedded_names="
+                f"{embedded_names}). Refusing to silently truncate/pad the "
+                f"input vector — this is a stale or mismatched artifact. "
+                f"Retrain and re-save (or repair the sidecar) rather than "
+                f"loading this pickle."
+            )
         log.info(
-            "MetaLabelClassifier loaded from %s (AUC=%.4f, n_features=%d)",
-            path, clf._auc, len(clf._feature_names),
+            "MetaLabelClassifier loaded from %s (AUC=%.4f, n_features=%d, "
+            "embedded_names=%s)",
+            path, clf._auc, len(clf._feature_names), embedded_names,
         )
         return clf
