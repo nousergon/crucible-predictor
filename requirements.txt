@@ -48,7 +48,7 @@ krepis[flow_doctor]==0.24.0  # pinned per §139 — first-party/fast-moving deps
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@c907a044bb1553815225327bc56644050543b6f2
 
 # Training dependencies (not needed in Lambda)
-arcticdb>=6.20.0
+arcticdb>=6.21.0
 # Floor bumped >=1.2.0 -> >=1.2.8 (numpy-2 migration, config#2815): catboost
 # 1.2.6/1.2.7 pinned numpy<2.0, incompatible with the numpy>=2.5.1 floor above.
 # >=1.2.0 alone still resolves today (pip picks the newest satisfying release),
