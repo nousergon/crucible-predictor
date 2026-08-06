@@ -34,7 +34,7 @@ lxml>=6.1.1
 lightgbm>=4.7.0
 # Floor bumped >=1.2.0 -> >=1.2.8 in lockstep with requirements.txt (numpy-2
 # migration, config#2815): catboost 1.2.6/1.2.7 pinned numpy<2.0.
-catboost>=1.2.8
+catboost>=1.2.10
 scikit-learn>=1.9.0
 # Regime substrate (regime/ submodule) — 3-state HMM. Pulls scipy
 # transitively, also needed by regime/bocpd.py for stats.t. Same
