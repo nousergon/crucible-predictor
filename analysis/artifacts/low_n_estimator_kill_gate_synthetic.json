@@ -1,0 +1,72 @@
+{
+  "mode": "synthetic",
+  "params": {
+    "depths": [
+      6,
+      8,
+      12,
+      16,
+      20,
+      26
+    ],
+    "real_effect": 0.8,
+    "noise_sd": 1.0,
+    "k_forks": 8,
+    "alpha": 0.1,
+    "trials": 3000,
+    "power_floor": 0.5,
+    "shallow_baseline_floor": 0.15,
+    "seed": 1524
+  },
+  "sweep": [
+    {
+      "n_cohorts": 6,
+      "baseline_overfit_rate": 0.322,
+      "estimator_overfit_rate": 0.0,
+      "estimator_power": 0.0,
+      "estimator_block_rate": 1.0
+    },
+    {
+      "n_cohorts": 8,
+      "baseline_overfit_rate": 0.239,
+      "estimator_overfit_rate": 0.0,
+      "estimator_power": 0.0017,
+      "estimator_block_rate": 0.9983
+    },
+    {
+      "n_cohorts": 12,
+      "baseline_overfit_rate": 0.1303,
+      "estimator_overfit_rate": 0.0003,
+      "estimator_power": 0.1067,
+      "estimator_block_rate": 0.893
+    },
+    {
+      "n_cohorts": 16,
+      "baseline_overfit_rate": 0.0627,
+      "estimator_overfit_rate": 0.003,
+      "estimator_power": 0.3793,
+      "estimator_block_rate": 0.6177
+    },
+    {
+      "n_cohorts": 20,
+      "baseline_overfit_rate": 0.036,
+      "estimator_overfit_rate": 0.0063,
+      "estimator_power": 0.6183,
+      "estimator_block_rate": 0.3753
+    },
+    {
+      "n_cohorts": 26,
+      "baseline_overfit_rate": 0.013,
+      "estimator_overfit_rate": 0.0073,
+      "estimator_power": 0.8093,
+      "estimator_block_rate": 0.1833
+    }
+  ],
+  "d_star_cohorts_for_power": 20,
+  "checks": {
+    "fdr_controlled_all_depths": true,
+    "separates_where_low_n_bias_bites": true,
+    "power_emerges_by_max_depth": true
+  },
+  "kill_gate": "PASS"
+}
