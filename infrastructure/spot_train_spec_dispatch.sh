@@ -17,6 +17,7 @@
 # Usage:
 #   ./infrastructure/spot_train_spec_dispatch.sh --spec-id <id>       # train one challenger
 #   ./infrastructure/spot_train_spec_dispatch.sh --spec-id <id> --instance-type c5.2xlarge
+#   ./infrastructure/spot_train_spec_dispatch.sh --spec-id <id> --preflight-only  # Friday dry path
 #
 # Required: --spec-id <id> (the MODEL_ZOO_SPEC_ID from the SF Map payload)
 
@@ -39,7 +40,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --spec-id) shift; MODEL_ZOO_SPEC_ID="$1" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
-    *) echo "WARNING: ignoring unknown flag: $1" >&2 ;;
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
+    *) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -82,6 +84,9 @@ wait_ssm_agent
 # ── Bootstrap + deps ─────────────────────────────────────────────────────────
 bootstrap_spot
 install_deps
+
+# ── Preflight-only (Friday shell_run dry path) ───────────────────────────────
+maybe_run_preflight_only_and_exit
 
 # ── Train one spec ───────────────────────────────────────────────────────────
 print_banner "MODEL-ZOO TRAIN ONE SPEC: ${MODEL_ZOO_SPEC_ID}"
