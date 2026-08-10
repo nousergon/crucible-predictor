@@ -16,6 +16,7 @@
 #   ./infrastructure/spot_model_zoo_select.sh --select-only         # select only (after Map joins)
 #   ./infrastructure/spot_model_zoo_select.sh --weekly --instance-type c5.2xlarge
 #   ./infrastructure/spot_model_zoo_select.sh --select-only --instance-type c5.xlarge
+#   ./infrastructure/spot_model_zoo_select.sh --select-only --preflight-only  # Friday dry path
 
 set -euo pipefail
 
@@ -36,7 +37,8 @@ while [ $# -gt 0 ]; do
     --weekly) MODE="weekly" ; _SPOT_NAME="model-zoo-weekly" ; _SSM_SLUG="spot-model-zoo-weekly" ; _PROCESS_NAME="predictor-model-zoo" ;;
     --select-only) MODE="select-only" ; _SPOT_NAME="model-zoo-select" ; _SSM_SLUG="spot-model-zoo-select" ; _PROCESS_NAME="predictor-model-zoo-select" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
-    *) echo "WARNING: ignoring unknown flag: $1" >&2 ;;
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
+    *) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -77,6 +79,9 @@ wait_ssm_agent
 # ── Bootstrap + deps ─────────────────────────────────────────────────────────
 bootstrap_spot
 install_deps
+
+# ── Preflight-only (Friday shell_run dry path) ───────────────────────────────
+maybe_run_preflight_only_and_exit
 
 # ── Weekly rotation ──────────────────────────────────────────────────────────
 if [ "$MODE" = "weekly" ]; then

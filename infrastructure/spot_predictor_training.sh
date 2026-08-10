@@ -43,11 +43,11 @@ SHADOW_BASIS=""
 _ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
-    --preflight-only) MODE="preflight-only" ;;
+    --preflight-only) MODE="preflight-only"; PREFLIGHT_ONLY=1 ;;
     --smoke-only) MODE="smoke-only" ;;
     --shadow-basis) shift; SHADOW_BASIS="$1" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
-    *) echo "WARNING: ignoring unknown flag: $1" >&2 ;;
+    *) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
   esac
   shift
 done
@@ -107,65 +107,8 @@ bootstrap_spot
 install_deps
 
 # ── Preflight-only (Friday shell_run dry path) ───────────────────────────────
-if [ "$MODE" = "preflight-only" ]; then
-  print_banner "PREFLIGHT-ONLY (no training, no promotion, no writes)"
-  run_ssm "preflight-only" "${_RUN_TOKEN_EXPORT}$(cat <<'PREFLIGHT'
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
-export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
-cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-$PY - <<'PYEOF'
-import os, sys
-sys.path.insert(0, '.')
-os.environ.setdefault('S3_BUCKET', os.environ.get('S3_BUCKET', 'alpha-engine-research'))
-bucket = os.environ.get('S3_BUCKET', 'alpha-engine-research')
-
-import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(levelname)-8s  %(message)s')
-log = logging.getLogger('preflight-only')
-
-log.info('[1/3] Importing training package...')
-import nousergon_lib
-from training import train_handler
-from training import model_zoo
-from training.preflight import TrainingPreflight
-log.info('       OK — nousergon_lib + training.train_handler + model_zoo import clean')
-
-log.info('[2/3] Running TrainingPreflight (env + S3 connectivity)...')
-TrainingPreflight(bucket=bucket).run()
-log.info('       OK — env vars present, S3 bucket reachable')
-
-log.info('[3/3] ArcticDB connectivity + universe-freshness probe...')
-from nousergon_lib.arcticdb import open_arctic
-arctic = open_arctic(bucket)
-universe = arctic.get_library('universe')
-symbols = universe.list_symbols()
-n = len(symbols)
-if n == 0:
-    raise RuntimeError('ArcticDB universe library is empty/unreachable')
-probe = sorted(symbols)[0]
-df_tail = universe.read(probe).data.tail(1)
-latest = df_tail.index.max() if not df_tail.empty else 'n/a'
-log.info('       OK — universe has %d symbols; %s latest index=%s', n, probe, latest)
-
-print()
-print('=' * 60)
-print('  PREFLIGHT-ONLY RESULT: PASS')
-print('=' * 60)
-print('  Imports:        nousergon_lib + training stack clean')
-print('  TrainingPreflight: PASS (env + S3 reachable)')
-print('  ArcticDB:       %d universe symbols (probe %s latest=%s)' % (n, probe, latest))
-print('  Training:       SKIPPED (no run_meta_training call)')
-print('  Promotion:      SKIPPED (no weights/meta write)')
-print('  S3/config writes: NONE')
-print('=' * 60)
-PYEOF
-PREFLIGHT
-)" 600
-  echo "==> Preflight-only mode — PASS. Exiting 0 BEFORE smoke + full-training steps."
-  exit 0
-fi
+# Shared across all three per-stage scripts — see _spot_common.sh.
+maybe_run_preflight_only_and_exit
 
 # ── Smoke test (dry_run=True) ────────────────────────────────────────────────
 print_banner "SMOKE TEST (dry_run=True)"
