@@ -114,11 +114,14 @@ def _mock_s3_with_keys(payloads_by_key: dict[str, dict], eod_csv: str | None = N
     return s3
 
 
-def _membership(cut_tickers, run_date: str = "2026-07-24") -> dict:
+def _membership(
+    cut_tickers, run_date: str = "2026-07-24", generated_at: str | None = "2026-07-24T12:49:30+00:00"
+) -> dict:
     """A universe_membership artifact whose predictor cut is ``cut_tickers``."""
     return {
         "schema_version": 1,
         "run_date": run_date,
+        "generated_at": generated_at,
         "predictor_universe_cut": "scanner_candidates",
         "cuts": {
             "scanner_candidates": {
@@ -290,6 +293,73 @@ class TestLoadWatchlistAutoResolvesMembership:
             )
         assert set(tickers) == {"AAPL", "MSFT"}
         assert data["universe_membership_run_date"] == "2026-07-24"
+
+
+class TestMembershipProvenanceIsStamped:
+    """alpha-engine-config-I6786. ``run_date`` names the CYCLE; it does not name
+    the INSTANCE, and both S3 keys in the resolution chain are pointers that the
+    postclose-chained exercise Scanner rewrites for the same trading day.
+
+    Measured 2026-08-07: the surviving ``universe_membership/2026-08-07/
+    membership.json`` carried a ``generated_at`` 17 hours after the predictions
+    it fed, and four names stamped ``attractiveness_top_20`` in those
+    predictions were absent from it. Re-reading the key alone cannot reproduce
+    what was scored; ``generated_at`` can."""
+
+    def test_stamps_generated_at_and_the_resolved_key(self):
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(["AAPL", "MSFT"]),
+        })
+        with patch("boto3.client", return_value=s3):
+            _, _, data = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert data["universe_membership_generated_at"] == "2026-07-24T12:49:30+00:00"
+        assert data["universe_membership_key"] == "universe_membership/latest.json"
+
+    def test_the_key_names_the_dated_artifact_when_the_pointer_is_absent(self):
+        # Resolution falls back to the dated walk; provenance must follow it
+        # rather than reporting the pointer that did not answer.
+        s3 = _mock_s3_with_keys({
+            "universe_membership/2026-07-24/membership.json": _membership(["AAPL"]),
+        })
+        with patch("boto3.client", return_value=s3):
+            _, _, data = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert data["universe_membership_key"] == "universe_membership/2026-07-24/membership.json"
+
+    def test_absent_generated_at_is_recorded_as_none_not_invented(self):
+        # A producer that predates the field must yield null, not a substituted
+        # run_date — a fabricated instance stamp is worse than a missing one.
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(["AAPL"], generated_at=None),
+        })
+        with patch("boto3.client", return_value=s3):
+            _, _, data = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert data["universe_membership_generated_at"] is None
+        assert data["universe_membership_run_date"] == "2026-07-24"
+
+    def test_future_stamped_membership_logs_error_but_still_scores(self, caplog):
+        # Provenance check, not a trading gate: halting inference on a clock
+        # artifact would cost a trading day to protect a metadata field.
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(
+                ["AAPL"], generated_at="2026-08-01T00:00:00+00:00"
+            ),
+        })
+        with caplog.at_level("ERROR"):
+            with patch("boto3.client", return_value=s3):
+                tickers, _, data = load_watchlist(
+                    "auto", s3_bucket="b", date_str="2026-07-27",
+                )
+        assert tickers == ["AAPL"]
+        assert data["universe_membership_generated_at"] == "2026-08-01T00:00:00+00:00"
+        assert any("AFTER this run's date" in r.message for r in caplog.records)
+
+    def test_unparseable_generated_at_is_kept_verbatim(self):
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(["AAPL"], generated_at="not-a-date"),
+        })
+        with patch("boto3.client", return_value=s3):
+            _, _, data = load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert data["universe_membership_generated_at"] == "not-a-date"
 
 
 class TestLoadWatchlistFailsOnStaleOrMissingMembership:
