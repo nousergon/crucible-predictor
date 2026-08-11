@@ -140,12 +140,28 @@ def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
 
     Staleness is judged on the artifact's own ``run_date``, never on S3
     LastModified: a re-upload of an old cycle must not read as fresh.
+
+    The winning payload is annotated with ``_resolved_key`` (alpha-engine-config
+    -I6786) — the exact S3 key that answered. Underscore-prefixed because it is
+    resolution metadata, not part of the producer's schema; only the explicitly
+    named fields are copied onto the predictions payload.
+
+    Why the key matters and ``run_date`` alone does not: BOTH keys in the chain
+    are POINTERS, and a single run_date can have more than one write. The
+    Scanner runs in the weekday preopen SF and again in the postclose-chained
+    weekly exercise run, which normalises to the same trading day and rewrites
+    the same key. Measured 2026-08-07: the surviving membership.json carried
+    ``generated_at`` 17 hours AFTER the predictions it fed, and four names those
+    predictions were stamped ``attractiveness_top_20`` with (FFIV, PFGC, SN,
+    TREX) were absent from it. Naming the run_date identifies the cycle; it does
+    not identify the instance, and the instance is what was actually consumed.
     """
     from datetime import date as _date, timedelta as _td
 
     candidates: list[dict] = []
     latest = try_read_s3_json(s3, bucket, _MEMBERSHIP_LATEST_KEY)
     if latest:
+        latest["_resolved_key"] = _MEMBERSHIP_LATEST_KEY
         candidates.append(latest)
 
     try:
@@ -155,10 +171,10 @@ def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
     if start is not None:
         for days_back in range(MEMBERSHIP_MAX_AGE_DAYS + 1):
             probe = start - _td(days=days_back)
-            payload = try_read_s3_json(
-                s3, bucket, _membership_dated_key(str(probe))
-            )
+            dated_key = _membership_dated_key(str(probe))
+            payload = try_read_s3_json(s3, bucket, dated_key)
             if payload:
+                payload["_resolved_key"] = dated_key
                 candidates.append(payload)
                 break
 
@@ -180,6 +196,63 @@ def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
         if fresh is None or run_date > fresh.get("run_date", ""):
             fresh = payload
     return fresh
+
+
+def _stamp_membership_provenance(data: dict, membership: dict, date_str: str) -> dict:
+    """Record WHICH membership instance this run consumed (config-I6786).
+
+    Three fields, all additive (S3 Contract Safety Standard §124):
+
+      ``universe_membership_run_date``     the cycle — pre-existing.
+      ``universe_membership_generated_at`` the instance — the artifact's own
+                                           clock, verbatim.
+      ``universe_membership_key``          the exact S3 key that answered.
+
+    Together these make the run reconstructable from the predictions artifact
+    alone, which ``run_date`` could not: the pointer keys are rewritten by the
+    later same-day Scanner run, so re-reading the key named here can return a
+    different cut than the one scored. Once the producer's immutable
+    ``universe_membership/{run_date}/runs/{stamp}.json`` copies are live
+    (config-I6785), ``generated_at`` locates the exact object even after the
+    pointers move.
+
+    Also asserts ordering. A membership stamped in the FUTURE relative to this
+    run's own date means clock skew or a cross-cycle read, and the predictions
+    would then claim provenance they do not have. Logged at ERROR and allowed
+    to proceed deliberately: this is a provenance check, not a trading gate.
+    Halting inference on a clock artifact would cost a trading day to protect a
+    metadata field — strictly worse than scoring the universe and saying loudly
+    that its stamp is wrong.
+    """
+    data["universe_membership_run_date"] = membership.get("run_date")
+    generated_at = membership.get("generated_at")
+    data["universe_membership_generated_at"] = generated_at
+    data["universe_membership_key"] = membership.get("_resolved_key")
+
+    if generated_at:
+        try:
+            from datetime import date as _date, datetime as _dt
+
+            stamped = _dt.fromisoformat(str(generated_at)).date()
+            if stamped > _date.fromisoformat(date_str):
+                log.error(
+                    "Universe membership %s is stamped %s, AFTER this run's date "
+                    "%s — clock skew or a cross-cycle read; provenance on this "
+                    "predictions file is not trustworthy",
+                    membership.get("run_date"), generated_at, date_str,
+                )
+        except (TypeError, ValueError) as exc:
+            log.warning(
+                "Universe membership generated_at %r is unparseable (%s) — "
+                "recorded verbatim, ordering unchecked", generated_at, exc,
+            )
+    else:
+        log.warning(
+            "Universe membership %s carries no generated_at — the consumed "
+            "instance cannot be identified, only its cycle",
+            membership.get("run_date"),
+        )
+    return data
 
 
 def _read_holdings(s3, bucket: str) -> set[str]:
@@ -438,7 +511,7 @@ def load_watchlist(
                 "intact (membership-sourced) but the morning brief will omit "
                 "macro context", date_str,
             )
-        data["universe_membership_run_date"] = membership.get("run_date")
+        _stamp_membership_provenance(data, membership, date_str)
 
         tickers = sorted(sources.keys())
         log.info(

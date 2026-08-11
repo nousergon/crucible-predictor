@@ -4,12 +4,20 @@ name: IAM Drift Check
 # infrastructure/iam/<role>.json and the live AWS role state — the SOTA pattern
 # from crucible-executor extended to the predictor role (alpha-engine-config#2340).
 #
+# NOT a pull_request check (Brian ruling 2026-08-10): a PR whose only failing
+# check is a drift check must read GREEN. A drift check compares codified
+# source against LIVE AWS, so its answer is a property of the account at the
+# moment it runs, never of the branch under review. --pr-diff-aware already
+# excused drift on roles the PR itself changes (that half is red-by-
+# construction: the codified JSON deliberately differs from live until apply.sh
+# runs post-merge, alpha-engine-config#3492). What it left is drift on roles
+# the PR does NOT touch — real, but caused by someone else, at some other time,
+# and unclearable by this author. Reddening a PR for it is the
+# gate-only-the-blocked-actor-can-clear trap, and it teaches the reader to
+# merge past a red drift check, which is how a real finding goes unread
+# (nous-ergon-ops-I563, alarm-red-by-construction).
+#
 # Triggers:
-#   - Every PR that touches infrastructure/iam/** — in --pr-diff-aware mode:
-#     drift on roles the PR itself is changing is EXPECTED (the codified JSON
-#     deliberately differs from live AWS until apply.sh runs post-merge;
-#     alpha-engine-config#3492); drift on roles the PR does NOT touch is a hard
-#     failure (out-of-band live edit).
 #   - Daily at 09:35 UTC (catches out-of-band manual IAM edits; offset from the
 #     executor repo's 09:30 run to avoid a concurrent OIDC assume pile-up) —
 #     full hard-fail mode.
@@ -20,7 +28,8 @@ name: IAM Drift Check
 # the role's iam-readonly.json already grants read on alpha-engine-predictor-role).
 
 on:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - 'infrastructure/iam/**'
       - '.github/workflows/iam-drift-check.yml'
@@ -44,8 +53,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-        with:
-          fetch-depth: 0  # needed for git diff origin/main...HEAD in --pr-diff-aware mode
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
@@ -53,12 +60,9 @@ jobs:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
           aws-region: us-east-1
 
+      # Always full hard-fail mode now: --pr-diff-aware existed only for the
+      # pull_request path, which this workflow no longer has. The flag stays in
+      # check-drift.py — crucible-executor's reference implementation still
+      # exposes it, and removing it here would fork the two checkers.
       - name: Run IAM drift check (codified vs live AWS)
-        env:
-          IS_PR: ${{ github.event_name == 'pull_request' }}
-        run: |
-          if [ "$IS_PR" = "true" ]; then
-            python3 infrastructure/iam/check-drift.py --pr-diff-aware
-          else
-            python3 infrastructure/iam/check-drift.py
-          fi
+        run: python3 infrastructure/iam/check-drift.py
