@@ -255,7 +255,18 @@ bootstrap_spot() {
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 
-# systemd watchdog — self-terminates on SSM-agent stoppage (config#2693)
+# systemd watchdog — self-terminates on SSM-agent stoppage (config#2693).
+# Type=simple, NOT oneshot: ExecStart is an endless supervision loop, and
+# `systemctl start` on a Type=oneshot unit BLOCKS until ExecStart exits
+# (TimeoutStartSec defaults to infinity for oneshot). This unit declared
+# Type=oneshot + RemainAfterExit=yes, so every bootstrap hung here until SSM
+# gave up at its budget — status=TimedOut with stderr ending on the
+# `systemctl enable` symlink line and nothing after it. Measured on
+# ne-weekly-freshness-pipeline watch-rerun-2026-08-10-5 (2026-08-11): the
+# PredictorTraining stage died exactly this way, taking Branch B down.
+# nousergon-data hit the identical defect in its twin of this file and fixed
+# it in nousergon-data#1294; this is the mirror (AGENTS.md: when a SOTA
+# pattern exists in another alpha-engine repo, mirror it).
 if ! systemctl is-enabled ec2-spot-watchdog 2>/dev/null; then
   cat > /tmp/ec2-spot-watchdog.service <<'UNIT'
 [Unit]
@@ -264,9 +275,10 @@ After=amazon-ssm-agent.service
 Requires=amazon-ssm-agent.service
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/usr/local/bin/ec2-spot-watchdog.sh
-RemainAfterExit=yes
+Restart=always
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -286,8 +298,14 @@ done
 WDSH
   chmod +x /usr/local/bin/ec2-spot-watchdog.sh
   cp /tmp/ec2-spot-watchdog.service /etc/systemd/system/
-  systemctl enable ec2-spot-watchdog
-  systemctl start ec2-spot-watchdog
+  # `timeout` so a future unit-shape regression fails in seconds WITH a message,
+  # instead of consuming the whole SSM budget and dying with no output — that
+  # silence is what made the hang read as "bootstrap is slow" rather than
+  # "systemctl is blocked forever".
+  timeout 60 systemctl enable --now ec2-spot-watchdog || {
+    echo "ERROR: enabling ec2-spot-watchdog did not return within 60s — the unit is misdeclared (an endless ExecStart under Type=oneshot blocks systemctl start forever)" >&2
+    exit 1
+  }
 fi
 
 command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found" >&2; exit 1; }
