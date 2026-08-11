@@ -250,7 +250,16 @@ stage_config() {
 bootstrap_spot() {
   echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
   local _spot_env_export
-  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH} ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}"$'\n'
+  # REPO_URL was named in the NOTE above but never actually exported: the
+  # heredoc is single-quoted (literal on the spot), so ${REPO_URL} resolved to
+  # the empty string there and the clone died with
+  # `fatal: repository '' does not exist` — ne-weekly-freshness-pipeline
+  # watch-rerun-2026-08-10-7, 2026-08-11. Third defect in this bootstrap
+  # exposed by fixing the two ahead of it (#461 watchdog hang, #462 missing
+  # python3.12); a step that has never completed hides the next failure behind
+  # the current one. tests/test_spot_bootstrap_env_closure.py now fails when a
+  # variable the heredoc reads is neither exported here nor defaulted inline.
+  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH} REPO_URL=${REPO_URL} ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}"$'\n'
   run_ssm "bootstrap" "${_spot_env_export}$(cat <<'BOOTSTRAP'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
