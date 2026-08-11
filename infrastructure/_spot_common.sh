@@ -308,7 +308,22 @@ WDSH
   }
 fi
 
-command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found" >&2; exit 1; }
+# Install the interpreter — the AL2023 spot AMI does not ship python3.12.
+# This was a bare assertion, encoding an AMI contract nothing provides. It was
+# latent behind the watchdog hang (#461): once `systemctl` stopped blocking,
+# the very next bootstrap died here — ne-weekly-freshness-pipeline
+# watch-rerun-2026-08-10-6, 2026-08-11, "ERROR: python3.12 not found".
+# gcc + devel are needed by source-built wheels in requirements.txt; git for
+# the clone below. nousergon-data hit and fixed the identical defect in its
+# twin of this file (nousergon-data#1296) — this is the mirror.
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+    dnf install -y -q python3 python3-pip python3-devel git gcc
+
+# Post-condition, not a precondition: the install above is what makes this
+# true, and a silent fallback to a system python3 is exactly the drift this
+# bootstrap must not inherit (requirements.txt is resolved against 3.12).
+command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found after dnf install" >&2; exit 1; }
+echo "Using: $(python3.12 --version)"
 
 if [ ! -d /home/ec2-user/predictor/.git ]; then
   rm -rf /home/ec2-user/predictor
