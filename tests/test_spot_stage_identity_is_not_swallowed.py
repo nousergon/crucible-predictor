@@ -55,10 +55,30 @@ _STAGES = {
 
 _IDENTITY_VARS = ("_SPOT_NAME", "_SSM_SLUG", "_PROCESS_NAME", "MAX_RUNTIME_SECONDS")
 
-#: `_SPOT_NAME="${_SPOT_NAME:-value}"` at the start of a line.
+#: `_SPOT_NAME="${_SPOT_NAME:-value}"` at the start of a line. This is the
+#: SWALLOWABLE form — the one whose whole failure mode is expanding to nothing
+#: because the parameter is already set — so it is what the no-op assertions
+#: below are written against.
 _ASSIGN_RE = re.compile(
     r"^(?P<var>_SPOT_NAME|_SSM_SLUG|_PROCESS_NAME|MAX_RUNTIME_SECONDS)="
     r'"\$\{(?P=var):-(?P<value>[^}]*)\}"',
+    re.MULTILINE,
+)
+
+#: Lines the identity harness must replay to reproduce the stage's prologue.
+#:
+#: `MAX_RUNTIME_SECONDS` is no longer always a `${VAR:-literal}` line: as of
+#: config#6998 `spot_predictor_training.sh` DERIVES it from the outer SF stage
+#: budget minus a stated pre-workload reserve, because an inner SSM ceiling
+#: equal to the outer one can never bind and so can never name itself. Lifting
+#: only the `${VAR:-...}` form left that stage's runtime budget empty in the
+#: harness and reported it as a swallowed identity — a false positive on this
+#: test, not a defect in the script. So the harness replays every assignment in
+#: the prologue, and the `${VAR:-...}`-specific assertions above stay narrow.
+_PROLOGUE_ASSIGN_RE = re.compile(
+    r"^(?:_SPOT_NAME|_SSM_SLUG|_PROCESS_NAME|MAX_RUNTIME_SECONDS"
+    r"|_ENV_MAX_RUNTIME_SECONDS|SF_STAGE_EXECUTION_TIMEOUT_SECONDS"
+    r"|SPOT_PREWORKLOAD_RESERVE_SECONDS|SPOT_WORKLOAD_MAX_RUNTIME_SECONDS)=.*$",
     re.MULTILINE,
 )
 
@@ -90,10 +110,11 @@ def test_stage_identity_wins_over_the_shared_defaults(
 ) -> None:
     """Sourcing then declaring must yield the STAGE's identity."""
     script = _INFRA / script_name
+    source = script.read_text()
+    assert _ASSIGN_RE.search(source), f"{script_name}: declares no identity at all"
     stage_lines = [
-        match.group(0) for match in _ASSIGN_RE.finditer(script.read_text())
+        match.group(0) for match in _PROLOGUE_ASSIGN_RE.finditer(source)
     ]
-    assert stage_lines, f"{script_name}: declares no identity at all"
 
     harness = tmp_path / "identity.sh"
     harness.write_text(
