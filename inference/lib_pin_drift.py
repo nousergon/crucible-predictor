@@ -20,9 +20,20 @@ Exposed as `action=check_lib_pin_drift` on the predictor Lambda handler (mirrors
 a JSON-serializable dict the SF Choice consumes via `has_drift`.
 
 Fail-open on the checker's own fragility (mirrors `deploy_drift.py` degraded mode):
-a GitHub-fetch or parse failure for any needed repo → `has_drift=false` + WARN, so
-the probe never false-halts the weekly run. It only halts on a CONFIRMED drift
-(all needed pins fetched + parsed + a parity mismatch or below-floor pin).
+a GitHub-fetch or parse failure for any needed repo → `has_drift` is OMITTED from
+the result (not set to `false`) + WARN, so the probe never false-halts the
+weekly run. It only halts on a CONFIRMED drift (all needed pins fetched + parsed
++ a parity mismatch or below-floor pin).
+
+alpha-engine-config-I7048 (2026-08-12): previously this branch returned
+`has_drift=False` — a definite, present-key "no drift" verdict — indistinguishable
+downstream from a real pass. The SF's `LibPinDriftGate` Choice (nousergon-data
+infrastructure/step_function.json) already has a correctly-designed
+IsPresent-guarded branch for exactly this case — an ABSENT `has_drift` routes to
+`LibPinGateDegraded` (visible, SNS-alerted, non-blocking) rather than the
+silent-pass Default. Omitting the key here reuses machinery that already existed
+and was already correct. Do NOT default to `has_drift=True` on a fetch failure —
+inverting the lie does not make it true.
 """
 
 from __future__ import annotations
@@ -110,14 +121,18 @@ def _ge_floor(pin: str) -> bool:
 def check_lib_pin_drift(branch: str = "main") -> dict:
     """Assert the cross-repo lib-pin invariant; return a dict the SF Choice reads.
 
-    `has_drift=true` ONLY when every needed pin was fetched + parsed AND a parity
-    mismatch or below-floor pin is confirmed. Any fetch/parse miss → `has_drift=false`
-    + `reason=fetch_failed` (fail-open). Shape mirrors `check_deploy_drift`.
+    `has_drift` is present (`true`/`false`) ONLY when every needed pin was
+    fetched + parsed. Any fetch/parse miss OMITS `has_drift` entirely +
+    sets `reason=fetch_failed` (fail-open, alpha-engine-config-I7048:
+    unmeasured is not the same as measured-clean). `has_drift=true` only
+    when a parity mismatch or below-floor pin is confirmed. Shape mirrors
+    `check_deploy_drift`.
     """
     repos = tuple(dict.fromkeys(_CO_INSTALL_PAIR + _FLOOR_REPOS))  # de-dup, ordered
     pins: dict[str, str | None] = {r: _fetch_repo_pin(r, branch=branch) for r in repos}
 
     # Fail-open: if any needed pin is unknown, do NOT halt the weekly run.
+    # has_drift is OMITTED (not set False) — see module docstring I7048 note.
     missing = [r for r, p in pins.items() if p is None]
     if missing:
         log.warning(
@@ -125,7 +140,6 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
             len(missing), missing,
         )
         return {
-            "has_drift": False,
             "parity_ok": None,
             "floor_ok": None,
             "min_lib_version": MIN_LIB_VERSION,
