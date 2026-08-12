@@ -15,7 +15,7 @@
 #   - wait_ssm_agent() — poll SSM until instance agent is Online
 #   - stage_config() — upload config yaml to S3 staging prefix
 #   - bootstrap_spot() — watchdog + python + git clone + staged config fetch
-#   - install_deps() — pip install -r requirements.txt
+#   - install_deps() — pip install -r requirements.txt, keeping the log
 #   - emit_heartbeat() — CloudWatch Heartbeat metric
 #   - print_banner() / check_config_exists() — utilities
 #   - maybe_run_preflight_only_and_exit() — Friday shell_run dry path: boot +
@@ -351,13 +351,30 @@ BOOTSTRAP
 # ── Dependency installation ──────────────────────────────────────────────────
 
 install_deps() {
+  # config-I6949: this step used to pipe pip through `tail -1`, so a run that
+  # exited 0 having silently skipped an extra was indistinguishable from a
+  # clean one — and pip reports a dropped extra as a WARNING on a SUCCESSFUL
+  # exit, which is precisely the line `tail -1` could not keep. The fleet copy
+  # is krepis.spot_bootstrap.render_install_deps; keep the two in step.
   echo "==> Installing python deps..."
   run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-$PY -m pip install --quiet --no-warn-script-location -r requirements.txt 2>&1 | tail -1
+_pip_log=/tmp/pip-install-deps.log
+if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
+  echo "ERROR: pip install -r requirements.txt failed" >&2
+  tail -80 "$_pip_log" >&2
+  exit 1
+fi
+grep -E "^(Successfully installed|WARNING: .*does not provide the extra)" "$_pip_log" || true
+# Non-fatal on purpose: an inconsistent environment is reported, not raised.
+# (a) The failure mode left unraised is a pre-existing AMI-baked conflict
+# unrelated to this checkout, which would otherwise fail every lane on every
+# run. (b) It is recorded on stdout of this SSM step, captured with the rest
+# of the deps output.
+$PY -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
 DEPS
 )" 600
   echo "  Deps installed."
