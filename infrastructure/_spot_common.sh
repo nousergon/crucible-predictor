@@ -15,7 +15,7 @@
 #   - wait_ssm_agent() — poll SSM until instance agent is Online
 #   - stage_config() — upload config yaml to S3 staging prefix
 #   - bootstrap_spot() — watchdog + python + git clone + staged config fetch
-#   - install_deps() — pip install -r requirements.txt
+#   - install_deps() — pip install -r requirements.txt, keeping the log
 #   - emit_heartbeat() — CloudWatch Heartbeat metric
 #   - print_banner() / check_config_exists() — utilities
 #   - maybe_run_preflight_only_and_exit() — Friday shell_run dry path: boot +
@@ -250,12 +250,32 @@ stage_config() {
 bootstrap_spot() {
   echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
   local _spot_env_export
-  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH} ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}"$'\n'
+  # REPO_URL was named in the NOTE above but never actually exported: the
+  # heredoc is single-quoted (literal on the spot), so ${REPO_URL} resolved to
+  # the empty string there and the clone died with
+  # `fatal: repository '' does not exist` — ne-weekly-freshness-pipeline
+  # watch-rerun-2026-08-10-7, 2026-08-11. Third defect in this bootstrap
+  # exposed by fixing the two ahead of it (#461 watchdog hang, #462 missing
+  # python3.12); a step that has never completed hides the next failure behind
+  # the current one. tests/test_spot_bootstrap_env_closure.py now fails when a
+  # variable the heredoc reads is neither exported here nor defaulted inline.
+  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH} REPO_URL=${REPO_URL} ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}"$'\n'
   run_ssm "bootstrap" "${_spot_env_export}$(cat <<'BOOTSTRAP'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 
-# systemd watchdog — self-terminates on SSM-agent stoppage (config#2693)
+# systemd watchdog — self-terminates on SSM-agent stoppage (config#2693).
+# Type=simple, NOT oneshot: ExecStart is an endless supervision loop, and
+# `systemctl start` on a Type=oneshot unit BLOCKS until ExecStart exits
+# (TimeoutStartSec defaults to infinity for oneshot). This unit declared
+# Type=oneshot + RemainAfterExit=yes, so every bootstrap hung here until SSM
+# gave up at its budget — status=TimedOut with stderr ending on the
+# `systemctl enable` symlink line and nothing after it. Measured on
+# ne-weekly-freshness-pipeline watch-rerun-2026-08-10-5 (2026-08-11): the
+# PredictorTraining stage died exactly this way, taking Branch B down.
+# nousergon-data hit the identical defect in its twin of this file and fixed
+# it in nousergon-data#1294; this is the mirror (AGENTS.md: when a SOTA
+# pattern exists in another alpha-engine repo, mirror it).
 if ! systemctl is-enabled ec2-spot-watchdog 2>/dev/null; then
   cat > /tmp/ec2-spot-watchdog.service <<'UNIT'
 [Unit]
@@ -264,9 +284,10 @@ After=amazon-ssm-agent.service
 Requires=amazon-ssm-agent.service
 
 [Service]
-Type=oneshot
+Type=simple
 ExecStart=/usr/local/bin/ec2-spot-watchdog.sh
-RemainAfterExit=yes
+Restart=always
+RestartSec=30
 
 [Install]
 WantedBy=multi-user.target
@@ -286,11 +307,32 @@ done
 WDSH
   chmod +x /usr/local/bin/ec2-spot-watchdog.sh
   cp /tmp/ec2-spot-watchdog.service /etc/systemd/system/
-  systemctl enable ec2-spot-watchdog
-  systemctl start ec2-spot-watchdog
+  # `timeout` so a future unit-shape regression fails in seconds WITH a message,
+  # instead of consuming the whole SSM budget and dying with no output — that
+  # silence is what made the hang read as "bootstrap is slow" rather than
+  # "systemctl is blocked forever".
+  timeout 60 systemctl enable --now ec2-spot-watchdog || {
+    echo "ERROR: enabling ec2-spot-watchdog did not return within 60s — the unit is misdeclared (an endless ExecStart under Type=oneshot blocks systemctl start forever)" >&2
+    exit 1
+  }
 fi
 
-command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found" >&2; exit 1; }
+# Install the interpreter — the AL2023 spot AMI does not ship python3.12.
+# This was a bare assertion, encoding an AMI contract nothing provides. It was
+# latent behind the watchdog hang (#461): once `systemctl` stopped blocking,
+# the very next bootstrap died here — ne-weekly-freshness-pipeline
+# watch-rerun-2026-08-10-6, 2026-08-11, "ERROR: python3.12 not found".
+# gcc + devel are needed by source-built wheels in requirements.txt; git for
+# the clone below. nousergon-data hit and fixed the identical defect in its
+# twin of this file (nousergon-data#1296) — this is the mirror.
+dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
+    dnf install -y -q python3 python3-pip python3-devel git gcc
+
+# Post-condition, not a precondition: the install above is what makes this
+# true, and a silent fallback to a system python3 is exactly the drift this
+# bootstrap must not inherit (requirements.txt is resolved against 3.12).
+command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found after dnf install" >&2; exit 1; }
+echo "Using: $(python3.12 --version)"
 
 if [ ! -d /home/ec2-user/predictor/.git ]; then
   rm -rf /home/ec2-user/predictor
@@ -309,13 +351,30 @@ BOOTSTRAP
 # ── Dependency installation ──────────────────────────────────────────────────
 
 install_deps() {
+  # config-I6949: this step used to pipe pip through `tail -1`, so a run that
+  # exited 0 having silently skipped an extra was indistinguishable from a
+  # clean one — and pip reports a dropped extra as a WARNING on a SUCCESSFUL
+  # exit, which is precisely the line `tail -1` could not keep. The fleet copy
+  # is krepis.spot_bootstrap.render_install_deps; keep the two in step.
   echo "==> Installing python deps..."
   run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-$PY -m pip install --quiet --no-warn-script-location -r requirements.txt 2>&1 | tail -1
+_pip_log=/tmp/pip-install-deps.log
+if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
+  echo "ERROR: pip install -r requirements.txt failed" >&2
+  tail -80 "$_pip_log" >&2
+  exit 1
+fi
+grep -E "^(Successfully installed|WARNING: .*does not provide the extra)" "$_pip_log" || true
+# Non-fatal on purpose: an inconsistent environment is reported, not raised.
+# (a) The failure mode left unraised is a pre-existing AMI-baked conflict
+# unrelated to this checkout, which would otherwise fail every lane on every
+# run. (b) It is recorded on stdout of this SSM step, captured with the rest
+# of the deps output.
+$PY -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
 DEPS
 )" 600
   echo "  Deps installed."
