@@ -116,3 +116,40 @@ def test_scanning_nothing_is_an_error_not_a_pass(tmp_path):
         f"empty tree reported rc={result.returncode}, expected 2 — "
         "a check with nothing to check is not a passing check"
     )
+
+
+def test_scans_dockerfiles_including_nested(tmp_path):
+    """Dockerfiles are requesters too, and they matter more, not less.
+
+    A Docker base image pins its own pip, so a Dockerfile resolving correctly
+    today breaks silently the day that pin moves back. The live defects in
+    crucible-research / crucible-backtester / nousergon-data are all in
+    Dockerfiles, several of them nested one directory down (lambda_health/,
+    lambda_concordance/), so the nested case is asserted explicitly.
+    """
+    (tmp_path / "requirements.txt").write_text("krepis[flow-doctor]==0.38.0\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text(
+        'RUN pip install --no-cache-dir "nousergon-lib[arcticdb,flow_doctor,rag] '
+        '@ git+https://example/x@v1"\n',
+        encoding="utf-8",
+    )
+    assert _run(tmp_path).returncode == 1, "a top-level Dockerfile requester must be caught"
+
+    (tmp_path / "Dockerfile").unlink()
+    nested = tmp_path / "lambda_health"
+    nested.mkdir()
+    (nested / "Dockerfile").write_text(
+        'RUN pip install "nousergon-lib[flow_doctor] @ git+https://example/x@v1"\n',
+        encoding="utf-8",
+    )
+    assert _run(tmp_path).returncode == 1, "a nested Dockerfile requester must be caught"
+
+
+def test_dockerfile_variants_are_scanned(tmp_path):
+    """`Dockerfile.alerts` is a real filename in crucible-research."""
+    (tmp_path / "requirements.txt").write_text("krepis[flow-doctor]==0.38.0\n", encoding="utf-8")
+    (tmp_path / "Dockerfile.alerts").write_text(
+        'RUN pip install "nousergon-lib[flow_doctor] @ git+https://example/x@v1"\n',
+        encoding="utf-8",
+    )
+    assert _run(tmp_path).returncode == 1

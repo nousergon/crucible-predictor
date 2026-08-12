@@ -58,7 +58,12 @@ _REQUIREMENTS_GLOBS = ("requirements*.txt",)
 # In pyproject/Dockerfiles the requester appears inside a string or a pip
 # command rather than at line start, so match the bracket form anywhere.
 _INLINE_RE = re.compile(r"(?P<name>[A-Za-z0-9._-]+)\[(?P<extras>[^\]]*)\]")
+# Dockerfiles carry `RUN pip install "pkg[extra] @ git+https://..."` — the same
+# requester shape inside a shell string. They matter MORE than requirements
+# files here, not less: a Docker base image pins its own pip, so a Dockerfile
+# that resolves correctly today breaks silently the day that pin moves back.
 _INLINE_FILES = ("pyproject.toml",)
+_INLINE_GLOBS = ("Dockerfile", "Dockerfile.*", "*/Dockerfile", "*/Dockerfile.*")
 
 
 def _offending_extras(extras_body: str) -> list[str]:
@@ -123,6 +128,14 @@ def main(argv: list[str]) -> int:
     for name in _INLINE_FILES:
         path = root / name
         if path.exists():
+            scanned += 1
+            problems.extend(_scan_inline(path))
+    seen: set[Path] = set()
+    for pattern in _INLINE_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            if not path.is_file() or path in seen:
+                continue
+            seen.add(path)
             scanned += 1
             problems.extend(_scan_inline(path))
 
