@@ -279,9 +279,13 @@ def handler(event: dict, context) -> dict:
     if action == "check_lib_pin_drift":
         from inference.lib_pin_drift import check_lib_pin_drift
         result = check_lib_pin_drift()
+        # alpha-engine-config-I7048: has_drift is OMITTED (not False) on a
+        # fetch/parse miss — .get() with an "unmeasured" sentinel keeps this
+        # log line from KeyError-ing on the exact degraded path it exists to
+        # report, while still logging the honest state.
         log.info(
             "Lib-pin drift check: has_drift=%s reason=%s pins=%s%s",
-            result["has_drift"], result["reason"], result["pins"],
+            result.get("has_drift", "unmeasured"), result["reason"], result["pins"],
             (" offenders=" + "; ".join(result["offenders"])) if result["offenders"] else "",
         )
         return result
@@ -290,9 +294,11 @@ def handler(event: dict, context) -> dict:
     if action == "check_pipeline_contract":
         from inference.pipeline_contract_check import check_pipeline_contract
         result = check_pipeline_contract()
+        # alpha-engine-config-I7048: has_violation is OMITTED (not False) on
+        # a fetch/parse miss — same .get() rationale as check_lib_pin_drift.
         log.info(
             "Pipeline-contract preflight: has_violation=%s reason=%s boundaries=%s%s",
-            result["has_violation"], result["reason"], result["boundary_count"],
+            result.get("has_violation", "unmeasured"), result["reason"], result["boundary_count"],
             (" violations=" + "; ".join(result["violations"]))
             if result["violations"] else "",
         )
