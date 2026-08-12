@@ -69,16 +69,20 @@ jobs:
       # so without this step every canary invoke dies with
       # `ModuleNotFoundError: No module named 'krepis'` (surfaced 2026-07-01,
       # config#1494 follow-up: PR #324 wired the CLI call but never installed
-      # it on the caller). Pin matches requirements.txt's `krepis[flow_doctor]
+      # it on the caller). Pin matches requirements.txt's `krepis[flow-doctor]
       # >=0.7.0` floor; setup-python pins the interpreter so the pip install
       # target doesn't drift with GH's ubuntu-latest image updates.
+      # HYPHENATED (config-I6963): pip <23.3 does not normalise `_` to `-` in a
+      # REQUESTED extra and drops it with a WARNING on a SUCCESSFUL exit. This
+      # line survived PR #465 because scripts/lint_extras.py did not scan
+      # workflow YAML — the denominator fix is in this same PR.
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Install krepis (runner-side canary + alert CLI)
-        run: pip install "krepis[flow_doctor]>=0.7.0"
+        run: pip install "krepis[flow-doctor]>=0.7.0"
 
       - name: Deploy inference Lambda (alpha-engine-predictor-inference)
         working-directory: alpha-engine-predictor

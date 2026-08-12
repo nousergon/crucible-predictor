@@ -159,6 +159,28 @@ spot_launch() {
 
 cleanup() {
   local exit_code=$?
+
+  # FIRST, before anything that can itself fail or block. _heartbeat_start
+  # backgrounds `krepis.heartbeat emit`, and every per-stage script stops it
+  # only on the SUCCESS path — a `set -e` abort between start and stop lands
+  # here with the heartbeat still running. That process inherited this script's
+  # stdout, which is the pipe `krepis.ssm_log_capture` reads until EOF, so it
+  # held the whole SSM command open long after the workload had died.
+  #
+  # Measured on ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9
+  # (2026-08-11): the smoke step failed 142 seconds in on a flow-doctor
+  # ImportError (config-I6963); the command was SIGKILLed at its full 5400s
+  # executionTimeout — ResponseCode 137, ExecutionTimedOut — and no log was
+  # ever shipped, because the S3 ship runs after that read loop. The stage was
+  # recorded as a 90-minute overrun (config-I6948) when it had in fact failed
+  # almost immediately.
+  #
+  # krepis 0.50.0 breaks the hang at the chokepoint (krepis-PR132) and kills
+  # the orphan group. This is the launcher's own half: not leaking it in the
+  # first place, so the breaker never has to fire and the heartbeat's absence
+  # remains a true signal that the phase ended.
+  _heartbeat_stop
+
   echo ""
 
   # Belt-and-suspenders: confirm spot-side workload log landed in S3
