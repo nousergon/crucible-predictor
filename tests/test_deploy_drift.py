@@ -114,20 +114,43 @@ def test_cf_drift_detected(mock_fetch, mock_tag, mock_comment):
 def test_missing_stamps_do_not_trigger_drift(mock_fetch, mock_tag, mock_comment):
     # First SF deploy before stamping shipped won't have a prefix; first CF
     # deploy without git-sha tag won't have the tag. Don't block these paths.
+    # alpha-engine-config-I7048: a MISSING local stamp is a confirmed,
+    # already-measured state (nothing to compare) — distinct from an
+    # unmeasured upstream fetch failure — so sf_drift/cf_drift stay a
+    # definite, present False here (upstream IS reachable in this fixture;
+    # see test_github_outage_is_no_drift below for the genuinely
+    # unmeasured — upstream unreachable — case).
     result = dd.check_deploy_drift(region="us-east-1", account_id="123")
     assert result["has_drift"] is False
     assert result["sf_stamp_present"] is False
     assert result["stack_stamp_present"] is False
+    assert result["sf_drift"] is False
+    assert result["cf_drift"] is False
+    assert result["sf_drift_reason"] == "no_git_sha_stamp_legacy"
+    assert result["cf_drift_reason"] == "no_git_sha_tag_legacy"
 
 
-@patch.object(dd, "_read_sf_comment", return_value="[git:abc123] old")
-@patch.object(dd, "_read_stack_tag", return_value="abc123")
+@patch.object(dd, "_read_sf_comment", return_value="[git:abc1234] old")
+@patch.object(dd, "_read_stack_tag", return_value="abc1234")
 @patch.object(dd, "_fetch_origin_main_sha", return_value=None)
 def test_github_outage_is_no_drift(mock_fetch, mock_tag, mock_comment):
-    # Can't compare against upstream → report stamps but don't flag drift
+    # Can't compare against upstream, but stamps DO exist → genuinely
+    # UNMEASURED, not "confirmed no drift". alpha-engine-config-I7048: this
+    # test previously pinned the bug it now guards against — sf_drift/
+    # cf_drift must be OMITTED here (not a present False), so the SF's
+    # IsPresent-guarded DeployDriftGate Choice (config#6615, fail CLOSED on
+    # unknown) actually halts on a GitHub outage instead of silently
+    # trading through an unverified deploy.
     result = dd.check_deploy_drift(region="us-east-1", account_id="123")
-    assert result["has_drift"] is False
     assert result["upstream_sha"] is None
+    assert "sf_drift" not in result
+    assert "cf_drift" not in result
+    assert result["sf_drift_reason"] == "fetch_failed"
+    assert result["cf_drift_reason"] == "fetch_failed"
+    # has_drift is a best-effort summary field the SF Choice does NOT read
+    # (it reads sf_drift/cf_drift directly) — it degrades to False when
+    # both components are unmeasured, same non-gating status as before.
+    assert result["has_drift"] is False
 
 
 # ── AWS read surface ─────────────────────────────────────────────────────────

@@ -267,11 +267,14 @@ def handler(event: dict, context) -> dict:
             region=os.environ.get("AWS_REGION", "us-east-1"),
             account_id=account_id,
         )
+        # alpha-engine-config-I7048: sf_drift/cf_drift are OMITTED (not
+        # False) when unmeasured (upstream fetch failed) — .get() keeps
+        # this log line from KeyError-ing on that exact path.
         log.info(
             "Deploy-drift check: upstream=%s  sf=%s(drift=%s)  cf=%s(drift=%s)",
             (result["upstream_sha"] or "?")[:12],
-            (result["sf_sha"] or "missing")[:12], result["sf_drift"],
-            (result["stack_sha"] or "missing")[:12], result["cf_drift"],
+            (result["sf_sha"] or "missing")[:12], result.get("sf_drift", "unmeasured"),
+            (result["stack_sha"] or "missing")[:12], result.get("cf_drift", "unmeasured"),
         )
         return result
 
