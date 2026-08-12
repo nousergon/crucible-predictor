@@ -210,11 +210,32 @@ def check_deploy_drift(
     """Compare deployed SF + CF SHAs against GitHub `repo@branch` HEAD.
 
     Returns a dict with per-artifact stamps, the upstream SHA, and
-    booleans flagging drift. The Step Function's Choice state uses
-    `has_drift` to decide whether to proceed or route to HandleFailure.
-    Degraded modes (GitHub outage, missing stamps) set `has_drift=false`
-    with diagnostic fields populated — see sibling functions for the
-    "why" of each None value.
+    booleans flagging drift. The Step Function's `DeployDriftGate` Choice
+    (nousergon-data infrastructure/step_function_daily.json) reads
+    `sf_drift`/`cf_drift` directly and is IsPresent-guarded on each,
+    per Brian's 2026-08-09 ruling (config#6615): sf_drift is
+    trading-correctness-critical, so an ABSENT sf_drift or cf_drift
+    already routes to `HandleFailure` (fail CLOSED on unknown) — the
+    OPPOSITE convention from the Saturday-SF preflight gates
+    (`check_lib_pin_drift`/`check_pipeline_contract`, alpha-engine-config-
+    I7048), which fail open-but-visible. Either way, the shared invariant
+    is the same: a field this function could not actually MEASURE must
+    never be a present, defaulted `False` — that reads as "checked, no
+    drift" to the SF's IsPresent guard exactly as if it had been verified.
+
+    alpha-engine-config-I7048 sibling fix (2026-08-12): `sf_drift`/
+    `cf_drift` are now OMITTED (not `False`) specifically when a needed
+    comparison SHA could not be fetched — i.e. `upstream is None` — while a
+    local stamp to compare it against DOES exist. A MISSING local stamp
+    (`sf_sha`/`stack_sha` is `None`) is a distinct, already-measured state
+    (first deploy before stamping shipped, or a legacy CF stack with no
+    git-sha tag) and correctly stays `False` regardless of `upstream` —
+    there is nothing to compare, which is a confirmed non-drift verdict,
+    not an unmeasured one. Previously `test_github_outage_is_no_drift`
+    pinned the bug this fixes: stamps present, GitHub unreachable, yet
+    `has_drift=False` — a live GitHub outage during the weekday preflight
+    would have silently traded through an unverified deploy instead of
+    halting per the fail-closed ruling this Choice was built to enforce.
     """
     sf_arn = _SF_ARN_TEMPLATE.format(
         region=region, account=account_id, name=sf_name,
@@ -225,6 +246,10 @@ def check_deploy_drift(
     stack_read = _read_stack_tag(stack_name)
     upstream = _fetch_origin_main_sha(repo, branch=branch)
 
+    # sf_drift is UNMEASURED (omitted below) only when there IS a local
+    # stamp to compare and upstream could not be fetched. A missing stamp
+    # is its own confirmed state (see docstring) and stays a definite False.
+    sf_drift_unmeasured = sf_sha is not None and upstream is None
     sf_drift = (
         upstream is not None
         and sf_sha is not None
@@ -239,36 +264,59 @@ def check_deploy_drift(
         stack_sha = None
         stack_stamp_present = False
         cf_drift = True
+        cf_drift_unmeasured = False
         cf_drift_reason = stack_read.reason
         cf_drift_detail = stack_read.detail
         cf_stack_status = stack_read.stack_status
     else:
         stack_sha = stack_read  # str | None
         stack_stamp_present = stack_sha is not None
+        # Same unmeasured rule as sf_drift: a real stack tag exists but
+        # upstream could not be fetched.
+        cf_drift_unmeasured = stack_sha is not None and upstream is None
         cf_drift = (
             upstream is not None
             and stack_sha is not None
             and not _shas_match(stack_sha, upstream)
         )
         cf_drift_reason = (
+            "fetch_failed" if cf_drift_unmeasured else
             "sha_mismatch" if cf_drift else
             ("no_git_sha_tag_legacy" if stack_sha is None else "in_sync")
         )
         cf_drift_detail = ""
         cf_stack_status = None
 
-    return {
+    sf_drift_reason = (
+        "fetch_failed" if sf_drift_unmeasured else
+        "sha_mismatch" if sf_drift else
+        ("no_git_sha_stamp_legacy" if sf_sha is None else "in_sync")
+    )
+
+    result = {
         "repo": repo,
         "branch": branch,
         "upstream_sha": upstream,
         "sf_sha": sf_sha,
         "sf_stamp_present": sf_sha is not None,
+        "sf_drift_reason": sf_drift_reason,
         "stack_sha": stack_sha,
         "stack_stamp_present": stack_stamp_present,
-        "sf_drift": sf_drift,
-        "cf_drift": cf_drift,
         "cf_drift_reason": cf_drift_reason,
         "cf_drift_detail": cf_drift_detail,
         "cf_stack_status": cf_stack_status,
-        "has_drift": sf_drift or cf_drift,
+        # alpha-engine-config-I7048: OMIT sf_drift/cf_drift entirely when
+        # unmeasured — see the module/function docstrings. The SF's
+        # DeployDriftGate Choice is already IsPresent-guarded to fail
+        # CLOSED on an absent key (Brian's 2026-08-09 ruling, config#6615);
+        # a present `False` here would silently defeat that guard.
+        "has_drift": bool(
+            (not sf_drift_unmeasured and sf_drift)
+            or (not cf_drift_unmeasured and cf_drift)
+        ),
     }
+    if not sf_drift_unmeasured:
+        result["sf_drift"] = sf_drift
+    if not cf_drift_unmeasured:
+        result["cf_drift"] = cf_drift
+    return result

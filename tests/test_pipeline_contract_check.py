@@ -187,15 +187,21 @@ def test_collects_all_violations_not_just_first():
 def test_contract_fetch_failure_fails_open():
     with _patch_raw(None, _GOOD_REGISTRY):  # contract unreachable
         out = pcc.check_pipeline_contract()
-    assert out["has_violation"] is False
+    # alpha-engine-config-I7048: an unmeasured gate must not report a
+    # definite verdict — has_violation is OMITTED, not set to False, so the
+    # SF's IsPresent-guarded Choice routes to the visible degraded path
+    # instead of a silent pass.
+    assert "has_violation" not in out
     assert out["reason"] == "fetch_failed"
+    assert out["boundary_count"] is None
 
 
 def test_registry_fetch_failure_fails_open():
     with _patch_raw(_GOOD_CONTRACT, None):  # registry unreachable
         out = pcc.check_pipeline_contract()
-    assert out["has_violation"] is False
+    assert "has_violation" not in out
     assert out["reason"] == "fetch_failed"
+    assert out["boundary_count"] is None
 
 
 def test_malformed_yaml_fails_open():
@@ -204,8 +210,9 @@ def test_malformed_yaml_fails_open():
         return bad_yaml
     with patch.object(pcc, "_fetch_raw", side_effect=_side_effect):
         out = pcc.check_pipeline_contract()
-    # A parse failure is the checker's own fragility — must never false-halt.
-    assert out["has_violation"] is False
+    # A parse failure is the checker's own fragility — must never false-halt,
+    # and must never report a measured verdict it does not have.
+    assert "has_violation" not in out
     assert out["reason"] == "fetch_failed"
 
 

@@ -23,10 +23,28 @@ gate right after ``LibPinDriftCheck``. Returns a JSON-serializable dict the SF
 Choice consumes via ``has_violation``.
 
 Fail-open on the checker's own fragility (mirrors ``lib_pin_drift.py`` degraded
-mode): a GitHub-fetch or YAML-parse failure for either file → ``has_violation=
-false`` + WARN (``reason=fetch_failed``), so the probe never false-halts the
-weekly run. It halts ONLY on a CONFIRMED structural violation (both files
-fetched + parsed AND a self-consistency / dangling-artifact_id breach).
+mode): a GitHub-fetch or YAML-parse failure for either file → ``has_violation``
+is OMITTED from the result (not set to ``false``) + WARN (``reason=
+fetch_failed``), so the probe never false-halts the weekly run. It halts ONLY
+on a CONFIRMED structural violation (both files fetched + parsed AND a
+self-consistency / dangling-artifact_id breach).
+
+alpha-engine-config-I7048 (2026-08-12): previously this branch returned
+``has_violation=False`` — a definite, present-key "no violation" verdict —
+indistinguishable downstream from a real pass. Measured live on the
+scheduled 2026-08-08 weekly run: ``{"has_violation": false, "violations":
+[], "boundary_count": null, "reason": "fetch_failed"}`` — the check never
+examined anything (``boundary_count: null`` is the honest field) but reported
+green anyway. The SF's ``PipelineContractGate`` Choice (nousergon-data
+infrastructure/step_function.json) already has a correctly-designed
+IsPresent-guarded branch for exactly this case — an ABSENT ``has_violation``
+routes to ``PipelineContractGateDegraded`` (visible, SNS-alerted, non-
+blocking) rather than the silent-pass Default. Omitting the key here (instead
+of adding a new SF state) is the surgical fix: it reuses machinery that
+already existed and was already correct, mirroring ``check_lib_pin_drift``'s
+identical correction in ``lib_pin_drift.py``. Do NOT default to
+``has_violation=True`` on a fetch failure — a check that could not run is not
+evidence of a violation either; inverting the lie does not make it true.
 
 Validation invariants mirror ``validate_pipeline_contract.py`` (the human SoT
 lives in the config repo; this re-implements the *rules* because the predictor
@@ -207,15 +225,21 @@ def _validate_contract(contract: object, registry_ids: set[str]) -> list[str]:
 def check_pipeline_contract(branch: str = "main") -> dict:
     """Assert the pipeline-contract invariants; return a dict the SF Choice reads.
 
-    ``has_violation=true`` ONLY when BOTH the contract + registry were fetched
-    and parsed AND a confirmed self-consistency / dangling-artifact_id breach is
-    found. Any fetch/parse miss → ``has_violation=false`` + ``reason=fetch_failed``
-    (fail-open). Shape mirrors ``check_lib_pin_drift``.
+    ``has_violation`` is present (``true``/``false``) ONLY when BOTH the
+    contract + registry were fetched and parsed. Any fetch/parse miss OMITS
+    ``has_violation`` entirely + sets ``reason=fetch_failed`` (fail-open,
+    alpha-engine-config-I7048: unmeasured is not the same as measured-clean).
+    ``has_violation=true`` only when a confirmed self-consistency /
+    dangling-artifact_id breach is found. Shape mirrors ``check_lib_pin_drift``.
     """
     contract_raw = _fetch_raw(_CONTRACT_PATH, branch=branch)
     registry_raw = _fetch_raw(_REGISTRY_PATH, branch=branch)
 
     # Fail-open: if either file is unreachable, do NOT halt the weekly run.
+    # has_violation is OMITTED (not set False) — alpha-engine-config-I7048:
+    # this state was never measured, so it must not report a definite
+    # verdict. The SF's IsPresent-guarded Choice routes an absent key to
+    # the visible PipelineContractGateDegraded path.
     if contract_raw is None or registry_raw is None:
         log.warning(
             "Pipeline-contract preflight: source file(s) unresolved "
@@ -224,7 +248,6 @@ def check_pipeline_contract(branch: str = "main") -> dict:
             registry_raw is not None,
         )
         return {
-            "has_violation": False,
             "violations": [],
             "boundary_count": None,
             "reason": "fetch_failed",
@@ -239,7 +262,6 @@ def check_pipeline_contract(branch: str = "main") -> dict:
             exc,
         )
         return {
-            "has_violation": False,
             "violations": [],
             "boundary_count": None,
             "reason": "fetch_failed",

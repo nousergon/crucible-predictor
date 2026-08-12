@@ -97,8 +97,11 @@ def test_fetch_failure_fails_open():
     pins["nousergon/crucible-research"] = None  # GitHub unreachable / parse miss
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
-    # The checker's own fragility must NEVER halt the weekly run.
-    assert out["has_drift"] is False
+    # The checker's own fragility must NEVER halt the weekly run — but must
+    # also never report a definite verdict it never measured.
+    # alpha-engine-config-I7048: has_drift is OMITTED, not False, so the
+    # SF's IsPresent-guarded Choice routes to the visible degraded path.
+    assert "has_drift" not in out
     assert out["reason"] == "fetch_failed"
 
 
