@@ -42,6 +42,12 @@ Usage:
   ./infrastructure/iam/check-drift.py --pr-diff-aware     # PR mode: soft-warn on
                                                           #   expected drift, hard-fail
                                                           #   on unexpected drift
+  ./infrastructure/iam/check-drift.py --post-merge        # post-merge mode:
+                                                          #   auto-apply drifted
+                                                          #   roles via apply.sh,
+                                                          #   re-check, fail only
+                                                          #   on residual drift
+                                                          #   (config#3495)
 """
 
 from __future__ import annotations
@@ -155,6 +161,71 @@ def _check_role(role_file: Path) -> list[str]:
     return findings
 
 
+def _apply_role(role_file: Path) -> tuple[bool, str]:
+    """Run apply.sh for one role. Returns (success, message)."""
+    apply_script = role_file.parent / "apply.sh"
+    role_name = role_file.stem
+    result = subprocess.run(
+        ["bash", str(apply_script), role_name],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=role_file.parent,
+    )
+    if result.returncode == 0:
+        return True, f"{role_name}: applied successfully"
+    return False, f"{role_name}: apply.sh failed (exit {result.returncode}): {result.stderr.strip()}"
+
+
+def _apply_and_reconcile(role_files: list[Path], findings: list[str]) -> int:
+    """Post-merge mode: auto-apply drifted roles, re-check, fail on residual.
+
+    Returns 0 on clean, 1 on residual drift, 2 on apply failure."""
+    print(f"Post-merge drift detected — auto-applying {len(findings)} finding(s):")
+    for f in findings:
+        print(f"  {f}")
+
+    # Determine which roles drifted
+    drifted_roles: set[str] = set()
+    for finding in findings:
+        role_name = finding.split("/")[0].split(":")[0]
+        drifted_roles.add(role_name)
+
+    # Apply each drifted role
+    apply_failures: list[str] = []
+    for role_name in sorted(drifted_roles):
+        role_file = SCRIPT_DIR / f"{role_name}.json"
+        if not role_file.is_file():
+            apply_failures.append(f"{role_name}: no codified JSON found to apply")
+            continue
+        ok, msg = _apply_role(role_file)
+        print(f"  {msg}")
+        if not ok:
+            apply_failures.append(msg)
+
+    if apply_failures:
+        print(f"\nApply failures ({len(apply_failures)}):")
+        for f in apply_failures:
+            print(f"  - {f}")
+        return 2
+
+    # Re-check after apply
+    print("\nRe-checking after auto-apply...")
+    residual: list[str] = []
+    for role_file in role_files:
+        residual.extend(_check_role(role_file))
+
+    if residual:
+        print(f"Residual IAM drift after auto-apply ({len(residual)} finding(s)):")
+        for f in residual:
+            print(f"  - {f}")
+        return 1
+
+    role_names = ", ".join(f.stem for f in role_files)
+    print(f"OK: auto-apply resolved all drift for {role_names}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -169,6 +240,16 @@ def main() -> int:
             "is a hard failure (exits 1). Prevents the structural "
             "circularity where IAM-change PRs produce red checks by "
             "construction (config#3492)."
+        ),
+    )
+    parser.add_argument(
+        "--post-merge",
+        action="store_true",
+        help=(
+            "Post-merge mode: on drift, auto-apply each drifted role via "
+            "apply.sh, then re-check. Residual drift after apply is real "
+            "and fails (exit 1). Apply failures exit 2. Clean state exits 0. "
+            "(config#3495)"
         ),
     )
     args = parser.parse_args()
@@ -190,14 +271,24 @@ def main() -> int:
 
     expected_findings: list[str] = []
     unexpected_findings: list[str] = []
+    all_findings: list[str] = []
     for role_file in role_files:
         findings = _check_role(role_file)
         if not findings:
             continue
+        all_findings.extend(findings)
         if role_file.stem in changed_roles:
             expected_findings.extend(findings)
         else:
             unexpected_findings.extend(findings)
+
+    # --post-merge: auto-apply + re-check, then done (config#3495)
+    if args.post_merge:
+        if not all_findings:
+            role_names = ", ".join(f.stem for f in role_files)
+            print(f"OK: no IAM drift for {role_names} — nothing to apply")
+            return 0
+        return _apply_and_reconcile(role_files, all_findings)
 
     if expected_findings:
         print(
