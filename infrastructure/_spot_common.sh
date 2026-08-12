@@ -368,7 +368,22 @@ if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_l
   tail -80 "$_pip_log" >&2
   exit 1
 fi
-grep -E "^(Successfully installed|WARNING: .*does not provide the extra)" "$_pip_log" || true
+grep -E "^Successfully installed" "$_pip_log" || true
+# A dropped extra is a BROKEN ENVIRONMENT, not a note. pip reports it as a
+# WARNING on a SUCCESSFUL exit, so nothing downstream fails until an import
+# does — in another process, minutes later, with the install log long gone.
+# That is exactly how config#6963 reached production: the training smoke died
+# on `ModuleNotFoundError: No module named 'flow_doctor'` out of
+# krepis.logging.setup_logging, from an install pip had called a success.
+# AL2023 ships pip 23.2.1, which predates PEP 685 extras normalisation
+# (measured boundary: 23.2.1 drops, 23.3.2 honours), so this bootstrap sits on
+# the broken side by default and cannot rely on the resolver to be strict.
+# Fail here, where the log is still in hand and the cause is one line.
+if grep -E "^WARNING: .*does not provide the extra" "$_pip_log" >&2; then
+  echo "ERROR: pip dropped a requested extra (above) — the environment is incomplete." >&2
+  echo "       Extras must be HYPHENATED; pip <23.3 does not normalise '_' to '-'." >&2
+  exit 1
+fi
 # Non-fatal on purpose: an inconsistent environment is reported, not raised.
 # (a) The failure mode left unraised is a pre-existing AMI-baked conflict
 # unrelated to this checkout, which would otherwise fail every lane on every
