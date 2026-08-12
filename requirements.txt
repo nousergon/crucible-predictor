@@ -25,6 +25,24 @@ setuptools>=83.0.0
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
 #
+# This note sat directly above a `krepis[flow_doctor]` line for months and the
+# hazard it names took down the weekly pipeline anyway (config#6963). The rule
+# is now mechanical, not advisory: `scripts/lint_extras.py` (CI, `ci.yml`) fails
+# the build on any underscored extra in either requirements file, and the spot
+# bootstrap raises on pip's dropped-extra WARNING instead of printing it.
+#
+# Measured boundary, 2026-08-12 — `krepis[flow_doctor]==0.38.0`, dry-run resolve:
+#   pip 23.2.1  -> 18 packages, "WARNING: krepis 0.38.0 does not provide the
+#                  extra 'flow_doctor'", exit 0. flow-doctor ABSENT.
+#   pip 23.3.2  -> 30 packages, flow-doctor present.
+#   pip 24.0    -> 30 packages, flow-doctor present.
+#   pip 25.0    -> 30 packages, flow-doctor present.
+# AL2023's `python3.12-pip` is 23.2.1 — the spot bootstrap installs on the
+# broken side of that boundary, which is why this repo hit it in production
+# while the Docker-based consumers (newer pip in their base images) did not.
+# The hyphenated form resolves correctly on EVERY pip version, so it is the
+# form to use unconditionally rather than a workaround for old pip.
+#
 # Dual-import (config#1269, mirrors crucible-evaluator #69): non-edge commodity
 # modules (secrets/dates/logging/trading_calendar/alerts/email_sender/metrics +
 # the flow-doctor wiring glue) import from MIT ``krepis``; AGPL edge modules
@@ -44,7 +62,7 @@ setuptools>=83.0.0
 # `aws lambda invoke`. The invoke is now LOAD-BEARING, so krepis must be
 # importable in the deploy environment — this floor makes it a hard dep. Kept
 # in lockstep with requirements-lambda.txt.
-krepis[flow_doctor]==0.38.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis[flow-doctor]==0.38.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@c907a044bb1553815225327bc56644050543b6f2
 
 # Training dependencies (not needed in Lambda)

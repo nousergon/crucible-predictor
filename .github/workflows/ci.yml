@@ -61,12 +61,37 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Static spelling gate. Must run BEFORE the resolves below, because those
+      # `pip install --upgrade pip` first and therefore resolve on a pip that
+      # normalises extras per PEP 685 — an underscored extra resolves fine here
+      # and is silently dropped on the AL2023 spot box (pip 23.2.1). CI cannot
+      # reproduce the production resolver, so the spelling is checked statically
+      # instead of being inferred from a green resolve. (config#6963)
+      - name: Lint dependency extras (no underscores)
+        run: python3 scripts/lint_extras.py .
+
       - name: Resolve requirements.txt into a clean venv
         run: |
           python -m venv /tmp/venv-root
           /tmp/venv-root/bin/pip install --upgrade pip -q
           /tmp/venv-root/bin/pip install -r requirements.txt -q
           /tmp/venv-root/bin/pip freeze > /tmp/root-freeze.txt
+
+      # Outcome assertion, not a spelling one: flow-doctor is what the
+      # `[flow-doctor]` extra exists to pull in, and krepis.logging raises hard
+      # when a flow_doctor_yaml is configured and the package is absent. This
+      # catches a dropped extra for ANY reason — a renamed extra upstream, a
+      # resolver backtrack onto a krepis that no longer declares it — not only
+      # the underscore spelling the lint above covers.
+      - name: Assert the flow-doctor extra actually resolved
+        run: |
+          grep -qi '^flow.doctor==' /tmp/root-freeze.txt || {
+            echo "ERROR: flow-doctor absent from the resolved requirements.txt environment." >&2
+            echo "       The [flow-doctor] extra did not pull it in. krepis.logging" >&2
+            echo "       setup_logging() raises on this in any deployed runtime." >&2
+            exit 1
+          }
+          echo "flow-doctor resolved: $(grep -i '^flow.doctor==' /tmp/root-freeze.txt)"
 
       - name: Resolve requirements-lambda.txt into a clean venv
         run: |
