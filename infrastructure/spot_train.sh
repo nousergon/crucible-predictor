@@ -308,6 +308,22 @@ cleanup() {
   # later `exit "$exit_code"` is required so the EXIT trap never masks a real
   # failure as rc=0 (the L4485 class the sibling backtester also guards).
   local exit_code=$?
+
+  # Stop the background heartbeat FIRST — the comment above _heartbeat_stop has
+  # said "or in the cleanup EXIT trap" since it was written, and nothing did it.
+  # `_heartbeat_start` backgrounds `krepis.heartbeat emit`, which inherits this
+  # script's stdout; that stdout is the pipe `krepis.ssm_log_capture` reads
+  # until EOF, and EOF needs every writer to close. A `set -e` abort between
+  # start and stop therefore left the SSM command held open long after the
+  # workload had died — measured as a full 5400s executionTimeout, SIGKILL,
+  # ResponseCode 137, and no log shipped, on a stage that had actually failed
+  # 142 seconds in (config-I6948, root cause config-I6963).
+  #
+  # `declare -F` guard: the trap is installed before this function is defined,
+  # so an early abort would otherwise hit command-not-found INSIDE the trap and
+  # skip the instance-termination call below — leaving a spot instance billing.
+  declare -F _heartbeat_stop >/dev/null 2>&1 && _heartbeat_stop
+
   echo ""
   # Belt-and-suspenders (STEP 3): BEFORE terminating the spot, confirm where
   # each workload's spot-side log landed in S3. The spot SELF-SHIP via
