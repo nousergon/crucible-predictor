@@ -64,12 +64,29 @@ MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-2}"
 SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
 SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 
-# Per-stage overrides (set these BEFORE sourcing _spot_common.sh if needed)
-_SPOT_NAME="${_SPOT_NAME:-predictor-training}"
-_SSM_SLUG="${_SSM_SLUG:-spot-training}"
-_PROCESS_NAME="${_PROCESS_NAME:-predictor-training}"
-# MAX_RUNTIME_SECONDS must be set per-stage (default 5400 = 90 min)
-MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
+# Per-stage identity — DECLARED HERE, NEVER DEFAULTED HERE.
+#
+# This block used to carry `predictor-training` / `spot-training` defaults, and
+# every per-stage script then set its own with the SAME `${VAR:-...}` form
+# AFTER sourcing this file — where the parameter is already non-empty, so the
+# expansion is a NO-OP and the stage identity silently stayed whatever this
+# file said. Measured 2026-08-11 on `watch-rerun-2026-08-10-9`: the heartbeat
+# emitted under slug `spot-spot-training` although `spot_predictor_training.sh`
+# asks for `spot-full-training`, and `cleanup`'s log-pointer probe therefore
+# listed `_ssm_logs/spot-training/<date>/` — a prefix nothing ever writes — and
+# printed no pointer while the real log sat under a different slug. The same
+# no-op made every model-zoo spot instance Name-tagged `predictor-training` and
+# published `SpotInterruptionRetry` under the wrong `Process` dimension.
+#
+# Declared EMPTY so `set -u` is satisfied at source time and the per-stage
+# `${VAR:-<stage default>}` lines are load-bearing again (an explicit env
+# override still wins, because it is set before this file runs). `spot_launch`
+# asserts all four are non-empty before any instance exists, so a stage that
+# forgets one fails loud and free rather than inheriting a sibling's identity.
+_SPOT_NAME="${_SPOT_NAME:-}"
+_SSM_SLUG="${_SSM_SLUG:-}"
+_PROCESS_NAME="${_PROCESS_NAME:-}"
+MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-}"
 
 # Derived at launch time
 _INSTANCE_ID=""
@@ -121,6 +138,20 @@ run_ssm() {
 # ── Spot launch (capacity-resilient) ─────────────────────────────────────────
 
 spot_launch() {
+  # Stage identity must be real BEFORE anything is billable. See the
+  # "Per-stage identity" block above for why these can no longer be defaulted
+  # in this file: a default here silently swallows the per-stage assignment.
+  local _unset=""
+  [ -n "$_SPOT_NAME" ] || _unset="${_unset} _SPOT_NAME"
+  [ -n "$_SSM_SLUG" ] || _unset="${_unset} _SSM_SLUG"
+  [ -n "$_PROCESS_NAME" ] || _unset="${_unset} _PROCESS_NAME"
+  [ -n "$MAX_RUNTIME_SECONDS" ] || _unset="${_unset} MAX_RUNTIME_SECONDS"
+  if [ -n "$_unset" ]; then
+    echo "ERROR: per-stage variable(s) unset before spot_launch:${_unset}" >&2
+    echo "       Set them AFTER sourcing _spot_common.sh — see its header." >&2
+    exit 2
+  fi
+
   echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 
   _INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
@@ -199,15 +230,32 @@ cleanup() {
   # Spot-reclaim DECISION (lib chokepoint) — run BEFORE terminate-instances
   local _spot_relaunch=0
   if [ "$exit_code" -ne 0 ] && [ -n "${_INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-    local _decide_out _decide_rc
+    # `|| _decide_rc=$?` is LOAD-BEARING, not defensive noise. This file runs
+    # under `set -e`, and `relaunch-decision` signals "hold" by EXIT CODE
+    # (NO_RELAUNCH_EXIT_CODE=75) — the designed answer for every non-reclaim
+    # failure, which is nearly all of them. An unguarded `VAR="$(cmd)"` is a
+    # simple command whose status is the substitution's, so errexit fired and
+    # tore the shell down INSIDE the EXIT trap: the `_decide_rc=$?` line below
+    # was unreachable, and so was everything after it. `set -e` does not
+    # re-enter a trap it is already running, so the abort was completely
+    # silent — no message, no non-zero echo, nothing in the log.
+    #
+    # Measured on ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9
+    # (2026-08-11): cleanup's output stops dead after the blank line above and
+    # `==> Terminating spot instance ...` never appears. CloudTrail records NO
+    # TerminateInstances call for i-092854cbb6e62b753 in the window — the
+    # r5.large ran on until its own systemd watchdog shut it down 90 minutes
+    # later, the S3 staging prefix was left behind, and the launcher exited 75
+    # instead of the workload's real status. Every non-reclaim failure of every
+    # stage leaked an instance this way.
+    local _decide_out="" _decide_rc=0
     _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
       --instance-id "$_INSTANCE_ID" \
       --region "$AWS_REGION" \
       --attempt "$SPOT_ATTEMPT" \
       --max-attempts "$MAX_SPOT_ATTEMPTS" \
       ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
-      2>/dev/null)"
-    _decide_rc=$?
+      2>/dev/null)" || _decide_rc=$?
     echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
     if [ "$_decide_rc" -eq 0 ]; then
       _spot_relaunch=1
