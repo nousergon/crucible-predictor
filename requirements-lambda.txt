@@ -26,7 +26,7 @@
 # requirements.txt.
 krepis[flow-doctor]==0.51.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@c907a044bb1553815225327bc56644050543b6f2
-numpy>=2.5.1,<3
+numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.0
 yfinance>=1.5.2
