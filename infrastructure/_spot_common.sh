@@ -514,6 +514,61 @@ check_config_exists() {
   fi
 }
 
+# resolve_or_stage_predictor_config — self-heal predictor.yaml at the DISPATCH
+# box before declaring it missing (alpha-engine-config-I7216, crucible-
+# backtester mirror: spot_common_resolve_predictor_config).
+#
+# All three predictor-family launchers (spot_predictor_training.sh,
+# spot_model_zoo_select.sh, spot_train_spec_dispatch.sh) called plain
+# check_config_exists() against this repo's local `config/predictor.yaml`,
+# on the DISPATCH box. That file is gitignored (the .example pattern), so a
+# fresh dispatcher only has it because something copied it there — and the
+# only thing that does, today, is the weekly SF's own command array
+# (`sudo -u ec2-user cp --remove-destination
+# ~/alpha-engine-config/experiments/reference/predictor/predictor.yaml
+# ~/alpha-engine-predictor/config/predictor.yaml`), run by PredictorTraining
+# and ModelZooSelect immediately BEFORE this script's own SSM command.
+#
+# Audited 2026-08-13 against the live step_function.json: every path that
+# reaches spot_train_spec_dispatch.sh or spot_model_zoo_select.sh --select-
+# only passes through PredictorTraining first (skip_predictor_training's
+# validated-skip terminal, PredictorTrainingSkipped, ends the WHOLE branch
+# before ResolveZooSpecs/ModelZooTrainMap is ever reached) — so this is not
+# observed failing today. But that guarantee lives entirely in SF TOPOLOGY,
+# never asserted by this script, exactly the shape that let crucible-
+# backtester's PredictorBacktest silently inherit a missing predictor.yaml
+# the moment a mechanical rerun's skip-set diverged from the graph's
+# assumption (config#7216 live failure, 2026-08-13). A future skip flag
+# scoped to ONLY the model-zoo fan-out, or a reordered Map, reintroduces the
+# identical defect here with the identical blast radius.
+#
+# Staging here — the layer that DECLARES the requirement — rather than a
+# fourth `cp` in the SF's command array keeps the fix where PR657 put it:
+# the stage that needs the file obtains it, instead of every caller
+# remembering to.
+resolve_or_stage_predictor_config() {
+  local dest="$1"
+  if [ ! -f "$dest" ]; then
+    local experiment_id="${ALPHA_ENGINE_EXPERIMENT_ID:-reference}"
+    local _ref="$HOME/alpha-engine-config/experiments/${experiment_id}/predictor/predictor.yaml"
+    if [ -f "$_ref" ]; then
+      echo "  predictor.yaml absent at ${dest} — staging from alpha-engine-config reference (config-I7216)"
+      mkdir -p "$(dirname "$dest")"
+      # `rm -f` then plain `cp`, NOT `cp --remove-destination`: the SF's own
+      # copy uses the GNU flag, which exists only to replace a SYMLINKED
+      # destination and is unsupported by BSD cp. This form is equivalent on
+      # Linux and also runs on a developer's machine, which is what lets this
+      # staging path be exercised before it ships.
+      if rm -f "$dest" && cp "$_ref" "$dest"; then
+        echo "  staged predictor.yaml from ${_ref}"
+      else
+        echo "  WARNING: staging predictor.yaml from ${_ref} failed" >&2
+      fi
+    fi
+  fi
+  check_config_exists "$dest"
+}
+
 # PREFLIGHT_ONLY — unconditionally initialized (empty = disabled). Each
 # per-stage script's flag parser sets this to "1" on --preflight-only.
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-}"
