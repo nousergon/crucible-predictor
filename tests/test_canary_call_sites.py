@@ -41,19 +41,44 @@ HANDLER_PY = REPO_ROOT / "inference" / "handler.py"
 CALL_SITE_RE = re.compile(r"run_canary_action\s+(.+?);\s*then")
 
 # The Step-Function gate actions dispatched by inference/handler.py, and the
-# domain key their handler returns (SF Choice states consume these — see
-# handler.py's `action ==` branches and trading_day_gate.py /
+# set of domain keys whose presence proves the invoke dispatched to that
+# action's branch and returned its contract (SF Choice states consume these —
+# see handler.py's `action ==` branches and trading_day_gate.py /
 # drift_detector.py / pipeline_contract_check.py). Mirrors the contract
 # already pinned by tests/test_canary_status_allowlist.py's
 # test_accept_domain_key_present_promotes parametrization.
-SF_GATE_ACTION_EXPECT_KEY = {
-    "check_drift": "status",
-    "check_trading_day": "is_trading_day",
-    "check_market_hours": "is_market_hours",
-    "check_weekly_run_day": "is_weekly_run_day",
-    "check_pipeline_contract": "has_violation",
-    "check_coverage": "missing_count",
-    "check_lib_pin_drift": "has_drift",
+#
+# A set, not a single key, because a gate action's contract may have more than
+# one legitimate SHAPE. alpha-engine-config-I7048 gave check_lib_pin_drift and
+# check_pipeline_contract a fail-open branch that OMITS the verdict key and
+# emits `reason=fetch_failed` in its place, so an unmeasured gate cannot be
+# read as measured-clean. This suite pinned only the measured shape and so
+# passed on every commit while the deploy canary rejected the degraded one:
+# three consecutive deploys published a version and were refused promotion,
+# freezing the `live` alias at v455 while main advanced — including past the
+# commit adding action=check_market_hours, which the market-hours gate (by then
+# the first state of both trading pipelines) invokes. The 2026-08-13 preopen
+# run hit a live Lambda with no such action, fell through to the default
+# predict branch, and failed States.Runtime on the absent verdict. No orders
+# were placed. See DEGRADED_SHAPE_ACTIONS below for the invariant that keeps a
+# fail-open branch and its canary from drifting apart again.
+SF_GATE_ACTION_EXPECT_KEYS = {
+    "check_drift": {"status"},
+    "check_trading_day": {"is_trading_day"},
+    "check_market_hours": {"is_market_hours"},
+    "check_weekly_run_day": {"is_weekly_run_day"},
+    "check_pipeline_contract": {"has_violation", "reason"},
+    "check_coverage": {"missing_count"},
+    "check_lib_pin_drift": {"has_drift", "reason"},
+}
+
+# Gate actions with an I7048 fail-open branch: the verdict key is ABSENT and
+# `reason` carries why. Both are asserted live in
+# test_degraded_shape_actions_really_omit_their_verdict_key, so this map cannot
+# quietly widen a canary for an action that has no such branch.
+DEGRADED_SHAPE_ACTIONS = {
+    "check_pipeline_contract": ("has_violation", "reason"),
+    "check_lib_pin_drift": ("has_drift", "reason"),
 }
 
 _BARE_TOKEN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -88,20 +113,25 @@ def _validate_call_site(args: list[str]) -> None:
             f"payload arg for {action_label!r} is not valid JSON: {payload!r} ({exc})"
         ) from None
 
-    assert expect and _BARE_TOKEN_RE.match(expect), (
-        f"<expect> for {action_label!r} must be a bare token (statusCode or a "
-        f"domain key), got {expect!r}"
+    # `|` separates alternative acceptable keys (canary_accept accepts on any).
+    tokens = expect.split("|")
+    assert expect and all(_BARE_TOKEN_RE.match(t) for t in tokens), (
+        f"<expect> for {action_label!r} must be a bare token, or several "
+        f"separated by '|' (statusCode or domain keys), got {expect!r}"
     )
 
     payload_action = payload_obj.get("action") if isinstance(payload_obj, dict) else None
-    if payload_action in SF_GATE_ACTION_EXPECT_KEY:
-        want = SF_GATE_ACTION_EXPECT_KEY[payload_action]
-        assert expect == want, (
+    if payload_action in SF_GATE_ACTION_EXPECT_KEYS:
+        want = SF_GATE_ACTION_EXPECT_KEYS[payload_action]
+        assert set(tokens) == want, (
             f"call site for SF-gate action {payload_action!r} declares "
-            f"<expect>={expect!r}, but the handler returns its result under "
-            f"the {want!r} key (not a statusCode) — this is exactly the "
-            f"2026-07-12 v351 false-canary-fail (PR #362): gating a "
-            f"domain-dict response on statusCode always fails."
+            f"<expect>={expect!r}, but the handler's contract for that action "
+            f"is the key set {sorted(want)!r} (not a statusCode) — a mismatch "
+            f"is either the 2026-07-12 v351 false-canary-fail (PR #362: gating "
+            f"a domain-dict response on statusCode always fails) or the "
+            f"2026-08-13 promote freeze (asserting only the measured shape of "
+            f"an I7048 two-shaped contract refuses promotion whenever the "
+            f"probe's upstream fetch misses)."
         )
 
 
@@ -140,7 +170,7 @@ def test_sf_gate_actions_are_all_covered_by_the_contract_map():
         if action in ("dry_run", "produce", None):
             continue  # HTTP-shaped / non-gate actions, not in the map
         seen_actions.add(action)
-    assert seen_actions == set(SF_GATE_ACTION_EXPECT_KEY), (
+    assert seen_actions == set(SF_GATE_ACTION_EXPECT_KEYS), (
         "deploy.sh's SF-gate call sites and SF_GATE_ACTION_EXPECT_KEY have "
         "drifted apart — update the map alongside any new/renamed gate action"
     )
@@ -151,10 +181,10 @@ def test_handler_source_still_returns_the_mapped_keys():
     # inference/handler.py (or the modules it dispatches to) fails this test
     # instead of silently invalidating the cross-check above.
     handler_src = HANDLER_PY.read_text()
-    for action, key in SF_GATE_ACTION_EXPECT_KEY.items():
+    for action in SF_GATE_ACTION_EXPECT_KEYS:
         assert action in handler_src, (
             f"inference/handler.py no longer dispatches {action!r} — update "
-            f"SF_GATE_ACTION_EXPECT_KEY (config#2384)"
+            f"SF_GATE_ACTION_EXPECT_KEYS (config#2384)"
         )
     # trading_day_gate / drift_detector / pipeline_contract_check are the
     # modules handler.py imports for these actions (see handler.py's
@@ -175,7 +205,77 @@ def test_handler_source_still_returns_the_mapped_keys():
         )
 
 
+# ── The I7048 two-shaped contract, bound to real behavior ───────────────────
+
+
+@pytest.mark.parametrize(
+    ("action", "verdict_key", "degraded_key"),
+    [(a, v, d) for a, (v, d) in DEGRADED_SHAPE_ACTIONS.items()],
+)
+def test_degraded_shape_actions_really_omit_their_verdict_key(
+    action, verdict_key, degraded_key, monkeypatch
+):
+    """Drive each fail-open branch and assert the shape the canary must accept.
+
+    This is the assertion whose absence let the 2026-08-13 promote freeze run
+    for three deploys: `DEGRADED_SHAPE_ACTIONS` is only allowed to widen a
+    canary for an action that demonstrably HAS a branch omitting its verdict
+    key, and the widened key must be the one that branch actually emits.
+    """
+    if action == "check_lib_pin_drift":
+        from inference import lib_pin_drift as mod
+
+        # Every upstream pin unresolvable → the I7048 fail-open branch.
+        monkeypatch.setattr(mod, "_fetch_repo_pin", lambda *a, **k: None)
+        result = mod.check_lib_pin_drift()
+    else:
+        from inference import pipeline_contract_check as mod
+
+        # Contract + registry unreachable → the I7048 fail-open branch.
+        monkeypatch.setattr(mod, "_fetch_raw", lambda *a, **k: None)
+        result = mod.check_pipeline_contract()
+
+    assert verdict_key not in result, (
+        f"{action}: the fail-open branch must OMIT {verdict_key!r} (I7048 — an "
+        f"unmeasured gate must not report a definite verdict). If this branch "
+        f"now always emits it, remove {action!r} from DEGRADED_SHAPE_ACTIONS "
+        f"and narrow its deploy.sh <expect> back to {verdict_key!r}."
+    )
+    assert degraded_key in result, (
+        f"{action}: the fail-open branch must still emit {degraded_key!r} — it "
+        f"is the only key the deploy canary can gate on when the verdict is "
+        f"absent, and without it a degraded probe is indistinguishable from a "
+        f"broken dispatch."
+    )
+
+
+def test_degraded_shape_actions_are_widened_at_their_call_site():
+    """Every fail-open action's call site must accept the degraded key too."""
+    for action, (verdict_key, degraded_key) in DEGRADED_SHAPE_ACTIONS.items():
+        want = SF_GATE_ACTION_EXPECT_KEYS[action]
+        assert want == {verdict_key, degraded_key}, (
+            f"{action} has an I7048 fail-open branch, so its canary must "
+            f"accept either {verdict_key!r} or {degraded_key!r}; "
+            f"SF_GATE_ACTION_EXPECT_KEYS declares {sorted(want)!r}"
+        )
+
+
 # ── Regression: this suite must fail on the actual historical bad states ─────
+
+
+def test_would_have_caught_the_20260813_promote_freeze():
+    # main's state 2026-08-12..13: check_lib_pin_drift gated on `has_drift`
+    # alone, which the I7048 fail-open branch does not emit — so every deploy
+    # whose probe could not reach github.com published a version and was then
+    # refused promotion, silently freezing the `live` alias.
+    bad_deploy_sh = """
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift"; then
+  CANARY_FAILED=1
+fi
+"""
+    (site,) = _parse_call_sites(bad_deploy_sh)
+    with pytest.raises(AssertionError, match="promote freeze"):
+        _validate_call_site(site)
 
 
 def test_would_have_caught_pr362_statuscode_mismatch():
