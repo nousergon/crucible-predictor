@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 # infrastructure/spot_train.sh — Run GBM retraining on a spot EC2 instance.
 #
+# STATUS (alpha-engine-config-I6998 deliverable 3, 2026-08-13): this monolith
+# is NOT invoked by the current SF definition. `ne-weekly-freshness-pipeline`
+# -> `PredictorTraining` sends `bash infrastructure/spot_predictor_training.sh`
+# (nousergon-data/infrastructure/step_function.json, PredictorTraining state
+# Command). It IS deliberately retained, unchanged, as the rollback path for
+# the whole spot_train.sh -> per-stage split (crucible-predictor#436,
+# alpha-engine-config-I4442/I4497, 2026-08-09) — every sendCommand state
+# across the weekly SF carries that same "the monolith is retained unchanged
+# as the rollback path" comment. Roll back by repointing the SF Command back
+# to this file if the split proves unstable; do not delete it while that
+# comment stands in the SF definition.
+#
+# The one other repo-external reference found by grep,
+# nous-ergon-ops/alpha-engine-predictor/infrastructure/add-training-cron.sh
+# (a crontab-registration helper, last touched 2026-07-30 — one day before
+# #436 merged), still names this script by its pre-split path and was never
+# updated for the split. It is STALE, not a second live caller: the SF is the
+# sole scheduling authority for the weekly training run (policy-sf-pipeline),
+# and nothing re-runs that installer today. Tracked to correct/retire it so a
+# future re-run cannot fire a second, conflicting training pass:
+# alpha-engine-config-I7155.
+#
 # Launches a c5.large spot instance, syncs code, runs training via the
 # same train_handler.main() pipeline that Lambda uses (S3 price cache
 # download → refresh → train → promote → slim cache → email).
@@ -353,37 +375,43 @@ cleanup() {
   # exit with a provisioned instance, ask the lib whether this was a confirmed AWS
   # reclaim that warrants a fresh-spot relaunch. The lib's classify_termination
   # (describe-instances) MUST run while the instance still exists, so decide HERE,
-  # BEFORE terminate-instances. exit 0 = relaunch; NO_RELAUNCH_EXIT_CODE (75) /
-  # any other = hold (fail loud). The actual `exec` happens AFTER teardown so the
-  # dead worker + its S3 staging are already cleaned when the fresh attempt starts.
+  # BEFORE terminate-instances. --json's "relaunch" field carries the verdict
+  # (alpha-engine-config-I7009); a CLI failure (non-zero exit) is treated as
+  # hold (fail loud). The actual `exec` happens AFTER teardown so the dead
+  # worker + its S3 staging are already cleaned when the fresh attempt starts.
   local _spot_relaunch=0
   if [ "$exit_code" -ne 0 ] && [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-    # `|| _decide_rc=$?` is LOAD-BEARING — see the identical guard in
-    # _spot_common.sh. This script runs under `set -e`; `relaunch-decision`
-    # returns 75 ("hold") for every non-reclaim failure, so an unguarded
-    # `VAR="$(cmd)"` made errexit tear the shell down inside the EXIT trap,
-    # skipping `terminate-instances` and leaking the spot instance. The abort
-    # is silent because `set -e` does not re-enter a trap it is running.
-    local _decide_out="" _decide_rc=0
-    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+    # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
+    local _decide_json="" _decide_rc=0
+    _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
       --instance-id "$INSTANCE_ID" \
       --region "$AWS_REGION" \
       --attempt "$SPOT_ATTEMPT" \
       --max-attempts "$MAX_SPOT_ATTEMPTS" \
       ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+      --json \
       2>/dev/null)" || _decide_rc=$?
-    echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
-    if [ "$_decide_rc" -eq 0 ]; then
-      _spot_relaunch=1
-      # Fail-loud-but-recovering: record the absorbed interruption on a named
-      # CloudWatch surface so the retry is observable, never silent (mirrors the
-      # #349 data launcher's AlphaEngine/SpotInterruptionRetry metric).
-      aws cloudwatch put-metric-data \
-        --namespace "AlphaEngine" \
-        --metric-name "SpotInterruptionRetry" \
-        --dimensions "Process=predictor-training" \
-        --value 1 --unit "Count" \
-        --region "$AWS_REGION" 2>/dev/null || true
+    # alpha-engine-config-I7009: --json puts the verdict on a field, not the
+    # exit code. Non-zero here means the CLI could not answer (bad input /
+    # AWS error), not a verdict — treated explicitly as hold below.
+    if [ "$_decide_rc" -ne 0 ]; then
+      echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold"
+    else
+      local _relaunch=""
+      _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+      echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+      if [ "$_relaunch" = "1" ]; then
+        _spot_relaunch=1
+        # Fail-loud-but-recovering: record the absorbed interruption on a named
+        # CloudWatch surface so the retry is observable, never silent (mirrors the
+        # #349 data launcher's AlphaEngine/SpotInterruptionRetry metric).
+        aws cloudwatch put-metric-data \
+          --namespace "AlphaEngine" \
+          --metric-name "SpotInterruptionRetry" \
+          --dimensions "Process=predictor-training" \
+          --value 1 --unit "Count" \
+          --region "$AWS_REGION" 2>/dev/null || true
+      fi
     fi
   fi
 
@@ -548,7 +576,19 @@ cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
 # alpha-engine-lib is public (git+https in requirements.txt, no auth).
-# flow-doctor is private + not on PyPI — filtered out (same as legacy).
+# CORRECTED 2026-08-13 (alpha-engine-config-I6998 deliverable 4): flow-doctor
+# IS on public PyPI (latest 0.11.0 measured 2026-08-12) — this was never true.
+# The real defect this line's `grep -v` was masking: pip <23.3 (AL2023 ships
+# 23.2.1) predates PEP 685 extras normalisation, so an underscored
+# `krepis[flow_doctor]` extra was silently dropped with only a WARNING on a
+# SUCCESSFUL exit (config-I6963). The filter below has been a no-op self-fix
+# for that — `flow-doctor` is not itself a requirements.txt line, it is an
+# EXTRA on the `krepis[...]` line, so `grep -v '^flow-doctor'` never matched
+# anything and never filtered anything out. See
+# infrastructure/_spot_common.sh install_deps() (the live path this monolith
+# is a rollback for) for the real fix: hyphenated extras + a hard fail on any
+# "does not provide the extra" pip warning, so the defect surfaces at install
+# time instead of at import time in a later process.
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
 $PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
