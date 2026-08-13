@@ -152,10 +152,14 @@ def test_forced_bear_floor_preserved() -> None:
     assert out["regime_score_categorical"] == "bear"
 
 
-def test_score_bounded_and_no_heads_is_zero() -> None:
+def test_score_no_heads_is_undefined() -> None:
+    # config-I7272: with NO head present, the score is UNDEFINED — not a
+    # measured 0.0, which is indistinguishable from a genuinely neutral
+    # market. regime_score_categorical projects None to "unknown", a
+    # fourth outcome distinct from bull/neutral/bear.
     out = compose_regime_score()
-    assert out["regime_score"] == 0.0
-    assert out["regime_score_categorical"] == "neutral"
+    assert out["regime_score"] is None
+    assert out["regime_score_categorical"] == "unknown"
     assert out["head_scores"] == {}
 
 

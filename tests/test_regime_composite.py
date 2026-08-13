@@ -77,12 +77,16 @@ def test_composite_handles_missing_features_gracefully() -> None:
     assert np.isfinite(result["intensity_z"])
 
 
-def test_composite_zero_when_no_history() -> None:
-    """Empty history → intensity_z falls back to 0 (no signal to extract)."""
+def test_composite_undefined_when_no_history() -> None:
+    """config-I7272: empty history for every feature → intensity_z is
+    UNDEFINED (None), not a fabricated 0.0 — a total input outage must
+    not read as a measured calm reading."""
     history = pd.DataFrame(columns=list(DEFAULT_WEIGHTS))
     current = {f: 1.0 for f in DEFAULT_WEIGHTS}
     result = compute_composite_intensity(current=current, history=history)
-    assert result["intensity_z"] == 0.0
+    assert result["intensity_z"] is None
+    assert result["per_feature_z"] == {}
+    assert result["features_used"] == []
 
 
 def test_composite_per_feature_z_signs() -> None:
