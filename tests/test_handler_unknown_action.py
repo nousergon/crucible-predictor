@@ -56,6 +56,33 @@ class TestUnknownActionRaises:
             handler_mod.handler({"action": "nope"}, None)
         assert "check_market_hours" in str(exc.value)
 
+    def test_the_message_names_the_build_it_is_speaking_for(
+        self, handler_mod, monkeypatch
+    ):
+        """The code SHA is the operative field — the error means "your caller is
+        newer than this image", which cannot be acted on without knowing which
+        image. Measured 2026-08-13: the first version of this guard read
+        os.environ["GIT_SHA"], which does not exist on the Lambda (the Docker
+        build stamps /var/task/GIT_SHA.txt from a build-arg), so it always said
+        "unknown".
+        """
+        import model.registry as registry_mod
+
+        monkeypatch.setattr(registry_mod, "resolve_code_sha", lambda: "abc123def456")
+        with pytest.raises(handler_mod.UnknownAction) as exc:
+            handler_mod.handler({"action": "nope"}, None)
+        assert "abc123def456" in str(exc.value)
+
+    def test_an_unresolvable_sha_says_so_rather_than_claiming_unknown_build(
+        self, handler_mod, monkeypatch
+    ):
+        import model.registry as registry_mod
+
+        monkeypatch.setattr(registry_mod, "resolve_code_sha", lambda: None)
+        with pytest.raises(handler_mod.UnknownAction) as exc:
+            handler_mod.handler({"action": "nope"}, None)
+        assert "unresolved" in str(exc.value)
+
     def test_raises_rather_than_returning_an_error_dict(self, handler_mod):
         # A returned dict is indistinguishable from a successful invoke to an
         # SF Choice state; only a FunctionError reaches the Task's Catch.
