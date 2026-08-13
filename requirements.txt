@@ -2,7 +2,7 @@
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 yfinance>=1.5.2
-boto3>=1.43.65
+boto3>=1.43.70
 scipy>=1.18.0
 hmmlearn>=0.3.3
 tqdm>=4.68.4
