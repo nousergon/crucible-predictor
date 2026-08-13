@@ -64,6 +64,11 @@ MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-2}"
 SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
 SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 
+# Stage-coverage window (config-I7214): the instant this launcher started.
+# An artifact older than this is a leftover from a previous cycle, not this
+# run's output — an existence-only probe cannot tell those apart.
+_STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+
 # Per-stage identity — DECLARED HERE, NEVER DEFAULTED HERE.
 #
 # This block used to carry `predictor-training` / `spot-training` defaults, and

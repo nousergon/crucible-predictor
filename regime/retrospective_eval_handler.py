@@ -59,6 +59,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 import pandas as pd
@@ -452,6 +453,8 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     ``dry_run``. Event payload schema documented in the module
     docstring above.
     """
+    # Stage-coverage window (config-I7214), captured at handler entry.
+    _started = datetime.now(timezone.utc)
     event = event or {}
     action = event.get("action", "produce")
 
@@ -474,7 +477,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
 
     if action == "produce":
         result = produce_t1_eval(**kwargs, write=True)
-        return {
+        _response = {
             "statusCode": 200,
             "action": action,
             "run_id": result["payload"]["run_id"],
@@ -484,6 +487,20 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "asymmetric_weighted_agreement_rate": result["payload"]["score"]["asymmetric_weighted_agreement_rate"],
             "rolling_window_score": result["payload"]["score"]["rolling_window_score"],
         }
+        # Per-stage output assertion (config-I7214, sf-pipeline-policy.md
+        # §2.1) — only on the write=True path; ``dry_run`` declares by
+        # design that it writes nothing. Observe mode — the handler's own
+        # outcome is unchanged on an absent module.
+        try:
+            from nousergon_lib.stage_coverage import assert_stage_coverage
+            _response["stage_coverage"] = assert_stage_coverage(
+                "RegimeRetrospectiveEval",
+                run_date=result["payload"].get("calendar_date"),
+                window_start=_started,
+            )
+        except ImportError as exc:
+            logger.error("stage-coverage assertion unavailable: %s", exc)
+        return _response
     elif action == "dry_run":
         result = produce_t1_eval(**kwargs, write=False)
         return {

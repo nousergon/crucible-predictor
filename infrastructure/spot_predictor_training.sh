@@ -41,6 +41,14 @@ _SPOT_NAME="${_SPOT_NAME:-predictor-training}"
 _SSM_SLUG="${_SSM_SLUG:-spot-full-training}"
 _PROCESS_NAME="${_PROCESS_NAME:-predictor-training}"
 
+# Stage-coverage identity (config-I7214). This script's default `full-only`
+# mode IS the SF's PredictorTraining state (nousergon-data
+# infrastructure/step_function.json, ResearchPredictorParallel/
+# PredictorTraining) — the only mode the weekly SF invokes. The assertion
+# below fires only on that path, never on the manual-only smoke/preflight
+# exits, which do not produce PredictorTraining's declared output.
+_COVERAGE_STAGE="PredictorTraining"
+
 # ── Timeout ordering: the inner ceiling must be STRICTLY LESS than the outer ──
 #
 # This launcher runs INSIDE the weekly SF's PredictorTraining sendCommand, whose
@@ -294,6 +302,11 @@ $PY -m krepis.ssm_log_capture run --slug spot-full-training --log /var/log/spot-
 TRAIN
 )" "${MAX_RUNTIME_SECONDS}"
 _heartbeat_stop
+
+# Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+# assert THIS stage wrote what it declared, at the boundary where the fact
+# becomes knowable. OBSERVE MODE — it can never fail the stage.
+"$LIB_PYTHON" -m nousergon_lib.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 # ── Completion ───────────────────────────────────────────────────────────────
 echo ""

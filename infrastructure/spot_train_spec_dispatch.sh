@@ -32,6 +32,14 @@ _SSM_SLUG="${_SSM_SLUG:-spot-model-zoo-spec}"
 _PROCESS_NAME="${_PROCESS_NAME:-predictor-model-zoo-spec}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 
+# Stage-coverage identity (config-I7214). This script IS the SF's
+# TrainSpecDispatch Map-iteration Task (nousergon-data
+# infrastructure/step_function.json,
+# ResearchPredictorParallel/ModelZooTrainMap/TrainSpecDispatch) — NOT
+# "ResolveZooSpecs", which is a separate inline `python -m training.model_zoo
+# list-rotation-specs` SSM command with no launcher script of its own.
+_COVERAGE_STAGE="TrainSpecDispatch"
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 MODEL_ZOO_SPEC_ID=""
 
@@ -137,6 +145,11 @@ ZOOSPEC
 )" "${MAX_RUNTIME_SECONDS}"
 
 emit_heartbeat
+
+# Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+# assert THIS stage wrote what it declared, at the boundary where the fact
+# becomes knowable. OBSERVE MODE — it can never fail the stage.
+"$LIB_PYTHON" -m nousergon_lib.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 echo ""
 echo "==> Model-zoo train-spec ${MODEL_ZOO_SPEC_ID} complete. Instance will be terminated."
