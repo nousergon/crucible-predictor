@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import re
 import urllib.request
+from typing import NamedTuple
 
 from packaging.version import InvalidVersion, Version
 
@@ -77,9 +78,45 @@ _LIB_PIN_RE = re.compile(
     r"nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
 
+# The SAME pin line, ending in a raw commit SHA instead of a version tag. This
+# is a legitimate, in-use pin form — `crucible-predictor` has pinned this way
+# since crucible-predictor#422 — and it is NOT comparable to MIN_LIB_VERSION or
+# to another repo's tag without resolving the commit to a release.
+#
+# It exists as its own pattern so the probe can say WHICH problem it hit.
+# Before alpha-engine-config-I7171 a SHA pin fell through `_LIB_PIN_RE` and was
+# reported identically to an unreachable GitHub — `reason=fetch_failed`. That
+# is a permanent condition wearing a transient's name, and it held on every
+# invocation from 2026-07-31 onward (59 of 68 measured) while reading as
+# intermittent flakiness. It is also what turned alpha-engine-config-I7048's
+# correct omit-the-verdict-key change into a three-deploy promote freeze, which
+# took out the 2026-08-13 preopen run.
+_LIB_SHA_PIN_RE = re.compile(
+    r"(?:alpha-engine-lib|nousergon-lib)\[[^\]]*\]\s*@\s*git\+https://github\.com/"
+    r"nousergon/nousergon-lib@([0-9a-f]{7,40})\b"
+)
+
 _RAW_REQUIREMENTS_URL = (
     "https://raw.githubusercontent.com/{repo}/{branch}/requirements.txt"
 )
+
+# Why a pin could not be resolved. `None` means it was.
+UNREACHABLE = "unreachable"        # the fetch itself failed — genuinely transient
+SHA_PINNED = "sha_pinned"          # fetched and recognised; not comparable to a floor
+UNRECOGNISED = "unrecognised_pin"  # fetched, and nothing in it looks like a lib pin
+
+
+class PinRead(NamedTuple):
+    """One repo's pin, or a named reason it is not available.
+
+    Tri-state deliberately: a caller that collapses "could not reach GitHub"
+    and "read the file and did not understand it" into one bucket cannot tell
+    an outage from a contract change, and will wait out the wrong one.
+    """
+
+    pin: str | None
+    problem: str | None
+    detail: str | None = None
 
 
 def _parse_pin(text: str) -> str | None:
@@ -88,13 +125,13 @@ def _parse_pin(text: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _fetch_repo_pin(repo: str, branch: str = "main", timeout: float = 5.0) -> str | None:
-    """Fetch `repo@branch`'s pinned `alpha-engine-lib` version from GitHub.
+def _fetch_repo_pin(repo: str, branch: str = "main", timeout: float = 5.0) -> PinRead:
+    """Fetch `repo@branch`'s pinned lib version from GitHub.
 
-    Reads the raw `requirements.txt` (public, no auth) and parses the pin.
-    Returns `None` on any network/parse error — the probe treats that as
-    "unknown, proceed with warning" (fail-open), mirroring
-    `alpha_engine_lib.preflight._fetch_origin_main_sha`.
+    Reads the raw `requirements.txt` (public, no auth). Returns a `PinRead`
+    naming which of the three outcomes occurred; every non-pin outcome is
+    still fail-open at the caller, but it is fail-open with the reason
+    attached (alpha-engine-config-I7171).
     """
     url = _RAW_REQUIREMENTS_URL.format(repo=repo, branch=branch)
     try:
@@ -102,11 +139,29 @@ def _fetch_repo_pin(repo: str, branch: str = "main", timeout: float = 5.0) -> st
             text = resp.read().decode("utf-8")
     except OSError as exc:  # URLError/HTTPError + bare read-phase TimeoutError
         log.warning("Lib-pin drift: requirements.txt unreachable for %s (%s)", repo, exc)
-        return None
+        return PinRead(None, UNREACHABLE, str(exc))
+
     pin = _parse_pin(text)
-    if pin is None:
-        log.warning("Lib-pin drift: no alpha-engine-lib pin found in %s/requirements.txt", repo)
-    return pin
+    if pin is not None:
+        return PinRead(pin, None)
+
+    sha_match = _LIB_SHA_PIN_RE.search(text)
+    if sha_match is not None:
+        sha = sha_match.group(1)
+        log.warning(
+            "Lib-pin drift: %s pins nousergon-lib by commit SHA %s, not a vX.Y.Z "
+            "tag — the pin was READ successfully but cannot be compared to the "
+            "%s floor or to another repo's tag (alpha-engine-config-I7171)",
+            repo, sha[:12], MIN_LIB_VERSION,
+        )
+        return PinRead(None, SHA_PINNED, sha)
+
+    log.warning(
+        "Lib-pin drift: no nousergon-lib pin found in %s/requirements.txt "
+        "(file fetched successfully — this is a contract mismatch, not an outage)",
+        repo,
+    )
+    return PinRead(None, UNRECOGNISED, None)
 
 
 def _ge_floor(pin: str) -> bool:
@@ -122,22 +177,52 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
     """Assert the cross-repo lib-pin invariant; return a dict the SF Choice reads.
 
     `has_drift` is present (`true`/`false`) ONLY when every needed pin was
-    fetched + parsed. Any fetch/parse miss OMITS `has_drift` entirely +
-    sets `reason=fetch_failed` (fail-open, alpha-engine-config-I7048:
-    unmeasured is not the same as measured-clean). `has_drift=true` only
-    when a parity mismatch or below-floor pin is confirmed. Shape mirrors
-    `check_deploy_drift`.
+    fetched + parsed. Any fetch/parse miss OMITS `has_drift` entirely
+    (fail-open, alpha-engine-config-I7048: unmeasured is not the same as
+    measured-clean). `has_drift=true` only when a parity mismatch or
+    below-floor pin is confirmed. Shape mirrors `check_deploy_drift`.
+
+    alpha-engine-config-I7171: `reason` now NAMES which miss occurred rather
+    than reporting every one of them as `fetch_failed`. `unresolved` carries
+    the per-repo detail. The distinction is operational, not cosmetic — a
+    transient outage is waited out, a SHA pin or a contract change never
+    resolves itself, and reporting the second as the first is why this gate
+    sat unmeasured from 2026-07-31 to 2026-08-13 while looking like GitHub
+    flakiness. Reasons, most-actionable first:
+
+      ``sha_pinned``     a repo pins the lib by commit SHA, which is a real
+                         pin the probe cannot compare to a version floor
+      ``unrecognised_pin`` the file was read and carries no lib pin at all
+      ``fetch_failed``   GitHub was genuinely unreachable — the only
+                         transient of the three, and the only one worth a
+                         retry
     """
     repos = tuple(dict.fromkeys(_CO_INSTALL_PAIR + _FLOOR_REPOS))  # de-dup, ordered
-    pins: dict[str, str | None] = {r: _fetch_repo_pin(r, branch=branch) for r in repos}
+    reads: dict[str, PinRead] = {r: _fetch_repo_pin(r, branch=branch) for r in repos}
+    pins: dict[str, str | None] = {r: read.pin for r, read in reads.items()}
 
     # Fail-open: if any needed pin is unknown, do NOT halt the weekly run.
     # has_drift is OMITTED (not set False) — see module docstring I7048 note.
-    missing = [r for r, p in pins.items() if p is None]
-    if missing:
+    unresolved = {
+        r: {"problem": read.problem, "detail": read.detail}
+        for r, read in reads.items()
+        if read.pin is None
+    }
+    if unresolved:
+        problems = {v["problem"] for v in unresolved.values()}
+        # Report the most actionable problem present. A permanent condition
+        # outranks a transient one: if any repo is SHA-pinned or carries no
+        # recognisable pin, saying "fetch_failed" because some OTHER repo also
+        # happened to be unreachable would bury the finding that will still be
+        # here tomorrow.
+        for candidate in (SHA_PINNED, UNRECOGNISED, UNREACHABLE):
+            if candidate in problems:
+                reason = "fetch_failed" if candidate is UNREACHABLE else candidate
+                break
         log.warning(
-            "Lib-pin drift: %d repo pin(s) unresolved %s — proceeding (fail-open)",
-            len(missing), missing,
+            "Lib-pin drift: %d repo pin(s) unresolved (%s) — proceeding "
+            "(fail-open). Detail: %s",
+            len(unresolved), reason, unresolved,
         )
         return {
             "parity_ok": None,
@@ -145,7 +230,8 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
             "min_lib_version": MIN_LIB_VERSION,
             "pins": pins,
             "offenders": [],
-            "reason": "fetch_failed",
+            "unresolved": unresolved,
+            "reason": reason,
         }
 
     bt, pred = _CO_INSTALL_PAIR
