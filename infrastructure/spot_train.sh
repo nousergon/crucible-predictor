@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 # infrastructure/spot_train.sh — Run GBM retraining on a spot EC2 instance.
 #
+# STATUS (alpha-engine-config-I6998 deliverable 3, 2026-08-13): this monolith
+# is NOT invoked by the current SF definition. `ne-weekly-freshness-pipeline`
+# -> `PredictorTraining` sends `bash infrastructure/spot_predictor_training.sh`
+# (nousergon-data/infrastructure/step_function.json, PredictorTraining state
+# Command). It IS deliberately retained, unchanged, as the rollback path for
+# the whole spot_train.sh -> per-stage split (crucible-predictor#436,
+# alpha-engine-config-I4442/I4497, 2026-08-09) — every sendCommand state
+# across the weekly SF carries that same "the monolith is retained unchanged
+# as the rollback path" comment. Roll back by repointing the SF Command back
+# to this file if the split proves unstable; do not delete it while that
+# comment stands in the SF definition.
+#
+# The one other repo-external reference found by grep,
+# nous-ergon-ops/alpha-engine-predictor/infrastructure/add-training-cron.sh
+# (a crontab-registration helper, last touched 2026-07-30 — one day before
+# #436 merged), still names this script by its pre-split path and was never
+# updated for the split. It is STALE, not a second live caller: the SF is the
+# sole scheduling authority for the weekly training run (policy-sf-pipeline),
+# and nothing re-runs that installer today. Tracked to correct/retire it so a
+# future re-run cannot fire a second, conflicting training pass:
+# alpha-engine-config-I7155.
+#
 # Launches a c5.large spot instance, syncs code, runs training via the
 # same train_handler.main() pipeline that Lambda uses (S3 price cache
 # download → refresh → train → promote → slim cache → email).
@@ -554,7 +576,19 @@ cd /home/ec2-user/predictor
 command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
 $PIP install --upgrade pip -q
 # alpha-engine-lib is public (git+https in requirements.txt, no auth).
-# flow-doctor is private + not on PyPI — filtered out (same as legacy).
+# CORRECTED 2026-08-13 (alpha-engine-config-I6998 deliverable 4): flow-doctor
+# IS on public PyPI (latest 0.11.0 measured 2026-08-12) — this was never true.
+# The real defect this line's `grep -v` was masking: pip <23.3 (AL2023 ships
+# 23.2.1) predates PEP 685 extras normalisation, so an underscored
+# `krepis[flow_doctor]` extra was silently dropped with only a WARNING on a
+# SUCCESSFUL exit (config-I6963). The filter below has been a no-op self-fix
+# for that — `flow-doctor` is not itself a requirements.txt line, it is an
+# EXTRA on the `krepis[...]` line, so `grep -v '^flow-doctor'` never matched
+# anything and never filtered anything out. See
+# infrastructure/_spot_common.sh install_deps() (the live path this monolith
+# is a rollback for) for the real fix: hyphenated extras + a hard fail on any
+# "does not provide the extra" pip warning, so the defect surfaces at install
+# time instead of at import time in a later process.
 grep -v '^flow-doctor' requirements.txt | $PIP install -q -r /dev/stdin
 echo "Dependencies installed."
 $PIP list --format=columns | grep -iE 'numpy|pandas|lightgbm|scikit-learn|scipy|shap|pyyaml|alpha-engine-lib' || true
