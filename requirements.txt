@@ -1,8 +1,8 @@
 # Core inference dependencies (Lambda zip deployment)
-numpy>=2.5.1,<3
+numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 yfinance>=1.6.0
-boto3>=1.43.65
+boto3>=1.43.70
 scipy>=1.18.0
 hmmlearn>=0.3.3
 tqdm>=4.68.4
@@ -70,7 +70,7 @@ krepis[flow-doctor]==0.51.0  # pinned per §139 — first-party/fast-moving deps
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@c907a044bb1553815225327bc56644050543b6f2
 
 # Training dependencies (not needed in Lambda)
-arcticdb>=6.21.0
+arcticdb>=6.22.0
 # Floor bumped >=1.2.0 -> >=1.2.8 (numpy-2 migration, config#2815): catboost
 # 1.2.6/1.2.7 pinned numpy<2.0, incompatible with the numpy>=2.5.1 floor above.
 # >=1.2.0 alone still resolves today (pip picks the newest satisfying release),
