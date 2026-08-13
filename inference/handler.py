@@ -116,6 +116,47 @@ setup_logging(
 
 log = logging.getLogger(__name__)
 
+# Every `action` this handler dispatches. An omitted action means "predict",
+# the historical default, which is why `None` is a member.
+#
+# alpha-engine-config-I7111: an UNRECOGNISED action used to fall through to
+# that same default, so a caller asking a question this build cannot answer
+# got a full prediction run as the answer. On 2026-08-13 the market-hours gate
+# — the first state of both trading pipelines — invoked
+# action=check_market_hours against a `live` alias frozen on a version
+# predating it, and received {"statusCode": 200, "body": "Predictions written
+# for today"}. The Step Function then died with States.Runtime on the absent
+# verdict, 48s in, with no orders placed and no alert.
+#
+# Falling through was wrong in both directions. It answered a gate with an
+# unrelated side-effecting job, and it made a version skew — the one condition
+# a gate most needs to detect — look like a successful invoke. Raising instead
+# surfaces as a FunctionError, which every SF Task that calls this handler
+# already Catches into its own fail-closed path.
+KNOWN_ACTIONS = frozenset({
+    None,
+    "predict",
+    "check_coverage",
+    "check_drift",
+    "check_deploy_drift",
+    "check_trading_day",
+    "check_market_hours",
+    "check_weekly_run_day",
+    "check_pipeline_contract",
+    "check_lib_pin_drift",
+    "train",
+})
+
+
+class UnknownAction(ValueError):
+    """Raised when `event["action"]` names something this build cannot do.
+
+    Deliberately raised rather than returned: the caller is a Step Function
+    Task whose Catch routes a FunctionError to that pipeline's fail-closed
+    path. A returned error dict would be indistinguishable from a successful
+    invoke to a Choice state keyed on a domain key.
+    """
+
 
 @monitor_handler
 def handler(event: dict, context) -> dict:
@@ -136,6 +177,33 @@ def handler(event: dict, context) -> dict:
     # setup_logging already ran at module-top (see comment near the
     # krepis.logging import). Apply the standard log level here.
     logging.getLogger().setLevel(logging.INFO)
+
+    # Reject an unrecognised action BEFORE any dispatch, preflight or S3 write
+    # — see KNOWN_ACTIONS. This runs first precisely because the fall-through
+    # it replaces was side-effecting.
+    _requested = event.get("action")
+    if _requested not in KNOWN_ACTIONS:
+        # The build's identity is the operative field here — this error means
+        # "the deployed image is older than the caller", so a message that
+        # cannot name the image is a message that cannot be acted on.
+        # `GIT_SHA` is a Docker BUILD-ARG stamped to /var/task/GIT_SHA.txt, NOT
+        # an environment variable: measured 2026-08-13 against the live Lambda,
+        # the env var does not exist and this field always read "unknown".
+        # model.registry.resolve_code_sha() is the fleet's existing resolver for
+        # exactly this (file, then env, then `git rev-parse` for local dev, with
+        # the Dockerfile's "unknown" ARG default normalised to None). Imported
+        # inside the failure path so the guard stays free on every good call.
+        from model.registry import resolve_code_sha
+
+        _sha = resolve_code_sha() or "unresolved"
+        raise UnknownAction(
+            f"action={_requested!r} is not implemented by this build "
+            f"(code_sha={_sha}). Known actions: "
+            f"{sorted(a for a in KNOWN_ACTIONS if a)}. If a Step Function state "
+            f"invokes this action, the deployed image predates it — check that "
+            f"the `live` alias points at the newest published version "
+            f"(alpha-engine-config-I7111)."
+        )
 
     # ── Trading-day gate (weekday SF, runs BEFORE StartExecutorEC2) ─────────
     # Pure NYSE-calendar math — deliberately returns BEFORE preflight so the
