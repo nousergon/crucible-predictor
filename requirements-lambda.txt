@@ -29,7 +29,7 @@ nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.0
-yfinance>=1.5.2
+yfinance>=1.6.0
 boto3>=1.43.70
 tqdm>=4.68.4
 requests>=2.34.2
