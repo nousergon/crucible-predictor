@@ -131,6 +131,29 @@ canary_status_ok() {
 #              they never satisfy — the 2026-07-12 v351 false-canary-fail that
 #              refused to promote a healthy image (PR #362).
 #
+#   <expect> may name SEVERAL acceptable keys separated by `|`, and accepts
+#              when ANY of them is present. This exists because two gate actions
+#              have a legitimately two-shaped contract: alpha-engine-config-I7048
+#              made check_lib_pin_drift and check_pipeline_contract OMIT their
+#              verdict key (has_drift / has_violation) on a fetch or parse miss,
+#              emitting `reason=fetch_failed` instead, so the SF's IsPresent-
+#              guarded Choice routes an unmeasured gate to its degraded path
+#              rather than reading an unmeasured state as measured-clean. A
+#              single-key expectation asserts one BRANCH of that contract, not
+#              the contract, and the branch it asserts is the one a deploy-time
+#              canary cannot guarantee — the probes fetch from github.com at
+#              invoke time. Measured 2026-08-13: it failed for three consecutive
+#              deploys (07ccccb, c699019, fb062c5), each publishing a version
+#              that was then REFUSED promotion, freezing the `live` alias at
+#              v455 while main advanced. The third of those carried the
+#              action=check_market_hours evaluator that the market-hours gate —
+#              by then already the first state of both trading pipelines —
+#              invokes, so the 2026-08-13 preopen run reached a live Lambda with
+#              no such action and failed States.Runtime with no orders placed.
+#              A canary asserts that the invoke DISPATCHED and returned this
+#              action's contract; whether the probe could reach its upstream is
+#              a domain outcome and never a deploy gate.
+#
 #   A FunctionError (unhandled exception / broken import) is checked by the
 #   caller BEFORE this and always rejects, in every mode.
 canary_accept() {
@@ -142,10 +165,19 @@ canary_accept() {
     return $?
   fi
   local k
-  for k in $present_keys; do
-    if [ "$k" = "$expect" ]; then
-      return 0
-    fi
+  local want
+  # `|`-separated alternatives; a single key is the one-element case.
+  local old_ifs="$IFS"
+  IFS='|'
+  # shellcheck disable=SC2206 — deliberate word-split on IFS='|'.
+  local wants=( $expect )
+  IFS="$old_ifs"
+  for want in "${wants[@]}"; do
+    for k in $present_keys; do
+      if [ "$k" = "$want" ]; then
+        return 0
+      fi
+    done
   done
   return 1
 }
@@ -444,7 +476,12 @@ fi
 # skip ONLY the deploy-drift assertion; the contract check itself still
 # runs and fails loud on a genuine violation (config#2731, mirrors the
 # predict(dry_run) fix in config#1073).
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation"; then
+#
+# `has_violation|reason`: alpha-engine-config-I7048 made has_violation ABSENT on
+# a fetch/parse miss, with reason=fetch_failed in its place. Both shapes are the
+# contract; asserting only the measured one turned an unreachable github.com
+# into a failed deploy (see canary_accept).
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation|reason"; then
   CANARY_FAILED=1
 fi
 
@@ -462,7 +499,9 @@ fi
 # each Saturday-SF repo's requirements file); no dry_run needed, and it
 # fails open on a fetch/parse miss so a transient GitHub hiccup cannot
 # false-fail this canary.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift"; then
+#
+# `has_drift|reason`: same I7048 two-shaped contract as check_pipeline_contract.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift|reason"; then
   CANARY_FAILED=1
 fi
 
