@@ -60,7 +60,7 @@ fi
 MZ_SPEC_EXPORT="export MODEL_ZOO_SPEC_ID=${MODEL_ZOO_SPEC_ID}"$'\n'
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
-check_config_exists "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
+resolve_or_stage_predictor_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  MODEL-ZOO TRAIN ONE SPEC: ${MODEL_ZOO_SPEC_ID}"
