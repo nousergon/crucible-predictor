@@ -402,10 +402,33 @@ if [ ! -d /home/ec2-user/predictor/.git ]; then
   git clone --depth 1 --branch "${BRANCH:-main}" "${REPO_URL}" /home/ec2-user/predictor
 fi
 
+# Destination must be a path config.py's resolver actually searches. It
+# delegates to nousergon_lib.config.resolve_experiment_config("predictor",
+# "predictor.yaml", repo_root=<checkout>, repo_local_fallback=<checkout>/
+# config/predictor.yaml), so with the clone at /home/ec2-user/predictor the
+# candidates are /home/ec2-user/alpha-engine-config/{experiments/reference/,}
+# predictor/predictor.yaml plus the repo-local /home/ec2-user/predictor/
+# config/predictor.yaml — which is the line below.
+#
+# nousergon-data#1298 (config#6846) fixed the twin of this bootstrap, which
+# staged onto a config-repo path the resolver did not search;
+# alpha-engine-config-I6922 flagged it as "not ported; unknown whether it
+# applies". Audited 2026-08-13: it does NOT apply here, because this copy
+# stages onto the repo-local FALLBACK candidate rather than a config-repo
+# path, and that candidate is real.
+#
+# The audit did find the same class pointing the other way. A second cp wrote
+# /home/ec2-user/predictor/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor/
+# predictor.yaml, on the assumption that the experiment-package candidates are
+# rooted in this repo. They are not — they are rooted at the alpha-engine-config
+# checkout (~/alpha-engine-config and <repo>/../alpha-engine-config), so that
+# path matched no candidate and nothing ever read it. Removed: it cost an S3 GET
+# per launch and read as experiment-package coverage that did not exist.
+# tests/test_spot_bootstrap_config_lands_where_the_resolver_looks.py derives the
+# candidate list from the resolver, so a resolver change fails CI instead of
+# production, and a dead destination fails too.
 mkdir -p "/home/ec2-user/predictor/config"
-mkdir -p "/home/ec2-user/predictor/experiments/${ALPHA_ENGINE_EXPERIMENT_ID:-reference}/predictor"
 aws s3 cp "${S3_STAGING}/predictor.yaml" "/home/ec2-user/predictor/config/predictor.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
-aws s3 cp "${S3_STAGING}/predictor.yaml" "/home/ec2-user/predictor/experiments/${ALPHA_ENGINE_EXPERIMENT_ID:-reference}/predictor/predictor.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
 BOOTSTRAP
 )" 300
   echo "  Bootstrap complete."
