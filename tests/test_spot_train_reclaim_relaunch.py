@@ -20,8 +20,9 @@ These tests pin that adoption so a future refactor can't silently revert it:
   * the classify (describe-instances, inside the lib) happens BEFORE
     terminate-instances, the relaunch exec AFTER teardown
   * only a confirmed reclaim relaunches — fail-loud is preserved because
-    the lib classifies a genuine workload failure as "other"/"unknown"
-    and exits NO_RELAUNCH_EXIT_CODE (no blind retry)
+    the lib classifies a genuine workload failure as "other"/"unknown" and
+    the launcher's ``--json`` verdict field carries ``relaunch: false``
+    (alpha-engine-config-I7009; no blind retry)
 """
 
 from __future__ import annotations

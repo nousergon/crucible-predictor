@@ -230,41 +230,34 @@ cleanup() {
   # Spot-reclaim DECISION (lib chokepoint) — run BEFORE terminate-instances
   local _spot_relaunch=0
   if [ "$exit_code" -ne 0 ] && [ -n "${_INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-    # `|| _decide_rc=$?` is LOAD-BEARING, not defensive noise. This file runs
-    # under `set -e`, and `relaunch-decision` signals "hold" by EXIT CODE
-    # (NO_RELAUNCH_EXIT_CODE=75) — the designed answer for every non-reclaim
-    # failure, which is nearly all of them. An unguarded `VAR="$(cmd)"` is a
-    # simple command whose status is the substitution's, so errexit fired and
-    # tore the shell down INSIDE the EXIT trap: the `_decide_rc=$?` line below
-    # was unreachable, and so was everything after it. `set -e` does not
-    # re-enter a trap it is already running, so the abort was completely
-    # silent — no message, no non-zero echo, nothing in the log.
-    #
-    # Measured on ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9
-    # (2026-08-11): cleanup's output stops dead after the blank line above and
-    # `==> Terminating spot instance ...` never appears. CloudTrail records NO
-    # TerminateInstances call for i-092854cbb6e62b753 in the window — the
-    # r5.large ran on until its own systemd watchdog shut it down 90 minutes
-    # later, the S3 staging prefix was left behind, and the launcher exited 75
-    # instead of the workload's real status. Every non-reclaim failure of every
-    # stage leaked an instance this way.
-    local _decide_out="" _decide_rc=0
-    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+    # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
+    local _decide_json="" _decide_rc=0
+    _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
       --instance-id "$_INSTANCE_ID" \
       --region "$AWS_REGION" \
       --attempt "$SPOT_ATTEMPT" \
       --max-attempts "$MAX_SPOT_ATTEMPTS" \
       ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+      --json \
       2>/dev/null)" || _decide_rc=$?
-    echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
-    if [ "$_decide_rc" -eq 0 ]; then
-      _spot_relaunch=1
-      aws cloudwatch put-metric-data \
-        --namespace "AlphaEngine" \
-        --metric-name "SpotInterruptionRetry" \
-        --dimensions "Process=${_PROCESS_NAME}" \
-        --value 1 --unit "Count" \
-        --region "$AWS_REGION" 2>/dev/null || true
+    # alpha-engine-config-I7009: --json puts the verdict on a field, not the
+    # exit code. Non-zero here means the CLI could not answer (bad input /
+    # AWS error), not a verdict — treated explicitly as hold below.
+    if [ "$_decide_rc" -ne 0 ]; then
+      echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold"
+    else
+      local _relaunch=""
+      _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+      echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+      if [ "$_relaunch" = "1" ]; then
+        _spot_relaunch=1
+        aws cloudwatch put-metric-data \
+          --namespace "AlphaEngine" \
+          --metric-name "SpotInterruptionRetry" \
+          --dimensions "Process=${_PROCESS_NAME}" \
+          --value 1 --unit "Count" \
+          --region "$AWS_REGION" 2>/dev/null || true
+      fi
     fi
   fi
 
