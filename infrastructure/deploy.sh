@@ -419,6 +419,18 @@ if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"
   CANARY_FAILED=1
 fi
 
+# Test check_market_hours — trading_day_gate returns {is_market_hours, verdict,
+# ...}. alpha-engine-config-I7111: this action is the FIRST state of both
+# ne-preopen-trading-pipeline and ne-postclose-trading-pipeline, so a broken
+# contract here does not degrade a pipeline — it stops one from starting at
+# all. Canaried at deploy time for the same reason check_trading_day is.
+# A fixed `now` inside the session is passed deliberately: a wall-clock
+# canary would exercise a different branch depending on when the deploy ran,
+# and the branch that matters is the one that refuses.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_market_hours" '{"action": "check_market_hours", "now": "2026-08-12T16:00:00Z"}' "is_market_hours"; then
+  CANARY_FAILED=1
+fi
+
 # Test check_weekly_run_day — trading_day_gate returns {is_weekly_run_day,...}.
 if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}' "is_weekly_run_day"; then
   CANARY_FAILED=1

@@ -49,6 +49,7 @@ CALL_SITE_RE = re.compile(r"run_canary_action\s+(.+?);\s*then")
 SF_GATE_ACTION_EXPECT_KEY = {
     "check_drift": "status",
     "check_trading_day": "is_trading_day",
+    "check_market_hours": "is_market_hours",
     "check_weekly_run_day": "is_weekly_run_day",
     "check_pipeline_contract": "has_violation",
     "check_coverage": "missing_count",
@@ -112,12 +113,15 @@ def _live_call_sites() -> list[list[str]]:
 
 
 def test_deploy_sh_has_the_expected_call_sites():
-    # 7 inference (predict + 6 SF-gate) + 2 regime + 2 regime-eval. config#3025
+    # 8 inference (predict + 7 SF-gate) + 2 regime + 2 regime-eval. config#3025
     # dim8 added check_coverage + check_lib_pin_drift to the inference matrix
     # (previously excluded with no documented rationale), bringing inference
-    # from 5 to 7 sites. A count drift means a site was added or removed
-    # without updating this suite's assumptions.
-    assert len(_live_call_sites()) == 11
+    # from 5 to 7 sites. alpha-engine-config-I7111 added check_market_hours —
+    # the first state of both trading pipelines, so a broken contract there
+    # stops a pipeline from starting rather than degrading one. A count drift
+    # means a site was added or removed without updating this suite's
+    # assumptions.
+    assert len(_live_call_sites()) == 12
 
 
 @pytest.mark.parametrize("args", _live_call_sites(), ids=lambda a: a[2])
