@@ -183,9 +183,22 @@ def handler(event: dict, context) -> dict:
     # it replaces was side-effecting.
     _requested = event.get("action")
     if _requested not in KNOWN_ACTIONS:
+        # The build's identity is the operative field here — this error means
+        # "the deployed image is older than the caller", so a message that
+        # cannot name the image is a message that cannot be acted on.
+        # `GIT_SHA` is a Docker BUILD-ARG stamped to /var/task/GIT_SHA.txt, NOT
+        # an environment variable: measured 2026-08-13 against the live Lambda,
+        # the env var does not exist and this field always read "unknown".
+        # model.registry.resolve_code_sha() is the fleet's existing resolver for
+        # exactly this (file, then env, then `git rev-parse` for local dev, with
+        # the Dockerfile's "unknown" ARG default normalised to None). Imported
+        # inside the failure path so the guard stays free on every good call.
+        from model.registry import resolve_code_sha
+
+        _sha = resolve_code_sha() or "unresolved"
         raise UnknownAction(
             f"action={_requested!r} is not implemented by this build "
-            f"(GIT_SHA={os.environ.get('GIT_SHA', 'unknown')}). Known actions: "
+            f"(code_sha={_sha}). Known actions: "
             f"{sorted(a for a in KNOWN_ACTIONS if a)}. If a Step Function state "
             f"invokes this action, the deployed image predates it — check that "
             f"the `live` alias points at the newest published version "
