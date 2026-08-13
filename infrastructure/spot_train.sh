@@ -353,37 +353,43 @@ cleanup() {
   # exit with a provisioned instance, ask the lib whether this was a confirmed AWS
   # reclaim that warrants a fresh-spot relaunch. The lib's classify_termination
   # (describe-instances) MUST run while the instance still exists, so decide HERE,
-  # BEFORE terminate-instances. exit 0 = relaunch; NO_RELAUNCH_EXIT_CODE (75) /
-  # any other = hold (fail loud). The actual `exec` happens AFTER teardown so the
-  # dead worker + its S3 staging are already cleaned when the fresh attempt starts.
+  # BEFORE terminate-instances. --json's "relaunch" field carries the verdict
+  # (alpha-engine-config-I7009); a CLI failure (non-zero exit) is treated as
+  # hold (fail loud). The actual `exec` happens AFTER teardown so the dead
+  # worker + its S3 staging are already cleaned when the fresh attempt starts.
   local _spot_relaunch=0
   if [ "$exit_code" -ne 0 ] && [ -n "${INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
-    # `|| _decide_rc=$?` is LOAD-BEARING — see the identical guard in
-    # _spot_common.sh. This script runs under `set -e`; `relaunch-decision`
-    # returns 75 ("hold") for every non-reclaim failure, so an unguarded
-    # `VAR="$(cmd)"` made errexit tear the shell down inside the EXIT trap,
-    # skipping `terminate-instances` and leaking the spot instance. The abort
-    # is silent because `set -e` does not re-enter a trap it is running.
-    local _decide_out="" _decide_rc=0
-    _decide_out="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
+    # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
+    local _decide_json="" _decide_rc=0
+    _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
       --instance-id "$INSTANCE_ID" \
       --region "$AWS_REGION" \
       --attempt "$SPOT_ATTEMPT" \
       --max-attempts "$MAX_SPOT_ATTEMPTS" \
       ${SF_EXECUTION_TIMEOUT:+--sf-execution-timeout "$SF_EXECUTION_TIMEOUT" --per-attempt-seconds "$MAX_RUNTIME_SECONDS"} \
+      --json \
       2>/dev/null)" || _decide_rc=$?
-    echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): rc=$_decide_rc ${_decide_out:+[$_decide_out]}"
-    if [ "$_decide_rc" -eq 0 ]; then
-      _spot_relaunch=1
-      # Fail-loud-but-recovering: record the absorbed interruption on a named
-      # CloudWatch surface so the retry is observable, never silent (mirrors the
-      # #349 data launcher's AlphaEngine/SpotInterruptionRetry metric).
-      aws cloudwatch put-metric-data \
-        --namespace "AlphaEngine" \
-        --metric-name "SpotInterruptionRetry" \
-        --dimensions "Process=predictor-training" \
-        --value 1 --unit "Count" \
-        --region "$AWS_REGION" 2>/dev/null || true
+    # alpha-engine-config-I7009: --json puts the verdict on a field, not the
+    # exit code. Non-zero here means the CLI could not answer (bad input /
+    # AWS error), not a verdict — treated explicitly as hold below.
+    if [ "$_decide_rc" -ne 0 ]; then
+      echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold"
+    else
+      local _relaunch=""
+      _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+      echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+      if [ "$_relaunch" = "1" ]; then
+        _spot_relaunch=1
+        # Fail-loud-but-recovering: record the absorbed interruption on a named
+        # CloudWatch surface so the retry is observable, never silent (mirrors the
+        # #349 data launcher's AlphaEngine/SpotInterruptionRetry metric).
+        aws cloudwatch put-metric-data \
+          --namespace "AlphaEngine" \
+          --metric-name "SpotInterruptionRetry" \
+          --dimensions "Process=predictor-training" \
+          --value 1 --unit "Count" \
+          --region "$AWS_REGION" 2>/dev/null || true
+      fi
     fi
   fi
 
