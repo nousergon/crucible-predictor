@@ -28,6 +28,15 @@ training exceeding Lambda's 15-minute timeout.
     the prior on-box SSM trading_calendar check whose stdout was unreliably
     captured on a cold-booted instance (config#1430).
 
+  action == "check_market_hours":
+    NYSE regular-session gate for BOTH trading pipelines' first state
+    (alpha-engine-config-I7111; pure calendar, no preflight). Judges
+    `now` (both pipelines pass $$.Execution.StartTime) against the
+    half-open [09:30, 16:00) ET session and validates the
+    `market_hours_override` carried in `execution_input`. Returns
+    {is_market_hours, verdict, override, reason, ...} where verdict is
+    PROCEED | BLOCKED | PROCEED_OVERRIDE | OVERRIDE_MALFORMED.
+
   action == "check_weekly_run_day":
     Weekly-SF run-day gate (pure calendar, no preflight; config#1824).
     Returns {is_weekly_run_day, check_date, day_name, marker, ...} — true
@@ -139,6 +148,25 @@ def handler(event: dict, context) -> dict:
             "Trading-day gate: %s (%s) -> %s%s",
             _r["check_date"], _r["day_name"], _r["marker"],
             "" if _r["is_trading_day"] else f" (next: {_r.get('next_trading_day')})",
+        )
+        return _r
+
+    # ── Market-hours gate (FIRST state of both trading pipelines) ──────────
+    # alpha-engine-config-I7111. Same zero-infra posture as
+    # check_trading_day, and for a sharper reason: this action decides
+    # whether a trading pipeline may start at all, so it must not be
+    # capable of failing for any reason other than its own calendar math.
+    # A preflight dependency here would let an ArcticDB or S3 problem
+    # take out the boundary AND the pipeline together.
+    if event.get("action") == "check_market_hours":
+        from inference.trading_day_gate import check_market_hours
+        _r = check_market_hours(event.get("now"), event.get("execution_input"))
+        log.info(
+            "Market-hours gate: %s (%s) -> %s [%s] override=%s%s",
+            _r["now_et"], _r["day_name"], _r["verdict"], _r["reason"],
+            _r["override"]["present"],
+            f" rejected: {_r['override']['rejection']}"
+            if _r["override"].get("rejection") else "",
         )
         return _r
 
