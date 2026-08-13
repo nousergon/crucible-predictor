@@ -46,6 +46,31 @@ identical correction in ``lib_pin_drift.py``. Do NOT default to
 ``has_violation=True`` on a fetch failure — a check that could not run is not
 evidence of a violation either; inverting the lie does not make it true.
 
+alpha-engine-config-I7277 (2026-08-13): omitting ``has_violation`` was
+necessary but not sufficient. The fail-open branch still emitted
+``violations: []`` alongside ``reason=fetch_failed`` — measured live on
+``ne-weekly-freshness-pipeline`` executions ``watch-rerun-2026-08-13-2`` and
+``-3``: ``{"violations": [], "boundary_count": null, "reason":
+"fetch_failed"}``. ``violations`` is the field a consumer is shaped to read,
+and an empty list reads as an authoritative "checked, found nothing". A
+payload cannot be honest about its verdict key and lie in the evidence list
+beside it. The unmeasured branch now carries an explicit ``status=UNKNOWN``
+and OMITS ``violations`` entirely, so no field in it can be read as a clean
+check; the measured branch carries ``status=MEASURED`` alongside its
+``violations`` list. ``boundary_count: null`` never again coexists with an
+authoritative-looking empty ``violations``.
+
+Root cause of the fetch failure itself (measured 2026-08-13 from
+``/aws/lambda/alpha-engine-predictor-inference``, live alias v473): ``HTTP
+Error 404: Not Found`` on BOTH raw URLs. ``nousergon/alpha-engine-config`` is
+a PRIVATE repository, so the unauthenticated ``raw.githubusercontent.com``
+read this module was built on can never succeed — the "public, no auth"
+premise in ``_fetch_raw``'s docstring is false for this repo. This gate has
+therefore never measured anything in production. Fixing the fetch needs an
+authenticated read (a credential in the Lambda plus the IAM grant to reach
+it) and is tracked separately; this module's job is to stop the failure
+reading as a pass.
+
 Validation invariants mirror ``validate_pipeline_contract.py`` (the human SoT
 lives in the config repo; this re-implements the *rules* because the predictor
 does not depend on the config repo as an importable package). Unlike the CI
@@ -61,6 +86,13 @@ import urllib.request
 import yaml
 
 log = logging.getLogger(__name__)
+
+# Measurement status (alpha-engine-config-I7277, sf-pipeline-policy.md §2.3a
+# rule 2). UNKNOWN means the probe could not run; it is NOT a verdict, and a
+# payload carrying it deliberately omits `has_violation` AND `violations` so
+# no consumer keyed on either can read an unmeasured gate as a clean one.
+STATUS_UNKNOWN = "UNKNOWN"
+STATUS_MEASURED = "MEASURED"
 
 # Config repo + default branch the contract SoT lives on.
 _CONFIG_REPO = "nousergon/alpha-engine-config"
@@ -222,13 +254,35 @@ def _validate_contract(contract: object, registry_ids: set[str]) -> list[str]:
     return violations
 
 
+def _unknown_result(reason: str) -> dict:
+    """The single unmeasured-gate payload (alpha-engine-config-I7277).
+
+    Constructed in one place so a future edit cannot reintroduce an
+    authoritative-looking field on one fail-open branch and not the other.
+    Carries NO ``has_violation`` and NO ``violations``: a consumer keyed on
+    either sees an absent key, never an empty-and-clean-looking one.
+    """
+    return {
+        "status": STATUS_UNKNOWN,
+        "boundary_count": None,
+        "reason": reason,
+    }
+
+
 def check_pipeline_contract(branch: str = "main") -> dict:
     """Assert the pipeline-contract invariants; return a dict the SF Choice reads.
 
-    ``has_violation`` is present (``true``/``false``) ONLY when BOTH the
-    contract + registry were fetched and parsed. Any fetch/parse miss OMITS
-    ``has_violation`` entirely + sets ``reason=fetch_failed`` (fail-open,
-    alpha-engine-config-I7048: unmeasured is not the same as measured-clean).
+    Two mutually exclusive shapes, distinguished by ``status``:
+
+    * ``status=MEASURED`` — both files fetched and parsed. Carries
+      ``has_violation`` (``true``/``false``), the full ``violations`` list and
+      a non-null ``boundary_count``.
+    * ``status=UNKNOWN`` — a fetch or YAML-parse miss. Carries ``reason=
+      fetch_failed`` and ``boundary_count=None``, and OMITS BOTH
+      ``has_violation`` and ``violations`` (alpha-engine-config-I7048 +
+      I7277: unmeasured is not measured-clean, and an empty evidence list is
+      just as much a claim as a false verdict key).
+
     ``has_violation=true`` only when a confirmed self-consistency /
     dangling-artifact_id breach is found. Shape mirrors ``check_lib_pin_drift``.
     """
@@ -239,7 +293,8 @@ def check_pipeline_contract(branch: str = "main") -> dict:
     # has_violation is OMITTED (not set False) — alpha-engine-config-I7048:
     # this state was never measured, so it must not report a definite
     # verdict. The SF's IsPresent-guarded Choice routes an absent key to
-    # the visible PipelineContractGateDegraded path.
+    # the visible PipelineContractGateDegraded path. `violations` is omitted
+    # too (I7277): an empty list is the same claim in a different field.
     if contract_raw is None or registry_raw is None:
         log.warning(
             "Pipeline-contract preflight: source file(s) unresolved "
@@ -247,11 +302,7 @@ def check_pipeline_contract(branch: str = "main") -> dict:
             contract_raw is not None,
             registry_raw is not None,
         )
-        return {
-            "violations": [],
-            "boundary_count": None,
-            "reason": "fetch_failed",
-        }
+        return _unknown_result("fetch_failed")
 
     try:
         contract = yaml.safe_load(contract_raw)
@@ -261,11 +312,7 @@ def check_pipeline_contract(branch: str = "main") -> dict:
             "Pipeline-contract preflight: YAML parse failed (%s) — proceeding (fail-open)",
             exc,
         )
-        return {
-            "violations": [],
-            "boundary_count": None,
-            "reason": "fetch_failed",
-        }
+        return _unknown_result("fetch_failed")
 
     registry_ids = _registry_artifact_ids(registry)
     violations = _validate_contract(contract, registry_ids)
@@ -282,6 +329,7 @@ def check_pipeline_contract(branch: str = "main") -> dict:
         )
 
     return {
+        "status": STATUS_MEASURED,
         "has_violation": has_violation,
         "violations": violations,
         "boundary_count": boundary_count,
