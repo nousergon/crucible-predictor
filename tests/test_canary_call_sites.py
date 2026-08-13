@@ -226,7 +226,13 @@ def test_degraded_shape_actions_really_omit_their_verdict_key(
         from inference import lib_pin_drift as mod
 
         # Every upstream pin unresolvable → the I7048 fail-open branch.
-        monkeypatch.setattr(mod, "_fetch_repo_pin", lambda *a, **k: None)
+        # PinRead, not None, since alpha-engine-config-I7171 gave the read a
+        # reason alongside the (absent) pin.
+        monkeypatch.setattr(
+            mod,
+            "_fetch_repo_pin",
+            lambda *a, **k: mod.PinRead(None, mod.UNREACHABLE, "patched"),
+        )
         result = mod.check_lib_pin_drift()
     else:
         from inference import pipeline_contract_check as mod
