@@ -203,7 +203,11 @@ def test_digest_includes_console_deeplink(monkeypatch):
     }
     ok = mz.send_zoo_digest_email(leaderboard, "bkt", "2026-06-26", s3=s3)
     assert ok is True
-    expected = "https://console.nousergon.ai/model-zoo?date=2026-06-26"
+    # dashboard.nousergon.ai, not console.nousergon.ai: the Streamlit page
+    # serving this slug lives at :8501 (dashboard host); console.nousergon.ai
+    # is nousergon-console v2, a fleet entity index that 404s every slug here
+    # (krepis 0.54.0, alpha-engine-config#6140).
+    expected = "https://dashboard.nousergon.ai/model-zoo?date=2026-06-26"
     assert expected in captured["plain"]
     assert f'href="{expected}"' in captured["html"]
     # The slug constant is the cross-repo contract with the dashboard page.
