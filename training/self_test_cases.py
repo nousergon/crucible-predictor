@@ -35,18 +35,24 @@ optional.
 
 WHAT THIS HALF PINS
 -------------------
-Its headline is a real cross-implementation divergence found on first contact
-(**alpha-engine-config-I7271**): ``downside_ic_stats`` computes
+Its headline was a real cross-implementation divergence found on first contact
+(**alpha-engine-config-I7271**): ``downside_ic_stats`` computed
 ``downside = ic[ic < target] - target`` and then ``mean(downside ** 2)``, so its
-downside-deviation denominator is ``n_downside``, while
+downside-deviation denominator was ``n_downside``, while
 ``nousergon_lib.quant.riskstats.sortino_ratio`` uses ``min(0, r)`` over ALL ``n``
-— the convention the evaluator's own self-test documents as "the load-bearing
-half". On the frozen fixture the two differ by ``sqrt(10/3) = 1.8257x`` on the
-deviation, so the reported Sortino differs by ``sqrt(3/10) = 0.5477x``.
+— the standard Sortino/Satchell convention, and the one the evaluator's own
+self-test documents as "the load-bearing half".
 
-Pinned at its MEASURED value, not corrected: changing a risk-statistic convention
-moves every historical number and every gate keyed to one, which is Brian's
-decision, not a patch (binding precedent: `I7236`).
+**RULED 2026-08-13 (Brian, "use sota" / standing "ALWAYS USE SOTA UNLESS THERE
+IS A CLEAR RATIONALE NOT TO"): aligned to the divide-by-N convention.**
+``downside_ic_stats`` now agrees with the lib. On the frozen fixture below the
+old (n_downside) convention OVERSTATED the deviation by ``sqrt(10/3) =
+1.8257x``, so every historical ``sortino_of_ic`` RISES by that same factor
+under the fix, and ``passes_downside_gate`` becomes
+MORE PERMISSIVE at any fixed ``sortino_threshold`` (which defaults to 0.0 and
+has never been set to a tuned nonzero value — W1.4 was still pending, so this
+was free to fix now rather than after a threshold was tuned against the wrong
+scale).
 """
 
 from __future__ import annotations
@@ -91,12 +97,14 @@ def expected_spearman_ic() -> float:
     return 1.0 - 12.0 / (n * (n * n - 1))
 
 
-def expected_sortino_n_downside() -> float:
-    """The MEASURED convention: denominator is the count of NEGATIVES.
+def expected_sortino_pre_fix_n_downside() -> float:
+    """The PRE-FIX (retired) convention: denominator was the count of NEGATIVES.
 
-    ``training/deflated_sharpe.py`` filters to ``ic[ic < target]`` BEFORE taking
-    the mean of squares, so the divisor is ``n_downside``. Rounded to 6dp because
-    the production path rounds there.
+    Kept ONLY as a documented historical value — this is what
+    ``downside_ic_stats`` returned before alpha-engine-config-I7271 was fixed,
+    and it is what ``downside_ic_sortino_closed_form`` would still assert if the
+    production code ever regressed back to it. Rounded to 6dp because the
+    production path rounds there.
     """
     mean_ic = sum(DOWNSIDE_IC) / len(DOWNSIDE_IC)
     downside = [v for v in DOWNSIDE_IC if v < 0.0]
@@ -105,9 +113,10 @@ def expected_sortino_n_downside() -> float:
 
 
 def expected_sortino_full_n() -> float:
-    """The REFERENCE convention (``nousergon_lib.quant.riskstats.sortino_ratio``):
-    RMS of ``min(0, r)`` over ALL n. Kept so the divergence case can measure the
-    gap rather than assert an agreement that provably does not hold."""
+    """The FLEET-STANDARD convention (matches
+    ``nousergon_lib.quant.riskstats.sortino_ratio``, and now matches
+    ``training/deflated_sharpe.py::downside_ic_stats`` post-I7271-fix): RMS of
+    ``min(0, r)`` over ALL n."""
     n = len(DOWNSIDE_IC)
     mean_ic = sum(DOWNSIDE_IC) / n
     downside = [min(0.0, v) for v in DOWNSIDE_IC]
@@ -116,14 +125,20 @@ def expected_sortino_full_n() -> float:
 
 
 def expected_sortino_convention_ratio() -> float:
-    """sqrt(n_downside/n) = sqrt(3/10) = 0.5477225575051661.
+    """POST-FIX: local-over-reference must be 1.0 — both now divide by N.
 
-    Note the DIRECTION: averaging the squared downside over the 3 negatives rather
-    than all 10 observations makes the downside deviation LARGER by sqrt(10/3),
-    and therefore makes the reported Sortino SMALLER by its reciprocal. The
-    predictor's Sortino-of-IC is the CONSERVATIVE one — which is why the
-    divergence never announced itself as an implausibly good number.
+    Retained for its historical value too: pre-fix this was
+    ``sqrt(n_downside/n) = sqrt(3/10) = 0.5477225575051661``, the reciprocal of
+    the ``sqrt(10/3)`` inflation the n_downside denominator put on the downside
+    deviation. If this number ever moves off 1.0 again, one of the two
+    conventions changed — the re-examination trigger for I7271.
     """
+    return 1.0
+
+
+def expected_sortino_pre_fix_convention_ratio() -> float:
+    """Historical value of ``expected_sortino_convention_ratio`` before the
+    I7271 fix: ``sqrt(n_downside/n) = sqrt(3/10)``."""
     n = len(DOWNSIDE_IC)
     n_down = sum(1 for v in DOWNSIDE_IC if v < 0.0)
     return math.sqrt(n_down / n)
@@ -151,6 +166,20 @@ def _downside_stats(ic_series=DOWNSIDE_IC) -> dict:
     from training.deflated_sharpe import downside_ic_stats
 
     return downside_ic_stats(np.array(list(ic_series)))
+
+
+def _lib_sortino_of_ic(ic_series=DOWNSIDE_IC) -> float:
+    """The SAME quantity via ``nousergon_lib.quant.riskstats.sortino_ratio``,
+    called UNROUNDED (production rounds ``sortino_of_ic`` to 6dp; this reference
+    does not) so the agreement case measures the real cross-implementation gap
+    rather than a rounding artifact. ``periods_per_year=1`` disables the lib's
+    annualization (irrelevant to an IC series) and ``risk_free_rate=0.0``
+    matches ``downside_ic_stats``'s default ``target=0.0``."""
+    from nousergon_lib.quant.riskstats import sortino_ratio
+
+    return sortino_ratio(
+        list(ic_series), risk_free_rate=0.0, periods_per_year=1,
+    )
 
 
 def _ic_series(preds, realized, dates=None):
@@ -247,31 +276,35 @@ def build_cases() -> list[Case]:
         Case(
             name="downside_ic_sortino_closed_form",
             description=(
-                "KNOWN GAP (alpha-engine-config-I7271), PINNED NOT FIXED. "
-                "training/deflated_sharpe.py::downside_ic_stats computes "
-                "downside = ic[ic < target] - target and then mean(downside^2), "
-                "so the downside-deviation denominator is n_DOWNSIDE (3 here), "
-                "NOT n (10). nousergon_lib.quant.riskstats.sortino_ratio uses "
-                "min(0, r) over ALL n — the convention the evaluator's own "
-                "self-test documents as 'the load-bearing half'. On this fixture "
-                "the downside DEVIATION differs by sqrt(10/3) = 1.8257x, so the "
-                "reported Sortino differs by its reciprocal sqrt(3/10) = 0.5477x. "
-                "Expected pins the MEASURED value so further drift goes red; a "
-                "PASS means 'unchanged', NOT 'this is the right convention'"
+                "FIXED 2026-08-13 (alpha-engine-config-I7271, Brian ruling "
+                "'use sota'). training/deflated_sharpe.py::downside_ic_stats now "
+                "divides the downside sum-of-squares by n (10 here), matching "
+                "nousergon_lib.quant.riskstats.sortino_ratio's min(0, r)-over-ALL-n "
+                "convention — the standard Sortino/Satchell definition and the "
+                "evaluator's own documented 'load-bearing half'. PRE-FIX this "
+                "denominator was n_DOWNSIDE (3), which overstated the downside "
+                "deviation by sqrt(10/3) = 1.8257x and understated Sortino by its "
+                "reciprocal sqrt(3/10) = 0.5477x — the pre-fix expected value is "
+                "preserved in expected_sortino_pre_fix_n_downside() so a "
+                "regression back to it goes red here"
             ),
             inputs={"ic_series": list(DOWNSIDE_IC), "target": 0.0,
-                    "downside_denominator_in_use": "n_downside (3)",
+                    "downside_denominator_in_use": "n (10)",
+                    "pre_fix_denominator": "n_downside (3)",
+                    "pre_fix_value_for_reference": expected_sortino_pre_fix_n_downside(),
                     "fleet_reference_denominator":
                         "n (10), nousergon_lib.quant.riskstats.sortino_ratio",
-                    "downside_deviation_factor": expected_downside_deviation_ratio(),
-                    "sortino_factor": expected_sortino_convention_ratio(),
-                    "direction": "the predictor's convention reports the SMALLER "
-                                 "(more conservative) Sortino",
+                    "downside_deviation_factor_pre_fix":
+                        expected_downside_deviation_ratio(),
+                    "sortino_factor_pre_fix":
+                        expected_sortino_pre_fix_convention_ratio(),
+                    "direction": "the fix RAISES every historical sortino_of_ic "
+                                 "by sqrt(10/3) = 1.8257x, making "
+                                 "passes_downside_gate MORE PERMISSIVE at any "
+                                 "fixed sortino_threshold",
                     "rounding": "production rounds to 6dp", "units": "ratio"},
-            expected=expected_sortino_n_downside(),
+            expected=round(expected_sortino_full_n(), 6),
             compute=lambda: float(_downside_stats()["sortino_of_ic"]),
-            known_gap=True,
-            gap_issue="alpha-engine-config-I7271",
         ),
 
         # ── cross-implementation agreement (the I7236 class) ────────────────
@@ -293,25 +326,31 @@ def build_cases() -> list[Case]:
             compute=lambda: _predictor_ic() - _lib_ic(),
         ),
         Case(
-            name="sortino_convention_divergence_agreement",
+            name="sortino_convention_agreement",
             description=(
-                "CROSS-IMPLEMENTATION. Measures the SIZE of the I7271 divergence "
-                "rather than asserting agreement, because the two implementations "
-                "provably do NOT agree. ratio = sortino(n_downside) / "
-                "sortino(full n) must equal sqrt(n_downside/n) = sqrt(3/10) = "
-                "0.5477225575051661 exactly. If this number ever moves, one of the "
-                "two conventions changed — which is the event I7271 must be "
-                "re-examined on"
+                "CROSS-IMPLEMENTATION. Post-I7271-fix, both implementations "
+                "divide by N, so ratio = local sortino_of_ic / "
+                "nousergon_lib.quant.riskstats.sortino_ratio(same series, "
+                "periods_per_year=1) must equal 1.0. Renamed from "
+                "'sortino_convention_divergence_agreement' — pre-fix this case "
+                "measured the SIZE of the divergence (sqrt(3/10) = "
+                "0.5477225575051661, preserved in "
+                "expected_sortino_pre_fix_convention_ratio()) rather than "
+                "asserting agreement, because the two implementations provably "
+                "did not agree. If this number ever moves off 1.0, one of the "
+                "two conventions changed — the re-examination trigger for I7271"
             ),
             inputs={"local": "training.deflated_sharpe.downside_ic_stats",
                     "reference": "nousergon_lib.quant.riskstats.sortino_ratio "
-                                 "(denominator convention)",
+                                 "(periods_per_year=1, risk_free_rate=0.0)",
                     "n": len(DOWNSIDE_IC),
                     "n_downside": sum(1 for v in DOWNSIDE_IC if v < 0.0),
-                    "units": "ratio of ratios"},
+                    "pre_fix_ratio_for_reference":
+                        expected_sortino_pre_fix_convention_ratio(),
+                    "units": "ratio"},
             expected=expected_sortino_convention_ratio(),
             compute=lambda: (float(_downside_stats()["sortino_of_ic"])
-                             / expected_sortino_full_n()),
+                             / _lib_sortino_of_ic()),
             # 6dp production rounding on the numerator caps achievable agreement
             # at ~1e-6; tightening below that would assert precision the artifact
             # does not carry.

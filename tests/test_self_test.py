@@ -90,7 +90,7 @@ _TOLERANCE_EXEMPTIONS = {
     # `downside_ic_stats` rounds its output to 6dp, which caps the achievable
     # agreement on a ratio built from it at ~1e-6. Tightening below that would
     # assert precision the production artifact does not carry.
-    "sortino_convention_divergence_agreement": 1e-5,
+    "sortino_convention_agreement": 1e-5,
 }
 
 
@@ -161,7 +161,7 @@ def test_the_training_scope_carries_the_cross_implementation_cases():
     names = {c.name for c in tsc.build_cases()}
     assert {
         "ic_cross_implementation_agreement",
-        "sortino_convention_divergence_agreement",
+        "sortino_convention_agreement",
         "downside_ic_sortino_closed_form",
         "predictor_ic_closed_form",
     } <= names
@@ -200,18 +200,21 @@ def test_expected_calibrator_p_up_is_the_linear_fallback():
     assert st._expected_calibrator_p_up() == pytest.approx(0.60, rel=0, abs=1e-15)
 
 
-def test_the_two_sortino_conventions_differ_by_the_sqrt_of_the_count_ratio():
-    """alpha-engine-config-I7271. The predictor divides the squared downside by
-    the count of NEGATIVES; nousergon_lib.quant.riskstats divides by N. This
-    pins both the factor and its DIRECTION — the predictor's is the smaller,
-    more conservative number, which is why it never looked implausible."""
+def test_the_two_sortino_conventions_now_agree():
+    """alpha-engine-config-I7271, FIXED 2026-08-13 (Brian ruling 'use sota'):
+    the predictor now divides the squared downside by N, matching
+    nousergon_lib.quant.riskstats's convention, so the two agree exactly
+    (ratio 1.0). The pre-fix factor and its direction — the predictor's OLD
+    convention was the smaller, more conservative number, which is why it
+    never looked implausible — is preserved for the historical record."""
     n = len(tsc.DOWNSIDE_IC)
     n_down = sum(1 for v in tsc.DOWNSIDE_IC if v < 0.0)
     assert tsc.expected_downside_deviation_ratio() == pytest.approx(
         math.sqrt(n / n_down), rel=0, abs=1e-15)
-    assert tsc.expected_sortino_convention_ratio() == pytest.approx(
+    assert tsc.expected_sortino_convention_ratio() == pytest.approx(1.0, rel=0, abs=1e-15)
+    assert tsc.expected_sortino_pre_fix_convention_ratio() == pytest.approx(
         math.sqrt(n_down / n), rel=0, abs=1e-15)
-    assert tsc.expected_sortino_convention_ratio() < 1.0
+    assert tsc.expected_sortino_pre_fix_convention_ratio() < 1.0
 
 
 def test_the_composite_intensity_fixture_is_not_self_cancelling():
@@ -253,13 +256,15 @@ def test_every_case_publishes_enough_to_re_derive_it(body):
 
 def test_known_gap_cases_say_so_in_words(body):
     """A pinned-wrong case must never read as an endorsement. The artifact has to
-    carry that in words, not leave a reader to infer it from a green row."""
+    carry that in words, not leave a reader to infer it from a green row.
+
+    config-I7272 fixed the two regime-layer known gaps (zero-variance z-score,
+    regime_score with no heads); config-I7271 (Sortino denominator, fixed
+    2026-08-13) was the last remaining one. Zero known gaps is the CURRENT
+    state, not a structural guarantee — the assertion loop below still holds
+    if a future known gap is pinned, so this test does not go stale silently."""
     gaps = [c for c in body["cases"] if c.get("known_gap")]
-    # config-I7272: the two regime-layer known gaps (zero-variance z-score,
-    # regime_score with no heads) were FIXED — they now assert the honest
-    # undefined representation and no longer pin a wrong value. Only the
-    # separate I7271 (Sortino denominator) known gap remains.
-    assert len(gaps) == body["n_known_gaps"] >= 1
+    assert len(gaps) == body["n_known_gaps"] == 0
     for case in gaps:
         assert case["gap_issue"].startswith("alpha-engine-config-I")
         assert "NOT" in case["known_gap_note"]
