@@ -66,7 +66,18 @@ setuptools>=83.0.0
 # `--json` in krepis-PR133 (released 0.51.0). The spot-cleanup call sites
 # migrated off the exit-code contract onto the JSON verdict field. Kept in
 # lockstep with requirements-lambda.txt.
-krepis[flow-doctor]==0.59.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+# Bumped to 0.59.6 (alpha-engine-config-I4992/I6922/I7372, G16 spot-bootstrap
+# cutover): 0.59.6 is the first published krepis carrying
+# `krepis.spot_bootstrap.scan_for_inline_bootstraps` (this repo's anti-fork
+# test, tests/test_no_inline_spot_bootstrap.py, imports it directly) and the
+# `--max-runtime-seconds` render flag (infrastructure/_spot_common.sh's
+# bootstrap_spot() now passes it, called by both infrastructure/spot_train.sh
+# and every other spot launcher in this repo). Below 0.59.6 the flag is
+# unrecognized by `python -m krepis.spot_bootstrap render`, so a bootstrap on
+# a box resolving an older krepis fails AFTER a spot instance already exists
+# and is billing — this floor is load-bearing at runtime, not only for CI
+# collection. Kept in lockstep with requirements-lambda.txt.
+krepis[flow-doctor]==0.59.6  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57
 
 # Training dependencies (not needed in Lambda)

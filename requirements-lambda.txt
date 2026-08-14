@@ -24,7 +24,13 @@
 # Bumped to 0.51.0 (config#7009): `krepis.ec2_spot relaunch-decision` grew
 # `--json` in krepis-PR133 (released 0.51.0). Kept in lockstep with
 # requirements.txt.
-krepis[flow-doctor]==0.59.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+# Bumped to 0.59.6 (alpha-engine-config-I4992/I6922/I7372, G16 spot-bootstrap
+# cutover): first published krepis carrying `scan_for_inline_bootstraps` and
+# the `--max-runtime-seconds` render flag `_spot_common.sh`'s bootstrap_spot()
+# now passes — load-bearing at runtime (a bootstrap on an older-krepis box
+# fails after the spot already exists and is billing), not only for CI
+# collection. Kept in lockstep with requirements.txt.
+krepis[flow-doctor]==0.59.6  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.57
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
