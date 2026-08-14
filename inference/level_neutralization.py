@@ -58,6 +58,16 @@ from model.calibrator import derive_direction
 log = logging.getLogger(__name__)
 
 
+# The anchor name the executor's optimizer accepts, mirrored from
+# `crucible-executor/executor/alpha_contract.py::OPTIMIZER_ALPHA_ANCHOR`
+# (alpha-engine-config-I7337 layer 3). It is a literal on both sides on
+# purpose: the two repos deploy independently, so a shared import would make
+# the executor's alpha contract depend on a predictor release landing first.
+# The consumer-contract test below pins the string, so a rename on either side
+# fails here rather than at 05:15 PT on a trading morning.
+OPTIMIZER_ALPHA_ANCHOR = "market_relative_21d_log"
+
+
 def cross_sectional_mean(predictions: list[dict]) -> float:
     """Mean of the per-name ``predicted_alpha`` across the batch (the
     common-mode level to remove). All entries are universe names — SPY/cash are
@@ -147,6 +157,22 @@ def apply_cross_sectional_neutralization(
 
         if enabled:
             p["predicted_alpha"] = round(centered, 6)
+            # The anchor is stamped by the step that ESTABLISHES it, and only
+            # on the branch where it actually holds. Subtracting the
+            # cross-sectional mean is what makes this alpha market-relative;
+            # before this line the value is the model's raw output, which
+            # carries the batch's common-mode level. Stamping at record
+            # construction would declare an anchor the number does not yet
+            # have — and the executor cannot re-derive one, because a
+            # common-mode level is only measurable over a complete
+            # cross-section (alpha-engine-config-I7337 layer 3).
+            #
+            # On the `enabled=False` / `n<2` paths NOTHING is stamped, which is
+            # correct and load-bearing: `predicted_alpha` is then the raw
+            # value, the optimizer's SPY=0.0 anchor does not apply to it, and
+            # `assert_optimizer_anchor` must refuse the batch rather than solve
+            # against an alpha whose zero means something else.
+            p["alpha_anchor"] = OPTIMIZER_ALPHA_ANCHOR
             p["p_up"] = der["p_up"]
             p["p_down"] = der["p_down"]
             p["predicted_direction"] = der["predicted_direction"]
@@ -161,6 +187,9 @@ def apply_cross_sectional_neutralization(
         "n_direction_flips": n_flips_sign,
         "direction_skew_raw": round(n_down_raw / n, 4),
         "direction_skew_centered": round(n_down_centered / n, 4),
+        # What the optimizer will read off each record — published so an
+        # operator can see the declared anchor without opening a prediction.
+        "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR if enabled else None,
     }
     log.info(
         "Level-neutralization %s: mean_removed=%.6f  flips=%d  "
