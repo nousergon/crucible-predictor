@@ -34,24 +34,28 @@ would drift exactly like the first two.
 
 ## Why the Bash copy still exists at all
 
-``krepis.spot_bootstrap`` cannot simply replace this heredoc yet. The launcher
-resolves its interpreter as::
+``krepis.spot_bootstrap`` could not simply replace this heredoc while the
+launcher resolved its interpreter as::
 
     LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
 
-— the *shared application host's* venv, whose krepis version is governed by
+— the *shared application host's* venv, whose krepis version was governed by
 ``crucible-dashboard/requirements.txt``, a file no merge in this repo can see.
-A cutover therefore carries a runtime dependency this repo cannot pin, and when
-that venv is behind, the bootstrap does not degrade — it dies with
-``ModuleNotFoundError`` on every spot stage of every pipeline. Measured
-2026-08-13 the host is at krepis 0.54.0 and ``krepis.spot_bootstrap`` imports
-cleanly, but nothing *declares* or *enforces* that floor; ``alpha-engine-config
--I6931`` owns making it a fail-loud, declared version.
+A cutover therefore carried a runtime dependency this repo could not pin, and
+when that venv was behind, the bootstrap did not degrade — it died with
+``ModuleNotFoundError`` on every spot stage of every pipeline. So the dependency
+that could not safely exist at RUNTIME lived in a TEST instead: the Bash copies
+stay, and CI asserts they agree with the canonical renderer.
 
-So the dependency that cannot safely exist at RUNTIME lives in a TEST instead:
-the Bash copies stay, and CI asserts they agree with the canonical renderer.
-When I6931 lands its version floor, the cutover becomes a deletion and this
-test is what proves the deletion changed nothing.
+**That blocker is now cleared** (`alpha-engine-config-I7343`, 2026-08-14). The
+launcher resolves through ``/opt/nousergon/bin/lib-python``, the ops-owned guard
+over the box's DECLARED krepis venv, which aborts with ``EX_CONFIG`` (78) naming
+the version it found when that venv is below the launcher floor — a declared,
+enforced, fail-loud floor, which is what I6931 owed. The cutover to
+``krepis.spot_bootstrap`` is therefore unblocked and becomes a deletion;
+``alpha-engine-config-I6922`` owns it, and this test is what will prove the
+deletion changed nothing. Resolution is pinned by
+``tests/test_launchers_resolve_the_declared_krepis_guard.py``.
 """
 
 from __future__ import annotations
