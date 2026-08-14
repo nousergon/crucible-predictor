@@ -394,3 +394,126 @@ def test_handler_predict_supplemental_tickers_list(
     )
 
 
+
+
+# ── alpha-engine-config-I7316 ───────────────────────────────────────────────
+# The handler must survive the UNMEASURED payload of every gate probe that
+# omits keys on its fail-open path.
+#
+# What happened: alpha-engine-config-I7048 taught these probes to OMIT the
+# verdict key rather than report a false one, and guarded the handler's log
+# line for THAT key with `.get()`. -I7277 and -I7171 then extended the same
+# reasoning to the EVIDENCE lists (`violations`, `offenders`) — an empty list
+# is as much a claim as a false verdict — but the handler's bare subscripts on
+# those siblings were never updated. From that merge on, every unmeasured
+# invocation raised KeyError inside the very log line written to report it.
+#
+# Measured on the 2026-08-14T03:10 deploy canary against version 479:
+#   check_pipeline_contract: FunctionError: Unhandled, payload: 'violations'
+#   check_lib_pin_drift:     FunctionError: Unhandled, payload: 'offenders'
+# The canary refused the promote and the :live alias froze at v474.
+#
+# These tests drive the probes' REAL unmeasured payloads — built by the
+# producer's own constructor, not hand-written here — through the handler. A
+# third probe adopting the omit-the-key shape, or a fourth key joining the
+# omitted set, fails here instead of at a deploy canary.
+
+
+def _real_unknown_pipeline_contract_payload() -> dict:
+    from inference.pipeline_contract_check import _unknown_result
+    return _unknown_result("source_missing")
+
+
+def _real_unmeasured_lib_pin_payload() -> dict:
+    """The lib-pin probe's own fail-open payload, driven through the real
+    function with every upstream read unresolvable."""
+    from unittest.mock import patch as _patch
+
+    from inference import lib_pin_drift as lpd
+
+    with _patch.object(
+        lpd, "_fetch_repo_pin",
+        side_effect=lambda *a, **k: lpd.PinRead(None, lpd.UNREACHABLE, "patched"),
+    ):
+        return lpd.check_lib_pin_drift()
+
+
+def test_unmeasured_pipeline_contract_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unknown_pipeline_contract_payload()
+    # Precondition: this is the shape the bug needed. If the producer starts
+    # emitting these keys again, this test is no longer covering anything and
+    # should be re-pointed rather than silently passing.
+    assert "violations" not in payload
+    assert "has_violation" not in payload
+
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    assert result == payload, "the handler must return the probe's payload verbatim"
+
+
+def test_unmeasured_lib_pin_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unmeasured_lib_pin_payload()
+    assert "has_drift" not in payload
+
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    assert result == payload
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_a_payload_carrying_only_a_reason(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """The floor: a probe payload that carries nothing but a reason.
+
+    Generalizes past the two keys that actually broke. Any future key the
+    handler's log line reaches for must be optional, because the whole point
+    of the unmeasured shape is that it asserts as little as possible.
+    """
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={"reason": "source_missing"}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    result = h.handler({"action": action}, _fake_context())
+
+    assert result == {"reason": "source_missing"}
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_an_entirely_empty_payload(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """Even `reason` is not guaranteed by anything structural. The handler is
+    a reporting surface; it must never be the thing that turns a degraded
+    probe into an Unhandled Lambda error, because the SF then attributes the
+    failure to the invocation rather than to the gate
+    (alpha-engine-config-I7302)."""
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    assert h.handler({"action": action}, _fake_context()) == {}
