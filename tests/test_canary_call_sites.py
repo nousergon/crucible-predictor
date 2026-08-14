@@ -237,8 +237,12 @@ def test_degraded_shape_actions_really_omit_their_verdict_key(
     else:
         from inference import pipeline_contract_check as mod
 
-        # Contract + registry unreachable → the I7048 fail-open branch.
-        monkeypatch.setattr(mod, "_fetch_raw", lambda *a, **k: None)
+        # Contract + registry unreadable → the I7048 fail-open branch.
+        # (text, reason, last_modified), not None, since
+        # alpha-engine-config-I7281 moved the read to S3 and gave it a reason.
+        monkeypatch.setattr(
+            mod, "_fetch_source", lambda *a, **k: (None, mod._REASON_MISSING, None)
+        )
         result = mod.check_pipeline_contract()
 
     assert verdict_key not in result, (

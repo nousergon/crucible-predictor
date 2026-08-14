@@ -2,14 +2,16 @@
 preflight probe (L4595 / config#693).
 
 Exercises the self-consistency validation rules + the fail-open degraded mode.
-``_fetch_raw`` (the GitHub read) is mocked so tests are hermetic.
+``_fetch_source`` (the S3 read) is mocked so tests are hermetic.
 """
 
 from __future__ import annotations
 
 import textwrap
-from unittest.mock import patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 import inference.pipeline_contract_check as pcc
@@ -48,19 +50,32 @@ def _yaml(obj) -> str:
     return yaml.safe_dump(obj)
 
 
-def _patch_raw(contract_obj, registry_obj):
-    """Patch _fetch_raw to return YAML for the contract/registry (or None)."""
+_PUBLISHED_AT = datetime(2026, 8, 14, 1, 5, 0, tzinfo=timezone.utc)
+
+
+def _patch_raw(contract_obj, registry_obj, failure_reason=pcc._REASON_FETCH_FAILED):
+    """Patch _fetch_source to return YAML for the contract/registry (or a miss).
+
+    `None` for either object means that S3 read failed, with `failure_reason`
+    as its reason — the signature keeps the (text, reason, last_modified)
+    contract the real `_fetch_source` returns.
+    """
     contract_text = None if contract_obj is None else _yaml(contract_obj)
     registry_text = None if registry_obj is None else _yaml(registry_obj)
 
-    def _side_effect(path, **_):
-        if path == pcc._CONTRACT_PATH:
-            return contract_text
-        if path == pcc._REGISTRY_PATH:
-            return registry_text
-        return None
+    def _one(text):
+        if text is None:
+            return None, failure_reason, None
+        return text, None, _PUBLISHED_AT
 
-    return patch.object(pcc, "_fetch_raw", side_effect=_side_effect)
+    def _side_effect(key, **_):
+        if key == pcc._CONTRACT_KEY:
+            return _one(contract_text)
+        if key == pcc._REGISTRY_KEY:
+            return _one(registry_text)
+        return None, pcc._REASON_MISSING, None
+
+    return patch.object(pcc, "_fetch_source", side_effect=_side_effect)
 
 
 # ── happy path ───────────────────────────────────────────────────────────────
@@ -192,7 +207,7 @@ def test_contract_fetch_failure_fails_open():
     # SF's IsPresent-guarded Choice routes to the visible degraded path
     # instead of a silent pass.
     assert "has_violation" not in out
-    assert out["reason"] == "fetch_failed"
+    assert out["reason"] == pcc._REASON_FETCH_FAILED
     assert out["boundary_count"] is None
 
 
@@ -200,20 +215,120 @@ def test_registry_fetch_failure_fails_open():
     with _patch_raw(_GOOD_CONTRACT, None):  # registry unreachable
         out = pcc.check_pipeline_contract()
     assert "has_violation" not in out
-    assert out["reason"] == "fetch_failed"
+    assert out["reason"] == pcc._REASON_FETCH_FAILED
     assert out["boundary_count"] is None
 
 
 def test_malformed_yaml_fails_open():
     bad_yaml = "schema_version: 1\nboundaries: [unterminated"
-    def _side_effect(path, **_):
-        return bad_yaml
-    with patch.object(pcc, "_fetch_raw", side_effect=_side_effect):
+
+    def _side_effect(key, **_):
+        return bad_yaml, None, _PUBLISHED_AT
+
+    with patch.object(pcc, "_fetch_source", side_effect=_side_effect):
         out = pcc.check_pipeline_contract()
     # A parse failure is the checker's own fragility — must never false-halt,
-    # and must never report a measured verdict it does not have.
+    # and must never report a measured verdict it does not have. It gets its
+    # OWN reason (alpha-engine-config-I7281): the publisher validates before it
+    # copies, so unparseable YAML in the bucket means something else wrote it —
+    # a different operator action from a read that did not land.
     assert "has_violation" not in out
-    assert out["reason"] == "fetch_failed"
+    assert out["reason"] == pcc._REASON_PARSE_FAILED
+
+
+# ── alpha-engine-config-I7281: the source is S3, and WHY it failed matters ───
+
+def test_reads_the_published_s3_keys_not_github():
+    """The gate reads S3. It read raw.githubusercontent.com against a PRIVATE
+    repo for its entire life, so every one of 190 invocations in the 30 days
+    to 2026-08-13 returned fetch_failed and it never measured anything."""
+    assert not hasattr(pcc, "_fetch_raw")
+    assert not hasattr(pcc, "_RAW_URL")
+    assert pcc._SOURCE_BUCKET == "alpha-engine-research"
+    assert pcc._CONTRACT_KEY == "_pipeline_contract/PIPELINE_CONTRACT.yaml"
+    # The registry is read at the key sync-artifact-registry.yml has published
+    # to since 2026-06-05 — NOT republished under a contract-specific prefix.
+    assert pcc._REGISTRY_KEY == "_freshness_monitor/ARTIFACT_REGISTRY.yaml"
+
+
+def _client_error(code: str, status: int):
+    from botocore.exceptions import ClientError
+    return ClientError(
+        {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "GetObject",
+    )
+
+
+@pytest.mark.parametrize(("code", "status", "expected"), [
+    ("NoSuchKey", 404, pcc._REASON_MISSING),
+    ("AccessDenied", 403, pcc._REASON_FORBIDDEN),
+    ("InternalError", 500, pcc._REASON_FETCH_FAILED),
+])
+def test_unreachable_and_unauthorized_get_different_reasons(code, status, expected):
+    """The defect that hid this gate for its whole life.
+
+    GitHub answers an unauthorized read of a private repo with 404, not 403,
+    so 'this can never work' and 'the network blipped' arrived as the same
+    `fetch_failed` string. On S3 they are genuinely distinguishable, and a
+    checker that collapses them back invites the same misreading.
+    """
+    client = MagicMock()
+    client.get_object.side_effect = _client_error(code, status)
+    with patch.object(pcc, "_s3", return_value=client):
+        text, reason, mtime = pcc._fetch_source(pcc._CONTRACT_KEY)
+    assert text is None
+    assert mtime is None
+    assert reason == expected
+
+
+def test_a_missing_object_does_not_report_the_registrys_reason():
+    """When both reads fail, the CONTRACT's reason wins.
+
+    The registry is only the set the contract is checked against; reporting
+    its reason for a missing contract sends the operator to the wrong
+    publisher.
+    """
+    def _side_effect(key, **_):
+        if key == pcc._CONTRACT_KEY:
+            return None, pcc._REASON_MISSING, None
+        return None, pcc._REASON_FORBIDDEN, None
+
+    with patch.object(pcc, "_fetch_source", side_effect=_side_effect):
+        out = pcc.check_pipeline_contract()
+    assert out["reason"] == pcc._REASON_MISSING
+
+
+def test_measured_payload_names_how_fresh_the_sources_were():
+    """A gate that says in_sync without saying WHAT it read cannot tell a
+    current contract from one published months ago."""
+    with _patch_raw(_GOOD_CONTRACT, _GOOD_REGISTRY):
+        out = pcc.check_pipeline_contract()
+    assert out["status"] == pcc.STATUS_MEASURED
+    assert out["contract_published_at"] == _PUBLISHED_AT.isoformat()
+    assert out["registry_published_at"] == _PUBLISHED_AT.isoformat()
+
+
+def test_the_whole_payload_is_json_serializable():
+    """The SF's Lambda integration JSON-encodes this. A datetime here would
+    fail the invocation, which the Catch would then report as a Lambda
+    failure — the exact miscategorisation alpha-engine-config-I7302 fixed on
+    the alert side."""
+    import json
+
+    with _patch_raw(_GOOD_CONTRACT, _GOOD_REGISTRY):
+        json.dumps(pcc.check_pipeline_contract())
+    with _patch_raw(None, None):
+        json.dumps(pcc.check_pipeline_contract())
+
+
+def test_check_pipeline_contract_takes_no_branch():
+    """The source is the PUBLISHED copy of main, not a ref the caller picks.
+
+    A `branch` parameter would invite gating a production run on an unmerged
+    branch.
+    """
+    import inspect
+    assert list(inspect.signature(pcc.check_pipeline_contract).parameters) == []
 
 
 # ── parse-helper sanity ──────────────────────────────────────────────────────
