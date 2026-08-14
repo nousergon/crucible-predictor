@@ -28,6 +28,16 @@ _SPOT_NAME="${_SPOT_NAME:-model-zoo-select}"
 _PROCESS_NAME="${_PROCESS_NAME:-predictor-model-zoo-select}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 
+# Stage-coverage identity (config-I7214). Only --select-only is reachable
+# from the live weekly SF (nousergon-data infrastructure/step_function.json
+# state "ModelZooSelect" runs exactly `spot_model_zoo_select.sh
+# --select-only`, verified 2026-08-13). --weekly has no corresponding state
+# in the live definition — "ModelZooWeekly" does not exist there — so it is
+# NOT asserted below; asserting an undeclared registry stage would be a
+# guaranteed-false MISSING, not a real signal. Set per-mode in the flag
+# parser.
+_COVERAGE_STAGE=""
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 MODE=""  # weekly | select-only
 
@@ -35,7 +45,7 @@ _ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --weekly) MODE="weekly" ; _SPOT_NAME="model-zoo-weekly" ; _SSM_SLUG="spot-model-zoo-weekly" ; _PROCESS_NAME="predictor-model-zoo" ;;
-    --select-only) MODE="select-only" ; _SPOT_NAME="model-zoo-select" ; _SSM_SLUG="spot-model-zoo-select" ; _PROCESS_NAME="predictor-model-zoo-select" ;;
+    --select-only) MODE="select-only" ; _SPOT_NAME="model-zoo-select" ; _SSM_SLUG="spot-model-zoo-select" ; _PROCESS_NAME="predictor-model-zoo-select" ; _COVERAGE_STAGE="ModelZooSelect" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
     --preflight-only) PREFLIGHT_ONLY=1 ;;
     *) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
@@ -138,6 +148,9 @@ ZOO
 )" "${MAX_RUNTIME_SECONDS}"
 
   emit_heartbeat
+  # No stage-coverage assertion here — see the "_COVERAGE_STAGE" comment
+  # above the flag parser: --weekly has no live SF state to assert against
+  # (config-I7214).
   echo ""
   echo "==> Model-zoo rotation complete. Instance will be terminated."
   exit 0
@@ -198,6 +211,12 @@ ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}"
 
   emit_heartbeat
+
+  # Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+  # assert THIS stage wrote what it declared, at the boundary where the fact
+  # becomes knowable. OBSERVE MODE — it can never fail the stage.
+  "$LIB_PYTHON" -m nousergon_lib.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+
   echo ""
   echo "==> Model-zoo select complete. Instance will be terminated."
   exit 0

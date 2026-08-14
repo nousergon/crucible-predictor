@@ -78,6 +78,10 @@ MAX_SPOT_ATTEMPTS="${MAX_SPOT_ATTEMPTS:-2}"
 SPOT_ATTEMPT="${SPOT_ATTEMPT:-1}"
 SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-}"
+# config-I7214: real _spot_common.sh now declares this; the fake must mirror
+# it or the script's own coverage-assertion line hits `set -u` on the way
+# to a clean exit.
+_STAGE_WINDOW_START="${_STAGE_WINDOW_START:-2026-08-13T00:00:00Z}"
 _RUN_TOKEN_EXPORT=""
 _INSTANCE_ID="i-0000000000test0000"
 

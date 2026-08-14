@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 # Ensure project root on sys.path for sibling imports (regime/, etc.).
@@ -256,6 +257,8 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     Routes ``event["action"]`` to either ``produce`` (default, writes
     to S3) or ``dry_run`` (returns payload without writing).
     """
+    # Stage-coverage window (config-I7214), captured at handler entry.
+    _started = datetime.now(timezone.utc)
     event = event or {}
     action = event.get("action", "produce")
 
@@ -273,7 +276,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
 
     if action == "produce":
         result = produce_regime_substrate(**kwargs, write=True)
-        return {
+        _response = {
             "statusCode": 200,
             "action": action,
             "run_id": result["payload"]["run_id"],
@@ -282,6 +285,22 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "hmm_argmax": result["payload"]["hmm"]["argmax"],
             "regime_change_signal": result["payload"]["bocpd"]["change_signal"],
         }
+        # Per-stage output assertion (config-I7214, sf-pipeline-policy.md
+        # §2.1) — only on the write=True path; ``dry_run`` declares by
+        # design that it writes nothing, so asserting there would be a
+        # guaranteed-false MISSING rather than a real signal. Observe
+        # mode — the handler's own outcome is unchanged on an absent
+        # module.
+        try:
+            from nousergon_lib.stage_coverage import assert_stage_coverage
+            _response["stage_coverage"] = assert_stage_coverage(
+                "RegimeSubstrate",
+                run_date=result["payload"].get("calendar_date"),
+                window_start=_started,
+            )
+        except ImportError as exc:
+            logger.error("stage-coverage assertion unavailable: %s", exc)
+        return _response
     elif action == "dry_run":
         result = produce_regime_substrate(**kwargs, write=False)
         return {

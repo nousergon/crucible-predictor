@@ -75,6 +75,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure the project root is on sys.path so sibling modules can be
@@ -174,6 +175,10 @@ def handler(event: dict, context) -> dict:
                                  existing predictions/{date}.json. Used by the
                                  weekday Step Function's coverage-gap re-invoke.
     """
+    # Stage-coverage window (config-I7214): captured at handler ENTRY so the
+    # three weekly-SF gate actions below (WeeklyRunDayGate, LibPinDriftCheck,
+    # PipelineContractCheck) can assert against it before they return.
+    _started = datetime.now(timezone.utc)
     os.environ.setdefault("S3_BUCKET", "alpha-engine-research")
     os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
     # setup_logging already ran at module-top (see comment near the
@@ -250,6 +255,18 @@ def handler(event: dict, context) -> dict:
             _r["check_date"], _r["day_name"], _r["marker"],
             "" if _r["is_weekly_run_day"] else f" ({_r.get('reason')})",
         )
+        # Stage-coverage (config-I7214): WeeklyRunDayGate is a
+        # positively-declared no-output gate stage — the lib returns
+        # COVERED_NO_OUTPUT for it. Loud, not silent, if the module is
+        # absent at the pinned nousergon-lib SHA: the handler's own outcome
+        # is unchanged (observe mode).
+        try:
+            from nousergon_lib.stage_coverage import assert_stage_coverage
+            _r["stage_coverage"] = assert_stage_coverage(
+                "WeeklyRunDayGate", run_date=_r.get("check_date"), window_start=_started,
+            )
+        except ImportError as exc:
+            log.error("stage-coverage assertion unavailable: %s", exc)
         return _r
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
@@ -403,6 +420,19 @@ def handler(event: dict, context) -> dict:
             result.get("pins", {}),
             (" offenders=" + "; ".join(offenders)) if offenders else "",
         )
+        # Stage-coverage (config-I7214): LibPinDriftCheck is a
+        # positively-declared no-output gate stage — the lib returns
+        # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
+        # outcome is unchanged on an absent module.
+        try:
+            from nousergon_lib.stage_coverage import assert_stage_coverage
+            result["stage_coverage"] = assert_stage_coverage(
+                "LibPinDriftCheck",
+                run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
+                window_start=_started,
+            )
+        except ImportError as exc:
+            log.error("stage-coverage assertion unavailable: %s", exc)
         return result
 
     # ── Pipeline-contract preflight (Saturday SF early state, L4595) ─────────
@@ -422,6 +452,19 @@ def handler(event: dict, context) -> dict:
             result.get("boundary_count"),
             (" violations=" + "; ".join(violations)) if violations else "",
         )
+        # Stage-coverage (config-I7214): PipelineContractCheck is a
+        # positively-declared no-output gate stage — the lib returns
+        # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
+        # outcome is unchanged on an absent module.
+        try:
+            from nousergon_lib.stage_coverage import assert_stage_coverage
+            result["stage_coverage"] = assert_stage_coverage(
+                "PipelineContractCheck",
+                run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
+                window_start=_started,
+            )
+        except ImportError as exc:
+            log.error("stage-coverage assertion unavailable: %s", exc)
         return result
 
     # ── Numeric self-test (alpha-engine-config-I7262) ───────────────────────
