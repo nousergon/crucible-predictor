@@ -232,11 +232,20 @@ def build_regime_substrate(
     # The composite's intensity_z is "stress orientation" (positive =
     # risk-off). Downstream consumers expect higher = risk-on, so we
     # invert here to align the substrate output with the contract.
+    #
+    # config-I7272: ``None`` means every candidate macro feature was
+    # missing or degenerate this run (total input outage) — undefined,
+    # not a measured calm reading. Preserve None through the sign
+    # inversion rather than crashing or fabricating a value.
+    _raw_intensity_z = composite_result["intensity_z"]
+    _inverted_intensity_z = (
+        None if _raw_intensity_z is None else -_raw_intensity_z
+    )
     composite_block = {
-        "intensity_z": -composite_result["intensity_z"],
+        "intensity_z": _inverted_intensity_z,
         "per_feature_z": composite_result["per_feature_z"],
         "features_used": composite_result["features_used"],
-        "implied_severity": _classify_intensity(-composite_result["intensity_z"]),
+        "implied_severity": _classify_intensity(_inverted_intensity_z),
     }
 
     # ─ BOCPD (optional; first-run = uninformative) ───────────────────
@@ -252,10 +261,21 @@ def build_regime_substrate(
                 current=row.to_dict(),
                 history=feature_history,
             )
-            bocpd_state = bocpd_detector.update(bocpd_state, -row_intensity["intensity_z"])
+            # config-I7272: skip degenerate/outage rows rather than
+            # feeding a fabricated 0.0 into the change-point detector.
+            if row_intensity["intensity_z"] is not None:
+                bocpd_state = bocpd_detector.update(
+                    bocpd_state, -row_intensity["intensity_z"]
+                )
     else:
-        # Incremental update with the current observation
-        bocpd_state = bocpd_detector.update(bocpd_state, composite_block["intensity_z"])
+        # Incremental update with the current observation. config-I7272:
+        # a None composite_block["intensity_z"] means a total feature
+        # outage this run — skip the update rather than voting a
+        # fabricated 0.0 into the detector's state.
+        if composite_block["intensity_z"] is not None:
+            bocpd_state = bocpd_detector.update(
+                bocpd_state, composite_block["intensity_z"]
+            )
     bocpd_block = bocpd_detector.change_signal(bocpd_state)
 
     # ─ Guardrail flags ───────────────────────────────────────────────
@@ -316,12 +336,17 @@ def build_regime_substrate(
     return payload
 
 
-def _classify_intensity(intensity_z: float) -> str:
+def _classify_intensity(intensity_z: float | None) -> str:
     """Map the inverted composite intensity to a coarse severity label.
 
     Note: the substrate's authoritative label is computed by the macro
     agent downstream. This is a hint surfaced for observability.
+
+    Returns ``"unknown"`` when ``intensity_z`` is ``None`` (config-I7272:
+    a total feature outage must not read as "neutral").
     """
+    if intensity_z is None:
+        return "unknown"
     if intensity_z > 1.0:
         return "risk_on"
     if intensity_z > 0.3:

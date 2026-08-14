@@ -145,6 +145,8 @@ KNOWN_ACTIONS = frozenset({
     "check_weekly_run_day",
     "check_pipeline_contract",
     "check_lib_pin_drift",
+    # The M slot's numeric correctness verdict (alpha-engine-config-I7262).
+    "check_self_test",
     "train",
 })
 
@@ -445,6 +447,73 @@ def handler(event: dict, context) -> dict:
         except ImportError as exc:
             log.error("stage-coverage assertion unavailable: %s", exc)
         return result
+
+    # ── Numeric self-test (alpha-engine-config-I7262) ───────────────────────
+    if action == "check_self_test":
+        # The M slot's CORRECTNESS verdict (`sf-pipeline-policy.md` §2.3a),
+        # computed where the numbers are computed: in the deployed interpreter,
+        # on the deployed wheels. CI proves the code is right on a runner; this
+        # proves the INSTRUMENT is right on the image that produced the week's
+        # predictions.
+        #
+        # `run_self_test` never raises and this action adds no hard-fail path,
+        # no new SF state and no topology change: the verdict is RETURNED for a
+        # Choice state to read, exactly as check_lib_pin_drift and
+        # check_pipeline_contract are. An accuracy instrument that can take down
+        # the pipeline is a worse defect than the one it detects.
+        from inference.self_test import (
+            publish_console_row,
+            run_self_test,
+            self_test_key,
+            write_self_test,
+        )
+
+        # `date_str` is the handler's already-resolved event date (None => today,
+        # the same convention every other action here uses). Resolved to a
+        # concrete ISO date for the artifact key, because a key containing
+        # "None" is a key nothing can ever look up.
+        import datetime as _dt
+
+        run_date = date_str or _dt.date.today().isoformat()
+        result = run_self_test(run_date=run_date)
+
+        # Both emissions are isolated: the verdict is already in `result` and in
+        # the logs, so a failed S3 write degrades the EVIDENCE, never the
+        # verdict, and must not turn a measured PASS into a stage error.
+        artifact_key = None
+        try:
+            artifact_key = write_self_test(bucket, run_date, result)
+        except Exception as exc:  # noqa: BLE001 — evidence emission never blocks
+            log.error(
+                "self-test artifact emission failed for %s (verdict=%s is still "
+                "carried in this response and in the logs): %s",
+                run_date, result.get("verdict"), exc, exc_info=True,
+            )
+        # `principles.md` §2.7 — a check that reports nowhere is unobserved.
+        console_uri = publish_console_row(result)
+
+        log.info(
+            "Predictor self-test: verdict=%s cases=%s failed=%s errored=%s "
+            "known_gaps=%s artifact=%s console=%s libs=%s",
+            result.get("verdict", "unmeasured"), result.get("n_cases"),
+            result.get("n_failed"), result.get("n_errored"),
+            result.get("n_known_gaps"), artifact_key or "<not written>",
+            console_uri or "<not published>", result.get("libraries"),
+        )
+        # The full case list is in the artifact; the response carries the
+        # verdict and the counts a Choice state can branch on without parsing
+        # a 33-element body out of the Step Functions payload size limit.
+        return {
+            "verdict": result.get("verdict"),
+            "n_cases": result.get("n_cases"),
+            "n_failed": result.get("n_failed"),
+            "n_errored": result.get("n_errored"),
+            "n_known_gaps": result.get("n_known_gaps"),
+            "run_date": run_date,
+            "self_test_key": artifact_key,
+            "expected_key": self_test_key(run_date),
+            "console_row": console_uri,
+        }
 
     # ── Train (DEPRECATED — moved to EC2 spot instance) ─────────────────────
     if action == "train":

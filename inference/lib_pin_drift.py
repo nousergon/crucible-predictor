@@ -101,6 +101,12 @@ _RAW_REQUIREMENTS_URL = (
 )
 
 # Why a pin could not be resolved. `None` means it was.
+# Measurement status (alpha-engine-config-I7277, sf-pipeline-policy.md §2.3a
+# rule 2), shared vocabulary with pipeline_contract_check.py. UNKNOWN is not a
+# verdict: that payload omits BOTH `has_drift` and `offenders`.
+STATUS_UNKNOWN = "UNKNOWN"
+STATUS_MEASURED = "MEASURED"
+
 UNREACHABLE = "unreachable"        # the fetch itself failed — genuinely transient
 SHA_PINNED = "sha_pinned"          # fetched and recognised; not comparable to a floor
 UNRECOGNISED = "unrecognised_pin"  # fetched, and nothing in it looks like a lib pin
@@ -196,6 +202,12 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
       ``fetch_failed``   GitHub was genuinely unreachable — the only
                          transient of the three, and the only one worth a
                          retry
+
+    alpha-engine-config-I7277: the unresolved branch also carries an explicit
+    ``status=UNKNOWN`` and OMITS ``offenders``. It previously emitted
+    ``offenders: []`` — the same "could not measure rendered as a clean check"
+    defect I7277 fixed on ``check_pipeline_contract``'s ``violations: []``.
+    The measured branch carries ``status=MEASURED``.
     """
     repos = tuple(dict.fromkeys(_CO_INSTALL_PAIR + _FLOOR_REPOS))  # de-dup, ordered
     reads: dict[str, PinRead] = {r: _fetch_repo_pin(r, branch=branch) for r in repos}
@@ -224,12 +236,18 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
             "(fail-open). Detail: %s",
             len(unresolved), reason, unresolved,
         )
+        # alpha-engine-config-I7277: `offenders: []` used to sit here beside
+        # parity_ok/floor_ok=None — the same defect I7277 fixed on the
+        # pipeline-contract probe. `offenders` is the evidence list a consumer
+        # reads, and an empty one reads as "checked, nobody offended". Omitted
+        # entirely now, with an explicit status=UNKNOWN in its place, so the
+        # payload has no field that can be mistaken for a clean verdict.
         return {
+            "status": STATUS_UNKNOWN,
             "parity_ok": None,
             "floor_ok": None,
             "min_lib_version": MIN_LIB_VERSION,
             "pins": pins,
-            "offenders": [],
             "unresolved": unresolved,
             "reason": reason,
         }
@@ -254,6 +272,7 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
         log.error("Lib-pin drift DETECTED: %s", "; ".join(offenders))
 
     return {
+        "status": STATUS_MEASURED,
         "has_drift": has_drift,
         "parity_ok": parity_ok,
         "floor_ok": floor_ok,

@@ -95,6 +95,7 @@ _heartbeat_start() { :; }
 emit_heartbeat() { :; }
 print_banner() { echo "== $1"; }
 check_config_exists() { :; }
+resolve_or_stage_predictor_config() { :; }
 spot_launch() { :; }
 cleanup() { :; }
 wait_ssm_agent() { :; }

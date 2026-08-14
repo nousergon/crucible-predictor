@@ -1337,6 +1337,58 @@ def _main_impl(
     # krepis.logging import). Apply standard log level here.
     logging.getLogger().setLevel(logging.INFO)
 
+    # ── numeric self-test (alpha-engine-config-I7262) ───────────────────────
+    # The FULL composed battery — inference scope plus the training scope that
+    # only exists on this box (`training/` is deliberately absent from the
+    # Lambda image, see tests/test_dockerfile_import_closure.py). This is the
+    # only place the IC and deflated-Sharpe arithmetic can be attested on the
+    # wheels that actually computed it: the spot instance
+    # `pip install -r requirements.txt`s from scratch at boot, so numpy/scipy
+    # here can differ from the build CI proved correct.
+    #
+    # Runs BEFORE the training spend, and CANNOT block it: `run_self_test`
+    # never raises, and this whole block is isolated. A FAIL withholds the
+    # correctness guarantee (`sf-pipeline-policy.md` §2.3a) rather than failing
+    # the run — an accuracy instrument that can take down the pipeline is a
+    # worse defect than the one it detects.
+    self_test_result: dict = {}
+    try:
+        from inference.self_test import publish_console_row, run_self_test, write_self_test
+        from training import self_test_cases as _self_test_cases
+
+        self_test_result = run_self_test(
+            run_date=date_str,
+            extra_case_providers={"training": _self_test_cases.build_cases},
+        )
+        log.info(
+            "Predictor self-test (scope=%s): verdict=%s cases=%s failed=%s "
+            "errored=%s known_gaps=%s libs=%s",
+            self_test_result.get("scope"), self_test_result.get("verdict"),
+            self_test_result.get("n_cases"), self_test_result.get("n_failed"),
+            self_test_result.get("n_errored"), self_test_result.get("n_known_gaps"),
+            self_test_result.get("libraries"),
+        )
+        if not dry_run:
+            try:
+                write_self_test(bucket, date_str, self_test_result)
+            except Exception:  # noqa: BLE001 — evidence emission never blocks training
+                log.error(
+                    "self-test artifact emission failed for %s (verdict=%s is "
+                    "still in the logs)", date_str,
+                    self_test_result.get("verdict"), exc_info=True,
+                )
+            # `principles.md` §2.7 — a check that reports nowhere is unobserved.
+            publish_console_row(self_test_result)
+    except Exception:  # noqa: BLE001 — the battery must never be able to fail training
+        # The swallowed failure mode is "the self-test itself could not run".
+        # The primary deliverable (training) survives untouched; the recording
+        # surface is this ERROR line plus the ABSENT artifact, which the console
+        # renders as `unreadable`/stale rather than green.
+        log.error(
+            "Predictor self-test could not run at all — NO correctness guarantee "
+            "is granted for this training run's numbers.", exc_info=True,
+        )
+
     # PR7-7b: default to the live spec when called directly (e.g.
     # inference/handler.py "train" action) without an explicit io.
     from training.io_spec import TrainingIOSpec

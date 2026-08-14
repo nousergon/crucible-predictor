@@ -140,7 +140,7 @@ if [ -n "$INSTANCE_TYPE" ]; then
 fi
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
-check_config_exists "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
+resolve_or_stage_predictor_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  GBM Predictor Training — $(date +%Y-%m-%d)"

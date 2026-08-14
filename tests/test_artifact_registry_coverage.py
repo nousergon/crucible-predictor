@@ -43,6 +43,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "data_manifest.py": 1,
     "inference/research_free_inference.py": 2,  # predictions_research_free/{date}.json + latest.json — registered as predictor_predictions_research_free in ARTIFACT_REGISTRY.yaml (config#2365, warning severity — no consumer hard-blocked yet, see that row's comment)
     "inference/s3_io.py": 2,
+    "inference/self_test.py": 2,  # predictor/{run_date}/self_test.json (the §2.3a numeric-correctness verdict) + ops/checks/ae-predictor-self-test/latest.json (its console envelope) — BOTH REGISTERED in ARTIFACT_REGISTRY.yaml as predictor_self_test / predictor_self_test_check, not grandfathered: a missing correctness verdict is exactly the absence that makes every consumer succeed as though the check had passed (sf-pipeline-policy §2.3a), so its absence must page rather than pass. severity=warning while no consumer hard-blocks on it (the evaluator tile is not yet wired) — same posture as inference/research_free_inference.py above. config-I7262
     "inference/stages/shadow_versions.py": 1,  # predictions_shadow/{vid}/{date}.json — observe-only, best-effort, no freshness SLA (L4469 Phase 1)
     "model/registry.py": 4,  # lineage write + promote-in-place patch + _patch_stage + L4540 served-identity restamp of live manifest.json (already a registered artifact; L4469; copy_object not counted)
     "monitoring/drift_detector.py": 1,

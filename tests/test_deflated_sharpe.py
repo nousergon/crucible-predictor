@@ -134,3 +134,73 @@ def test_downside_insufficient_status():
     out = downside_ic_stats([0.1, 0.2])
     assert out["status"] == "insufficient"
     assert out["passes_downside_gate"] is False
+
+
+# ── downside-deviation denominator convention (alpha-engine-config-I7271) ──
+#
+# Brian ruled 2026-08-13 "use sota": downside deviation divides the sum of
+# squared downside shortfalls by N (all observations), not by n_downside
+# (the count of shortfall days) — the standard Sortino/Satchell definition,
+# and the convention nousergon_lib.quant.riskstats.sortino_ratio already uses.
+
+#: 10 observations, 3 negative — same fixture as
+#: training/self_test_cases.py::DOWNSIDE_IC, asymmetric so a sign error can't
+#: cancel.
+_IC_SERIES = (0.05, 0.03, -0.02, 0.07, -0.04, 0.01, 0.06, -0.01, 0.02, 0.08)
+
+
+def _dd_divide_by_n(ic_series, target=0.0):
+    """The FIXED (post-I7271) convention: RMS of the downside shortfall over
+    the full sample N."""
+    n = len(ic_series)
+    downside = [min(0.0, v - target) for v in ic_series]
+    return (sum(d * d for d in downside) / n) ** 0.5
+
+
+def _dd_divide_by_n_downside(ic_series, target=0.0):
+    """The PRE-FIX (retired) convention: RMS over the downside COUNT only —
+    what ``downside_ic_stats`` returned before this fix."""
+    downside = [v - target for v in ic_series if v < target]
+    return (sum(d * d for d in downside) / len(downside)) ** 0.5
+
+
+def test_downside_deviation_divides_by_n_not_n_downside():
+    """The new denominator, asserted directly against the production output.
+
+    Verified 2026-08-13 to FAIL against the pre-fix implementation: pre-fix,
+    ``downside_deviation`` returned 0.026458 (RMS over n_downside=3) against
+    this test's expected 0.014491 (RMS over n=10) — off by exactly the
+    sqrt(10/3)=1.8257x factor the issue measured. This test is the guard on
+    that regression (champion-challenger policy §7.4 — a guard must be
+    verified to fail without the fix).
+    """
+    out = downside_ic_stats(list(_IC_SERIES))
+    expected_dd = _dd_divide_by_n(_IC_SERIES)
+    assert abs(out["downside_deviation"] - expected_dd) < 1e-6
+    # Directly rules out the retired convention re-appearing under a refactor.
+    pre_fix_dd = _dd_divide_by_n_downside(_IC_SERIES)
+    assert abs(out["downside_deviation"] - pre_fix_dd) > 1e-3
+
+
+def test_downside_deviation_agrees_with_nousergon_lib_riskstats():
+    """Cross-implementation agreement to 1e-9 with the fleet reference
+    (nousergon_lib.quant.riskstats.sortino_ratio), unrounded on both sides.
+    ``periods_per_year=1`` disables the lib's annualization (meaningless for an
+    IC series) and ``risk_free_rate=0.0`` matches ``downside_ic_stats``'s
+    default ``target=0.0``.
+    """
+    from nousergon_lib.quant.riskstats import sortino_ratio
+
+    n = len(_IC_SERIES)
+    mean_ic = sum(_IC_SERIES) / n
+    local_dd = _dd_divide_by_n(_IC_SERIES)
+    local_sortino = mean_ic / local_dd
+
+    lib_sortino = sortino_ratio(
+        list(_IC_SERIES), risk_free_rate=0.0, periods_per_year=1,
+    )
+    assert abs(local_sortino - lib_sortino) < 1e-9
+
+    # And the production entrypoint (6dp-rounded) agrees to the rounding floor.
+    out = downside_ic_stats(list(_IC_SERIES))
+    assert abs(out["sortino_of_ic"] - lib_sortino) < 1e-5
