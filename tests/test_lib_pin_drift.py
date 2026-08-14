@@ -159,45 +159,50 @@ def test_a_sha_pin_is_recognised_not_treated_as_a_parse_miss():
 
 
 def test_sha_pinned_repo_reports_sha_pinned_not_fetch_failed():
+    # A FLOOR-ONLY repo (research) is SHA-pinned. The floor is the advisory
+    # half of the invariant, so this stays fail-open — the case this test was
+    # written for. The co-install-pair equivalent halts instead: see the
+    # I7301 block below.
     pins = {
         "nousergon/crucible-backtester": "v0.53.0",
-        "nousergon/crucible-predictor": lpd.PinRead(
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": lpd.PinRead(
             None, lpd.SHA_PINNED, "c907a044bb1553815225327bc56644050543b6f2"
         ),
-        "nousergon/nousergon-data": "v0.53.0",
-        "nousergon/crucible-research": "v0.53.0",
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     assert "has_drift" not in out          # still unmeasured, still fail-open
     assert out["reason"] == "sha_pinned"   # but the reason is now true
-    assert out["unresolved"]["nousergon/crucible-predictor"]["problem"] == "sha_pinned"
-    assert out["unresolved"]["nousergon/crucible-predictor"]["detail"].startswith("c907a04")
+    assert out["unresolved"]["nousergon/crucible-research"]["problem"] == "sha_pinned"
+    assert out["unresolved"]["nousergon/crucible-research"]["detail"].startswith("c907a04")
 
 
 def test_a_permanent_problem_outranks_a_transient_one_in_the_reason():
     # A SHA pin and an unreachable repo at once. Reporting "fetch_failed"
     # would bury the condition that is still here tomorrow behind the one
-    # that resolves itself.
+    # that resolves itself. Both on non-pair repos, so the fail-open path is
+    # the one under test.
     pins = {
-        "nousergon/crucible-backtester": None,   # unreachable
-        "nousergon/crucible-predictor": lpd.PinRead(None, lpd.SHA_PINNED, "c907a04"),
-        "nousergon/nousergon-data": "v0.53.0",
-        "nousergon/crucible-research": "v0.53.0",
+        "nousergon/crucible-backtester": "v0.53.0",
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": None,        # unreachable
+        "nousergon/crucible-research": lpd.PinRead(None, lpd.SHA_PINNED, "c907a04"),
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     assert out["reason"] == "sha_pinned"
     # ...and the transient one is still recorded, just not the headline.
-    assert out["unresolved"]["nousergon/crucible-backtester"]["problem"] == "unreachable"
+    assert out["unresolved"]["nousergon/nousergon-data"]["problem"] == "unreachable"
 
 
 def test_a_file_with_no_lib_pin_at_all_is_its_own_reason():
     pins = {
         "nousergon/crucible-backtester": "v0.53.0",
-        "nousergon/crucible-predictor": lpd.PinRead(None, lpd.UNRECOGNISED, None),
+        "nousergon/crucible-predictor": "v0.53.0",
         "nousergon/nousergon-data": "v0.53.0",
-        "nousergon/crucible-research": "v0.53.0",
+        "nousergon/crucible-research": lpd.PinRead(None, lpd.UNRECOGNISED, None),
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
@@ -217,3 +222,107 @@ def test_a_genuine_outage_still_reads_as_fetch_failed():
         out = lpd.check_lib_pin_drift()
     assert out["reason"] == "fetch_failed"
     assert "has_drift" not in out
+
+
+# ── I7301: a permanent problem on the CO-INSTALL PAIR is a finding, not a gap ─
+#
+# The 2026-08-13 arc. `crucible-predictor` pinned by SHA since #422, so
+# `parity_ok` came back None on every invocation and the SF fail-open fired
+# every run. Underneath it, real drift: backtester v0.124.5 against a predictor
+# SHA sitting ~v0.124.16 — the exact co-install shape the gate exists to catch,
+# invisible for 13 days behind an alert that could not be cleared by waiting.
+#
+# The distinction this section pins down: an unreachable GitHub means we do not
+# know the pin (fail open). A SHA or unrecognised pin ON A PAIR MEMBER means we
+# read the file and the invariant is structurally unverifiable until a human
+# edits it (halt). Floor-only repos keep the fail-open — see the tests above.
+
+
+def test_sha_pinned_co_install_member_halts_with_a_named_offender():
+    pins = {
+        "nousergon/crucible-backtester": "v0.124.5",
+        "nousergon/crucible-predictor": lpd.PinRead(
+            None, lpd.SHA_PINNED, "c907a044bb1553815225327bc56644050543b6f2"
+        ),
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": "v0.53.0",
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["status"] == lpd.STATUS_MEASURED
+    assert out["reason"] == "co_install_pin_unverifiable"
+    # The offender names the repo, the problem, the SHA, and the other half of
+    # the pair it could not be compared against — everything the FAILED SNS
+    # alert must carry for a human to act without opening the execution.
+    joined = " ".join(out["offenders"])
+    assert "crucible-predictor" in joined
+    assert "sha_pinned" in joined
+    assert "c907a044bb1553815225327bc56644050543b6f2" in joined
+    assert "v0.124.5" in joined
+
+
+def test_the_halt_does_not_claim_a_parity_mismatch_it_never_measured():
+    # has_drift=True says the invariant does not hold as VERIFIED. It must not
+    # be accompanied by parity_ok=False, which asserts a measured mismatch —
+    # the same fabrication (in the opposite direction) that this whole arc
+    # exists to remove.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = lpd.PinRead(None, lpd.SHA_PINNED, "abc1234")
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["parity_ok"] is None
+    assert out["floor_ok"] is None
+
+
+def test_unrecognised_pin_on_a_co_install_member_also_halts():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-backtester"] = lpd.PinRead(None, lpd.UNRECOGNISED, None)
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["reason"] == "co_install_pin_unverifiable"
+    assert "crucible-backtester" in " ".join(out["offenders"])
+
+
+def test_an_unreachable_co_install_member_still_fails_open():
+    # The line I7048 drew and I7301 does not cross: a transient outage on a
+    # pair member is an unknown pin, not a defect. Inverting it would let a
+    # GitHub blip halt the weekly run.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = None   # unreachable
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN
+    assert out["reason"] == "fetch_failed"
+
+
+def test_a_permanent_pair_problem_outranks_a_transient_pair_outage():
+    # Backtester unreachable AND predictor SHA-pinned. The permanent one wins:
+    # even once GitHub recovers, the comparison still cannot be made.
+    pins = {
+        "nousergon/crucible-backtester": None,
+        "nousergon/crucible-predictor": lpd.PinRead(None, lpd.SHA_PINNED, "abc1234"),
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": "v0.53.0",
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["reason"] == "co_install_pin_unverifiable"
+    # the transient one is still on the record
+    assert out["unresolved"]["nousergon/crucible-backtester"]["problem"] == "unreachable"
+
+
+def test_a_permanent_floor_only_problem_does_not_halt_the_pair_check():
+    # research SHA-pinned, pair intact and matching. Nothing load-bearing is
+    # unverifiable, so this must stay fail-open — a halt here would block the
+    # weekly on the advisory half of the invariant.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-research"] = lpd.PinRead(None, lpd.SHA_PINNED, "abc1234")
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN

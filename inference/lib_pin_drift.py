@@ -34,6 +34,18 @@ IsPresent-guarded branch for exactly this case — an ABSENT `has_drift` routes 
 silent-pass Default. Omitting the key here reuses machinery that already existed
 and was already correct. Do NOT default to `has_drift=True` on a fetch failure —
 inverting the lie does not make it true.
+
+alpha-engine-config-I7301 (2026-08-13) draws the one line that rule does NOT
+cover. A fetch failure means the pin is unknown. A pin that was READ and is
+permanently uncomparable — `sha_pinned`, `unrecognised_pin` — on a member of
+the CO-INSTALL PAIR is a different thing: invariant (a) is structurally
+unverifiable, on this run and on every future run, until a human edits that
+requirements.txt. That is a measured defect and it HALTS. Floor-only repos
+(data/research) keep the fail-open, because the floor is the advisory half.
+Reporting the permanent case as UNKNOWN is what let a real parity break
+(backtester v0.124.5 vs a predictor SHA pin ~v0.124.16) run unnoticed from
+2026-07-31 to 2026-08-13 behind a degraded alert that fired on every run and
+could not be cleared by waiting.
 """
 
 from __future__ import annotations
@@ -220,6 +232,63 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
         for r, read in reads.items()
         if read.pin is None
     }
+
+    # alpha-engine-config-I7301: a PERMANENT problem on a CO-INSTALL-PAIR member
+    # is a measured defect, not a failed measurement, and it halts.
+    #
+    # This is NOT the `has_drift=True`-on-fetch-failure inversion the module
+    # docstring forbids (I7048), and the difference is the whole point. A fetch
+    # failure means we do not know what the repo pins. `sha_pinned` and
+    # `unrecognised_pin` mean we READ the repo's requirements.txt successfully
+    # and it carries a pin that cannot be compared to the other half of the
+    # co-install pair — permanently, on every future invocation, until a human
+    # edits that file. Parity on that pair is invariant (a) — the one this gate
+    # exists to protect, and the shape of the 2026-05-12 silent-downgrade
+    # incident. A repo state that makes it structurally unverifiable IS the
+    # finding.
+    #
+    # Reporting it as UNKNOWN instead is what let the real drift measured on
+    # 2026-08-13 (backtester v0.124.5 vs a predictor SHA pin ~v0.124.16) sit
+    # unnoticed from 2026-07-31 onward behind a fail-open that fired every run
+    # and could never be cleared by waiting.
+    #
+    # Deliberately scoped to the pair: `nousergon-data` and `crucible-research`
+    # are floor-only repos that lag ON PURPOSE and do not co-install, so an
+    # uncomparable pin there weakens an advisory check, not a load-bearing one —
+    # it stays fail-open below.
+    unverifiable_pair = {
+        r: d
+        for r, d in unresolved.items()
+        if r in _CO_INSTALL_PAIR and d["problem"] in (SHA_PINNED, UNRECOGNISED)
+    }
+    if unverifiable_pair:
+        bt, pred = _CO_INSTALL_PAIR
+        offenders = [
+            f"co-install parity UNVERIFIABLE: {r} pins nousergon-lib by "
+            f"{d['problem']} ({d['detail']}), which is not comparable to the "
+            f"other half of the co-install pair "
+            f"({bt if r == pred else pred}={pins[bt if r == pred else pred]})"
+            for r, d in unverifiable_pair.items()
+        ]
+        log.error(
+            "Lib-pin drift HALT: co-install parity cannot be verified — %s",
+            "; ".join(offenders),
+        )
+        return {
+            "status": STATUS_MEASURED,
+            "has_drift": True,
+            # Still None, not False: we did not measure a MISMATCH, we measured
+            # that the comparison cannot be made. Asserting False here would be
+            # the same fabrication this change exists to remove.
+            "parity_ok": None,
+            "floor_ok": None,
+            "min_lib_version": MIN_LIB_VERSION,
+            "pins": pins,
+            "offenders": offenders,
+            "unresolved": unresolved,
+            "reason": "co_install_pin_unverifiable",
+        }
+
     if unresolved:
         problems = {v["problem"] for v in unresolved.values()}
         # Report the most actionable problem present. A permanent condition
