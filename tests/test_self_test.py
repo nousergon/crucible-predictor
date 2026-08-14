@@ -255,7 +255,11 @@ def test_known_gap_cases_say_so_in_words(body):
     """A pinned-wrong case must never read as an endorsement. The artifact has to
     carry that in words, not leave a reader to infer it from a green row."""
     gaps = [c for c in body["cases"] if c.get("known_gap")]
-    assert len(gaps) == body["n_known_gaps"] >= 3
+    # config-I7272: the two regime-layer known gaps (zero-variance z-score,
+    # regime_score with no heads) were FIXED — they now assert the honest
+    # undefined representation and no longer pin a wrong value. Only the
+    # separate I7271 (Sortino denominator) known gap remains.
+    assert len(gaps) == body["n_known_gaps"] >= 1
     for case in gaps:
         assert case["gap_issue"].startswith("alpha-engine-config-I")
         assert "NOT" in case["known_gap_note"]

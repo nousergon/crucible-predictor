@@ -62,29 +62,34 @@ THE FOUR CASE CLASSES
     two implementations of one quantity exist. `I7236` exists precisely because
     nothing asserted the second kind.
 
-PIN, DO NOT FIX — AND WHAT IS PINNED AS A KNOWN GAP
------------------------------------------------------
-Two cases below pin behaviour this module considers **wrong**, deliberately:
+FIXED (config-I7272) — FORMERLY THE PINNED KNOWN GAPS HERE
+-------------------------------------------------------------
+Two cases below used to pin behaviour this module considered **wrong**, and are
+now FIXED:
 
 ``regime_zscore_zero_variance_degenerate``
-    `regime/composite.py::_zscore` returns a finite **0.0** when the history has
-    zero variance. A z-score against a constant history is UNDEFINED, and 0.0 is
-    the exact value a genuinely at-the-mean observation produces — so a measured
-    zero and an undefined value are indistinguishable downstream. This is the
-    `I7237` class at the regime layer.
+    `regime/composite.py::_zscore` used to return a finite **0.0** when the
+    history has zero variance. A z-score against a constant history is
+    UNDEFINED, and 0.0 is the exact value a genuinely at-the-mean observation
+    produces — so a measured zero and an undefined value were indistinguishable
+    downstream (the `I7237` class at the regime layer). Now returns ``None``,
+    and every consumer (`compute_composite_intensity`,
+    `compute_intensity_z_series`, `regime/substrate.py`) was audited to drop
+    the leg / propagate the None rather than fabricate a value.
 
 ``regime_score_no_heads_degenerate``
-    `regime/drawdown.py::compose_regime_score` returns `regime_score: 0.0` when
-    NO head is present, which `regime_score_to_categorical` then projects to
-    `"neutral"` — the same output a genuinely neutral market produces.
+    `regime/drawdown.py::compose_regime_score` used to return `regime_score:
+    0.0` when NO head is present, which `regime_score_to_categorical` then
+    projected to `"neutral"` — the same output a genuinely neutral market
+    produces. Now returns `regime_score: None` /
+    `regime_score_categorical: "unknown"`, a fourth outcome distinct from
+    bull/neutral/bear.
 
-Both are pinned at their MEASURED value rather than corrected. Changing either
-moves live regime scores and every gate keyed to one, which is Brian's decision,
-not a patch — the precedent is `I7236`, pinned and filed rather than silently
-"fixed". The cases carry `known_gap: True` in the artifact and are filed as
-`alpha-engine-config-I7272`. Their PASS means "still behaves as
-recorded", never "this is correct" — a distinction the artifact states in words
-so no reader has to infer it from a green row.
+Both cases now assert the HONEST representation and will go red on a
+regression. `regime_score`/`regime_score_categorical` are still an
+OBSERVE-ONLY, additive field (per `regime/drawdown.py`'s `compose_effective_
+regime` docstring) — no live veto/promotion decision reads them yet, so this
+change moves no currently-graded number. Filed as `alpha-engine-config-I7272`.
 
 CONTRACT
 --------
@@ -597,45 +602,49 @@ def build_cases() -> list[Case]:
             compute=lambda: _is_undefined(dd.hmm_posterior_expectation(None)),
             tolerance=0.0,
         ),
-        # ── the two known gaps: pinned at MEASURED, not corrected ───────────
+        # ── the former two known gaps: FIXED (config-I7272) ────────────────
+        # regime/composite.py::_zscore and regime/drawdown.py::compose_
+        # regime_score used to return a finite 0.0 on a degenerate input —
+        # indistinguishable from a genuinely at-the-mean / neutral reading.
+        # Both now report the value as UNDEFINED (None), matching the
+        # already-correct hmm_posterior_expectation convention pinned
+        # above. These cases now assert the HONEST behaviour and will go
+        # red if a regression reintroduces the fabricated 0.0.
         Case(
             name="regime_zscore_zero_variance_degenerate",
             description=(
-                "KNOWN GAP (alpha-engine-config-I7272), PINNED NOT FIXED. "
-                "regime/composite.py::_zscore returns a finite 0.0 against a "
-                "ZERO-VARIANCE history, where the z-score is UNDEFINED. 0.0 is "
-                "also the exact value a genuinely at-the-mean observation "
-                "produces, so downstream cannot distinguish 'no signal' from "
-                "'measured neutral' — the I7237 class at the regime layer. "
-                "Expected 0.0 records the MEASURED behaviour so further drift "
-                "goes red; a PASS here means 'still behaves as recorded', NOT "
-                "'this is correct'"
+                "FIXED (alpha-engine-config-I7272). "
+                "regime/composite.py::_zscore against a ZERO-VARIANCE history "
+                "now reports UNDEFINED (None) rather than a finite 0.0 — 0.0 "
+                "is also the exact value a genuinely at-the-mean observation "
+                "produces, so the two were indistinguishable downstream (the "
+                "I7237 class at the regime layer). 1.0 iff undefined."
             ),
-            inputs={"history": [4.0] * 6, "value": 8.0, "correct_behaviour": "None",
-                    "measured_behaviour": 0.0, "units": "z-score"},
-            expected=0.0,
-            compute=_zero_variance_zscore,
-            known_gap=True,
-            gap_issue="alpha-engine-config-I7272",
+            inputs={"history": [4.0] * 6, "value": 8.0, "units": "z-score"},
+            expected=1.0,
+            compute=lambda: _is_undefined(_zero_variance_zscore()),
+            tolerance=0.0,
         ),
         Case(
             name="regime_score_no_heads_degenerate",
             description=(
-                "KNOWN GAP (alpha-engine-config-I7272), PINNED NOT FIXED. "
-                "regime/drawdown.py::compose_regime_score returns regime_score "
-                "0.0 when NO head is present, which regime_score_to_categorical "
-                "then projects to 'neutral' — indistinguishable from a genuinely "
-                "neutral market. A run with every regime input missing therefore "
-                "reads as a measured neutral regime. Expected 0.0 pins the "
-                "MEASURED behaviour; PASS means 'unchanged', not 'correct'"
+                "FIXED (alpha-engine-config-I7272). "
+                "regime/drawdown.py::compose_regime_score with NO head present "
+                "now reports regime_score=None, which regime_score_to_categorical "
+                "projects to 'unknown' — a fourth, distinct outcome from bull/"
+                "neutral/bear — rather than the previous 0.0 -> 'neutral', "
+                "indistinguishable from a genuinely neutral market. 1.0 iff "
+                "regime_score is undefined AND the categorical is 'unknown'."
             ),
             inputs={"hmm_probs": None, "intensity_z": None, "spy_tier": None,
-                    "excess_tier": None, "correct_behaviour": "None/UNKNOWN",
-                    "measured_behaviour": 0.0, "units": "signed score"},
-            expected=0.0,
-            compute=lambda: float(dd.compose_regime_score()["regime_score"]),
-            known_gap=True,
-            gap_issue="alpha-engine-config-I7272",
+                    "excess_tier": None, "units": "signed score"},
+            expected=1.0,
+            compute=lambda: (
+                _is_undefined(dd.compose_regime_score()["regime_score"])
+                if dd.compose_regime_score()["regime_score_categorical"] == "unknown"
+                else 0.0
+            ),
+            tolerance=0.0,
         ),
     ]
 
@@ -731,12 +740,12 @@ def build_cases() -> list[Case]:
 
 # ── compute helpers used by the battery ─────────────────────────────────────
 
-def _zero_variance_zscore() -> float:
+def _zero_variance_zscore() -> Any:
     import pandas as pd
 
     from regime.composite import _zscore
 
-    return float(_zscore(8.0, pd.Series([4.0] * 6)))
+    return _zscore(8.0, pd.Series([4.0] * 6))
 
 
 def _rank_permutation_delta() -> float:

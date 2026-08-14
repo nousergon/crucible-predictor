@@ -350,16 +350,24 @@ def intensity_z_to_score(intensity_z: float | None) -> float | None:
 
 
 def regime_score_to_categorical(
-    score: float, *, neutral_band: float = REGIME_SCORE_NEUTRAL_BAND
+    score: float | None, *, neutral_band: float = REGIME_SCORE_NEUTRAL_BAND
 ) -> str:
     """Project the signed [-1, 1] score onto the legacy 3-class macro
     vocabulary at documented symmetric thresholds, so existing categorical
     consumers keep working unchanged:
 
-        score >  +neutral_band ⇒ "bull"
-        |score| ≤ neutral_band ⇒ "neutral"
-        score <  -neutral_band ⇒ "bear"
+        score is None           ⇒ "unknown"
+        score >  +neutral_band  ⇒ "bull"
+        |score| ≤ neutral_band  ⇒ "neutral"
+        score <  -neutral_band  ⇒ "bear"
+
+    config-I7272: ``None`` (no regime head present at all) is a distinct,
+    fourth outcome — it must NOT collapse into "neutral". A total regime-
+    data outage is not the same observation as a genuinely calm market,
+    and the veto threshold is set from this projection.
     """
+    if score is None:
+        return "unknown"
     if score > neutral_band:
         return "bull"
     if score < -neutral_band:
@@ -418,21 +426,30 @@ def compose_regime_score(
     present_weight = sum(w.get(k, 0.0) for k in head_scores)
     if present_weight > 0:
         weights_used = {k: w.get(k, 0.0) / present_weight for k in head_scores}
-        score = sum(weights_used[k] * head_scores[k] for k in head_scores)
+        score: float | None = sum(
+            weights_used[k] * head_scores[k] for k in head_scores
+        )
     else:
+        # NO head present at all — undefined, not a measured 0.0
+        # (config-I7272). A total regime-data outage must not read as
+        # a calm/neutral market: regime_score_to_categorical(None)
+        # projects this to "unknown", a fourth, distinct outcome.
         weights_used = {}
-        score = 0.0
+        score = None
 
     floor_applied = False
     if forced_bear:
-        # Asymmetric protective floor — clamp defensive regardless of blend.
+        # Asymmetric protective floor — clamp defensive regardless of blend,
+        # even when no head was present (a confirmed multi-signal bear
+        # tail override must win over "undefined").
         score = -1.0
         floor_applied = True
 
-    score = max(-1.0, min(1.0, score))
+    if score is not None:
+        score = max(-1.0, min(1.0, score))
 
     return {
-        "regime_score": float(score),
+        "regime_score": score if score is None else float(score),
         "regime_score_categorical": regime_score_to_categorical(score),
         "head_scores": head_scores,
         "weights_used": weights_used,
