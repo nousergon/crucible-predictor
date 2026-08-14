@@ -32,10 +32,10 @@ the canonical renderer, moves this test's expectations automatically. A test
 that hardcoded ``Type=simple`` would be a *third* copy of the invariant and
 would drift exactly like the first two.
 
-## Why the Bash copy still exists at all
+## Why the Bash copy no longer exists
 
-``krepis.spot_bootstrap`` could not simply replace this heredoc while the
-launcher resolved its interpreter as::
+``krepis.spot_bootstrap`` could not replace this heredoc while the launcher
+resolved its interpreter as::
 
     LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
 
@@ -43,25 +43,29 @@ launcher resolved its interpreter as::
 ``crucible-dashboard/requirements.txt``, a file no merge in this repo can see.
 A cutover therefore carried a runtime dependency this repo could not pin, and
 when that venv was behind, the bootstrap did not degrade — it died with
-``ModuleNotFoundError`` on every spot stage of every pipeline. So the dependency
-that could not safely exist at RUNTIME lived in a TEST instead: the Bash copies
-stay, and CI asserts they agree with the canonical renderer.
+``ModuleNotFoundError`` on every spot stage of every pipeline.
 
-**That blocker is now cleared** (`alpha-engine-config-I7343`, 2026-08-14). The
-launcher resolves through ``/opt/nousergon/bin/lib-python``, the ops-owned guard
-over the box's DECLARED krepis venv, which aborts with ``EX_CONFIG`` (78) naming
-the version it found when that venv is below the launcher floor — a declared,
-enforced, fail-loud floor, which is what I6931 owed. The cutover to
-``krepis.spot_bootstrap`` is therefore unblocked and becomes a deletion;
-``alpha-engine-config-I6922`` owns it, and this test is what will prove the
-deletion changed nothing. Resolution is pinned by
-``tests/test_launchers_resolve_the_declared_krepis_guard.py``.
+That blocker cleared (`alpha-engine-config-I7343`, 2026-08-14). The launcher
+now resolves through ``/opt/nousergon/bin/lib-python``, the ops-owned guard
+over the box's DECLARED krepis venv, which aborts with ``EX_CONFIG`` (78)
+naming the version it found when that venv is below the launcher floor — a
+declared, enforced, fail-loud floor, which is what I6931 owed. Every launcher
+interpreter that can run this repo at all now satisfies krepis's own pin
+(``requirements.txt`` / ``requirements-lambda.txt``: ``krepis[flow-doctor]
+==0.59.0``).
+
+The cutover this docstring called for has landed: ``bootstrap_spot()`` now
+constructs a ``krepis.spot_bootstrap render`` CLI call instead of an inline
+heredoc, and this module proves the deletion changed nothing — it derives the
+launcher's actual arguments from the live source, renders them through the
+real ``krepis.spot_bootstrap.render_bootstrap`` (the same function the
+launcher invokes at runtime), and asserts the invariants below against that
+RENDERED output, never a restated copy of it.
 """
 
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
@@ -72,8 +76,7 @@ from krepis.spot_bootstrap import (
     render_bootstrap,
 )
 
-_SPOT_COMMON = Path(__file__).resolve().parents[1] / "infrastructure" / "_spot_common.sh"
-
+from tests._spot_bootstrap_render_support import bootstrap_spot_block, rendered_script
 
 # A spec's values do not matter here: this test compares the parts of the
 # rendered script that are the SAME for every workload — the watchdog unit and
@@ -86,11 +89,46 @@ _CANONICAL = render_bootstrap(
 
 @pytest.fixture(scope="module")
 def bootstrap_block() -> str:
-    """The body of ``bootstrap_spot()`` — launcher glue plus the remote heredoc."""
-    text = _SPOT_COMMON.read_text(encoding="utf-8")
-    m = re.search(r"\nbootstrap_spot\(\)\s*\{(.*?)\n\}", text, re.S)
-    assert m, f"bootstrap_spot() not found in {_SPOT_COMMON.name}"
-    return m.group(1)
+    """The RENDERED script ``bootstrap_spot()`` sends to ``run_ssm`` today.
+
+    Not the raw shell source: the invariants below (watchdog unit shape,
+    interpreter install ordering) are about what actually reaches the spot
+    instance, and that is now krepis's output, not this repo's text. Now that
+    both sides of the class-level watchdog/interpreter tests below are
+    produced by the same ``render_bootstrap`` call, their protection has
+    moved: they still fail if a future krepis change regresses the unit or
+    the interpreter block, and ``test_bootstrap_spot_carries_no_inline_heredoc``
+    catches this repo constructing its own copy again instead of calling
+    krepis.
+    """
+    return rendered_script()
+
+
+def test_bootstrap_spot_carries_no_inline_heredoc():
+    """The heredoc cannot creep back in.
+
+    Structural guard for the cutover (alpha-engine-config-I4992/I6922):
+    ``bootstrap_spot()`` must construct a renderer call, never restate the
+    watchdog unit, the ``dnf install``, or the ``git clone`` inline.
+    """
+    block = bootstrap_spot_block()
+    for forbidden in (
+        "<<'BOOTSTRAP'",
+        "dnf install",
+        "git clone",
+        "systemctl is-enabled ec2-spot-watchdog",
+    ):
+        assert forbidden not in block, (
+            f"bootstrap_spot() contains {forbidden!r} — the inline heredoc has "
+            "crept back in. This function must only construct a "
+            "`krepis.spot_bootstrap render` call and hand the result to "
+            "run_ssm; the shared, non-repo-specific bootstrap logic belongs "
+            "in krepis, never restated here."
+        )
+    assert "krepis.spot_bootstrap" in block, (
+        "bootstrap_spot() no longer invokes krepis.spot_bootstrap — the "
+        "cutover has been reverted without restoring this test's premise"
+    )
 
 
 def _service_directives(script: str) -> set[str]:

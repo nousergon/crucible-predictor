@@ -20,18 +20,18 @@ permanent.
 "predictor.yaml", repo_root=<repo>, repo_local_fallback=<repo>/config/
 predictor.yaml)``. On the spot box, with the clone at ``/home/ec2-user/
 predictor``, the last candidate is ``/home/ec2-user/predictor/config/
-predictor.yaml`` — exactly where ``bootstrap_spot`` stages it. The predictor
-was never exposed to config#6846, because it stages onto its *repo-local
+predictor.yaml`` — exactly where the bootstrap stages it. The predictor was
+never exposed to config#6846, because it stages onto its *repo-local
 fallback* rather than onto a config-repo path.
 
-What the audit DID find is the same class pointing the other way: the bootstrap
-also staged a second copy to ``/home/ec2-user/predictor/experiments/<id>/
-predictor/predictor.yaml``, which matches no candidate at all. The resolver's
-experiment-package candidates are rooted at the *alpha-engine-config* checkout
-(``~/alpha-engine-config`` and ``<repo>/../alpha-engine-config``), never inside
-this repo's own tree. That copy was a dead write: it cost an S3 GET per launch
-and, worse, read as experiment-package coverage that did not exist. Removed,
-and this test is what keeps it removed.
+## Subject moved: the rendered script, not this repo's source
+
+``bootstrap_spot()`` no longer builds this ``aws s3 cp`` line as literal text
+in ``_spot_common.sh`` (alpha-engine-config-I4992/I6922 cutover) — it passes
+``--config-copy predictor.yaml:/home/ec2-user/predictor/config/predictor.yaml``
+to ``krepis.spot_bootstrap render``, which emits the copy. This module now
+derives that argument from the live source and asserts the destination
+against the resolver using the script krepis actually renders.
 
 ## Why the assertion is EVERY destination, not ANY
 
@@ -39,7 +39,11 @@ A staged config at a path nothing searches is indistinguishable, from the
 outside, from one that works — until the workload raises ``FileNotFoundError``
 several minutes later, on a box that looked healthy through the whole
 bootstrap. Allowing dead destinations alongside a live one is how the dead one
-survives long enough for someone to rely on it.
+survives long enough for someone to rely on it. (The audit that motivated this
+test found exactly one such dead write in this repo's history — a second copy
+rooted inside the checkout rather than at the alpha-engine-config checkout the
+resolver's experiment-package candidates actually live under — removed before
+this cutover and not reintroduced by it.)
 
 The candidate list here is DERIVED from
 ``nousergon_lib.config.resolve_experiment_config`` rather than hardcoded: if the
@@ -51,7 +55,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from nousergon_lib.config import resolve_experiment_config
+
+from tests._spot_bootstrap_render_support import rendered_script
 
 # Where the bootstrap clones crucible-predictor on the spot box, and the working
 # directory every stage's SSM heredoc cds into before invoking python.
@@ -60,13 +68,15 @@ _REMOTE_CHECKOUT = Path("/home/ec2-user/predictor")
 #: The bootstrap hardcodes `reference` as the experiment slot it exports.
 _EXPERIMENT_ID = "reference"
 
-_SPOT_COMMON = Path(__file__).resolve().parents[1] / "infrastructure" / "_spot_common.sh"
-_SRC = _SPOT_COMMON.read_text(encoding="utf-8")
-
-# `aws s3 cp "${S3_STAGING}/predictor.yaml" "<dest>"` inside the bootstrap heredoc.
+# `aws s3 cp "${S3_STAGING}/predictor.yaml" <dest>` in the RENDERED script.
 _STAGE_CP = re.compile(
     r'aws\s+s3\s+cp\s+"\$\{S3_STAGING\}/predictor\.yaml"\s+"?(?P<dest>[^"\s]+)"?'
 )
+
+
+@pytest.fixture(scope="module")
+def rendered() -> str:
+    return rendered_script()
 
 
 def _resolver_candidates() -> list[str]:
@@ -90,20 +100,20 @@ def _resolver_candidates() -> list[str]:
     ]
 
 
-def _staged_destinations() -> list[str]:
-    return [m.group("dest") for m in _STAGE_CP.finditer(_SRC)]
+def _staged_destinations(rendered: str) -> list[str]:
+    return [m.group("dest") for m in _STAGE_CP.finditer(rendered)]
 
 
-def test_bootstrap_stages_config_at_all():
-    assert _staged_destinations(), (
-        f"{_SPOT_COMMON.name} no longer stages predictor.yaml in its bootstrap — "
-        "if that is deliberate (prebaked image), delete this test with the "
-        "reason; otherwise every stage will fail on a fresh box."
+def test_bootstrap_stages_config_at_all(rendered: str):
+    assert _staged_destinations(rendered), (
+        "the rendered bootstrap no longer stages predictor.yaml — if that is "
+        "deliberate (prebaked image), delete this test with the reason; "
+        "otherwise every stage will fail on a fresh box."
     )
 
 
-def test_bootstrap_stages_config_to_a_resolver_candidate():
-    dests = _staged_destinations()
+def test_bootstrap_stages_config_to_a_resolver_candidate(rendered: str):
+    dests = _staged_destinations(rendered)
     candidates = _resolver_candidates()
     assert any(d in candidates for d in dests), (
         f"the bootstrap stages predictor.yaml to {dests}, none of which "
@@ -114,16 +124,10 @@ def test_bootstrap_stages_config_to_a_resolver_candidate():
     )
 
 
-def test_no_staged_destination_is_unreachable():
-    """A config staged where nothing looks is dead weight that reads as coverage.
-
-    The instance this pins: the bootstrap used to write a second copy into
-    ``<repo>/experiments/<id>/predictor/``, on the assumption that the
-    experiment-package candidates are rooted in the repo. They are not — they
-    are rooted at the alpha-engine-config checkout.
-    """
+def test_no_staged_destination_is_unreachable(rendered: str):
+    """A config staged where nothing looks is dead weight that reads as coverage."""
     candidates = set(_resolver_candidates())
-    dead = [d for d in _staged_destinations() if d not in candidates]
+    dead = [d for d in _staged_destinations(rendered) if d not in candidates]
     assert not dead, (
         f"the bootstrap stages predictor.yaml to {dead}, which "
         f"resolve_experiment_config never searches. Either the destination is "
