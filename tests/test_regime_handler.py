@@ -16,6 +16,8 @@ import pytest
 from regime.features import _PRICE_CACHE_NEW_PREFIX
 from regime.handler import (
     DEFAULT_HMM_FEATURE_COLUMNS,
+    UnknownAction,
+    lambda_handler,
     produce_regime_substrate,
 )
 from regime.substrate import read_regime_substrate
@@ -201,3 +203,35 @@ def test_produce_substrate_survives_drawdown_block_failure(monkeypatch) -> None:
     assert "drawdown" not in payload          # omitted, not crashed
     assert "effective_regime" not in payload
     assert payload["hmm"]["argmax"] in {"bear", "neutral", "bull"}
+
+
+class TestLambdaHandlerUnknownAction:
+    """alpha-engine-config-I7166 (class sweep).
+
+    This handler already refused an unrecognised action instead of falling
+    through to `produce` — but it did so by RETURNING
+    ``{"statusCode": 400, ...}``, which is indistinguishable from a
+    successful invoke to a Step Function Task whose Catch is keyed on a
+    raised FunctionError, not on statusCode. RegimeSubstrate's own SF state
+    (nousergon-data infrastructure/step_function.json) has exactly such a
+    Catch. Raising is what lets it fire.
+    """
+
+    def test_unknown_action_raises_rather_than_returning_400(self, monkeypatch):
+        with pytest.raises(UnknownAction) as exc:
+            lambda_handler({"action": "nonsense"}, None)
+        assert "nonsense" in str(exc.value)
+
+    def test_it_rejects_before_any_s3_or_hmm_work(self, monkeypatch):
+        # Poison the pipeline entry point and assert we never reach it.
+        import regime.handler as handler_mod
+
+        def _boom(*a, **k):  # pragma: no cover - must never be called
+            raise AssertionError(
+                "produce_regime_substrate ran for an unknown action — the "
+                "guard is too late"
+            )
+
+        monkeypatch.setattr(handler_mod, "produce_regime_substrate", _boom)
+        with pytest.raises(UnknownAction):
+            lambda_handler({"action": "nonsense"}, None)

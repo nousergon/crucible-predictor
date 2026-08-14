@@ -51,7 +51,9 @@ def _drive_unmeasured(action: str, monkeypatch) -> dict:
     """Force each probe down its fail-open branch and return the raw payload."""
     if action == "check_pipeline_contract":
         monkeypatch.setattr(
-            pipeline_contract_check, "_fetch_raw", lambda *a, **k: None
+            pipeline_contract_check,
+            "_fetch_source",
+            lambda *a, **k: (None, pipeline_contract_check._REASON_MISSING, None),
         )
         return pipeline_contract_check.check_pipeline_contract()
     monkeypatch.setattr(
@@ -85,9 +87,11 @@ def _drive_measured(action: str, monkeypatch) -> dict:
         registry = "artifacts:\n  - artifact_id: a1\n"
         monkeypatch.setattr(
             pipeline_contract_check,
-            "_fetch_raw",
-            lambda path, **k: (
-                contract if path == pipeline_contract_check._CONTRACT_PATH else registry
+            "_fetch_source",
+            lambda key, **k: (
+                (contract if key == pipeline_contract_check._CONTRACT_KEY else registry),
+                None,
+                None,
             ),
         )
         return pipeline_contract_check.check_pipeline_contract()

@@ -1,5 +1,6 @@
 """Tests for inference.handler — Lambda action dispatch."""
 
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -394,3 +395,258 @@ def test_handler_predict_supplemental_tickers_list(
     )
 
 
+
+
+# ── alpha-engine-config-I7316 ───────────────────────────────────────────────
+# The handler must survive the UNMEASURED payload of every gate probe that
+# omits keys on its fail-open path.
+#
+# What happened: alpha-engine-config-I7048 taught these probes to OMIT the
+# verdict key rather than report a false one, and guarded the handler's log
+# line for THAT key with `.get()`. -I7277 and -I7171 then extended the same
+# reasoning to the EVIDENCE lists (`violations`, `offenders`) — an empty list
+# is as much a claim as a false verdict — but the handler's bare subscripts on
+# those siblings were never updated. From that merge on, every unmeasured
+# invocation raised KeyError inside the very log line written to report it.
+#
+# Measured on the 2026-08-14T03:10 deploy canary against version 479:
+#   check_pipeline_contract: FunctionError: Unhandled, payload: 'violations'
+#   check_lib_pin_drift:     FunctionError: Unhandled, payload: 'offenders'
+# The canary refused the promote and the :live alias froze at v474.
+#
+# These tests drive the probes' REAL unmeasured payloads — built by the
+# producer's own constructor, not hand-written here — through the handler. A
+# third probe adopting the omit-the-key shape, or a fourth key joining the
+# omitted set, fails here instead of at a deploy canary.
+
+
+def _real_unknown_pipeline_contract_payload() -> dict:
+    from inference.pipeline_contract_check import _unknown_result
+    return _unknown_result("source_missing")
+
+
+def _real_unmeasured_lib_pin_payload() -> dict:
+    """The lib-pin probe's own fail-open payload, driven through the real
+    function with every upstream read unresolvable."""
+    from unittest.mock import patch as _patch
+
+    from inference import lib_pin_drift as lpd
+
+    with _patch.object(
+        lpd, "_fetch_repo_pin",
+        side_effect=lambda *a, **k: lpd.PinRead(None, lpd.UNREACHABLE, "patched"),
+    ):
+        return lpd.check_lib_pin_drift()
+
+
+def test_unmeasured_pipeline_contract_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unknown_pipeline_contract_payload()
+    # Precondition: this is the shape the bug needed. If the producer starts
+    # emitting these keys again, this test is no longer covering anything and
+    # should be re-pointed rather than silently passing.
+    assert "violations" not in payload
+    assert "has_violation" not in payload
+
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    assert result == payload, "the handler must return the probe's payload verbatim"
+
+
+def test_unmeasured_lib_pin_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unmeasured_lib_pin_payload()
+    assert "has_drift" not in payload
+
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    assert result == payload
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_a_payload_carrying_only_a_reason(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """The floor: a probe payload that carries nothing but a reason.
+
+    Generalizes past the two keys that actually broke. Any future key the
+    handler's log line reaches for must be optional, because the whole point
+    of the unmeasured shape is that it asserts as little as possible.
+    """
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={"reason": "source_missing"}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    result = h.handler({"action": action}, _fake_context())
+
+    assert result == {"reason": "source_missing"}
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_an_entirely_empty_payload(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """Even `reason` is not guaranteed by anything structural. The handler is
+    a reporting surface; it must never be the thing that turns a degraded
+    probe into an Unhandled Lambda error, because the SF then attributes the
+    failure to the invocation rather than to the gate
+    (alpha-engine-config-I7302)."""
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    assert h.handler({"action": action}, _fake_context()) == {}
+
+
+# ── alpha-engine-config-I7319: the other direction ──────────────────────────
+#
+# Every test above asserts that nothing RAISES on a payload missing its
+# evidence list. None asserts that the evidence still arrives when it exists.
+#
+# That asymmetry is a real risk here rather than a theoretical one, because
+# everything in this area has moved one way for two days: -I7048 omitted the
+# verdict key, -I7277 and -I7171 omitted the evidence lists, -I7316 guarded
+# every read. Each step was right. An edit that took the next step — dropping
+# the `offenders=` clause entirely, say, while "simplifying" the log line —
+# would pass the whole suite, because the suite only knows how to check that
+# the handler survives.
+#
+# `offenders` is what a human acts on when the gate halts the weekly SF: it
+# names the exact cross-repo pin mismatch to fix. Losing it silently costs
+# the diagnostic at precisely the moment it is needed, which is the same
+# reports-less-than-it-measured shape the whole -I7301/-I7316 arc is about.
+
+
+def _captured_gate_log(monkeypatch, h) -> list:
+    """Capture the handler's own log calls, rendered.
+
+    Deliberately NOT caplog: `handler()` reconfigures root logging on its
+    first invocation (``logging.getLogger().setLevel`` at handler.py:181,
+    plus krepis' own setup), so caplog captures nothing in whichever test
+    triggers that first — the assertion would pass or fail on collection
+    order. Patching the module logger tests the same thing (what the gate
+    line is asked to render) and cannot be perturbed by logging config.
+    """
+    rendered: list = []
+
+    def _info(fmt, *args):
+        rendered.append(fmt % args)
+
+    monkeypatch.setattr(h.log, "info", _info)
+    return rendered
+
+
+def test_lib_pin_offenders_reach_the_log_when_the_gate_measured_them(
+    stubbed_preflight, monkeypatch,
+):
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_drift": True,
+        "parity_ok": False,
+        "floor_ok": True,
+        "min_lib_version": "0.39.0",
+        "pins": {
+            "nousergon/crucible-backtester": "v0.124.5",
+            "nousergon/crucible-predictor": "v0.124.57",
+        },
+        "offenders": [
+            "co-install parity: nousergon/crucible-backtester=v0.124.5 != "
+            "nousergon/crucible-predictor=v0.124.57",
+        ],
+        "reason": "drift_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Lib-pin drift check:"))
+    assert "offenders=co-install parity" in line
+    # the offending versions, not just the label — this line is the only
+    # place a human sees them without opening the SF execution
+    assert "v0.124.5" in line and "v0.124.57" in line
+
+
+def test_pipeline_contract_violations_reach_the_log_when_measured(
+    stubbed_preflight, monkeypatch,
+):
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_violation": True,
+        "violations": ["producer/consumer mismatch: predictions/{date}.json"],
+        "boundary_count": 12,
+        "reason": "violation_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Pipeline-contract preflight:"))
+    assert "violations=producer/consumer mismatch" in line
+    assert "boundaries=12" in line
+
+
+# alpha-engine-config-I7319, second polarity. #498 pinned that a MEASURED run
+# with findings still LOGS them. This pins the complement: a MEASURED run with
+# an EMPTY evidence list omits the clause rather than printing an empty one.
+#
+# Both halves are needed. The payload distinguishes "ran and found nothing"
+# (`status: MEASURED`, `violations: []`) from "could not run" (`status:
+# UNKNOWN`, key absent) — alpha-engine-config-I7277. If the log printed
+# `violations=` for both, the surface a human actually reads would collapse the
+# distinction the payload was changed to preserve.
+@pytest.mark.parametrize(("action", "module_path", "func_name", "payload", "clause"), [
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift",
+     {"status": "MEASURED", "has_drift": False, "reason": "in_sync",
+      "pins": {}, "offenders": []}, "offenders="),
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract",
+     {"status": "MEASURED", "has_violation": False, "reason": "in_sync",
+      "boundary_count": 5, "violations": []}, "violations="),
+])
+def test_a_clean_measured_run_omits_the_evidence_clause(
+    stubbed_preflight, monkeypatch, caplog, action, module_path, func_name,
+    payload, clause,
+):
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value=payload))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": action}, _fake_context())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert clause not in logged, (
+        f"a clean MEASURED run printed an empty {clause!r} clause — that reads "
+        "identically to a gate that could not run, which is the distinction "
+        "alpha-engine-config-I7277 changed the payload to preserve"
+    )
+    assert "in_sync" in logged

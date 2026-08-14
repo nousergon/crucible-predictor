@@ -401,10 +401,24 @@ def handler(event: dict, context) -> dict:
         # fetch/parse miss — .get() with an "unmeasured" sentinel keeps this
         # log line from KeyError-ing on the exact degraded path it exists to
         # report, while still logging the honest state.
+        #
+        # alpha-engine-config-I7316: `offenders` and `pins` need the SAME
+        # treatment and did not get it. I7048 guarded the VERDICT key and left
+        # its siblings as bare subscripts; alpha-engine-config-I7277 then made
+        # the unmeasured payload omit the evidence list too, for the same
+        # reason (an empty list is as much a claim as a false verdict). From
+        # that merge on, every unmeasured invocation raised KeyError:
+        # 'offenders' HERE — in the line written to report it. Measured on the
+        # 2026-08-14T03:10 deploy canary: FunctionError: Unhandled,
+        # payload: 'offenders', which refused the promote and froze the :live
+        # alias at v474.
+        offenders = result.get("offenders") or ()
         log.info(
             "Lib-pin drift check: has_drift=%s reason=%s pins=%s%s",
-            result.get("has_drift", "unmeasured"), result["reason"], result["pins"],
-            (" offenders=" + "; ".join(result["offenders"])) if result["offenders"] else "",
+            result.get("has_drift", "unmeasured"),
+            result.get("reason", "unreported"),
+            result.get("pins", {}),
+            (" offenders=" + "; ".join(offenders)) if offenders else "",
         )
         # Stage-coverage (config-I7214): LibPinDriftCheck is a
         # positively-declared no-output gate stage — the lib returns
@@ -427,11 +441,16 @@ def handler(event: dict, context) -> dict:
         result = check_pipeline_contract()
         # alpha-engine-config-I7048: has_violation is OMITTED (not False) on
         # a fetch/parse miss — same .get() rationale as check_lib_pin_drift.
+        # alpha-engine-config-I7316: and so are `violations` and
+        # `boundary_count`, which were bare subscripts here until the
+        # 2026-08-14T03:10 canary raised KeyError: 'violations' on them.
+        violations = result.get("violations") or ()
         log.info(
             "Pipeline-contract preflight: has_violation=%s reason=%s boundaries=%s%s",
-            result.get("has_violation", "unmeasured"), result["reason"], result["boundary_count"],
-            (" violations=" + "; ".join(result["violations"]))
-            if result["violations"] else "",
+            result.get("has_violation", "unmeasured"),
+            result.get("reason", "unreported"),
+            result.get("boundary_count"),
+            (" violations=" + "; ".join(violations)) if violations else "",
         )
         # Stage-coverage (config-I7214): PipelineContractCheck is a
         # positively-declared no-output gate stage — the lib returns
