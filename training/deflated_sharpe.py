@@ -75,7 +75,13 @@ def downside_ic_stats(
     mean_ic = float(ic.mean())
     downside = ic[ic < target] - target
     n_down = int(downside.size)
-    dd = float(math.sqrt(float(np.mean(downside ** 2)))) if n_down > 0 else 0.0
+    # Standard Sortino/Satchell downside deviation: RMS of the downside
+    # shortfall over the FULL sample (n), not over the count of shortfall days
+    # (n_down). Upside days contribute an implicit 0 to the sum, exactly as
+    # `min(0, r)` over all n would (nousergon_lib.quant.riskstats.sortino_ratio`
+    # is the fleet reference for this convention). Divide-by-n_down instead
+    # inflates the deviation and understates Sortino — alpha-engine-config-I7271.
+    dd = float(math.sqrt(float(np.sum(downside ** 2)) / n)) if n_down > 0 else 0.0
     # No bad-ranking days → Sortino is "infinitely good"; report None +
     # n_downside_days=0 rather than inf (JSON-safe) so the consumer reads it as
     # a clean upside-only series, not a missing value.
