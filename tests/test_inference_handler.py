@@ -517,3 +517,96 @@ def test_gate_actions_survive_an_entirely_empty_payload(
 
     import inference.handler as h
     assert h.handler({"action": action}, _fake_context()) == {}
+
+
+# ── alpha-engine-config-I7319: the other direction ──────────────────────────
+#
+# Every test above asserts that nothing RAISES on a payload missing its
+# evidence list. None asserts that the evidence still arrives when it exists.
+#
+# That asymmetry is a real risk here rather than a theoretical one, because
+# everything in this area has moved one way for two days: -I7048 omitted the
+# verdict key, -I7277 and -I7171 omitted the evidence lists, -I7316 guarded
+# every read. Each step was right. An edit that took the next step — dropping
+# the `offenders=` clause entirely, say, while "simplifying" the log line —
+# would pass the whole suite, because the suite only knows how to check that
+# the handler survives.
+#
+# `offenders` is what a human acts on when the gate halts the weekly SF: it
+# names the exact cross-repo pin mismatch to fix. Losing it silently costs
+# the diagnostic at precisely the moment it is needed, which is the same
+# reports-less-than-it-measured shape the whole -I7301/-I7316 arc is about.
+
+
+def _captured_gate_log(monkeypatch, h) -> list:
+    """Capture the handler's own log calls, rendered.
+
+    Deliberately NOT caplog: `handler()` reconfigures root logging on its
+    first invocation (``logging.getLogger().setLevel`` at handler.py:181,
+    plus krepis' own setup), so caplog captures nothing in whichever test
+    triggers that first — the assertion would pass or fail on collection
+    order. Patching the module logger tests the same thing (what the gate
+    line is asked to render) and cannot be perturbed by logging config.
+    """
+    rendered: list = []
+
+    def _info(fmt, *args):
+        rendered.append(fmt % args)
+
+    monkeypatch.setattr(h.log, "info", _info)
+    return rendered
+
+
+def test_lib_pin_offenders_reach_the_log_when_the_gate_measured_them(
+    stubbed_preflight, monkeypatch,
+):
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_drift": True,
+        "parity_ok": False,
+        "floor_ok": True,
+        "min_lib_version": "0.39.0",
+        "pins": {
+            "nousergon/crucible-backtester": "v0.124.5",
+            "nousergon/crucible-predictor": "v0.124.57",
+        },
+        "offenders": [
+            "co-install parity: nousergon/crucible-backtester=v0.124.5 != "
+            "nousergon/crucible-predictor=v0.124.57",
+        ],
+        "reason": "drift_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Lib-pin drift check:"))
+    assert "offenders=co-install parity" in line
+    # the offending versions, not just the label — this line is the only
+    # place a human sees them without opening the SF execution
+    assert "v0.124.5" in line and "v0.124.57" in line
+
+
+def test_pipeline_contract_violations_reach_the_log_when_measured(
+    stubbed_preflight, monkeypatch,
+):
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_violation": True,
+        "violations": ["producer/consumer mismatch: predictions/{date}.json"],
+        "boundary_count": 12,
+        "reason": "violation_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Pipeline-contract preflight:"))
+    assert "violations=producer/consumer mismatch" in line
+    assert "boundaries=12" in line
