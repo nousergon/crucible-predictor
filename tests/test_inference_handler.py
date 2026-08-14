@@ -394,3 +394,110 @@ def test_handler_predict_supplemental_tickers_list(
     )
 
 
+
+
+# ── I7317: the handler must survive the payload its gates emit when they
+#           could not measure ────────────────────────────────────────────────
+#
+# The 2026-08-14 alias freeze. I7048 made `has_drift` / `has_violation` ABSENT
+# on a could-not-measure, and the handler's log lines were correctly changed
+# to `.get(..., "unmeasured")` for exactly those two keys. I7277 then removed
+# `offenders` / `violations` from the same branch — an empty list reads as
+# "checked, nobody offended" — and nothing revisited the log lines, which
+# still subscripted those two keys hard.
+#
+# So each gate raised KeyError on the precise path the comment above it says
+# it exists to report. deploy.sh's canary asserts `has_drift|reason`, got
+# `errorMessage/errorType/stackTrace` instead, and refused to promote:
+# alpha-engine-predictor-inference:live stayed frozen across three deploys
+# (03:06, 03:10, 03:14 UTC) while every other canary action passed.
+#
+# These two tests are the contract: a gate result that carries ONLY
+# {status, reason} must pass through the handler untouched.
+
+
+def _unknown_lib_pin_payload() -> dict:
+    """Exactly what lib_pin_drift returns when it cannot measure (I7277).
+
+    No has_drift, no offenders — that absence IS the signal.
+    """
+    return {
+        "status": "UNKNOWN",
+        "parity_ok": None,
+        "floor_ok": None,
+        "min_lib_version": "0.39.0",
+        "pins": {"nousergon/crucible-predictor": None},
+        "unresolved": {
+            "nousergon/crucible-predictor": {
+                "problem": "unreachable", "detail": "patched",
+            },
+        },
+        "reason": "fetch_failed",
+    }
+
+
+def test_handler_survives_a_lib_pin_payload_with_no_verdict(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _unknown_lib_pin_payload()
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    # Returned verbatim: the SF Choice reads the ABSENCE of has_drift to route
+    # to its degraded path, so the handler must not invent one.
+    assert result == payload
+    assert "has_drift" not in result
+    assert "offenders" not in result
+
+
+def test_handler_survives_a_pipeline_contract_payload_with_no_verdict(
+    stubbed_preflight, monkeypatch,
+):
+    payload = {
+        "status": "UNKNOWN",
+        "boundary_count": None,
+        "reason": "fetch_failed",
+    }
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    assert result == payload
+    assert "has_violation" not in result
+    assert "violations" not in result
+
+
+def test_handler_still_logs_the_offenders_when_they_are_present(
+    stubbed_preflight, monkeypatch, caplog,
+):
+    """Defensive reads must not cost the diagnostic they were added for.
+
+    `.get()` everywhere is only correct if the measured path still surfaces
+    the offender list a human acts on — the failure mode this whole issue is
+    about is a check that reports less than it measured.
+    """
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_drift": True,
+        "parity_ok": False,
+        "floor_ok": True,
+        "min_lib_version": "0.39.0",
+        "pins": {},
+        "offenders": ["co-install parity: bt=v0.124.5 != pred=v0.124.57"],
+        "reason": "drift_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    with caplog.at_level("INFO"):
+        h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    assert "offenders=co-install parity" in caplog.text

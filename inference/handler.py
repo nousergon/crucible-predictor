@@ -384,10 +384,24 @@ def handler(event: dict, context) -> dict:
         # fetch/parse miss — .get() with an "unmeasured" sentinel keeps this
         # log line from KeyError-ing on the exact degraded path it exists to
         # report, while still logging the honest state.
+        #
+        # alpha-engine-config-I7317: the SAME reasoning applies to `offenders`
+        # and it was not applied. I7277 later made the could-not-measure
+        # branch OMIT `offenders` (an empty list reads as "checked, nobody
+        # offended"), which was right — and turned this hard subscript into a
+        # KeyError on precisely the path the I7048 comment above says it is
+        # protecting. The canary asserts `has_drift|reason` and got
+        # `errorMessage/errorType/stackTrace`, so it refused to promote and
+        # FROZE the :live alias across three deploys on 2026-08-14.
+        # Every field here is now read defensively: a log line about a
+        # degraded payload must never assume the payload is complete.
         log.info(
             "Lib-pin drift check: has_drift=%s reason=%s pins=%s%s",
-            result.get("has_drift", "unmeasured"), result["reason"], result["pins"],
-            (" offenders=" + "; ".join(result["offenders"])) if result["offenders"] else "",
+            result.get("has_drift", "unmeasured"),
+            result.get("reason", "unknown"),
+            result.get("pins", {}),
+            (" offenders=" + "; ".join(result["offenders"]))
+            if result.get("offenders") else "",
         )
         return result
 
@@ -397,11 +411,19 @@ def handler(event: dict, context) -> dict:
         result = check_pipeline_contract()
         # alpha-engine-config-I7048: has_violation is OMITTED (not False) on
         # a fetch/parse miss — same .get() rationale as check_lib_pin_drift.
+        # alpha-engine-config-I7317: and the same omission of that reasoning
+        # for `violations`, which I7277 also made absent on the UNKNOWN
+        # branch. This one fired first, on the 03:06 UTC deploy; the lib-pin
+        # twin fired four minutes later on the same frozen alias. Read every
+        # field defensively — the twins are fixed together because they were
+        # broken together, by one change to a shared payload convention.
         log.info(
             "Pipeline-contract preflight: has_violation=%s reason=%s boundaries=%s%s",
-            result.get("has_violation", "unmeasured"), result["reason"], result["boundary_count"],
+            result.get("has_violation", "unmeasured"),
+            result.get("reason", "unknown"),
+            result.get("boundary_count"),
             (" violations=" + "; ".join(result["violations"]))
-            if result["violations"] else "",
+            if result.get("violations") else "",
         )
         return result
 
