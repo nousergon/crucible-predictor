@@ -105,10 +105,18 @@ def test_endless_execstart_is_never_a_blocking_service_type(script: Path):
 
 
 def test_the_spot_watchdog_unit_is_a_simple_service():
-    """Anchored assertion on the specific unit that hung the pipeline."""
-    text = (_INFRA / "_spot_common.sh").read_text()
+    """Anchored assertion on the specific unit that hung the pipeline.
+
+    ``_spot_common.sh`` no longer carries this unit as literal text
+    (alpha-engine-config-I4992/I6922 cutover: ``bootstrap_spot()`` now calls
+    ``krepis.spot_bootstrap render``) — asserted against the RENDERED script
+    instead, which is what actually reaches the spot box.
+    """
+    from tests._spot_bootstrap_render_support import rendered_script
+
+    text = rendered_script()
     units = [u for u, _ in _units_in(text) if "ec2-spot-watchdog" in u or "EC2 Spot Watchdog" in u]
-    assert units, "ec2-spot-watchdog unit not found in _spot_common.sh"
+    assert units, "ec2-spot-watchdog unit not found in the rendered bootstrap"
     for unit in units:
         assert _service_type(unit) == "simple", unit
         assert "RemainAfterExit" not in unit, (
@@ -120,8 +128,14 @@ def test_the_spot_watchdog_unit_is_a_simple_service():
 def test_the_watchdog_enable_call_is_time_bounded():
     """A future regression must fail loudly in seconds, not silently at the
     SSM budget. The 2026-08-11 hang produced NO stderr past the symlink line,
-    which is why it read as a slow bootstrap rather than a blocked systemctl."""
-    text = (_INFRA / "_spot_common.sh").read_text()
+    which is why it read as a slow bootstrap rather than a blocked systemctl.
+
+    Asserted against the RENDERED script — see the docstring on the test
+    above for why ``_spot_common.sh``'s own text no longer carries this.
+    """
+    from tests._spot_bootstrap_render_support import rendered_script
+
+    text = rendered_script()
     assert re.search(r"timeout\s+\d+\s+systemctl\s+enable\s+--now\s+ec2-spot-watchdog", text), (
         "the watchdog enable call must be wrapped in `timeout N systemctl "
         "enable --now ec2-spot-watchdog` with an explicit error message"

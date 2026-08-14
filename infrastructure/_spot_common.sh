@@ -320,130 +320,40 @@ stage_config() {
 }
 
 # ── Bootstrap (watchdog + python + clone + config) ───────────────────────────
-# NOTE: single-quoted heredoc body is literal on the spot; the launcher-side
-# export prefix sets S3_STAGING/BRANCH/REPO_URL so the spot can fetch config.
-
+# The heredoc this repo carried through crucible-predictor#461/#462/#463 is
+# GONE — this is the cutover to krepis.spot_bootstrap (alpha-engine-config-
+# I4992/I6922), the fleet's canonical renderer for the shared, non-repo-
+# specific part of a spot bootstrap (watchdog + interpreter + clone). It
+# became a deletion once the launcher's LIB_PYTHON resolution stopped
+# falling back to a co-tenant venv with no declared floor (config-I6931,
+# cleared by config-I7343): every launcher interpreter that can run this repo
+# at all now satisfies krepis's own pin. tests/test_spot_bootstrap_*.py assert
+# the deletion changed nothing, against the RENDERED script rather than a
+# restated heredoc.
+#
+# REPO_URL is passed as a --repo-url LITERAL, not interpolated into a
+# single-quoted heredoc: that interpolation was the exact defect that shipped
+# an empty string and killed the clone with `fatal: repository '' does not
+# exist` (crucible-predictor#463, ne-weekly-freshness-pipeline
+# watch-rerun-2026-08-10-7). Baking it in at render time removes that class
+# rather than re-guarding it.
+#
+# ALPHA_ENGINE_EXPERIMENT_ID is deliberately NOT passed through: it was
+# exported into the old heredoc's environment but nothing in the heredoc body
+# ever read it (the second `aws s3 cp` that once consumed it was removed
+# 2026-08-13 as a destination no resolver searched). Carrying an unread export
+# forward would be restating dead surface area, not preserving behaviour.
 bootstrap_spot() {
   echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
-  local _spot_env_export
-  # REPO_URL was named in the NOTE above but never actually exported: the
-  # heredoc is single-quoted (literal on the spot), so ${REPO_URL} resolved to
-  # the empty string there and the clone died with
-  # `fatal: repository '' does not exist` — ne-weekly-freshness-pipeline
-  # watch-rerun-2026-08-10-7, 2026-08-11. Third defect in this bootstrap
-  # exposed by fixing the two ahead of it (#461 watchdog hang, #462 missing
-  # python3.12); a step that has never completed hides the next failure behind
-  # the current one. tests/test_spot_bootstrap_env_closure.py now fails when a
-  # variable the heredoc reads is neither exported here nor defaulted inline.
-  _spot_env_export="export S3_STAGING=${_S3_STAGING} BRANCH=${BRANCH} REPO_URL=${REPO_URL} ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}"$'\n'
-  run_ssm "bootstrap" "${_spot_env_export}$(cat <<'BOOTSTRAP'
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
-
-# systemd watchdog — self-terminates on SSM-agent stoppage (config#2693).
-# Type=simple, NOT oneshot: ExecStart is an endless supervision loop, and
-# `systemctl start` on a Type=oneshot unit BLOCKS until ExecStart exits
-# (TimeoutStartSec defaults to infinity for oneshot). This unit declared
-# Type=oneshot + RemainAfterExit=yes, so every bootstrap hung here until SSM
-# gave up at its budget — status=TimedOut with stderr ending on the
-# `systemctl enable` symlink line and nothing after it. Measured on
-# ne-weekly-freshness-pipeline watch-rerun-2026-08-10-5 (2026-08-11): the
-# PredictorTraining stage died exactly this way, taking Branch B down.
-# nousergon-data hit the identical defect in its twin of this file and fixed
-# it in nousergon-data#1294; this is the mirror (AGENTS.md: when a SOTA
-# pattern exists in another alpha-engine repo, mirror it).
-if ! systemctl is-enabled ec2-spot-watchdog 2>/dev/null; then
-  cat > /tmp/ec2-spot-watchdog.service <<'UNIT'
-[Unit]
-Description=EC2 Spot Watchdog — self-terminate on SSM agent stoppage
-After=amazon-ssm-agent.service
-Requires=amazon-ssm-agent.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/ec2-spot-watchdog.sh
-Restart=always
-RestartSec=30
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  cat > /usr/local/bin/ec2-spot-watchdog.sh <<'WDSH'
-#!/usr/bin/env bash
-set -euo pipefail
-while true; do
-  if ! systemctl is-active amazon-ssm-agent >/dev/null 2>&1; then
-    sleep 60
-    if ! systemctl is-active amazon-ssm-agent >/dev/null 2>&1; then
-      shutdown -h now
-    fi
-  fi
-  sleep 60
-done
-WDSH
-  chmod +x /usr/local/bin/ec2-spot-watchdog.sh
-  cp /tmp/ec2-spot-watchdog.service /etc/systemd/system/
-  # `timeout` so a future unit-shape regression fails in seconds WITH a message,
-  # instead of consuming the whole SSM budget and dying with no output — that
-  # silence is what made the hang read as "bootstrap is slow" rather than
-  # "systemctl is blocked forever".
-  timeout 60 systemctl enable --now ec2-spot-watchdog || {
-    echo "ERROR: enabling ec2-spot-watchdog did not return within 60s — the unit is misdeclared (an endless ExecStart under Type=oneshot blocks systemctl start forever)" >&2
-    exit 1
-  }
-fi
-
-# Install the interpreter — the AL2023 spot AMI does not ship python3.12.
-# This was a bare assertion, encoding an AMI contract nothing provides. It was
-# latent behind the watchdog hang (#461): once `systemctl` stopped blocking,
-# the very next bootstrap died here — ne-weekly-freshness-pipeline
-# watch-rerun-2026-08-10-6, 2026-08-11, "ERROR: python3.12 not found".
-# gcc + devel are needed by source-built wheels in requirements.txt; git for
-# the clone below. nousergon-data hit and fixed the identical defect in its
-# twin of this file (nousergon-data#1296) — this is the mirror.
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-    dnf install -y -q python3 python3-pip python3-devel git gcc
-
-# Post-condition, not a precondition: the install above is what makes this
-# true, and a silent fallback to a system python3 is exactly the drift this
-# bootstrap must not inherit (requirements.txt is resolved against 3.12).
-command -v python3.12 >/dev/null || { echo "ERROR: python3.12 not found after dnf install" >&2; exit 1; }
-echo "Using: $(python3.12 --version)"
-
-if [ ! -d /home/ec2-user/predictor/.git ]; then
-  rm -rf /home/ec2-user/predictor
-  git clone --depth 1 --branch "${BRANCH:-main}" "${REPO_URL}" /home/ec2-user/predictor
-fi
-
-# Destination must be a path config.py's resolver actually searches. It
-# delegates to nousergon_lib.config.resolve_experiment_config("predictor",
-# "predictor.yaml", repo_root=<checkout>, repo_local_fallback=<checkout>/
-# config/predictor.yaml), so with the clone at /home/ec2-user/predictor the
-# candidates are /home/ec2-user/alpha-engine-config/{experiments/reference/,}
-# predictor/predictor.yaml plus the repo-local /home/ec2-user/predictor/
-# config/predictor.yaml — which is the line below.
-#
-# nousergon-data#1298 (config#6846) fixed the twin of this bootstrap, which
-# staged onto a config-repo path the resolver did not search;
-# alpha-engine-config-I6922 flagged it as "not ported; unknown whether it
-# applies". Audited 2026-08-13: it does NOT apply here, because this copy
-# stages onto the repo-local FALLBACK candidate rather than a config-repo
-# path, and that candidate is real.
-#
-# The audit did find the same class pointing the other way. A second cp wrote
-# /home/ec2-user/predictor/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor/
-# predictor.yaml, on the assumption that the experiment-package candidates are
-# rooted in this repo. They are not — they are rooted at the alpha-engine-config
-# checkout (~/alpha-engine-config and <repo>/../alpha-engine-config), so that
-# path matched no candidate and nothing ever read it. Removed: it cost an S3 GET
-# per launch and read as experiment-package coverage that did not exist.
-# tests/test_spot_bootstrap_config_lands_where_the_resolver_looks.py derives the
-# candidate list from the resolver, so a resolver change fails CI instead of
-# production, and a dead destination fails too.
-mkdir -p "/home/ec2-user/predictor/config"
-aws s3 cp "${S3_STAGING}/predictor.yaml" "/home/ec2-user/predictor/config/predictor.yaml" --region "${AWS_REGION:-us-east-1}" --quiet
-BOOTSTRAP
-)" 300
+  local _script
+  _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
+    --repo-url "$REPO_URL" \
+    --checkout /home/ec2-user/predictor \
+    --branch "${BRANCH:-main}" \
+    --region "$AWS_REGION" \
+    --export "S3_STAGING=${_S3_STAGING}" \
+    --config-copy "predictor.yaml:/home/ec2-user/predictor/config/predictor.yaml")"
+  run_ssm "bootstrap" "$_script" 300
   echo "  Bootstrap complete."
 }
 
