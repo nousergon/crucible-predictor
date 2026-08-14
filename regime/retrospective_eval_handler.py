@@ -106,6 +106,22 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+class UnknownAction(ValueError):
+    """Raised when ``event["action"]`` names something this build cannot do.
+
+    alpha-engine-config-I7166 (class sweep). This handler already refused an
+    unrecognised action instead of falling through to `produce` — but it did
+    so by RETURNING ``{"statusCode": 400, ...}``, which is indistinguishable
+    from a successful invoke to a Step Function Task lacking a Catch keyed on
+    that shape. RegimeRetrospectiveEval's own SF state (nousergon-data
+    infrastructure/step_function.json) only fails-closed on a raised
+    FunctionError. Raising here — mirroring inference/handler.py's
+    `UnknownAction` (config-I7111) and regime/handler.py's twin — lets that
+    Catch do its job instead of silently converging past a run that did
+    nothing.
+    """
+
+
 DEFAULT_SIGNALS_PREFIX: str = "signals/"
 DEFAULT_RETROSPECTIVE_PREFIX: str = "regime/retrospective"
 DEFAULT_AGENT_CALLS_WINDOW_WEEKS: int = 104
@@ -492,7 +508,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "payload": result["payload"],
         }
     else:
-        return {
-            "statusCode": 400,
-            "error": f"unknown action {action!r}; expected 'produce' or 'dry_run'",
-        }
+        raise UnknownAction(
+            f"action={action!r} is not implemented by this build. "
+            f"Known actions: ['dry_run', 'produce']."
+        )
