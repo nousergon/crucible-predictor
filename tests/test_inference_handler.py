@@ -1,5 +1,6 @@
 """Tests for inference.handler — Lambda action dispatch."""
 
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -610,3 +611,42 @@ def test_pipeline_contract_violations_reach_the_log_when_measured(
     line = next(m for m in rendered if m.startswith("Pipeline-contract preflight:"))
     assert "violations=producer/consumer mismatch" in line
     assert "boundaries=12" in line
+
+
+# alpha-engine-config-I7319, second polarity. #498 pinned that a MEASURED run
+# with findings still LOGS them. This pins the complement: a MEASURED run with
+# an EMPTY evidence list omits the clause rather than printing an empty one.
+#
+# Both halves are needed. The payload distinguishes "ran and found nothing"
+# (`status: MEASURED`, `violations: []`) from "could not run" (`status:
+# UNKNOWN`, key absent) — alpha-engine-config-I7277. If the log printed
+# `violations=` for both, the surface a human actually reads would collapse the
+# distinction the payload was changed to preserve.
+@pytest.mark.parametrize(("action", "module_path", "func_name", "payload", "clause"), [
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift",
+     {"status": "MEASURED", "has_drift": False, "reason": "in_sync",
+      "pins": {}, "offenders": []}, "offenders="),
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract",
+     {"status": "MEASURED", "has_violation": False, "reason": "in_sync",
+      "boundary_count": 5, "violations": []}, "violations="),
+])
+def test_a_clean_measured_run_omits_the_evidence_clause(
+    stubbed_preflight, monkeypatch, caplog, action, module_path, func_name,
+    payload, clause,
+):
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value=payload))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": action}, _fake_context())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert clause not in logged, (
+        f"a clean MEASURED run printed an empty {clause!r} clause — that reads "
+        "identically to a gate that could not run, which is the distinction "
+        "alpha-engine-config-I7277 changed the payload to preserve"
+    )
+    assert "in_sync" in logged
