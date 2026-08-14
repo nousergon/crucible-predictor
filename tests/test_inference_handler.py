@@ -1,5 +1,6 @@
 """Tests for inference.handler — Lambda action dispatch."""
 
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -517,3 +518,99 @@ def test_gate_actions_survive_an_entirely_empty_payload(
 
     import inference.handler as h
     assert h.handler({"action": action}, _fake_context()) == {}
+
+
+# ── alpha-engine-config-I7319 ───────────────────────────────────────────────
+# The positive half of I7316.
+#
+# Every change in this area over two days moved one way — omit more, read more
+# defensively — each time for a good reason (I7048 omitted the verdict key,
+# I7277 omitted the evidence list, I7316 guarded every read). The I7316 tests
+# assert only that nothing RAISES, so an edit that made the reads defensive
+# enough to drop the offender list entirely would pass the whole suite.
+#
+# `offenders` / `violations` is what a human acts on when a gate halts the
+# weekly SF: it names the exact cross-repo pin mismatch or contract breach.
+# Losing it silently costs the diagnostic precisely when it matters.
+
+
+def _gate_log_lines(caplog) -> str:
+    return "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_handler_still_logs_the_offenders_when_they_are_present(
+    stubbed_preflight, monkeypatch, caplog,
+):
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "status": "MEASURED", "has_drift": True, "reason": "version_mismatch",
+        "pins": {"nousergon/crucible-predictor": "v0.124.57"},
+        "offenders": ["crucible-predictor pins v0.124.57, nousergon-data pins v0.124.53"],
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    logged = _gate_log_lines(caplog)
+    assert "offenders=" in logged, (
+        "the measured path stopped logging the offender list — a gate that "
+        "halts the weekly SF must name WHICH pin mismatched"
+    )
+    assert "crucible-predictor pins v0.124.57" in logged
+    assert "version_mismatch" in logged
+
+
+def test_handler_still_logs_the_violations_when_they_are_present(
+    stubbed_preflight, monkeypatch, caplog,
+):
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "status": "MEASURED", "has_violation": True, "reason": "violation_detected",
+        "boundary_count": 5,
+        "violations": ["boundaries[2] (id=predictions) missing required keys: ['artifact_id']"],
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    logged = _gate_log_lines(caplog)
+    assert "violations=" in logged
+    assert "id=predictions" in logged
+    assert "boundaries=5" in logged, (
+        "boundary_count is the honest field that distinguishes a real check "
+        "from an unmeasured one — it must survive on the measured path"
+    )
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name", "payload", "absent"), [
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift",
+     {"status": "MEASURED", "has_drift": False, "reason": "in_sync",
+      "pins": {}, "offenders": []}, "offenders="),
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract",
+     {"status": "MEASURED", "has_violation": False, "reason": "in_sync",
+      "boundary_count": 5, "violations": []}, "violations="),
+])
+def test_a_clean_measured_run_logs_no_evidence_clause(
+    stubbed_preflight, monkeypatch, caplog, action, module_path, func_name,
+    payload, absent,
+):
+    """The other polarity: an EMPTY evidence list on a MEASURED run means the
+    gate ran and found nothing, and the log says so by omitting the clause
+    rather than printing an empty one. Pinned so the two cases stay
+    distinguishable in the log the same way they are in the payload."""
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value=payload))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": action}, _fake_context())
+
+    logged = _gate_log_lines(caplog)
+    assert absent not in logged
+    assert "in_sync" in logged
