@@ -58,6 +58,53 @@ def test_requirements_and_lambda_pins_match():
     )
 
 
+# ── I7171: a SHA pin must be an explicit, tracked exception ────────────────
+#
+# _LIB_PIN_RE above accepts EITHER a tag or a raw commit SHA — necessary
+# because crucible-predictor has pinned nousergon-lib by SHA since #422. But
+# an UNACKNOWLEDGED SHA pin defeats inference/lib_pin_drift.py's Saturday-SF
+# floor check (alpha-engine-config-I7171): a commit SHA cannot be compared
+# to MIN_LIB_VERSION, so that gate silently degrades to "unmeasured" for as
+# long as any SHA pin exists (lib_pin_drift.SHA_PINNED).
+#
+# The correct fix is re-pinning to a released tag + rejecting SHA pins
+# outright. That was NOT done here: verified 2026-08-13 —
+# `git -C nousergon-lib tag --contains c907a044bb1553815225327bc56644050543b6f2`
+# returns nothing, and the commit sits on a diverged line (103 commits
+# behind v0.124.57, 3 commits v0.124.57 does not have) — so a tag re-pin
+# right now would silently swap in ~100 unrelated commits' worth of library
+# code, which is a real dependency bump belonging in its own reviewed,
+# tested PR, not a gate-reason fix.
+#
+# Until that re-pin lands, this test holds the line at the ONE acknowledged
+# SHA: any OTHER SHA pin (a silent swap, or reintroduction after the tag
+# re-pin) fails here instead of silently reopening the unmeasured gate.
+_ACKNOWLEDGED_SHA_PIN = "c907a044bb1553815225327bc56644050543b6f2"
+
+
+def test_sha_pin_is_the_one_acknowledged_exception_not_a_silent_new_one():
+    """A SHA pin is allowed ONLY if it is the acknowledged one.
+
+    Tracked by alpha-engine-config-I7171 — re-pin to a vX.Y.Z tag once
+    nousergon-lib ships a release reachable from this commit (or once the
+    fix this commit carries is superseded on a tagged line), then delete
+    this exception and _LIB_SHA_PIN_RE's callers can go back to rejecting
+    SHA pins unconditionally.
+    """
+    for filename in ("requirements.txt", "requirements-lambda.txt"):
+        pin = _read_lib_pin(filename)
+        if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", pin):
+            continue  # tag pin — always fine, comparable to the floor
+        assert pin == _ACKNOWLEDGED_SHA_PIN, (
+            f"{filename} pins nousergon-lib by an UNACKNOWLEDGED commit SHA "
+            f"({pin!r}). A SHA pin defeats inference/lib_pin_drift.py's "
+            f"cross-repo floor check (alpha-engine-config-I7171) — either "
+            f"re-pin to a vX.Y.Z tag, or update _ACKNOWLEDGED_SHA_PIN in "
+            f"this file (and its docstring) with the rationale for the "
+            f"new SHA."
+        )
+
+
 def _parse_pip_pins(filename: str) -> dict[str, str]:
     """Parse a requirements file into {package_name: specifier}."""
     pins = {}
