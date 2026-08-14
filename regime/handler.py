@@ -98,6 +98,21 @@ setup_logging(
 logger = logging.getLogger(__name__)
 
 
+class UnknownAction(ValueError):
+    """Raised when ``event["action"]`` names something this build cannot do.
+
+    alpha-engine-config-I7166 (class sweep). This handler already refused an
+    unrecognised action instead of falling through to `produce` — but it did
+    so by RETURNING ``{"statusCode": 400, ...}``, which is indistinguishable
+    from a successful invoke to a Step Function Task lacking a Catch keyed on
+    that shape. RegimeSubstrate's own SF state (nousergon-data
+    infrastructure/step_function.json) has a `Catch: [States.ALL]` that only
+    fires on a raised FunctionError. Raising here — mirroring
+    inference/handler.py's `UnknownAction` (config-I7111) — lets that Catch
+    do its job instead of silently converging past a run that did nothing.
+    """
+
+
 # HMM feature subset — must include PIN_FEATURE (``spy_20d_return``) and
 # at minimum two more for K=3 to discover meaningful states. The default
 # matches what's available in the FRED price-cache today; can be
@@ -275,7 +290,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "payload": result["payload"],
         }
     else:
-        return {
-            "statusCode": 400,
-            "error": f"unknown action {action!r}; expected 'produce' or 'dry_run'",
-        }
+        raise UnknownAction(
+            f"action={action!r} is not implemented by this build. "
+            f"Known actions: ['dry_run', 'produce']."
+        )

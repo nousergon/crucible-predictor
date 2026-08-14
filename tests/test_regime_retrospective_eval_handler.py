@@ -19,6 +19,7 @@ from regime.features import _PRICE_CACHE_NEW_PREFIX
 from regime.retrospective_eval_handler import (
     DEFAULT_RETROSPECTIVE_PREFIX,
     DEFAULT_SIGNALS_PREFIX,
+    UnknownAction,
     _build_eval_indices,
     load_agent_calls_history,
     produce_t1_eval,
@@ -398,10 +399,14 @@ class TestProduceT1Eval:
 
 
 class TestLambdaHandler:
-    def test_unknown_action_returns_400(self, monkeypatch):
-        result = lambda_handler({"action": "nonsense"}, None)
-        assert result["statusCode"] == 400
-        assert "unknown action" in result["error"]
+    def test_unknown_action_raises_rather_than_returning_400(self, monkeypatch):
+        # alpha-engine-config-I7166 (class sweep): a returned error dict is
+        # indistinguishable from a successful invoke to a Step Function Task
+        # whose Catch is keyed on a raised FunctionError, not on statusCode.
+        # Raising is what lets RegimeRetrospectiveEval's own Catch fire.
+        with pytest.raises(UnknownAction) as exc:
+            lambda_handler({"action": "nonsense"}, None)
+        assert "nonsense" in str(exc.value)
 
     def test_produce_action_response_shape(self, monkeypatch):
         """Patch boto3 to return our fake S3, verify the produce path
