@@ -23,6 +23,21 @@
 # future re-run cannot fire a second, conflicting training pass:
 # alpha-engine-config-I7155.
 #
+# G16 spot-bootstrap cutover (alpha-engine-config-I4992/I6922/I7372): this
+# monolith's own inline bootstrap heredoc — carrying crucible-predictor#461
+# (watchdog Type=oneshot hang), #462 (bare python3.12 assertion with nothing
+# installing it) and #463 (an interpolated ${REPO_URL}/${BRANCH} git-clone
+# line) — is GONE. It now sources _spot_common.sh and reuses its
+# bootstrap_spot() (the fleet's canonical krepis.spot_bootstrap renderer
+# call) instead of restating those three defects a second time in this
+# retained rollback path. Every per-step heredoc's silent interpreter
+# fallback (bare `command -v python3.12` gating a `python3` fallback) is
+# also gone — the same class fixed in _spot_common.sh's install_deps() and
+# preflight-only step in this same PR: a fallback resolves requirements.txt
+# against a different interpreter than it was pinned for. See the `source`
+# line below for why this file keeps its own run_ssm()/cleanup() rather than
+# adopting _spot_common.sh's wholesale.
+#
 # Launches a c5.large spot instance, syncs code, runs training via the
 # same train_handler.main() pipeline that Lambda uses (S3 price cache
 # download → refresh → train → promote → slim cache → email).
@@ -191,6 +206,31 @@ IAM_PROFILE="alpha-engine-executor-profile"
 # owns this box's provisioning (nine copies across five repos is I6922).
 LIB_PYTHON="${LIB_PYTHON:-/opt/nousergon/bin/lib-python}"
 REPO_URL="https://github.com/nousergon/crucible-predictor.git"  # public repo, no auth
+
+# infrastructure/_spot_common.sh — sourced ONLY for its bootstrap_spot()
+# (alpha-engine-config-I4992/I6922/I7372 cutover): this monolith's own
+# "Bootstrap" step below now calls that shared function instead of restating
+# the watchdog + interpreter-install + clone heredoc that carried
+# crucible-predictor#461/#462/#463. Every variable bootstrap_spot() reads
+# (AWS_REGION, REPO_URL, BRANCH, LIB_PYTHON, MAX_RUNTIME_SECONDS) is already
+# set above with the SAME `${VAR:-default}` literals _spot_common.sh itself
+# declares, so sourcing it here is a no-op for all of them — confirmed by
+# diffing the two files' preambles before this change. This script keeps its
+# OWN run_ssm()/cleanup()/heartbeat functions (defined further below, using
+# un-prefixed INSTANCE_ID/S3_STAGING rather than _spot_common.sh's
+# underscore-prefixed _INSTANCE_ID/_S3_STAGING globals): those definitions
+# come AFTER this source line, so they override _spot_common.sh's
+# same-named functions and nothing here changes. _spot_common.sh's OTHER
+# functions (spot_launch, install_deps, wait_ssm_agent, stage_config, etc.)
+# are pulled in but never called — dormant, zero behavior change. Only
+# bootstrap_spot() is exercised, and its one un-prefixed dependency
+# (`_S3_STAGING`) is bridged immediately before the call, at the call site
+# below. A full rewrite of this legacy, non-SF-invoked rollback script onto
+# _spot_common.sh's own `_`-prefixed variable convention is out of scope for
+# this cutover — it is retained unchanged as the split's rollback path
+# (see the file header), and reusing bootstrap_spot() via a narrow bridge
+# achieves the collapse this arc requires without that rewrite's risk.
+source "$SCRIPT_DIR/_spot_common.sh"
 
 # Parse flags
 MODE="both"  # both | full-only | smoke-only | preflight-only | model-zoo-weekly | model-zoo-spec | model-zoo-select
@@ -544,34 +584,30 @@ run_ssm() {
 # ${AWS_REGION:-us-east-1} defaults). Origin: 2026-05-16 Saturday SF
 # PredictorTraining preflight failure.
 # ── Bootstrap (watchdog + deps + clone + staged config) ───────────────────────
+# GONE: the inline heredoc that carried crucible-predictor#461 (watchdog
+# Type=oneshot hang), #462 (bare `command -v python3.12` assertion with
+# nothing installing it) and #463 (an interpolated `${REPO_URL}`/`${BRANCH}`
+# git-clone line — cutover to infrastructure/_spot_common.sh's bootstrap_spot()
+# (alpha-engine-config-I4992/I6922/I7372), the fleet's canonical renderer for
+# the shared, non-repo-specific part of a spot bootstrap. See the `source`
+# line above for why this script can reuse it without a full rewrite.
+#
+# The old dual config-copy (experiment-package path PLUS repo-local fallback)
+# is now a single copy to the repo-local fallback only: the experiment-package
+# destination was audited (config#6846 / alpha-engine-config-I6922) as a dead
+# write nothing on the spot ever reads — config.py's experiment-package
+# candidates are rooted at the alpha-engine-config checkout, which does not
+# exist on a bare predictor clone — and removed from _spot_common.sh's
+# bootstrap_spot() ahead of this cutover; carrying it forward here would
+# restate dead surface area, not preserve behaviour.
+#
+# --max-runtime-seconds is threaded into bootstrap_spot() itself (see
+# _spot_common.sh), so the spot-side hard-timeout timer this heredoc used to
+# arm inline via `systemd-run --on-active=... shutdown -h now` is PRESERVED,
+# not dropped — MAX_RUNTIME_SECONDS is already set (default 5400) above.
 echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
-run_ssm "bootstrap" "$(cat <<BOOTSTRAP
-set -eo pipefail
-export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=${ALPHA_ENGINE_EXPERIMENT_ID}
-
-# Spot-side hard-timeout watchdog. The dispatcher-side 'trap cleanup EXIT'
-# only fires if THIS script exits; if the dispatcher is killed/cancelled the
-# spot would orphan. systemd-run shuts the box down after MAX_RUNTIME_SECONDS
-# regardless of dispatcher state.
-systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog \
-  --description='alpha-engine spot hard-timeout' /sbin/shutdown -h now
-
-dnf install -y -q python3.12 python3.12-pip python3.12-devel git gcc 2>/dev/null || \
-  dnf install -y -q python3 python3-pip python3-devel git gcc
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
-echo "Using: \$(\$PY --version)"
-
-git clone --depth 1 --branch ${BRANCH} ${REPO_URL} /home/ec2-user/predictor
-# config#1066 — stage the yaml to BOTH paths config.py searches: the
-# experiment-package path it tries FIRST and the legacy config/predictor.yaml
-# fallback. Both copies are byte-identical from the same staged source, so
-# MODEL_SPECS populates deterministically regardless of which path wins.
-mkdir -p /home/ec2-user/alpha-engine-config/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor
-aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/alpha-engine-config/experiments/${ALPHA_ENGINE_EXPERIMENT_ID}/predictor/predictor.yaml --region ${AWS_REGION}
-aws s3 cp ${S3_STAGING}/predictor.yaml /home/ec2-user/predictor/config/predictor.yaml --region ${AWS_REGION}
-echo "Bootstrap complete: repo cloned, predictor.yaml staged to experiment package ${ALPHA_ENGINE_EXPERIMENT_ID} plus config fallback."
-BOOTSTRAP
-)" 600
+_S3_STAGING="$S3_STAGING"  # bridge to _spot_common.sh's underscore-prefixed global
+bootstrap_spot
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 echo "==> Installing Python dependencies..."
@@ -579,7 +615,10 @@ run_ssm "deps" "$(cat <<'DEPS'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PIP="python3.12 -m pip" || PIP="python3 -m pip"
+# No silent fallback (crucible-predictor#462 class, alpha-engine-config-I7372)
+# — see the deps/smoke/model-zoo steps below for the same guard.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PIP="python3.12 -m pip"
 $PIP install --upgrade pip -q
 # alpha-engine-lib is public (git+https in requirements.txt, no auth).
 # CORRECTED 2026-08-13 (alpha-engine-config-I6998 deliverable 4): flow-doctor
@@ -629,7 +668,14 @@ if [ "$MODE" = "preflight-only" ]; then
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 $PY - <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
@@ -707,7 +753,14 @@ if [ "$MODE" != "full-only" ] && [ "$MODE" != "model-zoo-weekly" ] && [ "$MODE" 
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 # Spot-side log durability — the python workload below ran inline via $PY - so
 # its stdout/stderr lived ONLY in SSM get-command-invocation, which returns
 # EMPTY when the spot dies mid-run e.g. OOM RC=-1 and is destroyed when the
@@ -825,7 +878,14 @@ set -eo pipefail
 # substitution.
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 # Spot-side log durability — see the smoke step comment. Route the workload
 # through krepis.ssm_log_capture so the model-zoo log reaches S3 on
 # EXIT including OOM-kill before the dispatcher terminates the box. Paren-free
@@ -926,7 +986,14 @@ if [ "$MODE" = "model-zoo-spec" ]; then
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 # Spot-side log durability + flow-doctor wiring — see the model-zoo-weekly step.
 # Paren-free and apostrophe-free per the bash 3.2 note above.
 cat > /tmp/spot-model-zoo-spec.py <<'PYEOF'
@@ -1002,7 +1069,14 @@ if [ "$MODE" = "model-zoo-select" ]; then
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 # Spot-side log durability + flow-doctor wiring — see the model-zoo-weekly step.
 # Paren-free and apostrophe-free per the bash 3.2 note above.
 cat > /tmp/spot-model-zoo-select.py <<'PYEOF'
@@ -1076,7 +1150,14 @@ run_ssm "full-training" "${RUN_TOKEN_EXPORT}${DEFER_EMAIL_EXPORT}${SHADOW_EXPORT
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1 ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before this step ever runs, so an absence here means
+# the bootstrap's own postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 # Spot-side log durability — this is THE workload whose log was lost on the
 # off-cycle full-only OOM RC=-1 incident the python ran inline via $PY - so its
 # full training log lived only in SSM get-command-invocation which returns empty

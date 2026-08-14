@@ -77,6 +77,20 @@ _RUNTIME_ONLY_STANDINS = {
     "_S3_STAGING": "s3://alpha-engine-research/tmp/spot_train/RUNID",
 }
 
+#: MAX_RUNTIME_SECONDS has a static top-of-file default in _spot_common.sh
+#: of "" (deliberately empty — see that file's "Per-stage identity" comment:
+#: it must be a per-stage assignment, never defaulted here, so `set -u` is
+#: satisfied at source time while the real per-stage value stays load-
+#: bearing). `_static_default` would therefore resolve it to the empty
+#: string, which is a legitimate STATIC answer but not what the renderer
+#: ever actually sees: `spot_launch()` asserts it non-empty before any
+#: instance exists, and bootstrap_spot() only ever runs after spot_launch()
+#: has populated `_INSTANCE_ID`/`_S3_STAGING` — so by the time the render
+#: call executes, MAX_RUNTIME_SECONDS is guaranteed real, exactly like
+#: `_S3_STAGING` above. Stand in with a representative value so
+#: `rendered_script()` actually exercises the --max-runtime-seconds path.
+_RUNTIME_ONLY_STANDINS["MAX_RUNTIME_SECONDS"] = "5400"
+
 
 def _static_default(name: str, text: str) -> str | None:
     """A literal or ``${NAME:-default}``-declared value for a global var.
@@ -156,6 +170,7 @@ def spec_from_resolved(args: dict[str, list[str]]) -> SpotBootstrapSpec:
     for raw in args.get("config-copy", []):
         parts = raw.split(":")
         copies.append(ConfigCopy(source_name=parts[0], dest=parts[1]))
+    max_runtime_raw = args.get("max-runtime-seconds", [None])[0]
     return SpotBootstrapSpec(
         repo_url=args["repo-url"][0],
         checkout=args["checkout"][0],
@@ -163,6 +178,7 @@ def spec_from_resolved(args: dict[str, list[str]]) -> SpotBootstrapSpec:
         exports=exports,
         branch=args.get("branch", ["main"])[0],
         region=args.get("region", ["us-east-1"])[0],
+        max_runtime_seconds=int(max_runtime_raw) if max_runtime_raw else None,
     )
 
 
