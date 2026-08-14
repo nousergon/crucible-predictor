@@ -55,8 +55,16 @@ SECURITY_GROUP="sg-03cd3c4bd91e610b0"
 SUBNETS="${SUBNETS:-subnet-a61ec0fb,subnet-1e58307a,subnet-789d3857,subnet-c670118d,subnet-7cff7c43,subnet-e07166ec}"
 IAM_PROFILE="alpha-engine-executor-profile"
 
-# LIB_PYTHON — path to python binary with krepis/nousergon-lib installed
-LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python}"
+# Lib CLI path: every spot launcher on the dispatcher box resolves its
+# interpreter through the ops-owned guard /opt/nousergon/bin/lib-python
+# (nous-ergon-ops: alpha-engine-dashboard/live/infrastructure/bin/lib-python).
+# That guard execs the box's DECLARED krepis venv and aborts with EX_CONFIG
+# (78), naming the version it found, when the venv is absent or below the
+# launcher floor. It never falls back to a co-tenant checkout — the silent
+# fallback is exactly the defect alpha-engine-config-I6931/I7343 removes.
+# Do NOT add a guard block here: the contract lives ONCE, in the repo that
+# owns this box's provisioning (nine copies across five repos is I6922).
+LIB_PYTHON="${LIB_PYTHON:-/opt/nousergon/bin/lib-python}"
 REPO_URL="https://github.com/nousergon/crucible-predictor.git"
 
 # Spot-reclaim relaunch (#883)
