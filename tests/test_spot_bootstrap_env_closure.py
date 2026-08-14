@@ -81,3 +81,29 @@ def test_s3_staging_export_is_passed_and_resolves():
     assert staging, "no --export S3_STAGING=... argument passed to the renderer"
     resolved = resolve(staging[0], _TEXT)
     assert resolved != "S3_STAGING=", "S3_STAGING resolves to an empty value"
+
+
+def test_max_runtime_seconds_is_passed_and_resolves():
+    """The spot-side hard-timeout timer must not be silently un-shipped.
+
+    krepis 0.59.6 added --max-runtime-seconds (alpha-engine-config-I7372):
+    bootstrap_spot() now passes it through so the hard-timeout timer this
+    file's bootstrap previously had NO equivalent for at all is armed
+    alongside the SSM-liveness watchdog — a separate guarantee, neither
+    replaces the other. MAX_RUNTIME_SECONDS is declared empty at the top of
+    _spot_common.sh on purpose (per-stage identity, never defaulted there),
+    so its real value is only guaranteed by spot_launch()'s precondition
+    check — exactly like _S3_STAGING — which is why both are declared
+    runtime-only stand-ins rather than resolved off a static default.
+    """
+    runtime_args = [raw for flag, raw in _ARGS if flag == "max-runtime-seconds"]
+    assert runtime_args, (
+        "no --max-runtime-seconds argument passed to krepis.spot_bootstrap "
+        "render — the spot-side hard-timeout timer is unshipped"
+    )
+    resolved = resolve(runtime_args[0], _TEXT)
+    assert resolved and resolved.isdigit() and int(resolved) > 0, (
+        f"--max-runtime-seconds resolved to {resolved!r}, not a positive "
+        "integer — the renderer's transient-timer arm will fail loud (by "
+        "design) but the value must be real before it ever reaches a spot"
+    )

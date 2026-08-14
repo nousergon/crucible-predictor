@@ -201,19 +201,42 @@ def test_run_ssm_call_sites_present():
     Pinning the registry catches both:
       * a refactor that removes a stage (e.g. drops 'preflight-only')
       * a rename that drifts the operator vocabulary
+
+    G16 cutover (alpha-engine-config-I4992/I6922/I7372): the "bootstrap"
+    call site moved OUT of spot_train.sh's own text — it now sources
+    infrastructure/_spot_common.sh and calls the shared bootstrap_spot(),
+    which issues `run_ssm "bootstrap" ...` itself, rather than restating a
+    sixth copy of the watchdog/interpreter-install/clone heredoc here. That
+    is a deliberate architectural choice (reuse over a second render), so
+    this check now looks for "bootstrap" in _spot_common.sh too, exactly as
+    its own docstring instructs for a deliberate rename/move.
     """
     body = _SCRIPT.read_text()
+    common_body = (_REPO_ROOT / "infrastructure" / "_spot_common.sh").read_text()
     missing = sorted(
         desc
         for desc in _EXPECTED_DESCRIPTIONS
-        if f'run_ssm "{desc}"' not in body
+        if f'run_ssm "{desc}"' not in body and f'run_ssm "{desc}"' not in common_body
     )
     assert not missing, (
-        f"run_ssm call sites missing from spot_train.sh: {missing}. "
-        f"Expected descriptions (pre-2026-05-27 stable vocabulary): "
-        f"{sorted(_EXPECTED_DESCRIPTIONS)}. If the change is deliberate, "
-        "update _EXPECTED_DESCRIPTIONS in this test file in the SAME PR "
-        "and document the rename in operator notes."
+        f"run_ssm call sites missing from spot_train.sh (and its sourced "
+        f"_spot_common.sh): {missing}. Expected descriptions (pre-2026-05-27 "
+        f"stable vocabulary): {sorted(_EXPECTED_DESCRIPTIONS)}. If the change "
+        "is deliberate, update _EXPECTED_DESCRIPTIONS in this test file in "
+        "the SAME PR and document the rename in operator notes."
+    )
+    # The delegation itself must actually be wired — a call site "present"
+    # only because _spot_common.sh happens to define it, with spot_train.sh
+    # never sourcing or invoking it, would be a false green.
+    assert re.search(r'source\s+"\$SCRIPT_DIR/_spot_common\.sh"', body), (
+        "spot_train.sh no longer sources _spot_common.sh, but the "
+        '"bootstrap" call site above was found only there — the delegation '
+        "this check relies on is broken."
+    )
+    assert re.search(r"^\s*bootstrap_spot\s*$", body, re.MULTILINE), (
+        "spot_train.sh no longer calls bootstrap_spot() — the sourced "
+        '"bootstrap" run_ssm call site is dead code from this script\'s '
+        "point of view."
     )
 
 

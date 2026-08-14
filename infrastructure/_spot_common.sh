@@ -346,13 +346,24 @@ stage_config() {
 bootstrap_spot() {
   echo "==> Bootstrapping spot (watchdog, python, clone, config)..."
   local _script
+  # --max-runtime-seconds (krepis 0.59.6, alpha-engine-config-I7372): this
+  # render call previously carried no hard runtime cap at all — PR504 shipped
+  # before the flag existed on the pinned krepis version. The SSM-liveness
+  # ec2-spot-watchdog unit (self-terminate on SSM-agent stoppage) is a
+  # SEPARATE guarantee and does not cover a live-but-hung workload; only a
+  # transient systemd-run timer does. `spot_launch()` above asserts
+  # MAX_RUNTIME_SECONDS non-empty before any instance exists, and
+  # bootstrap_spot() only ever runs after spot_launch() has populated
+  # `_INSTANCE_ID`/`_S3_STAGING`, so the value is guaranteed here for every
+  # caller of this shared helper.
   _script="$("$LIB_PYTHON" -m krepis.spot_bootstrap render \
     --repo-url "$REPO_URL" \
     --checkout /home/ec2-user/predictor \
     --branch "${BRANCH:-main}" \
     --region "$AWS_REGION" \
     --export "S3_STAGING=${_S3_STAGING}" \
-    --config-copy "predictor.yaml:/home/ec2-user/predictor/config/predictor.yaml")"
+    --config-copy "predictor.yaml:/home/ec2-user/predictor/config/predictor.yaml" \
+    --max-runtime-seconds "$MAX_RUNTIME_SECONDS")"
   run_ssm "bootstrap" "$_script" 300
   echo "  Bootstrap complete."
 }
@@ -370,7 +381,14 @@ install_deps() {
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before any per-step run_ssm body ever runs, so an
+# absence here means that postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 _pip_log=/tmp/pip-install-deps.log
 if ! $PY -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
   echo "ERROR: pip install -r requirements.txt failed" >&2
@@ -513,7 +531,14 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+# No silent fallback to the AMI's system python3 (crucible-predictor#462
+# class, alpha-engine-config-I7372): bootstrap_spot() installs python3.12 and
+# asserts it is present before any per-step run_ssm body ever runs, so an
+# absence here means that postcondition was violated — resolving against a
+# different interpreter than requirements.txt was pinned for is worse than
+# failing loud.
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter" >&2; exit 1; }
+PY=python3.12
 $PY - <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
