@@ -63,13 +63,13 @@ _MODEL_ZOO_SELECT_SCRIPT = "spot_model_zoo_select.sh"
 _MODEL_ZOO_SELECT_STAGE = "ModelZooSelect"
 
 _ASSERT_CALL_RE = re.compile(
-    r'"\$LIB_PYTHON"\s+-m\s+nousergon_lib\.stage_coverage\s+assert\s+'
+    r'"\$LIB_PYTHON"\s+-m\s+krepis\.stage_coverage\s+assert\s+'
     r'--stage\s+"(?P<stage_var>\$_COVERAGE_STAGE)"\s+'
     r'--window-start\s+"\$_STAGE_WINDOW_START"'
 )
 
 _BARE_OR_TRUE_RE = re.compile(
-    r'nousergon_lib\.stage_coverage\s+assert[^\n]*\|\|\s*true\b'
+    r'krepis\.stage_coverage\s+assert[^\n]*\|\|\s*true\b'
 )
 
 
@@ -78,7 +78,7 @@ def test_launcher_calls_stage_coverage_with_correct_stage(script_name: str, stag
     """Each single-stage launcher carries the assertion, bound to its stage."""
     source = (_INFRA / script_name).read_text()
     assert _ASSERT_CALL_RE.search(source), (
-        f"{script_name}: no `nousergon_lib.stage_coverage assert --stage "
+        f"{script_name}: no `krepis.stage_coverage assert --stage "
         f'"$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START"` call found'
     )
     # _COVERAGE_STAGE must resolve to the correct stage name — assert the
@@ -131,7 +131,7 @@ def test_launcher_does_not_swallow_the_assertion_with_bare_or_true(script_name: 
         "— use `|| echo \"WARNING: ...\" >&2` instead (config-I7214)"
     )
     # And the loud form is actually present alongside every assert call.
-    for m in re.finditer(r'nousergon_lib\.stage_coverage\s+assert[^\n]*', source):
+    for m in re.finditer(r'krepis\.stage_coverage\s+assert[^\n]*', source):
         line = m.group(0)
         assert "|| echo" in line and ">&2" in line, (
             f"{script_name}: an assertion call does not end in the required "

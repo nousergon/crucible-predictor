@@ -3,7 +3,7 @@
 
 Two properties, per call site:
 
-1. When `nousergon_lib.stage_coverage` IS importable, its verdict lands in
+1. When `krepis.stage_coverage` IS importable, its verdict lands in
    the handler's returned payload under `stage_coverage`.
 2. When it is NOT importable (the pinned nousergon-lib SHA predates the
    module — the live condition today), the handler's own outcome is
@@ -25,11 +25,11 @@ from unittest.mock import MagicMock
 import pytest
 
 
-# ── Shared fake nousergon_lib.stage_coverage module ────────────────────────
+# ── Shared fake krepis.stage_coverage module ────────────────────────
 
 
 def _install_fake_stage_coverage(monkeypatch, verdict: dict) -> MagicMock:
-    """Install a fake `nousergon_lib.stage_coverage` submodule whose
+    """Install a fake `krepis.stage_coverage` submodule whose
     `assert_stage_coverage` returns `verdict` unconditionally, and return
     the mock so call args can be inspected.
 
@@ -40,25 +40,25 @@ def _install_fake_stage_coverage(monkeypatch, verdict: dict) -> MagicMock:
     (`nousergon_lib.trading_calendar`) in the same call.
     """
     fake_fn = MagicMock(return_value=verdict)
-    fake_module = types.ModuleType("nousergon_lib.stage_coverage")
+    fake_module = types.ModuleType("krepis.stage_coverage")
     fake_module.assert_stage_coverage = fake_fn
-    monkeypatch.setitem(sys.modules, "nousergon_lib.stage_coverage", fake_module)
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake_module)
     return fake_fn
 
 
 def _uninstall_stage_coverage(monkeypatch) -> None:
-    """Force `from nousergon_lib.stage_coverage import assert_stage_coverage`
+    """Force `from krepis.stage_coverage import assert_stage_coverage`
     to raise ImportError, mirroring the live pinned-SHA condition.
     """
-    monkeypatch.delitem(sys.modules, "nousergon_lib.stage_coverage", raising=False)
+    monkeypatch.delitem(sys.modules, "krepis.stage_coverage", raising=False)
     # Also block a real installed copy from being found on sys.path, if any.
     import builtins
 
     real_import = builtins.__import__
 
     def _blocking_import(name, *args, **kwargs):
-        if name == "nousergon_lib.stage_coverage" or name.startswith("nousergon_lib.stage_coverage."):
-            raise ImportError("no module named nousergon_lib.stage_coverage (test-forced)")
+        if name == "krepis.stage_coverage" or name.startswith("krepis.stage_coverage."):
+            raise ImportError("no module named krepis.stage_coverage (test-forced)")
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", _blocking_import)

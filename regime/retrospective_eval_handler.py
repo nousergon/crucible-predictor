@@ -508,7 +508,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
         # design that it writes nothing. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
         try:
-            from nousergon_lib.stage_coverage import assert_stage_coverage
+            from krepis.stage_coverage import assert_stage_coverage
             _response["stage_coverage"] = assert_stage_coverage(
                 "RegimeRetrospectiveEval",
                 run_date=result["payload"].get("calendar_date"),

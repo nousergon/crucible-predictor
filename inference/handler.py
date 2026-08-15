@@ -261,7 +261,7 @@ def handler(event: dict, context) -> dict:
         # absent at the pinned nousergon-lib SHA: the handler's own outcome
         # is unchanged (observe mode).
         try:
-            from nousergon_lib.stage_coverage import assert_stage_coverage
+            from krepis.stage_coverage import assert_stage_coverage
             _r["stage_coverage"] = assert_stage_coverage(
                 "WeeklyRunDayGate", run_date=_r.get("check_date"), window_start=_started,
             )
@@ -425,7 +425,7 @@ def handler(event: dict, context) -> dict:
         # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
         try:
-            from nousergon_lib.stage_coverage import assert_stage_coverage
+            from krepis.stage_coverage import assert_stage_coverage
             result["stage_coverage"] = assert_stage_coverage(
                 "LibPinDriftCheck",
                 run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
@@ -457,7 +457,7 @@ def handler(event: dict, context) -> dict:
         # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
         try:
-            from nousergon_lib.stage_coverage import assert_stage_coverage
+            from krepis.stage_coverage import assert_stage_coverage
             result["stage_coverage"] = assert_stage_coverage(
                 "PipelineContractCheck",
                 run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
