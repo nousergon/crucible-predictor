@@ -475,6 +475,53 @@ def test_unmeasured_lib_pin_payload_survives_the_handler(
     assert result == payload
 
 
+# ── alpha-engine-config-I7389: stage_coverage is now a real annotation ──────
+#
+# These gate tests used to assert exact equality against the probe payload
+# (`== {}` / `== {"reason": ...}`). That passed only because
+# `_record_stage_coverage` imported `nousergon_lib.stage_coverage`, a module
+# that has never existed on any released nousergon-lib, so the handler took
+# the `except ImportError` branch and annotated nothing.
+#
+# In other words: the assertion held BECAUSE the detector was broken. Fixing
+# the import (to `krepis.stage_coverage`) made four of these fail, which is the
+# correct signal and not a regression — the key they were asserting absent is
+# exactly the evidence I7214 exists to produce.
+#
+# The tests' real subject is unchanged and is restated below: the handler is a
+# reporting surface and must never turn a degraded probe into an Unhandled
+# Lambda error (alpha-engine-config-I7302). So the probe payload is compared
+# with the annotation lifted off, and the annotation is asserted SEPARATELY —
+# which makes these tests stronger than before, because they now also fail if
+# the coverage assertion silently stops running again.
+
+
+def _without_stage_coverage(result: dict) -> dict:
+    """The probe payload as the gate produced it, with the handler's own
+    stage-coverage annotation removed."""
+    return {k: v for k, v in result.items() if k != "stage_coverage"}
+
+
+def _assert_stage_coverage_ran(result: dict) -> None:
+    """The annotation must be PRESENT and carry a status.
+
+    Presence is the load-bearing half. An absent key is exactly what a broken
+    import produces AND what a healthy no-op would produce, so absence can
+    never be the unavailable signal (sf-pipeline-policy 2.3a). In CI there are
+    no AWS credentials, so the expected status is UNMEASURED with a reason —
+    a verdict, not silence.
+    """
+    assert "stage_coverage" in result, (
+        "the handler did not annotate stage_coverage — the krepis import is "
+        "broken again (alpha-engine-config-I7389) or the call site was removed"
+    )
+    coverage = result["stage_coverage"]
+    assert coverage.get("status"), (
+        f"stage_coverage carries no status: {coverage!r}. A verdict-less "
+        "annotation is indistinguishable from the detector not running."
+    )
+
+
 @pytest.mark.parametrize(("action", "module_path", "func_name"), [
     ("check_pipeline_contract", "inference.pipeline_contract_check",
      "check_pipeline_contract"),
@@ -496,7 +543,8 @@ def test_gate_actions_survive_a_payload_carrying_only_a_reason(
     import inference.handler as h
     result = h.handler({"action": action}, _fake_context())
 
-    assert result == {"reason": "source_missing"}
+    assert _without_stage_coverage(result) == {"reason": "source_missing"}
+    _assert_stage_coverage_ran(result)
 
 
 @pytest.mark.parametrize(("action", "module_path", "func_name"), [
@@ -517,7 +565,10 @@ def test_gate_actions_survive_an_entirely_empty_payload(
     monkeypatch.setitem(sys.modules, module_path, fake)
 
     import inference.handler as h
-    assert h.handler({"action": action}, _fake_context()) == {}
+    result = h.handler({"action": action}, _fake_context())
+
+    assert _without_stage_coverage(result) == {}
+    _assert_stage_coverage_ran(result)
 
 
 # ── alpha-engine-config-I7319: the other direction ──────────────────────────
