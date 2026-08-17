@@ -119,3 +119,72 @@ class TestEdgeCases:
         for k in ("n_unique_p_up", "modal_fraction", "stdev_p_up"):
             assert k in result.metrics
         assert math.isclose(result.metrics["alpha_modal_fraction"], 0.05, abs_tol=0.01)
+
+
+class TestConfidenceSemanticsInvariant:
+    """``prediction_confidence`` must be ``|p_up - 0.5| * 2`` (PR #143).
+
+    A units contract, not a quality signal. Until this check existed nothing
+    asserted it anywhere, and two sites kept emitting the retired
+    ``max(p_up, p_down)`` form — one of them the drift detector's threshold,
+    which then read every healthy batch as a CRITICAL collapse for three months
+    (alpha-engine-config#6952).
+    """
+
+    @staticmethod
+    def _conf_row(alpha, p_up, confidence):
+        row = _row(alpha, p_up)
+        row["prediction_confidence"] = confidence
+        return row
+
+    def _live_batch(self, n=20):
+        return [
+            self._conf_row((i - n // 2) * 0.002, 0.40 + i * 0.01,
+                           round(abs((0.40 + i * 0.01) - 0.5) * 2.0, 4))
+            for i in range(n)
+        ]
+
+    def test_live_semantics_pass(self):
+        result = validate_live_batch_invariant_health(self._live_batch())
+        assert result.passed is True, result.reason
+        assert result.metrics["n_confidence_checked"] == 20
+        assert result.metrics["confidence_semantic_violation_rate"] == 0.0
+
+    def test_retired_winner_probability_semantics_halt(self):
+        # max(p_up, p_down) — the pre-2026-05-12 form. Every row violates.
+        preds = [
+            self._conf_row((i - 10) * 0.002, 0.40 + i * 0.01,
+                           round(max(0.40 + i * 0.01, 1 - (0.40 + i * 0.01)), 4))
+            for i in range(20)
+        ]
+        result = validate_live_batch_invariant_health(preds)
+        assert result.passed is False
+        assert result.failed_check == "confidence_semantics"
+        assert result.metrics["confidence_semantic_violation_rate"] == 1.0
+
+    def test_a_single_violating_row_halts(self):
+        preds = self._live_batch()
+        preds[7]["prediction_confidence"] = 0.9
+        result = validate_live_batch_invariant_health(preds)
+        assert result.passed is False
+        assert result.failed_check == "confidence_semantics"
+
+    def test_four_decimal_rounding_on_both_fields_is_within_tolerance(self):
+        # p_up and prediction_confidence are each written rounded to 4dp; the
+        # tolerance must absorb that and nothing wider.
+        preds = [
+            self._conf_row((i - 10) * 0.002, round(0.40 + i * 0.0111, 4),
+                           round(abs(round(0.40 + i * 0.0111, 4) - 0.5) * 2.0, 4))
+            for i in range(20)
+        ]
+        result = validate_live_batch_invariant_health(preds)
+        assert result.passed is True, result.reason
+        assert result.metrics["confidence_semantic_max_delta"] <= 0.002
+
+    def test_rows_without_confidence_are_not_checked(self):
+        # Older artifacts / partial rows must degrade gracefully, not halt.
+        result = validate_live_batch_invariant_health(
+            [_row((i - 10) * 0.002, 0.40 + i * 0.01) for i in range(20)]
+        )
+        assert result.passed is True
+        assert result.metrics["n_confidence_checked"] == 0

@@ -281,6 +281,7 @@ def validate_live_batch_invariant_health(
     max_saturation_rate: float = 0.25,
     floor: float = 0.011,
     ceiling: float = 0.989,
+    confidence_semantic_tol: float = 0.002,
 ) -> OutputDistributionGateResult:
     """Inference-time circuit-breaker that halts ONLY on recalibration-invariant
     *broken-output* signals — never on benign isotonic-``p_up`` coarseness.
@@ -317,6 +318,18 @@ def validate_live_batch_invariant_health(
        ``max_sign_skew``. Level-neutralization demeans alpha cross-sectionally,
        so an all-one-sign tradable signal is degenerate by construction
        (the 2026-05-04 false-collapse class), invariant to the calibrator.
+    4a. **Confidence semantics** — every row carrying both ``p_up`` and
+       ``prediction_confidence`` must satisfy the emitted contract
+       ``prediction_confidence == |p_up - 0.5| * 2`` (PR #143, 2026-05-12) to
+       within ``confidence_semantic_tol``. This is a units check, not a quality
+       check: a batch that violates it is being written on one confidence axis
+       and read on another by the veto gate, the executor's sizing map and the
+       drift detector, none of which can tell. Two live sites carried the
+       retired ``max(p_up, p_down)`` form for months precisely because nothing
+       asserted the invariant (alpha-engine-config#6952 and the un-migrated
+       variance-fallback branch in ``run_inference``), so the check is here at
+       the write boundary where the artifact is sealed.
+
     4. **Calibrator saturation** — fraction of ``p_up`` clipped to the
        calibrator floor/ceiling above ``max_saturation_rate``. Retained from
        the legacy gate because hard floor/ceiling clipping reflects a wide
@@ -392,6 +405,30 @@ def validate_live_batch_invariant_health(
     n_saturated = int(np.sum((p_ups <= floor) | (p_ups >= ceiling))) if p_ups.size else 0
     saturation_rate = float(n_saturated / p_ups.size) if p_ups.size else 0.0
 
+    # --- Confidence-semantics invariant (units, not quality) ------------------
+    # prediction_confidence must be |p_up - 0.5| * 2. Both fields are written
+    # rounded to 4dp, so the tolerance absorbs rounding on each side and nothing
+    # wider.
+    conf_checked = 0
+    conf_violations = 0
+    worst_conf_delta = 0.0
+    worst_conf_row: dict | None = None
+    for p in predictions:
+        _pu, _c = p.get("p_up"), p.get("prediction_confidence")
+        if not isinstance(_pu, (int, float)) or not isinstance(_c, (int, float)):
+            continue
+        if not (math.isfinite(float(_pu)) and math.isfinite(float(_c))):
+            continue
+        conf_checked += 1
+        delta = abs(float(_c) - abs(float(_pu) - 0.5) * 2.0)
+        if delta > worst_conf_delta:
+            worst_conf_delta, worst_conf_row = delta, p
+        if delta > confidence_semantic_tol:
+            conf_violations += 1
+    conf_violation_rate = (
+        float(conf_violations / conf_checked) if conf_checked else 0.0
+    )
+
     # --- Observe-only isotonic-p_up shape stats (NEVER drive the verdict) -----
     if p_ups.size:
         rounded_p = np.round(p_ups, 6)
@@ -416,6 +453,10 @@ def validate_live_batch_invariant_health(
         "alpha_sign_skew": round(alpha_sign_skew, 4),
         # Calibrator output-health (drives the verdict):
         "saturation_rate": round(saturation_rate, 4),
+        # Confidence-semantics invariant (drives the verdict):
+        "n_confidence_checked": conf_checked,
+        "confidence_semantic_violation_rate": round(conf_violation_rate, 4),
+        "confidence_semantic_max_delta": round(worst_conf_delta, 6),
         # Observe-only isotonic shape stats (do NOT drive the verdict):
         "n_unique_p_up": n_unique_p_up,
         "modal_fraction": round(p_up_modal_fraction, 4),
@@ -464,6 +505,25 @@ def validate_live_batch_invariant_health(
             metrics=metrics,
         )
 
+    # Check 4a: confidence-semantics invariant. Any violation fails — this is a
+    # units contract, so a partial violation is not a milder version of the same
+    # problem, it is two axes in one file.
+    if conf_checked >= min_batch_size and conf_violations > 0:
+        _t = worst_conf_row.get("ticker", "?") if worst_conf_row else "?"
+        reason = (
+            f"prediction_confidence violates |p_up-0.5|*2 on "
+            f"{conf_violations}/{conf_checked} rows of {source_label} "
+            f"(max delta {worst_conf_delta:.4f} on {_t}, tol "
+            f"{confidence_semantic_tol}) — the batch mixes confidence axes, so "
+            f"the veto gate and downstream sizing are reading a scale the "
+            f"predictor did not write"
+        )
+        log.warning("Invariant output-health gate FAILED — %s", reason)
+        return OutputDistributionGateResult(
+            passed=False, failed_check="confidence_semantics", reason=reason,
+            metrics=metrics,
+        )
+
     # Check 4: calibrator saturation (clip-to-bounds).
     if p_ups.size >= min_batch_size and saturation_rate > max_saturation_rate:
         reason = (
@@ -480,10 +540,11 @@ def validate_live_batch_invariant_health(
 
     log.info(
         "Invariant output-health gate PASSED — alpha: %d unique (modal %.0f%%, "
-        "nonfinite %.1f%%, sign-skew %.0f%%), saturation %.1f%%  |  "
-        "[observe-only] isotonic p_up: %d unique, modal %.0f%%, stdev %.4f",
+        "nonfinite %.1f%%, sign-skew %.0f%%), saturation %.1f%%, confidence "
+        "semantics clean on %d rows  |  [observe-only] isotonic p_up: %d unique, "
+        "modal %.0f%%, stdev %.4f",
         n_unique_alpha, alpha_modal_fraction * 100, nonfinite_rate * 100,
-        alpha_sign_skew * 100, saturation_rate * 100,
+        alpha_sign_skew * 100, saturation_rate * 100, conf_checked,
         n_unique_p_up, p_up_modal_fraction * 100, stdev_p_up,
     )
     return OutputDistributionGateResult(

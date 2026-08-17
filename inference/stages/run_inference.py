@@ -1196,7 +1196,14 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         p_up = float(np.clip(0.5 + a / (2.0 * meta_clip), 0.0, 1.0))
         p_down = 1.0 - p_up
         direction = derive_direction(a)
-        confidence = p_up if direction == "UP" else p_down
+        # Confidence semantics: |p_up - 0.5| * 2 (PR #143, 2026-05-12). This
+        # site kept the retired `max(p_up, p_down)` winner-probability form for
+        # three months — it is only reachable on the no-calibrator / variance-
+        # fallback path, so no test and no live run ever exercised it. Had it
+        # fired, every confidence would have landed on the [0.5, 1.0] axis while
+        # the veto threshold (0.30) and the executor's sizing map read the
+        # [0, 1] one, waving through a batch the veto exists to stop.
+        confidence = abs(p_up - 0.5) * 2.0
         p["p_up"] = round(p_up, 4)
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction
