@@ -457,3 +457,149 @@ def test_format_alert_report_is_severity_led():
     # each alert renders its labeled block
     assert "Likely cause:" in report
     assert "Action:" in report
+
+
+# ── champion-replacement availability (alpha-engine-config#7536) ────────────
+
+
+_SF_KEY_PREFIX = "_sf_completion/ne-weekly-freshness-pipeline"
+
+
+def _sf_route(cycle: str, status: str, wrapped: bool = True):
+    """One `_sf_completion` record. Real records are DOUBLE-encoded — the body
+    is a JSON string containing the JSON object — so the fixture is too."""
+    payload = {"sf": "ne-weekly-freshness-pipeline", "status": status,
+               "cycle_key": cycle}
+    return {f"{_SF_KEY_PREFIX}/{cycle}.json": (
+        "json", json.dumps(payload) if wrapped else payload)}
+
+
+def _collapse_routes(target="2026-04-15"):
+    """Prediction routes that force a chronic confidence_collapse on `target`."""
+    return _conf_routes(target, lambda o: 0.05 if o < 5 else 0.20)
+
+
+def _degenerate_alpha_routes(target="2026-04-15"):
+    routes = {}
+    t = date.fromisoformat(target)
+    for offset in range(25):
+        d = (t - timedelta(days=offset)).isoformat()
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=_MIXED_DIRECTIONS, confidences=[0.15] * 21,
+            alphas=[0.05] * 21, n=21))  # zero stdev
+    return routes
+
+
+def test_fresh_training_keeps_the_champion_replacement_prescription():
+    # 2026-04-11 is the Saturday on/before 2026-04-15.
+    routes = {**_collapse_routes(), **_sf_route("2026-04-11", "SUCCEEDED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc, "expected a confidence_collapse alert"
+    assert "champion replacement (the challenger pipeline)" in cc[0]["action"]
+    assert cc[0]["champion_remedy_available"] is True
+    assert cc[0]["last_successful_training_cycle"] == "2026-04-11"
+
+
+def test_stale_training_names_the_pipeline_instead_of_prescribing_into_it():
+    """The 2026-08-08..08-12 shape: the weekly SF has not completed, so the
+    remedy the alert would prescribe cannot run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "FAILED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc
+    action = cc[0]["action"]
+    assert "do NOT reach for champion replacement" in action
+    assert "ne-weekly-freshness-pipeline" in action
+    assert "champion replacement (the challenger pipeline), not an" not in action
+    assert cc[0]["champion_remedy_available"] is False
+
+
+def test_one_missed_cycle_is_not_yet_stale():
+    """Staleness is two missed cycles, not one — a single failed Saturday is a
+    miss, and the remedy is still reachable on the next run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "SUCCEEDED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is True
+    assert cc[0]["last_successful_training_cycle"] == "2026-04-04"
+
+
+def test_no_completion_records_at_all_reads_as_stale():
+    """Absence is not health. With no SUCCEEDED cycle in the lookback the alert
+    must not prescribe the remedy."""
+    alerts = check_prediction_drift(
+        _s3_with_routes(_collapse_routes()), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is False
+    assert "no SUCCEEDED cycle" in cc[0]["action"]
+    assert cc[0]["last_successful_training_cycle"] is None
+
+
+def test_degraded_status_does_not_count_as_a_successful_cycle():
+    """A DEGRADED terminal is a real weekly-SF outcome (2026-08-13). It is not
+    SUCCEEDED, so it cannot vouch for champion replacement having run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "DEGRADED"),
+              **_sf_route("2026-04-04", "DEGRADED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is False
+
+
+def test_every_alert_prescribing_champion_replacement_consults_freshness():
+    """Not just confidence_collapse — persistent clustering and alpha
+    degeneration carry the same prescription and must not disagree with it."""
+    routes = {}
+    t = date.fromisoformat("2026-04-15")
+    for offset in range(25):
+        d = (t - timedelta(days=offset)).isoformat()
+        # All-UP (clustering) AND constant alpha (degeneration) on every day.
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=["UP"] * 21, confidences=[0.15] * 21,
+            alphas=[0.05] * 21, n=21))
+    routes.update(_sf_route("2026-04-11", "FAILED"))
+    routes.update(_sf_route("2026-04-04", "FAILED"))
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    codes = _codes(alerts)
+    assert "persistent_direction_clustering" in codes
+    assert "alpha_degeneration" in codes
+    for a in alerts:
+        if a["code"] in ("persistent_direction_clustering", "alpha_degeneration"):
+            assert a["champion_remedy_available"] is False
+            assert "do NOT reach for champion replacement" in a["action"]
+
+
+def test_double_encoded_completion_record_is_unwrapped():
+    """The live records are a JSON string containing JSON. Reading `.get()` off
+    the undecoded string returns nothing and raises nothing — a freshness check
+    that silently always-passes. Pin the unwrap."""
+    from monitoring.drift_detector import _load_json_maybe_wrapped
+
+    wrapped = _s3_with_routes(_sf_route("2026-04-11", "SUCCEEDED", wrapped=True))
+    got = _load_json_maybe_wrapped(
+        wrapped, "bucket", f"{_SF_KEY_PREFIX}/2026-04-11.json")
+    assert isinstance(got, dict) and got["status"] == "SUCCEEDED"
+
+    # A plain (non-wrapped) object must still work.
+    plain = _s3_with_routes(_sf_route("2026-04-11", "SUCCEEDED", wrapped=False))
+    got = _load_json_maybe_wrapped(
+        plain, "bucket", f"{_SF_KEY_PREFIX}/2026-04-11.json")
+    assert isinstance(got, dict) and got["status"] == "SUCCEEDED"
+
+
+def test_acute_confidence_drop_keeps_its_own_remedy():
+    """An acute drop points at today's served model, not at champion
+    replacement — the substitution must not leak into unrelated actions."""
+    routes = {**_conf_routes("2026-04-15", lambda o: 0.05 if o == 0 else 0.20),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "FAILED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["trend"] == "acute"
+    assert "served model" in cc[0]["action"]
+    assert "do NOT reach for champion replacement" not in cc[0]["action"]

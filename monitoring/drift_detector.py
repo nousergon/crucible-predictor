@@ -15,6 +15,16 @@ threshold and the distance between them, a TREND (chronic vs acute, derived from
 the recent-days window), a plain-language likely-cause, and a recommended
 action.
 
+Three of those actions prescribe champion replacement, which runs through
+``PredictorTraining`` on ``ne-weekly-freshness-pipeline``. This module therefore
+reads ONE external fact beyond the predictions themselves: the most recent
+SUCCEEDED cycle of that pipeline, from
+``s3://<bucket>/_sf_completion/ne-weekly-freshness-pipeline/{cycle_key}.json``
+(per-key GET, no listing, no Step Functions API — see
+``_last_successful_weekly_cycle``). When it is stale the alert names the stale
+pipeline instead of prescribing a lever that is disconnected
+(alpha-engine-config#7536).
+
 Usage:
     python -m monitoring.drift_detector                    # check today
     python -m monitoring.drift_detector --date 2026-04-03  # check specific date
@@ -66,6 +76,15 @@ CONFIDENCE_RELATIVE_DROP = 0.50       # today below this fraction of its own bas
 CONFIDENCE_BASELINE_MIN_DAYS = 10     # trading days of history the baseline needs
 CONFIDENCE_BASELINE_MAX_DAYS = 30     # trading days the baseline is computed over
 CONFIDENCE_BASELINE_LOOKBACK_DAYS = 45  # calendar days scanned to find them
+
+# ── Champion-replacement availability ─────────────────────────────────────────
+# Three of this module's alerts prescribe promoting a challenger or reverting to
+# a known-good champion. All three run through PredictorTraining on the weekly
+# freshness pipeline, so when that pipeline is down the prescription points at a
+# disconnected lever (alpha-engine-config#7536).
+WEEKLY_SF_NAME = "ne-weekly-freshness-pipeline"
+TRAINING_STALE_CYCLES = 2      # cycles without a SUCCEEDED run ⇒ remedy unavailable
+TRAINING_LOOKBACK_CYCLES = 6   # weekly cycles probed before giving up
 
 # ── Severity model ────────────────────────────────────────────────────────────
 # A small, explicit ladder so the most urgent finding can set the SNS subject and
@@ -127,6 +146,87 @@ def _load_json(s3, bucket: str, key: str) -> dict | None:
         return None
 
 
+def _load_json_maybe_wrapped(s3, bucket: str, key: str) -> dict | None:
+    """``_load_json`` plus one unwrap of a JSON-string-inside-JSON body.
+
+    The ``_sf_completion/`` records are written double-encoded — the object body
+    is a JSON *string* whose content is the JSON object. Decoding once yields a
+    ``str``, and reading ``.get("status")`` off that silently yields nothing
+    rather than raising, which is exactly how a freshness check turns into a
+    permanent quiet pass. Unwrap explicitly, once, and return None on anything
+    that is still not a mapping."""
+    data = _load_json(s3, bucket, key)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except (ValueError, TypeError):
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _last_successful_weekly_cycle(
+    s3, bucket: str, target: date,
+) -> tuple[str, int] | None:
+    """(cycle_key, cycles_ago) of the most recent SUCCEEDED weekly-freshness run,
+    or None if none of the recent cycles succeeded.
+
+    Champion replacement runs through ``PredictorTraining`` on
+    ``ne-weekly-freshness-pipeline``, so "can the prescribed remedy run today"
+    reduces to "has that pipeline completed recently". The pipeline stamps a
+    per-cycle completion record keyed by its Saturday ``cycle_key``; this reads
+    those by constructed key — the same GET-and-tolerate-404 shape the
+    predictions window above uses — rather than listing the prefix or querying
+    Step Functions directly. That choice is deliberate: the executions API would
+    couple a monitoring Lambda to Step Functions IAM for a fact already sitting
+    in the bucket it reads, and a per-key GET needs no new permission at all.
+
+    ``cycles_ago`` counts weekly cycles, not days, because staleness here is a
+    property of the pipeline's own cadence: one missed Saturday is a miss, two
+    is a standing outage.
+    """
+    # Most recent Saturday at or before the target (weekday(): Mon=0 … Sat=5).
+    last_saturday = target - timedelta(days=(target.weekday() - 5) % 7)
+    for cycles_ago in range(TRAINING_LOOKBACK_CYCLES):
+        cycle = last_saturday - timedelta(weeks=cycles_ago)
+        rec = _load_json_maybe_wrapped(
+            s3, bucket,
+            f"_sf_completion/{WEEKLY_SF_NAME}/{cycle.isoformat()}.json",
+        )
+        if rec and rec.get("status") == "SUCCEEDED":
+            return cycle.isoformat(), cycles_ago
+    return None
+
+
+def _champion_remedy(
+    training: tuple[str, int] | None, checked_cycles: int,
+) -> tuple[str, bool]:
+    """(action text, remedy_available) for an alert prescribing champion replacement.
+
+    When the pipeline that performs champion replacement has not completed
+    recently, the alert names THAT instead of prescribing a lever that is
+    disconnected. An advisory whose remedy cannot run is worse than one with no
+    remedy: it converts operator attention into wasted motion and reads as
+    though someone checked. Live during the 2026-08-08..08-12 outage
+    (alpha-engine-config#6949), when the weekly SF failed 11 consecutive times
+    while the drift alert kept pointing at the challenger pipeline.
+    """
+    if training is not None and training[1] < TRAINING_STALE_CYCLES:
+        return (
+            "resolve via champion replacement (the challenger pipeline), not an "
+            "inference hotfix; advisory — does not halt trading"
+        ), True
+    if training is None:
+        seen = (f"no SUCCEEDED cycle in the last {checked_cycles} weekly cycles")
+    else:
+        seen = f"last SUCCEEDED cycle was {training[0]}, {training[1]} cycles ago"
+    return (
+        f"do NOT reach for champion replacement yet — {WEEKLY_SF_NAME} is stale "
+        f"({seen}), and champion promotion runs through its PredictorTraining "
+        f"stage. Fix the pipeline first; this alert cannot be resolved by the "
+        f"remedy it would otherwise prescribe."
+    ), False
+
+
 def _daily_confidence_means(recent_preds: list[dict]) -> list[tuple[str, float]]:
     """Per-day mean ``prediction_confidence`` over the recent-days window
     (most-recent-first), skipping days with no confidence values."""
@@ -165,6 +265,19 @@ def check_prediction_drift(
         if len(window_preds) >= CONFIDENCE_BASELINE_MAX_DAYS:
             break
     recent_preds = window_preds[:5]
+
+    # Resolved once: is the pipeline that performs champion replacement up?
+    # Every alert below that prescribes promoting a challenger consults this,
+    # so a single outage cannot leave one alert honest and two prescribing into
+    # it (alpha-engine-config#7536).
+    _training = _last_successful_weekly_cycle(s3, bucket, target)
+    champion_action, champion_remedy_available = _champion_remedy(
+        _training, TRAINING_LOOKBACK_CYCLES,
+    )
+    training_ctx = {
+        "champion_remedy_available": champion_remedy_available,
+        "last_successful_training_cycle": _training[0] if _training else None,
+    }
 
     if not recent_preds:
         alerts.append(_alert(
@@ -238,10 +351,11 @@ def check_prediction_drift(
                         f"{DIRECTION_CLUSTER_THRESHOLD:.0%} same-direction floor"),
                 cause="the model has collapsed to a one-directional view — it has lost "
                       "cross-sectional signal, so its rankings carry no usable alpha",
-                action="treat the model as degenerate; promote a healthy challenger or revert "
-                       "to a known-good champion",
+                action=(("treat the model as degenerate; " + champion_action)
+                        if champion_remedy_available else champion_action),
                 consecutive_days=consecutive_clustered,
                 date=date_str,
+                **training_ctx,
             ))
 
     # ── Confidence checks ────────────────────────────────────────────────────
@@ -320,8 +434,7 @@ def check_prediction_drift(
                     cause = ("conviction has been sitting well under this book's own recent norm "
                              "for days — a standing model-quality condition, NOT a same-day "
                              "regression")
-                    action = ("resolve via champion replacement (the challenger pipeline), not an "
-                              "inference hotfix; advisory — does not halt trading")
+                    action = champion_action
                 elif trend == "acute":
                     cause = ("a sudden drop from a healthy recent baseline — points at today's "
                              "served-model version or feature inputs, not a slow decay")
@@ -349,6 +462,7 @@ def check_prediction_drift(
                     trend=trend,
                     recent_daily_means=[round(m, 3) for _, m in daily],
                     date=date_str,
+                    **training_ctx,
                 ))
 
     # Alpha degeneration — predictions nearly constant ⇒ no cross-sectional signal.
@@ -365,11 +479,13 @@ def check_prediction_drift(
                         f"— predictions are nearly constant across the universe"),
                 cause="the model emits a near-identical alpha for every name — there is no "
                       "cross-sectional ranking signal left to size on",
-                action="treat as degenerate; investigate the meta-model output and promote/revert "
-                       "to a healthy model",
+                action=(("treat as degenerate; investigate the meta-model output, then "
+                         + champion_action)
+                        if champion_remedy_available else champion_action),
                 value=round(alpha_std, 6),
                 threshold=ALPHA_MIN_STDEV,
                 date=date_str,
+                **training_ctx,
             ))
 
     return alerts
