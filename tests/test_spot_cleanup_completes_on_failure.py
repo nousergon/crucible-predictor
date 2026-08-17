@@ -161,6 +161,16 @@ def _run_cleanup(
     heartbeat_stop_text = _function_text(source, "_heartbeat_stop") or (
         "_heartbeat_stop() { :; }"
     )
+    # alpha-engine-config-I7442: `cleanup()` in BOTH launchers now calls
+    # `spot_common_teardown_staging`, defined once in `_spot_common.sh`.
+    # `spot_train.sh` relies on the sourced copy rather than defining its
+    # own, so it must be lifted here too or the harness's `cleanup` trap
+    # hits "command not found" under `set -euo pipefail` — exactly the
+    # silent-abort-inside-the-EXIT-trap class this file's own docstring
+    # pins for `relaunch-decision`.
+    common_source = (_INFRA / "_spot_common.sh").read_text()
+    teardown_text = _function_text(common_source, "spot_common_teardown_staging")
+    assert teardown_text, "_spot_common.sh: no spot_common_teardown_staging() to lift"
 
     harness = tmp_path / "harness.sh"
     harness.write_text(
@@ -169,6 +179,7 @@ def _run_cleanup(
         "set -euo pipefail\n"
         "_HEARTBEAT_PID=\"\"\n"
         f"{heartbeat_stop_text}\n"
+        f"{teardown_text}\n"
         f"{cleanup_text}\n"
         "S3_BUCKET=test-bucket\n"
         "AWS_REGION=us-east-1\n"
