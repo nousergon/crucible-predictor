@@ -149,17 +149,32 @@ class TestTeardownGoesThroughTheChokepoint:
         )
 
 
-class TestTheOperatorIsToldWhereToLook:
-    def test_the_resource_limit_reaches_the_dispatcher(self, body):
-        """sf-pipeline-policy §3 obligation 3 -- name the limit, not only the
-        classification. The dispatcher knows its own executionTimeout; only the
-        launcher knows which instance types the stage was allowed."""
-        assert re.search(r"--resource-limit\s+\"instance-types=", body)
+class TestTheResourceLimitFlagWaitsForThePinBump:
+    """`--resource-limit` is deliberately ABSENT, and that is load-bearing.
 
-    def test_spot_train_also_carries_the_resource_limit(self):
-        source = SPOT_TRAIN.read_text(encoding="utf-8")
-        assert re.search(r"--resource-limit\s+\"instance-types=", source), (
-            "spot_train.sh keeps its own run_ssm() (it does not adopt "
-            "_spot_common.sh's) so the resource-limit flag must be added "
-            "there too, not only in the shared file"
+    It is a NEW `krepis.ssm_dispatcher` flag (krepis-PR161). `$LIB_PYTHON` is
+    the dispatch box's venv, pinned to a krepis release that predates it, so
+    argparse would reject the unknown flag and EVERY SSM step would fail on
+    merge — in exactly the window before the pin bump. `krepis.spot_evidence`
+    degrades safely when absent (the teardown retains); this flag has no safe
+    degradation at all.
+
+    It lands with the pin bump, `alpha-engine-config-I7556`. Until then this
+    test is what stops it being reintroduced by someone reading
+    sf-pipeline-policy §3 obligation 3 and adding the obvious line.
+    """
+
+    def test_no_launcher_passes_the_flag_yet(self):
+        offenders = []
+        for path in sorted(INFRA.glob("*.sh")):
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.strip().startswith("#"):
+                    continue
+                if "--resource-limit" in line:
+                    offenders.append(f"{path.name}:{n}")
+        assert not offenders, (
+            "--resource-limit is passed to krepis.ssm_dispatcher before the "
+            "dispatch box's krepis pin ships it (alpha-engine-config-I7556). "
+            "An unknown argparse flag fails EVERY SSM step: "
+            + ", ".join(offenders)
         )
