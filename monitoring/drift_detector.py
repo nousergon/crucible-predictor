@@ -38,9 +38,34 @@ DEFAULT_BUCKET = "alpha-engine-research"
 
 # Thresholds
 DIRECTION_CLUSTER_THRESHOLD = 0.80  # >80% same direction = degenerate
-CONFIDENCE_MIN_MEAN = 0.45         # Mean confidence below this = collapsed model
 ALPHA_MIN_STDEV = 0.001            # Alpha stdev below this = degenerate
 CONSECUTIVE_DAYS_THRESHOLD = 3     # Direction clustering must persist N days
+
+# ── Confidence checks ─────────────────────────────────────────────────────────
+# ``prediction_confidence`` semantics since 2026-05-12 (PR #143, ROADMAP L1615):
+#
+#     prediction_confidence = |p_up - 0.5| * 2   ∈ [0, 1],  0 == coin-flip
+#
+# It is a DISTANCE FROM COIN-FLIP, not a winner-class probability. The previous
+# convention was ``max(p_up, p_down)`` ∈ [0.5, 1.0]; the two map linearly via
+# ``new = (old - 0.5) * 2``. The absolute floor this module used to carry
+# (``CONFIDENCE_MIN_MEAN = 0.45``) was authored against the pre-2026-04-15
+# 3-class max-class-probability convention and was never rescaled, so from
+# 2026-05-12 it sat above every value the predictor can realistically emit and
+# fired CRITICAL every single day (alpha-engine-config#6952, #6850, #5986).
+#
+# An absolute floor is the wrong instrument regardless of its value: the mean
+# distance-from-coin-flip of a calibrated daily-direction book is a property of
+# the calibration convention and the market, not of model health — a genuinely
+# healthy book sits near 0.1–0.2. What IS a health signal is (a) the batch
+# collapsing onto p_up ≡ 0.5 exactly, and (b) today's conviction falling far
+# below the book's OWN recent norm. Both are scale-free, so neither silently
+# inverts the next time the confidence convention changes.
+CONFIDENCE_DEGENERATE_MEAN = 0.01     # mean at/below this ⇒ p_up ≡ 0.5 ⇒ no signal
+CONFIDENCE_RELATIVE_DROP = 0.50       # today below this fraction of its own baseline
+CONFIDENCE_BASELINE_MIN_DAYS = 10     # trading days of history the baseline needs
+CONFIDENCE_BASELINE_MAX_DAYS = 30     # trading days the baseline is computed over
+CONFIDENCE_BASELINE_LOOKBACK_DAYS = 45  # calendar days scanned to find them
 
 # ── Severity model ────────────────────────────────────────────────────────────
 # A small, explicit ladder so the most urgent finding can set the SNS subject and
@@ -114,23 +139,32 @@ def _daily_confidence_means(recent_preds: list[dict]) -> list[tuple[str, float]]
     return out
 
 
-def check_prediction_drift(s3, bucket: str, date_str: str) -> list[dict]:
+def check_prediction_drift(
+    s3, bucket: str, date_str: str, skipped: list[dict] | None = None,
+) -> list[dict]:
     """Check prediction distribution patterns for degenerate model behavior.
 
-    Returns a list of structured alert dicts (see ``_alert``)."""
+    Returns a list of structured alert dicts (see ``_alert``). When ``skipped``
+    is supplied, checks that could not RUN (as distinct from checks that ran and
+    found nothing) append a record to it — a check with no verdict is reported
+    as absent rather than silently counted as healthy."""
     alerts: list[dict] = []
 
-    # Load recent predictions (up to 5 trading days)
+    # Load recent predictions. The clustering + degeneracy checks read the most
+    # recent 5 trading days; the confidence baseline reads the whole window
+    # (``CONFIDENCE_BASELINE_MAX_DAYS`` trading days) so today's conviction is
+    # judged against the book's own recent norm rather than a fixed constant.
     target = date.fromisoformat(date_str)
-    recent_preds = []
-    for offset in range(7):  # Scan 7 calendar days to find 5 trading days
+    window_preds: list[dict] = []
+    for offset in range(CONFIDENCE_BASELINE_LOOKBACK_DAYS):
         d = (target - timedelta(days=offset)).isoformat()
         data = _load_json(s3, bucket, f"predictor/predictions/{d}.json")
         if data and "predictions" in data:
             preds = data["predictions"]
-            recent_preds.append({"date": d, "predictions": preds})
-        if len(recent_preds) >= 5:
+            window_preds.append({"date": d, "predictions": preds})
+        if len(window_preds) >= CONFIDENCE_BASELINE_MAX_DAYS:
             break
+    recent_preds = window_preds[:5]
 
     if not recent_preds:
         alerts.append(_alert(
@@ -210,64 +244,112 @@ def check_prediction_drift(s3, bucket: str, date_str: str) -> list[dict]:
                 date=date_str,
             ))
 
-    # Confidence collapse — with chronic-vs-acute trend so severity reflects
-    # whether this is a standing weak-model condition or a sudden break.
-    confidences = [p.get("prediction_confidence", 0.5) for p in today
+    # ── Confidence checks ────────────────────────────────────────────────────
+    # Two checks, both scale-free (see the CONFIDENCE_* block at module top for
+    # why the retired absolute floor was neither):
+    #   1. DEGENERATE — the batch mean sits at coin-flip, i.e. p_up ≡ 0.5 and
+    #      there is no directional signal to size on at all. Absolute, but it is
+    #      an identity (0 == no edge) rather than a tuned level, so it stays
+    #      correct under any monotone re-parameterisation of confidence.
+    #   2. RELATIVE DROP — today's mean is far below the book's own trailing
+    #      median. This is what "the model got worse" actually looks like.
+    confidences = [p["prediction_confidence"] for p in today
                    if p.get("prediction_confidence") is not None]
     if confidences:
         mean_conf = float(np.mean(confidences))
-        if mean_conf < CONFIDENCE_MIN_MEAN:
-            deficit = (CONFIDENCE_MIN_MEAN - mean_conf) / CONFIDENCE_MIN_MEAN
-            daily = _daily_confidence_means(recent_preds)
-            days_below = sum(1 for _, m in daily if m < CONFIDENCE_MIN_MEAN)
-            n_days = len(daily)
-            lo = min((m for _, m in daily), default=mean_conf)
-            hi = max((m for _, m in daily), default=mean_conf)
+        daily = _daily_confidence_means(recent_preds)
+        baseline_daily = _daily_confidence_means(window_preds)
+        # Baseline excludes today so a collapsed today cannot lower the bar it
+        # is being judged against.
+        prior_means = [m for _, m in baseline_daily[1:]]
 
-            # chronic = below the floor on most of the recent window; acute = only
-            # today is below while the prior days sat above (a fresh collapse).
-            if n_days >= CONSECUTIVE_DAYS_THRESHOLD and days_below >= CONSECUTIVE_DAYS_THRESHOLD:
-                trend, trend_word = "chronic", "CHRONIC"
-            elif n_days >= 2 and days_below == 1 and daily[0][1] < CONFIDENCE_MIN_MEAN:
-                trend, trend_word = "acute", "ACUTE"
-            else:
-                trend, trend_word = "indeterminate", "trend-indeterminate"
-
-            # A sudden collapse, or confidence under half the floor, is CRITICAL;
-            # a standing chronic shortfall is an advisory WARN (model-quality, not
-            # a same-day break).
-            severity = CRITICAL if (trend == "acute" or mean_conf < 0.5 * CONFIDENCE_MIN_MEAN) else WARN
-
-            trend_detail = (f"below floor {days_below}/{n_days} recent days "
-                            f"(range {lo:.3f}–{hi:.3f})") if n_days else "no recent history"
-            if trend == "chronic":
-                cause = ("a low-IC champion producing low-conviction predictions — a standing "
-                         "model-quality condition, NOT a same-day regression")
-                action = ("resolve via champion replacement (the challenger pipeline), not an "
-                          "inference hotfix; advisory — does not halt trading")
-            elif trend == "acute":
-                cause = ("a sudden drop from a healthy recent baseline — points at today's "
-                         "served-model version or feature inputs, not a slow decay")
-                action = ("check today's served model + inference feature inputs for a regression")
-            else:
-                cause = "low mean conviction; insufficient recent history to call chronic vs acute"
-                action = "watch the next few days to classify; check served-model health"
-
+        if mean_conf <= CONFIDENCE_DEGENERATE_MEAN:
             alerts.append(_alert(
-                code="confidence_collapse",
-                severity=severity,
-                headline="Confidence collapse",
-                detail=(f"mean prediction confidence {mean_conf:.3f} is {deficit:.0%} below the "
-                        f"{CONFIDENCE_MIN_MEAN} floor — {trend_word} ({trend_detail})"),
-                cause=cause,
-                action=action,
-                value=round(mean_conf, 3),
-                threshold=CONFIDENCE_MIN_MEAN,
-                pct_below_threshold=round(deficit, 3),
-                trend=trend,
-                recent_daily_means=[round(m, 3) for _, m in daily],
+                code="confidence_degenerate",
+                severity=CRITICAL,
+                headline="Confidence degenerate",
+                detail=(f"mean prediction confidence {mean_conf:.4f} is at coin-flip "
+                        f"(<= {CONFIDENCE_DEGENERATE_MEAN}) — confidence is |p_up-0.5|*2, so "
+                        f"the calibrator is mapping essentially every name to p_up = 0.5"),
+                cause="the calibrator or the meta-model has collapsed — the batch carries no "
+                      "directional edge, so nothing downstream can rank or size on it",
+                action="check the served calibrator + meta-model artifacts for today's run; this "
+                       "is an inference-side failure, not a slow model-quality decay",
+                value=round(mean_conf, 4),
+                threshold=CONFIDENCE_DEGENERATE_MEAN,
                 date=date_str,
             ))
+        elif len(prior_means) < CONFIDENCE_BASELINE_MIN_DAYS:
+            # Not enough history to say whether today is low FOR THIS BOOK. Record
+            # the absence rather than passing silently — an unrun check is not a
+            # clean check.
+            if skipped is not None:
+                skipped.append({
+                    "check": "confidence_relative_drop",
+                    "severity": INFO,
+                    "reason": (f"{len(prior_means)} prior trading days of predictions in the "
+                               f"{CONFIDENCE_BASELINE_LOOKBACK_DAYS}-day lookback; the baseline "
+                               f"needs {CONFIDENCE_BASELINE_MIN_DAYS}"),
+                    "value": round(mean_conf, 4),
+                    "date": date_str,
+                })
+        else:
+            baseline = float(np.median(prior_means))
+            bar = baseline * CONFIDENCE_RELATIVE_DROP
+            if baseline > 0 and mean_conf < bar:
+                deficit = (baseline - mean_conf) / baseline
+                n_days = len(daily)
+                days_below = sum(1 for _, m in daily if m < bar)
+                lo = min((m for _, m in daily), default=mean_conf)
+                hi = max((m for _, m in daily), default=mean_conf)
+
+                # chronic = the recent window has been below the bar for days;
+                # acute = only today dropped while the prior days held up.
+                if n_days >= CONSECUTIVE_DAYS_THRESHOLD and days_below >= CONSECUTIVE_DAYS_THRESHOLD:
+                    trend, trend_word = "chronic", "CHRONIC"
+                elif n_days >= 2 and days_below == 1 and daily[0][1] < bar:
+                    trend, trend_word = "acute", "ACUTE"
+                else:
+                    trend, trend_word = "indeterminate", "trend-indeterminate"
+
+                severity = CRITICAL if trend == "acute" else WARN
+
+                trend_detail = (f"below the bar {days_below}/{n_days} recent days "
+                                f"(range {lo:.3f}–{hi:.3f})") if n_days else "no recent history"
+                if trend == "chronic":
+                    cause = ("conviction has been sitting well under this book's own recent norm "
+                             "for days — a standing model-quality condition, NOT a same-day "
+                             "regression")
+                    action = ("resolve via champion replacement (the challenger pipeline), not an "
+                              "inference hotfix; advisory — does not halt trading")
+                elif trend == "acute":
+                    cause = ("a sudden drop from a healthy recent baseline — points at today's "
+                             "served-model version or feature inputs, not a slow decay")
+                    action = ("check today's served model + inference feature inputs for a regression")
+                else:
+                    cause = "conviction below the trailing baseline; too little recent history to "\
+                            "call chronic vs acute"
+                    action = "watch the next few days to classify; check served-model health"
+
+                alerts.append(_alert(
+                    code="confidence_collapse",
+                    severity=severity,
+                    headline="Confidence collapse",
+                    detail=(f"mean prediction confidence {mean_conf:.3f} is {deficit:.0%} below "
+                            f"this book's own {len(prior_means)}-day median of {baseline:.3f} "
+                            f"(bar {bar:.3f} = {CONFIDENCE_RELATIVE_DROP:.0%} of it) — "
+                            f"{trend_word} ({trend_detail})"),
+                    cause=cause,
+                    action=action,
+                    value=round(mean_conf, 3),
+                    threshold=round(bar, 3),
+                    baseline=round(baseline, 3),
+                    baseline_days=len(prior_means),
+                    pct_below_threshold=round(deficit, 3),
+                    trend=trend,
+                    recent_daily_means=[round(m, 3) for _, m in daily],
+                    date=date_str,
+                ))
 
     # Alpha degeneration — predictions nearly constant ⇒ no cross-sectional signal.
     alphas = [p.get("predicted_alpha", 0.0) for p in today
@@ -317,9 +399,11 @@ def check_drift(
     Backward-compatible: ``alerts`` remains a ``list[str]`` (each a rich,
     self-describing line). New additive fields: ``severity`` (overall max, or
     None when clean), ``alert_details`` (the structured dicts), and
-    ``skipped_checks`` (retained in the output shape for compatibility; always
-    empty now that the only check this producer runs is prediction drift,
-    which never conditionally skips).
+    ``skipped_checks`` — checks that could not RUN today (currently only the
+    confidence relative-drop check, which needs a trailing baseline before it
+    has a verdict). A skipped check does NOT raise ``status`` to ``alert`` or
+    contribute to ``severity``: it is not a finding. It is recorded so an
+    absent verdict reads as absent rather than as a clean bill of health.
 
     ``date_str=None`` defaults to ``last_closed_trading_day()`` (NYSE-aware,
     NOT ``date.today()``) — alpha-engine-config-I2722 (2026-07-16): this
@@ -343,8 +427,8 @@ def check_drift(
         date_str = last_closed_trading_day().isoformat()
 
     details: list[dict] = []
-    details.extend(check_prediction_drift(s3, bucket, date_str))
     skipped: list[dict] = []
+    details.extend(check_prediction_drift(s3, bucket, date_str, skipped))
 
     overall_severity = _max_severity([d["severity"] for d in details])
     status = "ok" if not details else "alert"
