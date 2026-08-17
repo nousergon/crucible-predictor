@@ -101,7 +101,8 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter (alpha-engine-config-I7380)" >&2; exit 1; }
+PY=python3.12
 cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
@@ -164,7 +165,8 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter (alpha-engine-config-I7380)" >&2; exit 1; }
+PY=python3.12
 cat > /tmp/spot-model-zoo-select.py <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')

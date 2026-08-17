@@ -93,13 +93,14 @@ _CLONE_HOME_EC2_USER = re.compile(r"git\s+clone\b[^\n]*/home/ec2-user/")
 #: reference helper it reuses). Every path here must be one this test found
 #: BEFORE the carve-out was added, verified against a filed issue — never
 #: added speculatively.
-_KNOWN_LIVE_LAUNCHER_GAP = frozenset(
-    {
-        "infrastructure/spot_predictor_training.sh",
-        "infrastructure/spot_model_zoo_select.sh",
-        "infrastructure/spot_train_spec_dispatch.sh",
-    }
-)
+#: EMPTY as of alpha-engine-config-I7380 (2026-08-17). The three live
+#: launchers it named — spot_predictor_training.sh, spot_model_zoo_select.sh,
+#: spot_train_spec_dispatch.sh, five sites between them — now carry the strict
+#: `command -v python3.12 || exit 1` guard, so the carve-out shrank to empty
+#: exactly as its own stale-exemption assertion below requires. It must never
+#: grow again: a new entry means a live SSM step is resolving requirements.txt
+#: against whatever `python3` happens to mean on the AMI.
+_KNOWN_LIVE_LAUNCHER_GAP: frozenset[str] = frozenset()
 
 
 def _shell_files() -> list[Path]:
