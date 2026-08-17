@@ -298,7 +298,15 @@ if __name__ == "__main__":
         # Stub output
         _wo.write_predictions = lambda *a, **k: log.info("[OFFLINE] Skipped S3 write")
         _wo.send_predictor_email = lambda *a, **k: log.info("[OFFLINE] Skipped email")
-        _wo.get_veto_threshold = lambda *a, **k: 0.65
+        # Veto threshold: read the config default rather than a literal. The
+        # literal here was 0.65 — the pre-2026-05-12 winner-probability value,
+        # left behind when PR #143 flipped confidence to |p_up - 0.5| * 2 and
+        # rescaled the live gate to 0.30. On the live axis 0.65 means "veto only
+        # names at mean p_up >= 0.825", i.e. effectively no veto at all, so
+        # OFFLINE runs were exercising a veto configuration production has never
+        # used and could not have caught a veto regression. Sourcing the value
+        # instead of restating it means the next rescale reaches this stub too.
+        _wo.get_veto_threshold = lambda *a, **k: cfg.MIN_CONFIDENCE
 
         # Stub health write
         try:
