@@ -1135,9 +1135,19 @@ def run(ctx: PipelineContext) -> None:
     # candidates. 2026-05-11 incident: 15 of 30 vetos fired with mean
     # DOWN confidence 0.749; 8 of 28 research ENTERs blocked via predictor.
     #
-    # The threshold is regime-adapted via ``get_veto_threshold`` (bull +0.05,
-    # bear -0.10, …), sourced from ``config/predictor_params.json``'s
-    # ``veto_confidence`` field with ``cfg.MIN_CONFIDENCE`` (0.65) fallback.
+    # The threshold is regime-adapted via ``get_veto_threshold`` (bullish +0.10,
+    # bear -0.20, neutral 0.00 — the post-2026-05-12 doubled table, see that
+    # function's docstring), sourced from ``config/predictor_params.json``'s
+    # ``veto_confidence`` field with ``cfg.MIN_CONFIDENCE`` (0.30) fallback.
+    # The fallback is the live path today, by design rather than by breakage:
+    # ``config/predictor_params.json`` is absent because the params assembler
+    # has promoted nothing (``config/predictor_params/assembled/latest.json``
+    # reports ``status: all_skip``, ``base_was_present: false`` — every
+    # veto_analysis recommendation so far carries ``promotion_intent: skip``).
+    # So every run resolves to the config default. Measured 2026-08-17.
+    # The values above were stale — +0.05 / -0.10 / 0.65 are the pre-2026-05-12
+    # winner-probability table and gate, which PR #143 rescaled via
+    # ``new = (old - 0.5) * 2``.
     # Prior to this change the ``veto_thresh`` value was computed but only
     # consumed for the ``n_high_confidence`` metric — dead code w.r.t. the
     # actual veto decision.
