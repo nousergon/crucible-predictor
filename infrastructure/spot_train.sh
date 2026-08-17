@@ -480,8 +480,16 @@ cleanup() {
 
   echo "==> Terminating spot instance $INSTANCE_ID..."
   aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-  aws s3 rm "$S3_STAGING" --recursive --quiet 2>/dev/null || true
-  echo "  Instance terminated; S3 staging cleaned."
+  # alpha-engine-config-I7442: this file provisions its own un-prefixed
+  # S3_STAGING (see the `source _spot_common.sh` header comment above for why
+  # this monolith keeps its own cleanup() rather than adopting the shared
+  # one wholesale) — bridge it into _spot_common.sh's `spot_common_teardown_
+  # staging()`, the SAME chokepoint every other launcher in this repo now
+  # goes through, rather than restating its retain-before-delete logic here.
+  # "spot_train" matches this file's own S3_STAGING_PREFIX="tmp/spot_train/..."
+  # above — there is no separate per-substage slug var in this rollback path.
+  _S3_STAGING="$S3_STAGING" _SSM_SLUG="spot_train" spot_common_teardown_staging "$exit_code"
+  echo "  Instance terminated."
 
   # #883 — on a classified reclaim, relaunch a FRESH spot with the SAME argv,
   # threading the incremented SPOT_ATTEMPT via the env. `trap - EXIT` first so the
@@ -588,6 +596,7 @@ run_ssm() {
     --region "$AWS_REGION" \
     --diagnostics-bucket "$S3_BUCKET" \
     --diagnostics-prefix "_spot_diagnostics/ae-predictor" \
+    --resource-limit "instance-types=${INSTANCE_TYPES}" \
     --script-stdin
 }
 

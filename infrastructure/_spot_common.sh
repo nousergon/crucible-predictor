@@ -162,6 +162,7 @@ run_ssm() {
     --region "$AWS_REGION" \
     --diagnostics-bucket "$S3_BUCKET" \
     --diagnostics-prefix "_spot_diagnostics/ae-predictor" \
+    --resource-limit "instance-types=${INSTANCE_TYPES}" \
     --script-stdin
 }
 
@@ -213,6 +214,46 @@ spot_launch() {
   _S3_STAGING="s3://${S3_BUCKET}/${_S3_STAGING_PREFIX}"
 
   echo "  S3 staging: ${_S3_STAGING}/"
+}
+
+# ── Staging teardown (alpha-engine-config-I7442) ────────────────────────────
+# The staging prefix holds the ONLY full copy of a stage's stdout/stderr:
+# run_ssm() points SSM's OutputS3KeyPrefix at ${_S3_STAGING_PREFIX}/ssm-output,
+# and GetCommandInvocation returns just the first 24 KB, so on any long stage
+# the tail — where the failure is — exists nowhere else. Every spot launcher's
+# EXIT trap, including this one, used to run `aws s3 rm "$_S3_STAGING"
+# --recursive` unconditionally on the way out; on 2026-08-15 that destroyed
+# the weekly PredictorBacktest stage's own failure evidence four lines after
+# printing a pointer at it, and the cause is now permanently unrecoverable.
+#
+# `krepis.spot_evidence teardown` is the shared chokepoint (mirrored from
+# crucible-backtester's #675 fix, policy-shared-code — this stays a repo-local
+# sourced call, not a reimplementation): it copies the prefix to
+# `_spot_evidence/<slug>/<date>/<run-id>/` FIRST and deletes staging only if
+# that copy succeeded; on a successful run it deletes with nothing retained.
+# It also sweeps stale tmp/spot_<slug>/ and _spot_evidence/<slug>/ prefixes on
+# every teardown.
+spot_common_teardown_staging() {
+  local _exit_code="$1"
+  if [ -z "${_S3_STAGING:-}" ]; then
+    echo "  Instance terminated; no S3 staging was provisioned."
+    return 0
+  fi
+  if "$LIB_PYTHON" -m krepis.spot_evidence teardown \
+      --staging "$_S3_STAGING" \
+      --slug "$_SSM_SLUG" \
+      --exit-code "$_exit_code"; then
+    return 0
+  fi
+  # The chokepoint is unreachable on this box — a krepis older than the
+  # release carrying `spot_evidence`, or a broken interpreter. RETAIN rather
+  # than fall back to `aws s3 rm`: an unswept prefix is a cost bounded by the
+  # next teardown's sweep, where losing the diagnosis is config-I7442 again.
+  # This is also what makes the merge order safe — this change is correct on
+  # a box whose krepis pin has not yet been bumped.
+  echo "  spot_evidence: chokepoint unavailable via $LIB_PYTHON — S3 staging RETAINED at $_S3_STAGING/ (not deleted)" >&2
+  echo "    Full stage stdout/stderr: $_S3_STAGING/ssm-output/" >&2
+  return 0
 }
 
 # ── Cleanup + spot-reclaim trap ──────────────────────────────────────────────
@@ -293,8 +334,8 @@ cleanup() {
 
   echo "==> Terminating spot instance $_INSTANCE_ID..."
   aws ec2 terminate-instances --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
-  aws s3 rm "$_S3_STAGING" --recursive --quiet 2>/dev/null || true
-  echo "  Instance terminated; S3 staging cleaned."
+  spot_common_teardown_staging "$exit_code"
+  echo "  Instance terminated."
 
   # Relaunch on classified reclaim
   if [ "$_spot_relaunch" = "1" ]; then

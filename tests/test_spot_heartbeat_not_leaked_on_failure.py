@@ -79,12 +79,14 @@ class TestCleanupStopsTheHeartbeat:
 
     def test_it_stops_before_anything_that_can_block(self, script: Path):
         # Ordering is the point. cleanup() then calls `aws ec2 terminate-
-        # instances`, `aws s3 rm`, and (in _spot_common) a spot relaunch
-        # decision — any of which can hang or exit non-zero. A stop placed
-        # after them is not reached on the paths that need it.
+        # instances`, the shared staging teardown (alpha-engine-config-I7442:
+        # `spot_common_teardown_staging`, which replaced the unguarded
+        # `aws s3 rm` this test used to name), and (in _spot_common) a spot
+        # relaunch decision — any of which can hang or exit non-zero. A stop
+        # placed after them is not reached on the paths that need it.
         body = _body_of(script.read_text(encoding="utf-8"), "cleanup")
         stop_at = body.index("_heartbeat_stop")
-        for later in ("terminate-instances", "aws s3 rm", "relaunch-decision"):
+        for later in ("terminate-instances", "spot_common_teardown_staging", "relaunch-decision"):
             if later in body:
                 assert stop_at < body.index(later), (
                     "%s: _heartbeat_stop must precede %r in cleanup()"
