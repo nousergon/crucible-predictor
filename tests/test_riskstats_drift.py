@@ -66,11 +66,18 @@ def test_downside_deviation_matches_the_library(name: str) -> None:
 
 
 def test_it_is_the_n_denominator_not_the_n_down_denominator() -> None:
-    """config-I7271's convention. The two differ by sqrt(n / n_down)."""
+    """config-I7271's convention. The two differ by sqrt(n / n_down).
+
+    The retired side is written out from the definition, NOT asked of the
+    library: config-I7638 deleted the ``"downside"`` branch from
+    ``nousergon_lib.quant.riskstats`` (a call now raises ValueError), and a
+    drift test whose verdict depends on which library version happens to be
+    installed is the drift this file exists to catch.
+    """
     r = CORPUS["mixed"]
     n, n_down = len(r), sum(1 for x in r if x < 0)
     out = downside_ic_stats(r)
-    n_down_variant = riskstats.downside_deviation(r, denominator="downside")
+    n_down_variant = math.sqrt(sum(x * x for x in r if x < 0.0) / n_down)
     assert n_down_variant is not None
     # rel=1e-4: `downside_deviation` is emitted rounded to 6 decimal places,
     # so the ratio of an unrounded value to a rounded one carries that much.
