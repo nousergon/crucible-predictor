@@ -22,6 +22,7 @@ import json
 import math
 
 import pytest
+from nousergon_lib.quant.selftest_perturbation import assert_perturbation_caught
 
 from inference import self_test as st
 from training import self_test_cases as tsc
@@ -373,17 +374,19 @@ def test_a_perturbed_implementation_is_caught(monkeypatch, module_path, attr, pe
     any realistic edit — and asserts the battery goes FAIL. This fleet has shipped
     several detectors that could not fail; this is the standing guard against
     adding another.
+
+    Delegates to the LIFTED helper (alpha-engine-config-I7238/I7262) — the same
+    monkeypatch/rerun/assert-FAIL shape crucible-research's test suite carries
+    independently; both now import one proven-correct implementation from
+    ``nousergon_lib.quant.selftest_perturbation`` instead of each keeping its
+    own copy.
     """
-    import importlib
-
-    module = importlib.import_module(module_path)
-    assert getattr(module, attr) != perturbed, "perturbation is a no-op"
-    monkeypatch.setattr(module, attr, perturbed)
-
-    out = st.run_self_test(run_date="2026-08-15", extra_case_providers=_ALL_SCOPES)
-    assert out["verdict"] == st.FAIL, (
-        f"perturbing {module_path}.{attr} to {perturbed} did not fail the "
-        f"battery — the self-test cannot detect the thing it exists to detect"
+    out = assert_perturbation_caught(
+        monkeypatch,
+        module_path=module_path,
+        attr=attr,
+        perturbed=perturbed,
+        run=lambda: st.run_self_test(run_date="2026-08-15", extra_case_providers=_ALL_SCOPES),
     )
     assert out["n_failed"] >= 1
 
@@ -391,11 +394,7 @@ def test_a_perturbed_implementation_is_caught(monkeypatch, module_path, attr, pe
 def test_perturbing_the_z_score_denominator_is_caught(monkeypatch):
     """The ddof convention, perturbed at the production function rather than at a
     constant — the shape the sqrt(365)-vs-sqrt(252) defect (I7236) actually took."""
-    import pandas as pd
-
     from regime import composite
-
-    original = composite._zscore
 
     def ddof_one(value, history):
         if len(history) == 0:
@@ -406,18 +405,19 @@ def test_perturbing_the_z_score_denominator_is_caught(monkeypatch):
             return 0.0
         return (float(value) - mu) / sigma
 
-    monkeypatch.setattr(composite, "_zscore", ddof_one)
-    assert composite._zscore is not original
-
-    out = st.run_self_test(run_date="2026-08-15", extra_case_providers=_ALL_SCOPES)
-    assert out["verdict"] == st.FAIL
+    out = assert_perturbation_caught(
+        monkeypatch,
+        module_path="regime.composite",
+        attr="_zscore",
+        perturbed=ddof_one,
+        run=lambda: st.run_self_test(run_date="2026-08-15", extra_case_providers=_ALL_SCOPES),
+        case_name="regime_zscore_closed_form",
+    )
     failed = {c["case"] for c in out["cases"] if c["verdict"] == st.FAIL}
-    assert "regime_zscore_closed_form" in failed
     # The metamorphic case must NOT fire: a ddof change preserves affine
     # invariance, which is exactly why closed-form and metamorphic cases are
     # both needed and neither substitutes for the other.
     assert "regime_zscore_affine_invariance_metamorphic" not in failed
-    del pd  # imported only to make the fixture dependency explicit
 
 
 # ── the console surface ─────────────────────────────────────────────────────

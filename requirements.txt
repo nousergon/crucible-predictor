@@ -78,7 +78,7 @@ setuptools>=83.0.0
 # and is billing — this floor is load-bearing at runtime, not only for CI
 # collection. Kept in lockstep with requirements-lambda.txt.
 krepis[flow-doctor]==0.59.6  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
-nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.68
+nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.69
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.22.0
