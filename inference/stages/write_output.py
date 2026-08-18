@@ -416,6 +416,9 @@ def write_predictions(
     level_neutralization: dict | None = None,
     n_universe: int | None = None,
     n_universe_covered: int | None = None,
+    n_intended: int | None = None,
+    n_intended_covered: int | None = None,
+    intended_source: list[str] | None = None,
 ) -> None:
     """
     Write predictions JSON to S3 at both the dated key and latest.json.
@@ -429,6 +432,15 @@ def write_predictions(
     metrics :     Metrics dict to write to predictor/metrics/latest.json.
     dry_run :     If True, print to stdout instead of writing to S3.
     veto_threshold : Confidence threshold for veto gate. Defaults to cfg.MIN_CONFIDENCE.
+    n_universe / n_universe_covered :
+        The research population and how much of it got a prediction. Funnel
+        WIDTH, retained for that (config#1075).
+    n_intended / n_intended_covered / intended_source :
+        The set this invocation was ASKED to score, how much of it got a
+        prediction, and the vocabulary describing where the set came from.
+        This is `inference_coverage`'s denominator (alpha-engine-config-I7648);
+        the pair above is not, and grading against it reported 2.5% for a run
+        that scored 23 of the 24 names it was handed.
     """
     # Audit Phase 2a-INFER (2026-05-07): output-distribution gate at the
     # inference-time write site. Validates the live batch's p_up
@@ -576,6 +588,27 @@ def write_predictions(
         # degraded write paths (soft-timeout / abort partials) — honest absence.
         "n_universe": n_universe,
         "n_universe_covered": n_universe_covered,
+        # alpha-engine-config-I7648: the denominator that answers the question
+        # inference_coverage actually asks — "did every name we MEANT to score
+        # get scored?" `n_universe` above answers a different one, and has done
+        # since the champion cutover made the funnel the scanner's
+        # attractiveness top-20 plus current holdings rather than the research
+        # population. Measured 2026-08-18: every one of the day's 24 predictions
+        # carried a `watchlist_source` of `attractiveness_top_20` (20) or `held`
+        # (4), while signals.json declared universe=903 — so the report card
+        # divided 23 by 903, graded 2.5% against a 95% target it could not
+        # reach, held a CRITICAL component permanently RED, and put "restore
+        # inference coverage" on the Director's live-sizing de-risk conditions.
+        #
+        # `n_universe` is RETAINED, not replaced: funnel width is a real number
+        # and how narrow the funnel has become is worth seeing. It just is not
+        # the coverage denominator.
+        "n_intended": n_intended,
+        "n_intended_covered": n_intended_covered,
+        # Self-describing, so the consumer never has to infer what the
+        # denominator meant — the same vocabulary the per-row
+        # `watchlist_source` annotation already uses.
+        "intended_source": intended_source,
         "last_run_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "status": "ok",
         # Audit Phase 2a-INFER: persist the gate result alongside the
@@ -969,6 +1002,31 @@ _ROLLING_METRIC_FIELDS = (
 )
 
 
+def intended_scoring_set(ctx, scored: set) -> tuple[int | None, int | None, list[str] | None]:
+    """The set this invocation was ASKED to score, and how much of it landed.
+
+    alpha-engine-config-I7648. ``ctx.tickers`` is that set — produced by the
+    watchlist load, the supplemental explicit-ticker list, or the full
+    population, whichever ran — and ``ctx.ticker_sources`` says where each name
+    came from, in the same vocabulary the per-row ``watchlist_source``
+    annotation uses.
+
+    Returns ``(n_intended, n_intended_covered, intended_source)``, all three
+    ``None`` when ctx carries no tickers. **None, never a fallback to the
+    research population.** The consumer grades N/A on an absent field; a
+    fallback here is exactly how ``inference_coverage`` would go on reporting
+    the old 2.5% after this fix, and it would be invisible in the value.
+    """
+    intended = {(t or "").upper() for t in (getattr(ctx, "tickers", None) or [])}
+    intended.discard("")
+    if not intended:
+        return None, None, None
+    sources = sorted({
+        str(v) for v in (getattr(ctx, "ticker_sources", None) or {}).values() if v
+    }) or None
+    return len(intended), len(intended & scored), sources
+
+
 def _load_rolling_metrics(bucket: str) -> dict:
     """Fetch the backtester-owned rolling fields from the existing metrics file.
 
@@ -1105,6 +1163,19 @@ def run(ctx: PipelineContext) -> None:
     _universe_tickers.discard("")
     n_universe = len(_universe_tickers)
     n_universe_covered = len(_universe_tickers & _scored)
+
+    # ── Intended-scoring denominator (alpha-engine-config-I7648) ─────────────
+    # `ctx.tickers` is the set this invocation was ASKED to score — the
+    # watchlist load, the supplemental explicit-ticker list, or the full
+    # population, whichever produced it — and `ctx.ticker_sources` says which.
+    # That is the denominator `inference_coverage` needs; `n_universe` above is
+    # the research population, which the predictor stopped scoring.
+    #
+    # None rather than a fallback when ctx carries no tickers. The consumer
+    # grades N/A on an absent field, and a fallback to `n_universe` here is
+    # exactly how this metric would go on reporting the old number after the
+    # fix — a silent substitution nobody would see in the value.
+    n_intended, n_intended_covered, intended_source = intended_scoring_set(ctx, _scored)
 
     # ── Veto logic ───────────────────────────────────────────────────────────
     market_regime = ctx.signals_data.get("market_regime", "") if ctx.signals_data else ""
@@ -1251,7 +1322,9 @@ def run(ctx: PipelineContext) -> None:
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
                       dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd,
                       level_neutralization=getattr(ctx, "level_neutralization", None),
-                      n_universe=n_universe, n_universe_covered=n_universe_covered)
+                      n_universe=n_universe, n_universe_covered=n_universe_covered,
+                      n_intended=n_intended, n_intended_covered=n_intended_covered,
+                      intended_source=intended_source)
 
     # ── Send email ───────────────────────────────────────────────────────────
     # Goal: exactly one morning briefing per day, reflecting the final merged
