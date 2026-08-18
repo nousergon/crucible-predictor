@@ -31,7 +31,7 @@
 # fails after the spot already exists and is billing), not only for CI
 # collection. Kept in lockstep with requirements.txt.
 krepis[flow-doctor]==0.59.6  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
-nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.68
+nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.70
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.0

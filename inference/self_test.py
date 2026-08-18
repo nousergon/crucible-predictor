@@ -103,28 +103,45 @@ never UNKNOWN**.
 This module introduces no hard-fail path, no new SF state and no topology change.
 An accuracy instrument that can take down the pipeline is a worse defect than the
 one it detects.
+
+LIFTED RUNNER (alpha-engine-config-I7238)
+------------------------------------------
+The outcome taxonomy, ``Case`` shape (including ``known_gap``/``gap_issue`` and
+the ``extra_case_providers`` scope-composition this module introduced), the
+SIGALRM budget and the provenance helpers below are imported from
+``nousergon_lib.quant.selftest`` — this was the capability-superset adoption:
+the lib carries both features unconditionally so no adopter loses ground. This
+module keeps the domain-specific fixtures, ``build_cases()``, the artifact key,
+``write_self_test`` and the console-envelope publishing helpers (the latter
+deliberately NOT migrated to the lib's own ``fleet_check_result`` yet — see the
+note ahead of ``console_envelope_key`` below, unchanged by this lift).
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import os
-import platform
-import signal
-import threading
-import time
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable
+
+from nousergon_lib.quant.selftest import (
+    CASE_TIMEOUT_SECONDS,
+    Case,
+    code_sha as _lib_code_sha,
+    resolved_library_versions as _lib_resolved_library_versions,
+    run_self_test as _lib_run_self_test,
+)
+from nousergon_lib.quant.selftest import FAIL as FAIL  # noqa: PLC0414 — re-exported (st.FAIL)
+from nousergon_lib.quant.selftest import PASS as PASS  # noqa: PLC0414 — re-exported (st.PASS)
+from nousergon_lib.quant.selftest import UNKNOWN as UNKNOWN  # noqa: PLC0414 — re-exported (st.UNKNOWN)
+from nousergon_lib.quant.selftest import (
+    verdict_is_pass as verdict_is_pass,  # noqa: PLC0414 — re-exported (st.verdict_is_pass)
+)
 
 logger = logging.getLogger(__name__)
 
 SCHEMA = "predictor_self_test-1.0.0"
 COMPONENT = "predictor"
-
-PASS = "PASS"
-FAIL = "FAIL"
-UNKNOWN = "UNKNOWN"
 
 #: ``predictor/{run_date}/self_test.json`` — beside the run's predictions.
 _KEY_TEMPLATE = "predictor/{run_date}/self_test.json"
@@ -152,10 +169,6 @@ _TRACKED_DISTRIBUTIONS = (
     "krepis",
     "boto3",
 )
-
-#: Per-case wall-clock budget. Each case is one production call over a handful of
-#: in-memory rows; anything approaching this is a hang, not a slow machine.
-CASE_TIMEOUT_SECONDS = 30.0
 
 #: 1e-9 absolute, per `alpha-engine-config-I7262`. Every expectation is an exact
 #: float64 identity and the observed agreement is ~1e-16 — the band is far tighter
@@ -192,35 +205,6 @@ _HMM_P_BEAR = 0.10
 #: Calibrator probe. The linear fallback is p_up = 0.5 + a/(2*clip).
 _CAL_ALPHA = 0.03
 _CAL_CLIP = 0.15
-
-
-
-class _CaseTimeout(Exception):
-    """Raised when a case exceeds :data:`CASE_TIMEOUT_SECONDS`."""
-
-
-class Case(NamedTuple):
-    """One known-answer, metamorphic, degenerate or convention check.
-
-    ``expected`` is derived by hand from the function's definition; ``compute``
-    drives the production code and returns the comparable observed number. They
-    are kept apart — rather than ``compute`` returning a bool — so the artifact
-    carries both numbers and a later divergence is diagnosable from the artifact
-    alone. ``inputs`` is published verbatim: a reader must be able to re-derive
-    ``expected`` on paper without opening this file.
-
-    ``known_gap`` marks a case that pins behaviour believed WRONG, so a reader
-    never mistakes its PASS for an endorsement. See the module docstring.
-    """
-
-    name: str
-    description: str
-    inputs: dict
-    expected: float
-    compute: Callable[[], float]
-    tolerance: float = TOLERANCE
-    known_gap: bool = False
-    gap_issue: str | None = None
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -383,6 +367,7 @@ def build_cases() -> list[Case]:
                     "units": "z-score (ratio)"},
             expected=_expected_zscore(),
             compute=lambda: _regime_zscore(_Z_VALUE),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="composite_intensity_closed_form",
@@ -397,6 +382,7 @@ def build_cases() -> list[Case]:
                     "rolling_window_weeks": None, "units": "z-score (ratio)"},
             expected=_expected_composite_intensity(),
             compute=_composite_intensity,
+            tolerance=TOLERANCE,
         ),
         Case(
             name="veto_adjustment_closed_form",
@@ -408,6 +394,7 @@ def build_cases() -> list[Case]:
                     "units": "confidence threshold delta"},
             expected=_VETO_Z * 0.10,
             compute=lambda: float(regime_conditional_veto_adjustment(_VETO_Z)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="veto_adjustment_cap_closed_form",
@@ -420,6 +407,7 @@ def build_cases() -> list[Case]:
                     "units": "confidence threshold delta"},
             expected=0.20,
             compute=lambda: float(regime_conditional_veto_adjustment(_VETO_Z_OVER_CAP)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="hmm_staleness_discount_closed_form",
@@ -432,6 +420,7 @@ def build_cases() -> list[Case]:
                     "halflife_weeks": 12.0, "floor": 0.25, "units": "multiplier"},
             expected=_expected_hmm_staleness_discount(),
             compute=lambda: float(dd.hmm_staleness_discount(_HMM_WEEKS)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="hmm_posterior_expectation_closed_form",
@@ -446,6 +435,7 @@ def build_cases() -> list[Case]:
             compute=lambda: float(dd.hmm_posterior_expectation(
                 {"bull": _HMM_P_BULL, "bear": _HMM_P_BEAR, "neutral": 0.20},
                 weeks_in_current_state=_HMM_WEEKS)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="intensity_z_to_score_closed_form",
@@ -457,6 +447,7 @@ def build_cases() -> list[Case]:
             inputs={"intensity_z": 1.0, "tanh_scale": 2.0, "units": "signed score [-1,1]"},
             expected=_expected_intensity_z_to_score(),
             compute=lambda: float(dd.intensity_z_to_score(1.0)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="calibrator_p_up_closed_form",
@@ -469,6 +460,7 @@ def build_cases() -> list[Case]:
                     "units": "probability"},
             expected=_expected_calibrator_p_up(),
             compute=lambda: float(_calibrator_prediction(_CAL_ALPHA)["p_up"]),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="calibrator_confidence_closed_form",
@@ -481,6 +473,7 @@ def build_cases() -> list[Case]:
                     "units": "confidence [0,1]"},
             expected=_expected_calibrator_confidence(),
             compute=lambda: float(_calibrator_prediction(_CAL_ALPHA)["prediction_confidence"]),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="combined_rank_closed_form",
@@ -495,6 +488,7 @@ def build_cases() -> list[Case]:
             compute=lambda: float(sum(
                 abs(a - b) for a, b in zip(_combined_ranks([0.01, 0.05, 0.03]), [3, 1, 2])
             )),
+            tolerance=TOLERANCE,
         ),
     ]
 
@@ -519,6 +513,7 @@ def build_cases() -> list[Case]:
                 _regime_zscore(_Z_VALUE, _Z_AFFINE_SCALE, _Z_AFFINE_SHIFT)
                 - _regime_zscore(_Z_VALUE)
             ),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="intensity_z_to_score_antisymmetry_metamorphic",
@@ -533,6 +528,7 @@ def build_cases() -> list[Case]:
             expected=0.0,
             compute=lambda: float(dd.intensity_z_to_score(1.7))
                             + float(dd.intensity_z_to_score(-1.7)),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="regime_score_antisymmetry_metamorphic",
@@ -555,6 +551,7 @@ def build_cases() -> list[Case]:
                     hmm_probs={"bull": 0.10, "bear": 0.70, "neutral": 0.20},
                     intensity_z=-1.1)["regime_score"])
             ),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="combined_rank_permutation_invariance_metamorphic",
@@ -568,6 +565,7 @@ def build_cases() -> list[Case]:
                     "units": "rank difference sum"},
             expected=0.0,
             compute=_rank_permutation_delta,
+            tolerance=TOLERANCE,
         ),
         Case(
             name="calibrator_monotonicity_metamorphic",
@@ -672,6 +670,7 @@ def build_cases() -> list[Case]:
                     "units": "z-score (difference)"},
             expected=_expected_zscore() - _expected_zscore_sample_ddof(),
             compute=lambda: _regime_zscore(_Z_VALUE) - _expected_zscore_sample_ddof(),
+            tolerance=TOLERANCE,
         ),
         Case(
             name="intensity_z_tanh_scale_convention",
@@ -732,6 +731,7 @@ def build_cases() -> list[Case]:
                     "units": "weight sum"},
             expected=1.0,
             compute=lambda: float(sum(dd.REGIME_SCORE_WEIGHTS.values())),
+            tolerance=TOLERANCE,
         ),
     ]
 
@@ -763,7 +763,7 @@ def _calibrator_monotonicity_violations() -> float:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Provenance header — the reason this is an INSTRUMENT check, not a code check
+# Provenance + runner — thin wrappers over nousergon_lib.quant.selftest
 # ════════════════════════════════════════════════════════════════════════════
 
 def resolved_library_versions(
@@ -771,99 +771,19 @@ def resolved_library_versions(
 ) -> dict[str, str]:
     """The installed version of every numeric distribution loaded at runtime.
 
-    ``importlib.metadata.version`` reads the DISTRIBUTION metadata pip resolved
-    into this image — the thing that moves between the CI runner and the deployed
-    Lambda. A missing distribution is recorded explicitly, never omitted: an
-    absent key and a missing library must not look the same.
+    Thin wrapper binding this repo's tracked distribution tuple to the lifted
+    lib implementation (alpha-engine-config-I7238).
     """
-    from importlib.metadata import PackageNotFoundError, version
-
-    resolved: dict[str, str] = {}
-    for dist in distributions:
-        try:
-            resolved[dist] = version(dist)
-        except PackageNotFoundError:
-            resolved[dist] = "<not installed>"
-        except Exception as exc:  # noqa: BLE001 — a version probe never blocks
-            resolved[dist] = f"<unavailable: {type(exc).__name__}>"
-    return resolved
+    return _lib_resolved_library_versions(distributions)
 
 
 def code_sha() -> str:
     """The SHA of the code that ran, without shelling out.
 
-    Deploy-time stamps first (``GIT_SHA`` env, then ``/var/task/GIT_SHA.txt`` —
-    the fleet's Lambda-image convention), then the checkout's own ``.git`` refs
-    for a local run. ``unknown`` is a legitimate answer and is recorded as one — a
-    fabricated SHA is worse than an absent one.
+    Thin wrapper binding this repo's checkout root to the lifted lib
+    implementation (alpha-engine-config-I7238).
     """
-    for env_key in ("GIT_SHA", "CODE_SHA", "GITHUB_SHA"):
-        stamped = os.environ.get(env_key)
-        if stamped:
-            return stamped.strip()
-    try:
-        lambda_stamp = Path("/var/task/GIT_SHA.txt")
-        if lambda_stamp.is_file():
-            stamped = lambda_stamp.read_text().strip()
-            if stamped:
-                return stamped
-    except Exception:  # noqa: BLE001 — provenance never blocks the battery
-        pass
-    try:
-        git_dir = Path(__file__).resolve().parents[1] / ".git"
-        head = (git_dir / "HEAD").read_text().strip()
-        if not head.startswith("ref: "):
-            return head
-        ref = head[5:].strip()
-        ref_path = git_dir / ref
-        if ref_path.is_file():
-            return ref_path.read_text().strip()
-        for line in (git_dir / "packed-refs").read_text().splitlines():
-            if line.endswith(" " + ref):
-                return line.split(" ", 1)[0].strip()
-        return "unknown"
-    except Exception:  # noqa: BLE001 — provenance never blocks the battery
-        return "unknown"
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# Runner
-# ════════════════════════════════════════════════════════════════════════════
-
-def _call_with_timeout(fn: Callable[[], float], seconds: float) -> float:
-    """Run ``fn`` under a wall-clock budget.
-
-    A SIGALRM budget is installed when this is the main thread of a platform that
-    has one (a Lambda handler thread qualifies). Where it is not available the
-    elapsed time is checked after the call instead — that cannot interrupt a hang,
-    but it does catch an overrun, and the caller distinguishes neither: both FAIL.
-    """
-    can_interrupt = (
-        hasattr(signal, "SIGALRM")
-        and hasattr(signal, "setitimer")
-        and threading.current_thread() is threading.main_thread()
-    )
-    if not can_interrupt:
-        started = time.monotonic()
-        value = fn()
-        elapsed = time.monotonic() - started
-        if elapsed > seconds:
-            raise _CaseTimeout(
-                f"case exceeded its {seconds:g}s budget "
-                f"({elapsed:.1f}s, detected after the fact)"
-            )
-        return value
-
-    def _fire(_signum, _frame):
-        raise _CaseTimeout(f"case exceeded its {seconds:g}s budget")
-
-    previous = signal.signal(signal.SIGALRM, _fire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        return fn()
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, previous)
+    return _lib_code_sha(Path(__file__).resolve().parents[1])
 
 
 #: The battery scope this module can reach on its own. ``training/`` is NOT in
@@ -871,6 +791,15 @@ def _call_with_timeout(fn: Callable[[], float], seconds: float) -> float:
 #: training-path cases live in ``training/self_test_cases.py`` and are composed
 #: in by a caller that can reach them — CI and the spot trainer.
 SCOPE_INFERENCE = "inference"
+
+_SCOPE_NOTE = (
+    "The scopes whose cases ran. `inference` covers regime scoring, "
+    "calibration, veto thresholds and ranking (the Lambda's closure); "
+    "`training` covers IC, deflated Sharpe and downside statistics and "
+    "runs where training runs (EC2 spot + CI), because `training/` is "
+    "deliberately absent from the Lambda image. A verdict is a statement "
+    "about the scopes listed here and about nothing else."
+)
 
 
 def run_self_test(
@@ -891,176 +820,24 @@ def run_self_test(
     readable as full coverage, which is the "a number published without its
     members" failure.
 
-    Never raises — see the module docstring's CONTRACT section.
+    Never raises — see the module docstring's CONTRACT section. Delegates the
+    outcome taxonomy, scope composition, provenance header and timeout handling
+    to ``nousergon_lib.quant.selftest.run_self_test``
+    (alpha-engine-config-I7238); this wrapper supplies only this repo's identity,
+    default battery, resolved provenance and the inference-scope name/note.
     """
-    started = time.monotonic()
-    scopes = [SCOPE_INFERENCE] + sorted(extra_case_providers or {})
-    header = {
-        "schema": schema,
-        "component": component,
-        "run_date": run_date,
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "code_sha": code_sha(),
-        "libraries": resolved_library_versions(),
-        "case_timeout_seconds": case_timeout_seconds,
-        "scope": scopes,
-        "scope_note": (
-            "The scopes whose cases ran. `inference` covers regime scoring, "
-            "calibration, veto thresholds and ranking (the Lambda's closure); "
-            "`training` covers IC, deflated Sharpe and downside statistics and "
-            "runs where training runs (EC2 spot + CI), because `training/` is "
-            "deliberately absent from the Lambda image. A verdict is a statement "
-            "about the scopes listed here and about nothing else."
-        ),
-    }
-
-    def _provider() -> list[Case]:
-        collected = list((case_provider or build_cases)())
-        for _scope, extra in sorted((extra_case_providers or {}).items()):
-            collected.extend(extra())
-        return collected
-
-    provider = _provider
-    try:
-        # Materialised inside the try: a provider returning a lazy or broken
-        # iterable would otherwise raise at the FOR loop below, outside every
-        # handler, and take down the stage this must never be able to fail.
-        cases = list(provider())
-    except Exception as exc:  # noqa: BLE001 — see CONTRACT: this becomes UNKNOWN
-        logger.error(
-            "self-test: the battery could not be constructed (%s: %s) — verdict "
-            "UNKNOWN. No correctness guarantee is granted this cycle.",
-            type(exc).__name__, exc, exc_info=True,
-        )
-        return {**header, "status": "error", "verdict": UNKNOWN, "cases": [],
-                "n_cases": 0, "n_failed": 0, "n_errored": 0, "n_known_gaps": 0,
-                "error_class": type(exc).__name__, "error_msg": str(exc)[:500],
-                "wall_clock_seconds": round(time.monotonic() - started, 3)}
-
-    records: list[dict] = []
-    for index, case in enumerate(cases):
-        try:
-            record: dict[str, Any] = {
-                "case": case.name,
-                "description": case.description,
-                "inputs": case.inputs,
-                "expected": case.expected,
-                "actual": None,
-                "abs_error": None,
-                "tolerance": case.tolerance,
-                "verdict": UNKNOWN,
-            }
-        except Exception as exc:  # noqa: BLE001 — see CONTRACT: never raises
-            # A provider that returned a well-formed LIST of malformed items
-            # gets past the materialisation guard above and would otherwise
-            # raise here, outside every handler — taking down the stage this
-            # module must never be able to fail. Recorded as UNKNOWN (the
-            # battery could not ask the question), never as a pass.
-            logger.error(
-                "self-test: case %d is not a Case (%s: %s) => UNKNOWN",
-                index, type(exc).__name__, exc,
-            )
-            records.append({
-                "case": f"<malformed case {index}>",
-                "description": "the case provider returned a non-Case object",
-                "inputs": {"units": "n/a"},
-                "expected": None, "actual": None, "abs_error": None,
-                "tolerance": None, "verdict": UNKNOWN, "errored": True,
-                "error_class": type(exc).__name__, "error_msg": str(exc)[:500],
-                "wall_clock_seconds": 0.0,
-            })
-            continue
-        if case.known_gap:
-            # Stated in the artifact, in words, so a reader never reads this
-            # row's PASS as an endorsement of the behaviour it pins.
-            record["known_gap"] = True
-            record["gap_issue"] = case.gap_issue
-            record["known_gap_note"] = (
-                "This case PINS behaviour believed incorrect at its MEASURED "
-                "value so further drift goes red. PASS means 'unchanged since "
-                "recorded', NOT 'this is correct'. Tracked in "
-                f"{case.gap_issue}."
-            )
-        case_started = time.monotonic()
-        try:
-            actual = float(_call_with_timeout(case.compute, case_timeout_seconds))
-            error = abs(actual - case.expected)
-            record["actual"] = actual
-            record["abs_error"] = error
-            record["verdict"] = PASS if error <= case.tolerance else FAIL
-            if record["verdict"] == FAIL:
-                logger.error(
-                    "self-test case FAILED: %s expected=%r actual=%r abs_error=%r "
-                    "tolerance=%r", case.name, case.expected, actual, error,
-                    case.tolerance,
-                )
-        except _CaseTimeout as exc:
-            # Brian ruling 2026-08-13: a timeout is FAIL, never UNKNOWN. A
-            # known-answer case over a handful of in-memory rows that cannot
-            # finish in its budget is itself evidence something is wrong with the
-            # instrument — it must not buy the benefit of the doubt that "the
-            # battery could not be constructed" gets.
-            record["verdict"] = FAIL
-            record["timed_out"] = True
-            record["error_class"] = type(exc).__name__
-            record["error_msg"] = str(exc)[:500]
-            logger.error("self-test case TIMED OUT (=> FAIL): %s (%s)", case.name, exc)
-        except Exception as exc:  # noqa: BLE001 — a case that could not RUN is UNKNOWN
-            record["verdict"] = UNKNOWN
-            record["errored"] = True
-            record["error_class"] = type(exc).__name__
-            record["error_msg"] = str(exc)[:500]
-            logger.error(
-                "self-test case ERRORED (=> UNKNOWN): %s (%s: %s)",
-                case.name, type(exc).__name__, exc, exc_info=True,
-            )
-        record["wall_clock_seconds"] = round(time.monotonic() - case_started, 3)
-        records.append(record)
-
-    n_failed = sum(1 for r in records if r["verdict"] == FAIL)
-    n_errored = sum(1 for r in records if r["verdict"] == UNKNOWN)
-    n_known_gaps = sum(1 for r in records if r.get("known_gap"))
-    if n_failed:
-        verdict = FAIL
-    elif n_errored or not records:
-        verdict = UNKNOWN
-    else:
-        verdict = PASS
-
-    body = {**header, "status": "ok", "verdict": verdict, "cases": records,
-            "n_cases": len(records), "n_failed": n_failed, "n_errored": n_errored,
-            "n_known_gaps": n_known_gaps,
-            "wall_clock_seconds": round(time.monotonic() - started, 3)}
-
-    if verdict == PASS:
-        logger.info(
-            "self-test PASS — %d/%d known-answer cases agreed on %s (%s); "
-            "%d of them PIN a known gap rather than endorse it",
-            len(records), len(records), header["python"],
-            ", ".join(f"{k} {v}" for k, v in header["libraries"].items()),
-            n_known_gaps,
-        )
-    elif verdict == UNKNOWN:
-        logger.error(
-            "self-test UNKNOWN — %d/%d cases could not run. The correctness "
-            "guarantee is WITHHELD this cycle (never granted by default).",
-            n_errored, len(records),
-        )
-    else:
-        logger.error(
-            "self-test FAIL — %d/%d known-answer cases DISAGREE with their "
-            "hand-derived expectation on the DEPLOYED libraries (%s). THIS "
-            "CYCLE'S PREDICTIONS ARE NOT TRUSTWORTHY.",
-            n_failed, len(records),
-            ", ".join(f"{k} {v}" for k, v in header["libraries"].items()),
-        )
-    return body
-
-
-def verdict_is_pass(verdict: str | None) -> bool:
-    """True only for an explicit PASS — ``None`` and ``"ok"`` withhold the guarantee."""
-    return verdict == PASS
+    return _lib_run_self_test(
+        run_date,
+        case_provider=case_provider or build_cases,
+        extra_case_providers=extra_case_providers,
+        primary_scope=SCOPE_INFERENCE,
+        component=component,
+        schema=schema,
+        resolved_libraries=resolved_library_versions(),
+        code_sha_value=code_sha(),
+        case_timeout_seconds=case_timeout_seconds,
+        extra_header={"scope_note": _SCOPE_NOTE},
+    )
 
 
 def self_test_key(run_date: str) -> str:
