@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from nousergon_lib.quant import riskstats
 from scipy.stats import kurtosis as _kurtosis
 from scipy.stats import norm
 from scipy.stats import skew as _skew
@@ -73,15 +74,24 @@ def downside_ic_stats(
                 "sortino_of_ic": None, "cvar_of_ic": float("nan"),
                 "passes_downside_gate": False}
     mean_ic = float(ic.mean())
-    downside = ic[ic < target] - target
-    n_down = int(downside.size)
+    n_down = int((ic < target).sum())
     # Standard Sortino/Satchell downside deviation: RMS of the downside
     # shortfall over the FULL sample (n), not over the count of shortfall days
-    # (n_down). Upside days contribute an implicit 0 to the sum, exactly as
-    # `min(0, r)` over all n would (nousergon_lib.quant.riskstats.sortino_ratio`
-    # is the fleet reference for this convention). Divide-by-n_down instead
-    # inflates the deviation and understates Sortino — alpha-engine-config-I7271.
-    dd = float(math.sqrt(float(np.sum(downside ** 2)) / n)) if n_down > 0 else 0.0
+    # (n_down). Upside days contribute an implicit 0 to the sum. Divide-by-n_down
+    # instead inflates the deviation and understates Sortino —
+    # alpha-engine-config-I7271.
+    #
+    # This no longer re-derives that arithmetic: it is
+    # `nousergon_lib.quant.riskstats.downside_deviation`, the fleet's single
+    # implementation (config-I7597). The library primitive rather than
+    # `sortino_ratio` because this lens works in IC space, not return space —
+    # there is no trading-day scale to annualize by, and `downside_deviation`
+    # is itself an emitted field. The ratio's numerator stays `mean_ic` and the
+    # near-zero-dd sentinel stays local; both are this lens's own conventions.
+    dd = riskstats.downside_deviation(
+        [float(x) for x in ic], target=target, denominator="full"
+    )
+    dd = 0.0 if dd is None else float(dd)
     # No bad-ranking days → Sortino is "infinitely good"; report None +
     # n_downside_days=0 rather than inf (JSON-safe) so the consumer reads it as
     # a clean upside-only series, not a missing value.
