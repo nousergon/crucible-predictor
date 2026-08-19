@@ -78,6 +78,10 @@ setuptools>=83.0.0
 # and is billing — this floor is load-bearing at runtime, not only for CI
 # collection. Kept in lockstep with requirements-lambda.txt.
 krepis[flow-doctor]==0.59.6  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+# alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
+# gitleaks/session_dlp prerequisite — it does not. No file here imports
+# `krepis.LLMClient` (`grep -rn "LLMClient" --include="*.py" .` is empty); the
+# `[flow-doctor]` extra pulled in is the diagnosis wiring, not LLMClient itself.
 nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.70
 
 # Training dependencies (not needed in Lambda)
