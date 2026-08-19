@@ -425,8 +425,12 @@ class TestGetUniverseTickersFallback:
 
     def test_falls_back_to_signals_latest_when_today_missing(self):
         """No dated key → uses signals/latest.json universe + signals_data."""
+        # dict keyed by ticker, matching the frozen contract shape
+        # (nousergon_lib/contracts/signals.schema.json) — fixed 2026-08-18
+        # (alpha-engine-config-I7627), previously a list-of-dicts fixture
+        # that restated the consumer's own (wrong) assumption.
         signals_latest = {
-            "signals": [{"ticker": "AAPL"}, {"ticker": "MSFT"}],
+            "signals": {"AAPL": {"ticker": "AAPL"}, "MSFT": {"ticker": "MSFT"}},
             "market_regime": "bull",
         }
         s3 = _mock_s3_with_keys({"signals/latest.json": signals_latest})
