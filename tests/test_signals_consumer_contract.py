@@ -28,14 +28,11 @@ Consumer call sites traced (both walk the SAME
     dependency the schema could break.
   * ``get_universe_tickers`` reads ``signals`` (schema: ``type: object`` —
     "Legacy v2 per-ticker dict format (deprecated; retained for backward
-    compatibility)") as though it were an ARRAY of per-ticker dicts each
-    carrying ``ticker`` (``signals_data.get("signals", [])`` then
-    ``[s["ticker"] for s in signals_list if "ticker" in s]``). That is a
-    real drift: the schema does not promise ``signals`` is iterable-as-a-
-    list-of-dicts at all — see ``TestSignalsFieldShapeDrift`` below, xfail,
-    not silently patched here (config#3026's instruction: report, don't
-    widen the schema and don't quietly "fix" the consumer's assumption
-    without a ruling on which of the two is wrong).
+    compatibility)") over its ``.values()`` — fixed 2026-08-18
+    (alpha-engine-config-I7627; see ``TestSignalsFieldShapeDrift`` below).
+    It previously iterated the mapping directly, which yields its KEYS, not
+    its values — a real drift the schema does not promise ``signals`` is
+    iterable-as-a-list-of-dicts at all.
 """
 
 from __future__ import annotations
@@ -165,47 +162,42 @@ class TestSignalsPayloadFallback:
 
 
 class TestSignalsFieldShapeDrift:
-    """KNOWN GAP (report, not silently patched — config#3026's instruction).
+    """Was a KNOWN GAP (config#3026's instruction: report, don't patch);
+    resolved 2026-08-18 (alpha-engine-config-I7627).
 
-    ``get_universe_tickers`` (inference/stages/load_universe.py) reads:
+    ``get_universe_tickers`` (inference/stages/load_universe.py) used to read:
 
         signals_list = signals_data.get("signals", []) if signals_data else []
         tickers = [s["ticker"] for s in signals_list if "ticker" in s]
 
-    treating ``signals`` as an array of per-ticker dicts. The FROZEN v1
+    treating ``signals`` as an array of per-ticker dicts, while the FROZEN v1
     schema declares ``signals`` as ``{"type": "object", "description":
     "Legacy v2 per-ticker dict format (deprecated; retained for backward
     compatibility)"}`` — an OBJECT, not an array. A schema-conformant
     ``signals`` value is a dict (e.g. ``{"AAPL": {...}, "MSFT": {...}}``),
     and iterating a dict with ``for s in signals_list`` yields its KEYS
-    (ticker strings) — ``"ticker" in s`` then tests substring membership
-    against a ticker string (almost never true), so the primary code path
-    silently returns zero tickers and falls through to the hardcoded
-    ``_FALLBACK_TICKERS`` list, rather than raising. The exception handler
-    two lines up would also swallow a genuine ``TypeError`` from
-    ``s["ticker"]`` on a dict-not-object shape, masking either failure mode
-    identically as "signals load failed — using fallback universe".
+    (ticker strings), so ``"ticker" in s`` tested substring membership
+    against a ticker string (almost never true) — the primary code path
+    silently returned zero tickers and fell through to the hardcoded
+    ``_FALLBACK_TICKERS`` list, rather than raising.
 
-    This is exactly the class of drift config#3026 asks to surface, not
-    patch: the consumer's assumption (array of dicts) and the frozen
-    contract's declared shape (object) do not agree, and it is not this
-    test's job to decide which one is wrong. xfail, strict — this must
-    start FAILING (proving the gap closed) the moment either side is fixed,
-    so the xfail marker gets deleted then rather than rotting as a false
-    green forever.
+    Live-verified 2026-08-18: the deployed champion path (``handler.py``'s
+    default predict invocation always passes ``watchlist_path="auto"``,
+    which resolves via ``load_watchlist`` / ``resolve_universe_from_membership``
+    and never reaches this function) was NOT affected. The bug was live only
+    on the CLI's ``--watchlist`` omitted default (documented as "predict the
+    full universe" but silently substituting ``_FALLBACK_TICKERS`` instead).
+
+    Consumer fixed to read ``signals.values()``, matching the schema. No
+    schema change was needed — the producer's live shape already matched
+    the frozen v1 declaration.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="get_universe_tickers (inference/stages/load_universe.py) "
-        "reads payload['signals'] as an array of {'ticker': ...} dicts; "
-        "the frozen nousergon_lib.contracts signals schema (v1) declares "
-        "'signals' as type object (deprecated legacy per-ticker dict), "
-        "not an array — config#3026.",
-    )
     def test_get_universe_tickers_extracts_from_schema_conformant_signals_field(self):
         # A schema-conformant 'signals' object, per its own description:
-        # a per-ticker dict, keyed by ticker.
+        # a per-ticker dict, keyed by ticker. Fixed 2026-08-18
+        # (alpha-engine-config-I7627): get_universe_tickers now reads
+        # signals.values(), matching the schema this test validates against.
         payload = _signals_payload(
             signals={"AAA": _signal_entry(ticker="AAA"), "BBB": _signal_entry(ticker="BBB")}
         )
@@ -213,10 +205,4 @@ class TestSignalsFieldShapeDrift:
         s3 = _s3_returning({f"signals/{_DATE}/signals.json": payload})
         with patch("boto3.client", return_value=s3):
             tickers, _signals_data = get_universe_tickers(_BUCKET, _DATE)
-        # What the consumer's code intends: universe tickers sourced from
-        # the 'signals' field. Against a conformant payload this
-        # currently returns the hardcoded _FALLBACK_TICKERS instead,
-        # because dict-iteration silently yields no matches — proving the
-        # drift rather than asserting the (wrong) actual behavior as
-        # correct.
         assert sorted(tickers) == ["AAA", "BBB"]

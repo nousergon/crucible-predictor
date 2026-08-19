@@ -396,8 +396,14 @@ def get_universe_tickers(
         signals_data = _load_signals_payload_with_fallback(
             s3, s3_bucket, date_str
         )
-        signals_list = signals_data.get("signals", []) if signals_data else []
-        tickers = [s["ticker"] for s in signals_list if "ticker" in s]
+        # `signals` is a dict keyed by ticker (nousergon_lib/contracts/signals.
+        # schema.json, alpha-engine-config-I7627) — each value already carries
+        # its own "ticker" field matching the key. Iterating the mapping
+        # directly (as if it were a list of per-ticker dicts) yields the KEYS
+        # (strings), so `"ticker" in s` silently substring-matched against a
+        # ticker symbol and was always False — tickers was always empty.
+        signals_map = signals_data.get("signals", {}) if signals_data else {}
+        tickers = [s["ticker"] for s in signals_map.values() if "ticker" in s]
         if tickers:
             log.info(
                 "Universe: %d tickers from signals fallback chain", len(tickers)
