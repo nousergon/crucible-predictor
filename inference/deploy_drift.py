@@ -30,6 +30,39 @@ _SF_ARN_TEMPLATE = (
     "arn:aws:states:{region}:{account}:stateMachine:{name}"
 )
 
+# alpha-engine-config-I7799 (Brian ruling 2026-08-20, option b).
+#
+# Until 2026-08-20 `sf_drift` was a comparison of the deployed `[git:<sha>]`
+# STAMP against `repo@main` HEAD. That answers "has anything in this repo
+# merged without deploying" — strictly broader than the question
+# sf-pipeline-policy.md §3 halts on, which is whether "the live SF definition
+# has drifted so orchestration semantics are unknown".
+#
+# Measured 2026-08-20: an illegal ASL escape in the WEEKLY definition failed
+# the all-or-nothing deploy preflight for three consecutive merges. None of
+# those commits altered the preopen definition — the live preopen orchestration
+# was byte-identical to what `main` describes, and correct. `DeployDriftGate`
+# halted anyway and the session went unmanaged: no exit management, no risk
+# checks, no planner, open positions carried (§1.2).
+#
+# So for the WEEKDAY pipelines `sf_drift` now compares the deployed definition
+# BODY against the repo's, canonicalised. The stamp comparison survives as
+# `deploy_stamp_stale` — a real signal (a merged Lambda/collector/script change
+# this pipeline INVOKES but does not embed is genuinely undeployed) that
+# degrades and pages rather than halting. The weekly pipeline keeps stamp
+# semantics: it has no market-open deadline, and a lost run there costs a
+# rerun rather than a session.
+_SF_DEFINITION_PATHS = {
+    "ne-preopen-trading-pipeline": "infrastructure/step_function_daily.json",
+    "ne-postclose-trading-pipeline": "infrastructure/step_function_eod.json",
+}
+
+# Pinned to the RESOLVED upstream SHA, never to `main`: raw.githubusercontent
+# serves a CDN-cached copy of a branch ref, so fetching `@main` can return a
+# body that is not the SHA we just compared against — which would make the
+# comparison report drift that does not exist, or miss drift that does.
+_RAW_FILE_URL = "https://raw.githubusercontent.com/{repo}/{ref}/{path}"
+
 # `[git:<40 hex>]` prefix injected by alpha-engine-data/infrastructure/
 # deploy-infrastructure.sh into the SF Comment field at deploy time.
 _GIT_PREFIX_RE = re.compile(r"^\[git:([0-9a-f]{7,40})\]")
@@ -199,6 +232,65 @@ def _shas_match(deployed: Optional[str], upstream: Optional[str]) -> bool:
     return upstream.startswith(deployed) or deployed.startswith(upstream)
 
 
+def _canonical_definition(doc: dict) -> str:
+    """Canonical JSON for a definition, with the deploy stamp normalised out.
+
+    `deploy-infrastructure.sh` sets ``Comment = f'[git:{sha}] {orig}'.rstrip()``
+    on the copy it uploads, so the live document and the repo document differ by
+    that prefix by construction. Strip it from either side, drop the key when
+    nothing else remains (the rstrip case where the repo Comment is empty), and
+    serialise with sorted keys so key ORDER — which neither AWS nor the deploy
+    preserves — is not read as a semantic difference.
+    """
+    normalised = json.loads(json.dumps(doc))
+    comment = normalised.get("Comment")
+    if isinstance(comment, str):
+        stripped = comment.strip()
+        match = _GIT_PREFIX_RE.match(stripped)
+        if match:
+            stripped = stripped[match.end():].strip()
+        if stripped:
+            normalised["Comment"] = stripped
+        else:
+            normalised.pop("Comment", None)
+    return json.dumps(normalised, sort_keys=True, separators=(",", ":"))
+
+
+def _read_sf_definition(state_machine_arn: str) -> Optional[dict]:
+    """describe-state-machine → the parsed definition document. None on error."""
+    import boto3
+    try:
+        sfn = boto3.client("stepfunctions")
+        resp = sfn.describe_state_machine(stateMachineArn=state_machine_arn)
+        return json.loads(resp["definition"])
+    except Exception as exc:  # noqa: BLE001 — any failure routes to None
+        log.warning("describe_state_machine definition read failed for %s: %s",
+                    state_machine_arn, exc)
+        return None
+
+
+def _fetch_repo_definition(
+    repo: str, ref: str, path: str, timeout: float = 5.0,
+) -> Optional[dict]:
+    """Fetch and parse one SF definition from GitHub at an exact ref.
+
+    None on any failure — unreachable, non-200, or unparseable. The caller
+    treats None as "could not compare", never as "no drift"; there is no
+    outcome of this function that can grant the guarantee.
+    """
+    import urllib.request
+    url = _RAW_FILE_URL.format(repo=repo, ref=ref, path=path)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except OSError as exc:  # URLError/HTTPError + bare read-phase TimeoutError
+        log.warning("SF definition unreachable: %s (%s)", url, exc)
+        return None
+    except (ValueError, TypeError) as exc:
+        log.warning("SF definition at %s did not parse: %s", url, exc)
+        return None
+
+
 def check_deploy_drift(
     region: str,
     account_id: str,
@@ -250,11 +342,65 @@ def check_deploy_drift(
     # stamp to compare and upstream could not be fetched. A missing stamp
     # is its own confirmed state (see docstring) and stays a definite False.
     sf_drift_unmeasured = sf_sha is not None and upstream is None
-    sf_drift = (
+    stamp_drift = (
         upstream is not None
         and sf_sha is not None
         and not _shas_match(sf_sha, upstream)
     )
+
+    # ── config-I7799: content comparison for the weekday pipelines ──────────
+    # The stamp verdict is kept under its own name whatever happens below, so
+    # a genuinely undeployed repo is still SAID, just not halted on.
+    deploy_stamp_stale = stamp_drift
+    sf_definition_path = _SF_DEFINITION_PATHS.get(sf_name)
+    sf_definition_compared = False
+    sf_definition_reason = "stamp_only_pipeline"
+
+    if sf_definition_path is None:
+        # Weekly / unknown pipeline: stamp semantics, unchanged.
+        sf_drift = stamp_drift
+    elif upstream is None:
+        # Nothing to fetch AT. Falls through to the stamp path, which is
+        # already omitted as unmeasured by sf_drift_unmeasured above.
+        sf_drift = stamp_drift
+        sf_definition_reason = "upstream_sha_unavailable"
+    else:
+        live_definition = _read_sf_definition(sf_arn)
+        repo_definition = _fetch_repo_definition(
+            repo, upstream, sf_definition_path,
+        )
+        if live_definition is None or repo_definition is None:
+            # Could not compare. Fall back to the STAMP verdict rather than
+            # granting a pass: the stamp halts strictly more often, so the
+            # fallback can only be more conservative than the comparison it
+            # replaces (sf-pipeline-policy §2.3a rule 2 — a missing verdict is
+            # never a pass).
+            sf_drift = stamp_drift
+            sf_definition_reason = (
+                "live_definition_unreadable" if live_definition is None
+                else "repo_definition_unreachable"
+            )
+        else:
+            sf_definition_compared = True
+            sf_drift = (
+                _canonical_definition(live_definition)
+                != _canonical_definition(repo_definition)
+            )
+            sf_definition_reason = (
+                "definition_mismatch" if sf_drift else "definition_identical"
+            )
+            # The comparison IS the measurement; a fetched-and-compared pair
+            # is never unmeasured, whatever the stamp says.
+            sf_drift_unmeasured = False
+            if deploy_stamp_stale and not sf_drift:
+                log.warning(
+                    "Deploy stamp is stale (live %s vs main %s) but the "
+                    "%s definition is identical to the repo's — reporting "
+                    "deploy_stamp_stale=true and sf_drift=false so the "
+                    "pipeline degrades and pages instead of halting "
+                    "(alpha-engine-config-I7799).",
+                    sf_sha, upstream, sf_name,
+                )
 
     # Interpret stack_read tri-state:
     #   str               → healthy stack with tag; compare to upstream
@@ -287,11 +433,14 @@ def check_deploy_drift(
         cf_drift_detail = ""
         cf_stack_status = None
 
-    sf_drift_reason = (
-        "fetch_failed" if sf_drift_unmeasured else
-        "sha_mismatch" if sf_drift else
-        ("no_git_sha_stamp_legacy" if sf_sha is None else "in_sync")
-    )
+    if sf_definition_compared:
+        sf_drift_reason = sf_definition_reason
+    else:
+        sf_drift_reason = (
+            "fetch_failed" if sf_drift_unmeasured else
+            "sha_mismatch" if sf_drift else
+            ("no_git_sha_stamp_legacy" if sf_sha is None else "in_sync")
+        )
 
     result = {
         "repo": repo,
@@ -300,6 +449,16 @@ def check_deploy_drift(
         "sf_sha": sf_sha,
         "sf_stamp_present": sf_sha is not None,
         "sf_drift_reason": sf_drift_reason,
+        # config-I7799. `sf_drift` answers "is the orchestration about to run
+        # different from what main describes" and HALTS. `deploy_stamp_stale`
+        # answers "has this repo merged something it has not deployed" and
+        # DEGRADES — a merged Lambda, collector or script this pipeline invokes
+        # but does not embed is genuinely undeployed, and dropping that signal
+        # to fix the halt would be trading one blind spot for another.
+        "deploy_stamp_stale": deploy_stamp_stale,
+        "sf_definition_path": sf_definition_path,
+        "sf_definition_compared": sf_definition_compared,
+        "sf_definition_reason": sf_definition_reason,
         "stack_sha": stack_sha,
         "stack_stamp_present": stack_stamp_present,
         "cf_drift_reason": cf_drift_reason,
