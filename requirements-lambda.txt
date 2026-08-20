@@ -38,7 +38,7 @@ krepis[flow-doctor]==0.59.18  # pinned per §139 — first-party/fast-moving dep
 nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.70
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
-pyarrow>=25.0.0
+pyarrow>=25.0.1
 yfinance>=1.6.0
 boto3>=1.43.70
 tqdm>=4.68.4
