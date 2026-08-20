@@ -74,6 +74,22 @@ def test_shas_match_malformed_deployed_passes():
     assert dd._shas_match("abc", "deadbeef" * 5) is True
 
 
+# ── config-I7799: the definition comparison is OFF unless a test asks ────────
+#
+# `check_deploy_drift` now reads the live definition and fetches the repo's for
+# the weekday pipelines. Left unpatched these two would reach boto3 and
+# raw.githubusercontent from a unit test, and the pre-I7799 tests below would
+# pass only because both happened to fail. Default them to "could not compare"
+# — the documented fallback-to-stamp path — so every test below states which
+# world it is in.
+
+@pytest.fixture(autouse=True)
+def _no_definition_comparison_by_default():
+    with patch.object(dd, "_read_sf_definition", return_value=None), \
+         patch.object(dd, "_fetch_repo_definition", return_value=None):
+        yield
+
+
 # ── check_deploy_drift composition ───────────────────────────────────────────
 
 @patch.object(dd, "_read_sf_comment", return_value="[git:deadbeef12345] weekday pipeline")
@@ -204,3 +220,161 @@ def test_read_stack_tag_returns_none_when_tag_absent():
     with patch.dict("sys.modules", {"boto3": mock_boto3}):
         sha = dd._read_stack_tag("stack")
     assert sha is None
+
+
+# ── config-I7799: content comparison for the weekday pipelines ───────────────
+#
+# Brian ruling 2026-08-20, option (b). The 2026-08-20 preopen halted because
+# three merges to nousergon-data had not deployed — none of which touched the
+# preopen definition. The live orchestration was byte-identical to main's and
+# correct; the session went unmanaged anyway.
+
+_UPSTREAM = "bbbb222bbbb2cccccccccccccccccccccccccccc"
+_STALE_STAMP = "[git:aaaa111aaaa1] stale stamp, unrelated merges"
+
+_DEFINITION = {
+    "Comment": "Alpha Engine preopen",
+    "StartAt": "A",
+    "States": {"A": {"Type": "Pass", "End": True}},
+}
+
+
+def _stamped(doc, sha):
+    """What the deploy uploads: the same doc with a [git:<sha>] Comment."""
+    out = json.loads(json.dumps(doc))
+    out["Comment"] = f"[git:{sha}] {doc.get('Comment', '')}".rstrip()
+    return out
+
+
+def test_canonical_definition_ignores_the_deploy_stamp():
+    assert (
+        dd._canonical_definition(_stamped(_DEFINITION, "abc1234"))
+        == dd._canonical_definition(_DEFINITION)
+    )
+
+
+def test_canonical_definition_ignores_key_order():
+    reordered = {
+        "States": {"A": {"End": True, "Type": "Pass"}},
+        "StartAt": "A",
+        "Comment": "Alpha Engine preopen",
+    }
+    assert dd._canonical_definition(reordered) == dd._canonical_definition(_DEFINITION)
+
+
+def test_canonical_definition_drops_a_comment_that_was_only_a_stamp():
+    """`Comment = f'[git:{sha}] {orig}'.rstrip()` on an empty orig leaves the
+    stamp alone, which must normalise to the repo's absent Comment."""
+    bare = {"StartAt": "A", "States": {"A": {"Type": "Pass", "End": True}}}
+    assert (
+        dd._canonical_definition({**bare, "Comment": "[git:abc1234]"})
+        == dd._canonical_definition(bare)
+    )
+
+
+def test_canonical_definition_sees_a_real_difference():
+    changed = json.loads(json.dumps(_DEFINITION))
+    changed["States"]["A"]["Type"] = "Succeed"
+    assert dd._canonical_definition(changed) != dd._canonical_definition(_DEFINITION)
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_stale_stamp_with_identical_definition_degrades_instead_of_halting(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """The 2026-08-20 case exactly: unrelated merges undeployed, preopen
+    definition unchanged. Must NOT halt, must still SAY the stamp is stale."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is False
+    assert result["has_drift"] is False
+    assert result["deploy_stamp_stale"] is True
+    assert result["sf_definition_compared"] is True
+    assert result["sf_drift_reason"] == "definition_identical"
+    assert result["sf_definition_path"] == "infrastructure/step_function_daily.json"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_a_real_definition_change_still_halts(mock_fetch, mock_tag, mock_comment):
+    changed = json.loads(json.dumps(_DEFINITION))
+    changed["States"]["A"] = {"Type": "Fail", "Error": "Nope"}
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=changed):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is True
+    assert result["has_drift"] is True
+    assert result["sf_drift_reason"] == "definition_mismatch"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_unreachable_repo_definition_falls_back_to_the_stamp_verdict(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """A missing comparison is never a pass (sf-pipeline-policy §2.3a rule 2).
+    The fallback is the stamp, which halts strictly more often."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=None):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is True
+    assert result["sf_definition_compared"] is False
+    assert result["sf_definition_reason"] == "repo_definition_unreachable"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_unreadable_live_definition_falls_back_to_the_stamp_verdict(
+    mock_fetch, mock_tag, mock_comment,
+):
+    with patch.object(dd, "_read_sf_definition", return_value=None), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is True
+    assert result["sf_definition_compared"] is False
+    assert result["sf_definition_reason"] == "live_definition_unreadable"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_weekly_pipeline_keeps_stamp_semantics(mock_fetch, mock_tag, mock_comment):
+    """No market-open deadline there — a lost weekly run costs a rerun, not a
+    session, so the broader stamp signal stays the halt condition."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(
+            region="us-east-1", account_id="123",
+            sf_name="ne-weekly-freshness-pipeline",
+        )
+
+    assert result["sf_drift"] is True
+    assert result["sf_definition_compared"] is False
+    assert result["sf_definition_path"] is None
+    assert result["sf_definition_reason"] == "stamp_only_pipeline"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=None)
+def test_github_outage_still_omits_sf_drift(mock_fetch, mock_tag, mock_comment):
+    """config-I7048's invariant survives: with a stamp present and upstream
+    unfetchable there is nothing to compare AT, so the key is omitted and the
+    SF's IsPresent guard fails closed."""
+    result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+    assert "sf_drift" not in result
+    assert result["sf_definition_reason"] == "upstream_sha_unavailable"
