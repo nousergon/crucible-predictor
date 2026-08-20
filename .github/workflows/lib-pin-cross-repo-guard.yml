@@ -1,0 +1,101 @@
+name: Lib Pin Cross-Repo Parity Guard
+
+# alpha-engine-config-I7835. The weekly SF's `LibPinDriftGate`
+# (this repo's `inference/lib_pin_drift.py::check_lib_pin_drift`) hard-fails
+# when this repo's nousergon-lib pin != crucible-backtester's — the two are
+# co-installed into one venv by crucible-backtester's `spot_backtest.sh`
+# (backtester first, predictor second), so a lagging pin silently downgrades
+# the library.
+#
+# 2026-08-20: this repo and crucible-backtester each moved to v0.124.75 in a
+# correctly-executed lockstep PR pair (crucible-predictor#529 /
+# crucible-backtester#713). Minutes later, crucible-predictor#530 bumped
+# THIS repo alone to v0.124.76 — a single-repo pin PR that
+# `tests/test_lib_pin_lockstep.py` cannot see, because that test only
+# compares `requirements.txt` against `requirements-lambda.txt`, never
+# against crucible-backtester's pin. Nothing at merge time stopped it, and
+# the weekly SF's `LibPinDriftGate` was the first thing to notice — a
+# scheduled gate finding what a PR-time check should have caught.
+#
+# This workflow closes that gap one merge earlier, in both directions:
+# mirrors nousergon-data's `sf-stage-consumer-guard.yml` shape (check out the
+# sibling repo's main and compare against THIS PR's candidate state, rather
+# than growing a second implementation of the parity check that can drift
+# from `check_lib_pin_drift`). A companion workflow of the same name lives in
+# crucible-backtester and checks the opposite direction.
+#
+# NOT a full reimplementation of check_lib_pin_drift() — that function
+# fetches both repos at the SAME branch name, which only works for the
+# deployed `main` vs `main` comparison the weekly SF runs. A PR branch only
+# exists in ONE of the two repos, so a PR-time guard fetches the sibling's
+# `main` pin and compares it to THIS PR's own (checked-out) candidate pin
+# instead.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'requirements.txt'
+      - 'requirements-lambda.txt'
+      - '.github/workflows/lib-pin-cross-repo-guard.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lib-pin-cross-repo-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity-guard:
+    name: crucible-backtester co-install parity vs candidate pin
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out this PR's candidate state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Check out crucible-backtester (main — the co-install partner)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/crucible-backtester
+          ref: main
+          path: .backtester-sibling
+
+      - name: Compare co-install pins
+        run: |
+          set -euo pipefail
+          PIN_RE='(alpha-engine-lib|nousergon-lib)\[[^]]*\][[:space:]]*@[[:space:]]*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)'
+
+          own_pin=$(grep -oE "$PIN_RE" requirements.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          sibling_pin=$(grep -oE "$PIN_RE" .backtester-sibling/requirements.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+          if [ -z "$own_pin" ]; then
+            echo "::error::could not parse a nousergon-lib pin from this repo's requirements.txt"
+            exit 1
+          fi
+          if [ -z "$sibling_pin" ]; then
+            echo "::error::could not parse a nousergon-lib pin from crucible-backtester@main's requirements.txt"
+            exit 1
+          fi
+
+          echo "crucible-predictor (this PR): $own_pin"
+          echo "crucible-backtester (main):   $sibling_pin"
+
+          if [ "$own_pin" != "$sibling_pin" ]; then
+            echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin. spot_backtest.sh co-installs both into one venv (alpha-engine-config-I7835) — they must match exactly, or bump crucible-backtester in the SAME lockstep arc first."
+            exit 1
+          fi
+
+          echo "co-install parity OK: both pin $own_pin"
+
+          # requirements-lambda.txt must also carry the same tag — this repo's
+          # own test_lib_pin_lockstep.py already asserts this intra-repo; this
+          # step just reconfirms so a future refactor cannot drop that guard
+          # silently on the cross-repo-guard's watch.
+          lambda_pin=$(grep -oE "$PIN_RE" requirements-lambda.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          if [ "$lambda_pin" != "$own_pin" ]; then
+            echo "::error::intra-repo drift: requirements.txt=$own_pin but requirements-lambda.txt=$lambda_pin"
+            exit 1
+          fi
