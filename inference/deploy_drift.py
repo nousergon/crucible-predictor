@@ -406,6 +406,10 @@ def check_deploy_drift(
     sf_definition_reason = "stamp_only_pipeline"
 
     sf_definition_source = "none"
+    # The `[git:<sha>]` stamp carried INSIDE the S3 copy, i.e. the deploy that
+    # wrote it. None until an S3 read succeeds. config-I7927.
+    s3_deploy_sha: Optional[str] = None
+    deploy_stamp_stale_reason_override: Optional[str] = None
 
     if sf_definition_path is None:
         # Weekly / unknown pipeline: stamp semantics, unchanged.
@@ -442,6 +446,14 @@ def check_deploy_drift(
             repo_definition = _fetch_s3_definition(sf_definition_path)
             if repo_definition is not None:
                 sf_definition_source = "s3"
+                # alpha-engine-config-I7927 deliverable 4 — the S3 copy's own
+                # freshness. The deploy stamps `[git:<sha>] ` into the Comment of
+                # the very bytes it uploads, so the artifact SAYS which deploy
+                # wrote it. Read it out here: it is an in-region expected SHA,
+                # which is the one thing cf_drift was still going to GitHub for.
+                s3_deploy_sha = _extract_sf_sha(
+                    repo_definition.get("Comment") or "",
+                )
             elif upstream is not None:
                 # S3 unreadable — fall back to the pre-I7927 GitHub path rather
                 # than dropping straight to the stamp. Strictly more information
@@ -490,10 +502,49 @@ def check_deploy_drift(
                     sf_sha, upstream, sf_name,
                 )
 
+    # ── config-I7927 deliverable 4: is the S3 expectation the one that
+    # produced the live machine? ────────────────────────────────────────────
+    # The S3 copy is now load-bearing for a verdict that HALTS the trading day,
+    # and nothing yet asserted it describes the deploy that is actually live.
+    # The two are written by the same script but in different steps — upload in
+    # step 2, `update-state-machine` in step 3 — and `check-definition-drift.py`
+    # exists precisely because a third party can write to that key (out-of-band
+    # console edit, aborted deploy, drive-by S3 write).
+    #
+    # The assertion needs no clock and no third party: both artifacts carry the
+    # SHA of the deploy that wrote them, so they can be asked whether they agree.
+    #
+    # A disagreement is a MEASURED deploy incoherence, not an unmeasurable
+    # state, so it does NOT withdraw the verdict — withdrawing it would turn a
+    # rare inconsistency into a halted trading session, which is the harm I7799
+    # exists to prevent. It routes to the DEGRADE channel instead, via
+    # `deploy_stamp_stale`, whose DeployDriftGate branch pages without halting.
+    # Same halt-vs-degrade split, one layer down; strictly additive, and it
+    # weakens nothing: `sf_drift` is exactly what it was one line above.
+    s3_copy_stamp_mismatch = (
+        sf_definition_source == "s3"
+        and sf_sha is not None
+        and s3_deploy_sha is not None
+        and not _shas_match(s3_deploy_sha, sf_sha)
+    )
+    if s3_copy_stamp_mismatch:
+        deploy_stamp_stale = True
+        deploy_stamp_stale_unmeasured = False
+        deploy_stamp_stale_reason_override = "s3_copy_stamp_mismatch"
+        log.error(
+            "The S3 definition for %s was written by deploy %s but the live "
+            "state machine is stamped %s — the expectation this probe just "
+            "compared against is not the one that produced the running "
+            "orchestration. Degrading and paging rather than halting "
+            "(alpha-engine-config-I7927).",
+            sf_name, s3_deploy_sha, sf_sha,
+        )
+
     # Interpret stack_read tri-state:
     #   str               → healthy stack with tag; compare to upstream
     #   None              → healthy stack, tag absent (legacy-deploy warn)
     #   StackStateError   → stack not usable; cf_drift=true with reason code
+    cf_drift_source: Optional[str] = None
     if isinstance(stack_read, StackStateError):
         stack_sha = None
         stack_stamp_present = False
@@ -505,21 +556,47 @@ def check_deploy_drift(
     else:
         stack_sha = stack_read  # str | None
         stack_stamp_present = stack_sha is not None
-        # Same unmeasured rule as sf_drift: a real stack tag exists but
-        # upstream could not be fetched.
-        cf_drift_unmeasured = stack_sha is not None and upstream is None
-        cf_drift = (
-            upstream is not None
-            and stack_sha is not None
-            and not _shas_match(stack_sha, upstream)
-        )
-        cf_drift_reason = (
-            "fetch_failed" if cf_drift_unmeasured else
-            "sha_mismatch" if cf_drift else
-            ("no_git_sha_tag_legacy" if stack_sha is None else "in_sync")
-        )
         cf_drift_detail = ""
         cf_stack_status = None
+        if stack_sha is not None and s3_deploy_sha is not None:
+            # ── config-I7927: cf_drift measured IN-REGION ──────────────────
+            # This is the branch without which GitHub was still on the critical
+            # path after the sf_drift half landed (crucible-predictor#538).
+            # DeployDriftGate carries
+            #   Not IsPresent($.drift_result.Payload.cf_drift) -> HandleFailure
+            # so a GitHub outage omitted `cf_drift` and HALTED the trading day
+            # regardless of how `sf_drift` was obtained. Both had to become
+            # answerable without a third party, or neither did.
+            #
+            # The reference point moves from "main HEAD" to "the SHA the last
+            # deploy stamped", which is what the CFN stack tag is written from
+            # in the same run. A mismatch is therefore a partial or out-of-band
+            # deploy — real drift, degrading exactly as before.
+            #
+            # The case this reference point drops is "the stack is consistent
+            # with the last deploy but main has moved on". That is NOT lost: it
+            # is `deploy_stamp_stale`, which routes to the SAME
+            # SetDeployDriftDegradedFlag and pages the same way. Same outcome,
+            # one honest cause each, per I7799's split.
+            cf_drift_unmeasured = False
+            cf_drift = not _shas_match(stack_sha, s3_deploy_sha)
+            cf_drift_source = "s3"
+            cf_drift_reason = "sha_mismatch" if cf_drift else "in_sync"
+        else:
+            # Pre-I7927 path, unchanged. Same unmeasured rule as sf_drift: a
+            # real stack tag exists but no expected SHA could be obtained.
+            cf_drift_unmeasured = stack_sha is not None and upstream is None
+            cf_drift = (
+                upstream is not None
+                and stack_sha is not None
+                and not _shas_match(stack_sha, upstream)
+            )
+            cf_drift_source = None if stack_sha is None else "github"
+            cf_drift_reason = (
+                "fetch_failed" if cf_drift_unmeasured else
+                "sha_mismatch" if cf_drift else
+                ("no_git_sha_tag_legacy" if stack_sha is None else "in_sync")
+            )
 
     if sf_definition_compared:
         sf_drift_reason = sf_definition_reason
@@ -557,6 +634,16 @@ def check_deploy_drift(
         "stack_sha": stack_sha,
         "stack_stamp_present": stack_stamp_present,
         "cf_drift_reason": cf_drift_reason,
+        # config-I7927: WHICH expectation cf_drift was measured against —
+        # "s3" (in-region, the deploy's own record), "github" (the pre-I7927
+        # fallback), or None when there was no stack tag to compare. Emitted so
+        # "the halting gate's other field quietly went back to needing GitHub"
+        # is visible on the payload rather than inferred from a source read.
+        "cf_drift_source": cf_drift_source,
+        # The `[git:<sha>]` stamp inside the S3 expectation, i.e. the deploy
+        # that wrote it. Compared against `sf_sha` (the live machine's stamp) to
+        # assert the expectation describes the deploy that is actually running.
+        "s3_deploy_sha": s3_deploy_sha,
         "cf_drift_detail": cf_drift_detail,
         "cf_stack_status": cf_stack_status,
         # alpha-engine-config-I7048: OMIT sf_drift/cf_drift entirely when
@@ -581,6 +668,11 @@ def check_deploy_drift(
     if not deploy_stamp_stale_unmeasured:
         result["deploy_stamp_stale"] = deploy_stamp_stale
     result["deploy_stamp_stale_reason"] = (
+        # config-I7927: an S3 expectation written by a different deploy than the
+        # live machine is a distinct fault from "main has moved", and the alert
+        # must say which one fired.
+        deploy_stamp_stale_reason_override
+        if deploy_stamp_stale_reason_override is not None else
         "fetch_failed" if deploy_stamp_stale_unmeasured else
         "sha_mismatch" if deploy_stamp_stale else
         ("no_git_sha_stamp_legacy" if sf_sha is None else "in_sync")
