@@ -191,8 +191,22 @@ def _ge_floor(pin: str) -> bool:
         return False
 
 
-def check_lib_pin_drift(branch: str = "main") -> dict:
+def check_lib_pin_drift(branch: str = "main", *, probe: bool = False) -> dict:
     """Assert the cross-repo lib-pin invariant; return a dict the SF Choice reads.
+
+    `probe=True` marks a SYNTHETIC invocation — `infrastructure/deploy.sh`'s
+    deploy-time canary, whose only question is whether this action's wiring is
+    intact (it gates on the PRESENCE of `has_drift`, never on its value). The
+    returned payload is byte-identical either way; only the LOG SEVERITY of a
+    detected condition drops to WARNING, so the finding is still fully recorded
+    in CloudWatch but does not reach flow-doctor's ERROR handler as a page.
+    alpha-engine-config-I7954: a cross-repo lockstep pin bump is two merges and
+    cannot be atomic, so a canary firing in the window between them reports a
+    parity break that is TRUE, useless, and self-clearing minutes later — it
+    fired for real on 2026-08-21 (predictor#534 14:59:41Z, backtester#718
+    15:13:07Z, page at 15:06:03Z). The Step Function's own pre-spend invocation
+    passes no `probe` and keeps ERROR: a real drift there is spend about to be
+    wasted, and it must still halt and page.
 
     `has_drift` is present (`true`/`false`) ONLY when every needed pin was
     fetched + parsed. Any fetch/parse miss OMITS `has_drift` entirely
@@ -270,7 +284,8 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
             f"({bt if r == pred else pred}={pins[bt if r == pred else pred]})"
             for r, d in unverifiable_pair.items()
         ]
-        log.error(
+        log.log(
+            logging.WARNING if probe else logging.ERROR,
             "Lib-pin drift HALT: co-install parity cannot be verified — %s",
             "; ".join(offenders),
         )
@@ -338,7 +353,10 @@ def check_lib_pin_drift(branch: str = "main") -> dict:
 
     has_drift = not (parity_ok and floor_ok)
     if has_drift:
-        log.error("Lib-pin drift DETECTED: %s", "; ".join(offenders))
+        log.log(
+            logging.WARNING if probe else logging.ERROR,
+            "Lib-pin drift DETECTED: %s", "; ".join(offenders),
+        )
 
     return {
         "status": STATUS_MEASURED,

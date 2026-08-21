@@ -326,3 +326,62 @@ def test_a_permanent_floor_only_problem_does_not_halt_the_pair_check():
         out = lpd.check_lib_pin_drift()
     assert "has_drift" not in out
     assert out["status"] == lpd.STATUS_UNKNOWN
+
+
+# ── probe=True: a synthetic invocation records, it does not page ─────────────
+# alpha-engine-config-I7954. `handler.py` attaches flow-doctor at ERROR, so
+# the log LEVEL of a detected condition is the difference between an entry in
+# CloudWatch and an email. `infrastructure/deploy.sh`'s canary invokes this
+# action purely to exercise its wiring and gates on the PRESENCE of
+# `has_drift`, never on its value — so a true finding from that invocation is
+# noise. It fired for real on 2026-08-21T15:06:03Z, in the 13.5-minute window
+# between the two halves of a cross-repo lockstep pin bump.
+
+
+def _drifting_pins():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = "v0.52.1"
+    return pins
+
+
+def test_probe_downgrades_a_detected_drift_to_warning(caplog):
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(_drifting_pins()):
+        lpd.check_lib_pin_drift(probe=True)
+    records = [r for r in caplog.records if "Lib-pin drift DETECTED" in r.getMessage()]
+    assert records, "the finding must still be recorded, only at a lower level"
+    assert [r.levelname for r in records] == ["WARNING"]
+
+
+def test_default_invocation_still_logs_a_detected_drift_at_error(caplog):
+    # The Step Function's own pre-spend invocation passes no `probe`. A real
+    # drift there is spend about to be wasted: it must still halt AND page.
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(_drifting_pins()):
+        lpd.check_lib_pin_drift()
+    records = [r for r in caplog.records if "Lib-pin drift DETECTED" in r.getMessage()]
+    assert [r.levelname for r in records] == ["ERROR"]
+
+
+def test_probe_leaves_the_payload_identical():
+    # The canary gates on the payload; changing it would change what the
+    # deploy promotes on. `probe` may only move the log level.
+    with _patch_pins(_drifting_pins()):
+        as_probe = lpd.check_lib_pin_drift(probe=True)
+    with _patch_pins(_drifting_pins()):
+        as_gate = lpd.check_lib_pin_drift()
+    assert as_probe == as_gate
+    assert as_probe["has_drift"] is True
+
+
+def test_probe_downgrades_the_unverifiable_parity_halt_too(caplog):
+    # The second ERROR site: a co-install-pair member pinned by SHA is a
+    # permanently unverifiable parity invariant (I7301). Same reasoning — the
+    # canary is not the consumer of that verdict.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = lpd.PinRead(
+        None, lpd.SHA_PINNED, "patched: 1a2b3c4d"
+    )
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(pins):
+        out = lpd.check_lib_pin_drift(probe=True)
+    assert out["has_drift"] is True
+    records = [r for r in caplog.records if "Lib-pin drift HALT" in r.getMessage()]
+    assert [r.levelname for r in records] == ["WARNING"]

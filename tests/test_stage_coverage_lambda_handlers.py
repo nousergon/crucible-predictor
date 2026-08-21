@@ -134,7 +134,7 @@ def test_lib_pin_drift_check_merges_verdict_when_lib_available(monkeypatch):
     )
     fake_result = {"has_drift": False, "reason": "ok", "pins": {}, "offenders": []}
     monkeypatch.setattr(
-        "inference.lib_pin_drift.check_lib_pin_drift", lambda: fake_result
+        "inference.lib_pin_drift.check_lib_pin_drift", lambda **_: fake_result
     )
     _stub_preflight(monkeypatch)
 
@@ -152,7 +152,7 @@ def test_lib_pin_drift_check_outcome_unchanged_when_lib_absent(monkeypatch):
     _uninstall_stage_coverage(monkeypatch)
     fake_result = {"has_drift": False, "reason": "ok", "pins": {}, "offenders": []}
     monkeypatch.setattr(
-        "inference.lib_pin_drift.check_lib_pin_drift", lambda: fake_result
+        "inference.lib_pin_drift.check_lib_pin_drift", lambda **_: fake_result
     )
     _stub_preflight(monkeypatch)
 
@@ -175,7 +175,7 @@ def test_pipeline_contract_check_merges_verdict_when_lib_available(monkeypatch):
         "violations": [],
     }
     monkeypatch.setattr(
-        "inference.pipeline_contract_check.check_pipeline_contract", lambda: fake_result
+        "inference.pipeline_contract_check.check_pipeline_contract", lambda **_: fake_result
     )
     _stub_preflight(monkeypatch)
 
@@ -197,7 +197,7 @@ def test_pipeline_contract_check_outcome_unchanged_when_lib_absent(monkeypatch):
         "violations": [],
     }
     monkeypatch.setattr(
-        "inference.pipeline_contract_check.check_pipeline_contract", lambda: fake_result
+        "inference.pipeline_contract_check.check_pipeline_contract", lambda **_: fake_result
     )
     _stub_preflight(monkeypatch)
 
