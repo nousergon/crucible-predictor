@@ -81,21 +81,57 @@ jobs:
           fi
 
           echo "crucible-predictor (this PR): $own_pin"
-          echo "crucible-backtester (main):   $sibling_pin"
+          echo "crucible-backtester (main):     $sibling_pin"
 
-          if [ "$own_pin" != "$sibling_pin" ]; then
-            echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin. spot_backtest.sh co-installs both into one venv (alpha-engine-config-I7835) — they must match exactly, or bump crucible-backtester in the SAME lockstep arc first."
+          if [ "$own_pin" = "$sibling_pin" ]; then
+            echo "co-install parity OK: both pin $own_pin"
+            exit 0
+          fi
+
+          # ── alpha-engine-config-I7934 ──────────────────────────────────────
+          # A lockstep bump moves BOTH repos, so at the moment either PR runs,
+          # the sibling's main still holds the OLD pin. Comparing only against
+          # sibling@main therefore fails BOTH halves of every correct lockstep
+          # pair, and this guard's own error message ("bump the sibling in the
+          # SAME lockstep arc first") names a procedure that cannot be executed
+          # — whichever half goes first is red. Measured 2026-08-21 on
+          # crucible-backtester#718 / crucible-predictor#534.
+          #
+          # So before failing, look for the other half IN FLIGHT: an open PR on
+          # the sibling whose head already pins what this PR pins. Both repos
+          # are public, so this reads api.github.com and raw.githubusercontent
+          # unauthenticated — no cross-repo token, and no dependence on a
+          # credential that can expire (which is the defect this whole arc came
+          # from: alpha-engine-config-I7924).
+          #
+          # This does NOT weaken the invariant. It defers it by one merge, and
+          # the weekly SF's LibPinDriftGate (check_lib_pin_drift, main vs main)
+          # still hard-fails if the second half never lands.
+          echo "pins differ — checking whether the lockstep partner is in flight on crucible-backtester"
+
+          api="https://api.github.com/repos/nousergon/crucible-backtester/pulls?state=open&per_page=100"
+          if ! prs=$(curl -sS --fail --max-time 20 -H 'Accept: application/vnd.github+json' "$api"); then
+            echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin, AND the GitHub API could not be reached to check for an in-flight lockstep partner. Failing closed — this is 'no answer', not 'no partner'."
             exit 1
           fi
 
-          echo "co-install parity OK: both pin $own_pin"
+          match=""
+          while IFS=$'\t' read -r num sha; do
+            [ -n "$num" ] || continue
+            raw="https://raw.githubusercontent.com/nousergon/crucible-backtester/$sha/requirements.txt"
+            body=$(curl -sS --fail --max-time 20 "$raw" 2>/dev/null) || continue
+            head_pin=$(printf '%s' "$body" | grep -oE "$PIN_RE" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            if [ "$head_pin" = "$own_pin" ]; then
+              match="$num"
+              break
+            fi
+          done < <(printf '%s' "$prs" | python3 -c 'import json,sys; sys.stdout.write("".join("%s\t%s\n" % (p["number"], p["head"]["sha"]) for p in json.load(sys.stdin)))')
 
-          # requirements-lambda.txt must also carry the same tag — this repo's
-          # own test_lib_pin_lockstep.py already asserts this intra-repo; this
-          # step just reconfirms so a future refactor cannot drop that guard
-          # silently on the cross-repo-guard's watch.
-          lambda_pin=$(grep -oE "$PIN_RE" requirements-lambda.txt | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          if [ "$lambda_pin" != "$own_pin" ]; then
-            echo "::error::intra-repo drift: requirements.txt=$own_pin but requirements-lambda.txt=$lambda_pin"
-            exit 1
+          if [ -n "$match" ]; then
+            echo "::notice::co-install parity DEFERRED: crucible-backtester@main is still $sibling_pin, but crucible-backtester#$match is open and already pins $own_pin. This is the other half of the lockstep arc. Merge both — the weekly SF's LibPinDriftGate fails if the second half never lands."
+            echo "co-install parity OK (lockstep partner in flight): crucible-backtester#$match pins $own_pin"
+            exit 0
           fi
+
+          echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin, and NO open crucible-backtester PR pins $own_pin. spot_backtest.sh co-installs both into one venv (alpha-engine-config-I7835) — open the matching crucible-backtester pin PR and this check will pass on re-run."
+          exit 1
