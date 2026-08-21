@@ -1,0 +1,47 @@
+name: alert-class-pr-guard
+
+# alpha-engine-config-I7896.
+#
+# A PR in THIS repo that adds a `publish_observe_alert(source=...)` (or
+# `alerts.publish` / `publish_ops_alert` / `publish_ops_digest`, or a
+# `python -m krepis.alerts publish --source ...` invocation) whose source
+# literal has no row in nousergon-data's
+# infrastructure/overseer/playbooks.yaml::alert_classes now fails ITS OWN CI.
+#
+# WHAT IT REPLACES. Until this existed, that gap surfaced days later on a
+# THIRD repo's main -- alpha-engine-config's push-to-main fleet sweep -- where
+# a red main SILENTLY EJECTS every entry from that repo's merge queue while
+# each queued PR keeps reporting a healthy state. So a missing playbook row in
+# this repo blocked merges in a repo nobody here had touched, with no message
+# anywhere naming the cause. Measured 2026-08-20: twice in one session,
+# roughly two hours of fleet merge throughput (alpha-engine-config-I7876 and
+# -I7896). That sweep is untouched and is now the backstop, not the first
+# detector.
+#
+# ONLY THE DELTA FAILS. The guard scans this repo at the PR's base and at its
+# head and fails on newly-unregistered sources only, so pre-existing drift can
+# never block an unrelated PR.
+#
+# MERGE ORDER, AND WHY IT CANNOT DEADLOCK. The row lives in nousergon-data, so
+# a PR here can never add it in the same commit. The guard's failure output
+# prints the exact file and a paste-ready row. Push that companion PR and this
+# check goes green IMMEDIATELY -- an OPEN nousergon-data PR carrying the row
+# already satisfies it; it does not have to merge first. And nothing in
+# nousergon-data is blocked by this PR, so the two can never wait on each
+# other. (That circular red is what the equivalent guard for the observability
+# registry hit on its first live day, alpha-engine-config-I7860 / -PR7820.)
+#
+# The implementation is nousergon-data's, called rather than copied -- one
+# guard and one registry (policy-shared-code). nousergon-data is PUBLIC, so
+# this needs no credential and works on a fork PR.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  alert-class-pr-guard:
+    uses: nousergon/nousergon-data/.github/workflows/alert-class-pr-guard.yml@main
