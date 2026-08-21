@@ -56,3 +56,4 @@ scikit-learn>=1.9.0
 hmmlearn>=0.3.3
 pyyaml>=6.0.3
 arcticdb>=6.23.0
+# ci-trigger-check
