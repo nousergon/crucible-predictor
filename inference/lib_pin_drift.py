@@ -46,6 +46,34 @@ Reporting the permanent case as UNKNOWN is what let a real parity break
 (backtester v0.124.5 vs a predictor SHA pin ~v0.124.16) run unnoticed from
 2026-07-31 to 2026-08-13 behind a degraded alert that fired on every run and
 could not be cleared by waiting.
+
+alpha-engine-config-I7966 (2026-08-21): `crucible-executor` — the repo that
+actually places trades — pinned `nousergon-lib` by bare commit SHA and was in
+neither tuple below, so its pin was not merely unverifiable, it was never
+looked at (measured: the executor sat on a pre-`54b2a80`/I7924 lib for as
+long as the dead GITHUB_TOKEN credential that fix addressed). Added to
+`_FLOOR_REPOS`, not `_CO_INSTALL_PAIR`: the pair exists because
+`spot_backtest.sh` installs backtester and predictor into ONE venv, and a
+lagging half silently downgrades the shared lib mid-install (2026-05-12).
+The executor runs as its own EC2 daemon with its own venv — it never
+co-installs with the predictor or backtester, so widening the pair to
+include it would not protect anything and would change what a pair HALT
+means for no reason. It clears the (much more lenient) floor bar instead.
+
+The executor is not itself a participant in the Saturday weekly SF this
+module's Lambda action gates — it runs the weekday preopen/postclose
+pipeline. It is added to `_FLOOR_REPOS` anyway rather than standing up a
+second drift probe: this is the fleet's only existing cross-repo lib-pin
+drift checker, and reusing it is less to maintain than a parallel
+executor-only mechanism (its own accepted trade-off, not an oversight — a
+confirmed below-floor pin on the executor will now also surface, and could
+in principle halt, the Saturday SF's `check_lib_pin_drift` gate via
+`has_drift`; given the floor sits at data's v0.39.0 and the executor pins
+current releases, this is a theoretical coupling, not a practical one, but
+it is a real one and is recorded here rather than left implicit).
+
+See `_PIN_FILE_OVERRIDES` for why the executor's pin is read from
+`requirements.in`, not `requirements.txt` like every other repo.
 """
 
 from __future__ import annotations
@@ -68,12 +96,17 @@ MIN_LIB_VERSION = "0.39.0"
 # venv). Order is (first-installed, second-installed) for the message only.
 _CO_INSTALL_PAIR = ("nousergon/crucible-backtester", "nousergon/crucible-predictor")
 
-# Every repo that participates in the Saturday SF must clear the floor.
+# Every repo that participates in the Saturday SF must clear the floor —
+# plus, since alpha-engine-config-I7966, crucible-executor, which does NOT
+# participate in the Saturday SF but has no drift probe of its own (see the
+# module docstring's I7966 section for the floor-vs-pair reasoning and the
+# accepted has_drift coupling).
 _FLOOR_REPOS = (
     "nousergon/nousergon-data",
     "nousergon/crucible-predictor",
     "nousergon/crucible-backtester",
     "nousergon/crucible-research",
+    "nousergon/crucible-executor",
 )
 
 # Lifted from {predictor,backtester}/tests/test_lib_pin_lockstep.py (the pin
@@ -108,9 +141,25 @@ _LIB_SHA_PIN_RE = re.compile(
     r"nousergon/nousergon-lib@([0-9a-f]{7,40})\b"
 )
 
-_RAW_REQUIREMENTS_URL = (
-    "https://raw.githubusercontent.com/{repo}/{branch}/requirements.txt"
-)
+_RAW_FILE_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
+
+# Per-repo override of which file carries the human-authored pin this probe
+# should read. Every repo defaults to `requirements.txt`.
+#
+# crucible-executor's `requirements.txt` is a `uv pip compile` LOCKFILE
+# (crucible-executor/tests/test_requirements_lockstep.py) that resolves
+# every VCS ref — including this one — to its exact resolved commit SHA by
+# design (a tag can be force-moved, a commit SHA cannot; this is correct
+# behavior for that file, not a drift). That means crucible-executor's
+# `requirements.txt` reads as `sha_pinned` on every future invocation no
+# matter what tag `requirements.in` declares — a structural property of the
+# tool that generates it, not something a re-pin fixes. `requirements.in` is
+# the human-authored, tag-pinned source of truth for that repo (its own
+# `test_git_pinned_deps_match_pyproject_exactly` treats it the same way), so
+# it — not `requirements.txt` — is what this probe reads for the executor.
+_PIN_FILE_OVERRIDES = {
+    "nousergon/crucible-executor": "requirements.in",
+}
 
 # Why a pin could not be resolved. `None` means it was.
 # Measurement status (alpha-engine-config-I7277, sf-pipeline-policy.md §2.3a
@@ -151,12 +200,13 @@ def _fetch_repo_pin(repo: str, branch: str = "main", timeout: float = 5.0) -> Pi
     still fail-open at the caller, but it is fail-open with the reason
     attached (alpha-engine-config-I7171).
     """
-    url = _RAW_REQUIREMENTS_URL.format(repo=repo, branch=branch)
+    filename = _PIN_FILE_OVERRIDES.get(repo, "requirements.txt")
+    url = _RAW_FILE_URL.format(repo=repo, branch=branch, filename=filename)
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             text = resp.read().decode("utf-8")
     except OSError as exc:  # URLError/HTTPError + bare read-phase TimeoutError
-        log.warning("Lib-pin drift: requirements.txt unreachable for %s (%s)", repo, exc)
+        log.warning("Lib-pin drift: %s unreachable for %s (%s)", filename, repo, exc)
         return PinRead(None, UNREACHABLE, str(exc))
 
     pin = _parse_pin(text)
@@ -167,17 +217,17 @@ def _fetch_repo_pin(repo: str, branch: str = "main", timeout: float = 5.0) -> Pi
     if sha_match is not None:
         sha = sha_match.group(1)
         log.warning(
-            "Lib-pin drift: %s pins nousergon-lib by commit SHA %s, not a vX.Y.Z "
-            "tag — the pin was READ successfully but cannot be compared to the "
-            "%s floor or to another repo's tag (alpha-engine-config-I7171)",
-            repo, sha[:12], MIN_LIB_VERSION,
+            "Lib-pin drift: %s pins nousergon-lib by commit SHA %s in %s, not a "
+            "vX.Y.Z tag — the pin was READ successfully but cannot be compared "
+            "to the %s floor or to another repo's tag (alpha-engine-config-I7171)",
+            repo, sha[:12], filename, MIN_LIB_VERSION,
         )
         return PinRead(None, SHA_PINNED, sha)
 
     log.warning(
-        "Lib-pin drift: no nousergon-lib pin found in %s/requirements.txt "
+        "Lib-pin drift: no nousergon-lib pin found in %s/%s "
         "(file fetched successfully — this is a contract mismatch, not an outage)",
-        repo,
+        repo, filename,
     )
     return PinRead(None, UNRECOGNISED, None)
 
