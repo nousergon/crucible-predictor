@@ -336,7 +336,13 @@ def check_deploy_drift(
     sf_comment = _read_sf_comment(sf_arn) or ""
     sf_sha = _extract_sf_sha(sf_comment)
     stack_read = _read_stack_tag(stack_name)
-    upstream = _fetch_origin_main_sha(repo, branch=branch)
+    # alpha-engine-config-I7924: a rejected GITHUB_TOKEN no longer stops the
+    # fetch (nousergon-lib v0.124.79 retries unauthenticated against these
+    # public repos), but it is still a real defect that must reach the
+    # operator. Carried in the payload so the SF's degrade alert can NAME it,
+    # rather than surviving silently on the anonymous fallback.
+    github_stats: dict = {}
+    upstream = _fetch_origin_main_sha(repo, branch=branch, stats=github_stats)
 
     # sf_drift is UNMEASURED (omitted below) only when there IS a local
     # stamp to compare and upstream could not be fetched. A missing stamp
@@ -351,7 +357,17 @@ def check_deploy_drift(
     # ── config-I7799: content comparison for the weekday pipelines ──────────
     # The stamp verdict is kept under its own name whatever happens below, so
     # a genuinely undeployed repo is still SAID, just not halted on.
+    #
+    # alpha-engine-config-I7924: like sf_drift/cf_drift, this is OMITTED when
+    # it could not be measured. On 2026-08-21 the probe emitted
+    # `deploy_stamp_stale: false` with `upstream_sha: null` — nothing had been
+    # compared, yet the field read to every consumer exactly as a verified
+    # "this repo has deployed everything it merged". That is the same
+    # unmeasured-rendered-as-clean shape the sf_drift omission exists to
+    # prevent (sf-pipeline-policy 2.3a rule 2); it did not cause that morning's
+    # halt only because sf_drift's omission fired one branch earlier.
     deploy_stamp_stale = stamp_drift
+    deploy_stamp_stale_unmeasured = sf_sha is not None and upstream is None
     sf_definition_path = _SF_DEFINITION_PATHS.get(sf_name)
     sf_definition_compared = False
     sf_definition_reason = "stamp_only_pipeline"
@@ -454,8 +470,8 @@ def check_deploy_drift(
         # answers "has this repo merged something it has not deployed" and
         # DEGRADES — a merged Lambda, collector or script this pipeline invokes
         # but does not embed is genuinely undeployed, and dropping that signal
-        # to fix the halt would be trading one blind spot for another.
-        "deploy_stamp_stale": deploy_stamp_stale,
+        # to fix the halt would be trading one blind spot for another. It is
+        # emitted conditionally below (I7924), for the same reason sf_drift is.
         "sf_definition_path": sf_definition_path,
         "sf_definition_compared": sf_definition_compared,
         "sf_definition_reason": sf_definition_reason,
@@ -478,4 +494,23 @@ def check_deploy_drift(
         result["sf_drift"] = sf_drift
     if not cf_drift_unmeasured:
         result["cf_drift"] = cf_drift
+    # alpha-engine-config-I7924: same omit-when-unmeasured rule. The
+    # DeployDriftGate branch reading this is NOT IsPresent-guarded toward
+    # failure by design (see step_function_daily.json), so an absent key
+    # correctly declines to degrade rather than degrading on a fact nobody
+    # established — while `deploy_stamp_stale_reason` still says why.
+    if not deploy_stamp_stale_unmeasured:
+        result["deploy_stamp_stale"] = deploy_stamp_stale
+    result["deploy_stamp_stale_reason"] = (
+        "fetch_failed" if deploy_stamp_stale_unmeasured else
+        "sha_mismatch" if deploy_stamp_stale else
+        ("no_git_sha_stamp_legacy" if sf_sha is None else "in_sync")
+    )
+    # Present ONLY when the credential was actually rejected, so its absence
+    # is never mistaken for a token that was checked and found healthy.
+    if github_stats.get("github_credential_rejected"):
+        result["github_credential_rejected"] = True
+        result["github_credential_status"] = github_stats.get(
+            "github_credential_status",
+        )
     return result
