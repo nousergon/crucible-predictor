@@ -378,3 +378,89 @@ def test_github_outage_still_omits_sf_drift(mock_fetch, mock_tag, mock_comment):
     result = dd.check_deploy_drift(region="us-east-1", account_id="123")
     assert "sf_drift" not in result
     assert result["sf_definition_reason"] == "upstream_sha_unavailable"
+
+
+# ── alpha-engine-config-I7924: the 2026-08-21 preopen halt ──────────────────
+# An expired GITHUB_TOKEN made _fetch_origin_main_sha return None, so the probe
+# omitted sf_drift as unmeasured and DeployDriftGate's fail-closed branch
+# stopped the trading day 3.4 seconds in. nousergon-lib v0.124.79 makes the
+# fetch survive the rejected credential; these tests pin what the probe must
+# then SAY, so the surviving call does not become a silent dependence on the
+# anonymous fallback.
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+def test_deploy_stamp_stale_is_omitted_when_upstream_could_not_be_fetched(
+    mock_tag, mock_comment,
+):
+    """The literal 2026-08-21 payload had `deploy_stamp_stale: false` beside
+    `upstream_sha: null` — nothing compared, rendered as a verified clean.
+
+    It must be ABSENT, exactly like sf_drift/cf_drift, with the reason code
+    carrying why.
+    """
+    with patch.object(dd, "_fetch_origin_main_sha", return_value=None):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert "deploy_stamp_stale" not in result
+    assert result["deploy_stamp_stale_reason"] == "fetch_failed"
+    assert "sf_drift" not in result
+    assert "cf_drift" not in result
+    assert result["upstream_sha"] is None
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_deploy_stamp_stale_reason_is_in_sync_when_measured_clean(
+    mock_fetch, mock_tag, mock_comment,
+):
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["deploy_stamp_stale"] is True
+    assert result["deploy_stamp_stale_reason"] == "sha_mismatch"
+
+
+def test_a_rejected_github_credential_is_named_in_the_payload():
+    """The token is still expired even though the probe now answers. If the
+    payload did not say so, the fix would trade a loud halt for a silent
+    dependence on the unauthenticated fallback."""
+    def _fetch(repo, branch="main", *, stats=None, **_kw):
+        if stats is not None:
+            stats["github_credential_rejected"] = True
+            stats["github_credential_status"] = 401
+        return _UPSTREAM
+
+    with patch.object(dd, "_read_sf_comment", return_value=f"[git:{_UPSTREAM}] in sync"), \
+         patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM), \
+         patch.object(dd, "_fetch_origin_main_sha", side_effect=_fetch), \
+         patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, _UPSTREAM[:12])), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["github_credential_rejected"] is True
+    assert result["github_credential_status"] == 401
+    # …and the run is otherwise clean: a bad token must not halt trading.
+    assert result["sf_drift"] is False
+    assert result["has_drift"] is False
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_a_healthy_credential_leaves_no_rejection_key(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """Absence must never be readable as 'checked and healthy' — the key is
+    present ONLY on an actual rejection."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert "github_credential_rejected" not in result
+    assert "github_credential_status" not in result
