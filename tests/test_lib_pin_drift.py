@@ -17,6 +17,7 @@ _ALIGNED = {
     "nousergon/crucible-predictor": "v0.53.0",
     "nousergon/nousergon-data": "v0.39.0",      # == floor → passes
     "nousergon/crucible-research": "v0.42.0",
+    "nousergon/crucible-executor": "v0.124.79",  # alpha-engine-config-I7966
 }
 
 
@@ -126,6 +127,7 @@ def test_parity_mismatch_below_floor_combined():
         "nousergon/crucible-predictor": "v0.49.0",   # parity break
         "nousergon/nousergon-data": "v0.30.0",        # below floor
         "nousergon/crucible-research": "v0.42.0",
+        "nousergon/crucible-executor": "v0.124.79",
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
@@ -370,6 +372,120 @@ def test_probe_leaves_the_payload_identical():
         as_gate = lpd.check_lib_pin_drift()
     assert as_probe == as_gate
     assert as_probe["has_drift"] is True
+
+
+# ── I7966: crucible-executor joins the checker's scope ───────────────────────
+#
+# The executor pinned nousergon-lib by bare SHA and was in neither tuple this
+# module reads, so its pin was never looked at at all — not merely
+# unverifiable. Added to _FLOOR_REPOS (it never co-installs with the
+# predictor, unlike the backtester) with its pin read from requirements.in
+# rather than requirements.txt (see _PIN_FILE_OVERRIDES: the executor's
+# requirements.txt is a uv-compiled lockfile that always resolves the VCS
+# ref to a commit SHA, by design, regardless of what tag is pinned).
+
+
+def test_executor_is_in_the_floor_repo_set_not_the_pair():
+    assert "nousergon/crucible-executor" in lpd._FLOOR_REPOS
+    assert "nousergon/crucible-executor" not in lpd._CO_INSTALL_PAIR
+
+
+def test_executor_appears_in_the_reported_pins_map_when_aligned():
+    # The acceptance signal named in the issue: a live check_lib_pin_drift
+    # invocation must list nousergon/crucible-executor in its `pins` map —
+    # not just that a constant somewhere changed.
+    with _patch_pins(_ALIGNED):
+        out = lpd.check_lib_pin_drift()
+    assert "nousergon/crucible-executor" in out["pins"]
+    assert out["pins"]["nousergon/crucible-executor"] == "v0.124.79"
+    assert out["has_drift"] is False
+
+
+def test_executor_below_floor_halts_and_names_offender():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-executor"] = "v0.30.0"  # regressed below floor
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["floor_ok"] is False
+    assert any(
+        "below floor" in o and "crucible-executor" in o and "v0.30.0" in o
+        for o in out["offenders"]
+    )
+    # Not a co-install-pair invariant: parity itself is unaffected.
+    assert out["parity_ok"] is True
+
+
+def test_executor_sha_pin_stays_fail_open_it_is_floor_only():
+    # A SHA pin on a floor-only repo is the advisory half of the invariant —
+    # unlike a SHA pin on a CO_INSTALL_PAIR member (I7301), it must not halt.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-executor"] = lpd.PinRead(
+        None, lpd.SHA_PINNED, "fb383a98da36249c09aae3778c96b5ef92325ce1"
+    )
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN
+    assert out["unresolved"]["nousergon/crucible-executor"]["problem"] == lpd.SHA_PINNED
+    # But it is still IN the report — the whole point of I7966.
+    assert "nousergon/crucible-executor" in out["unresolved"]
+
+
+def test_pin_file_override_reads_requirements_in_for_the_executor():
+    # Proves the override actually changes which file is fetched, not just
+    # that the constant exists. urlopen is mocked; only the URL matters here.
+    seen_urls = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return (
+                b"nousergon-lib[flow-doctor,contracts] @ "
+                b"git+https://github.com/nousergon/nousergon-lib@v0.124.79\n"
+            )
+
+    def _fake_urlopen(url, timeout=None):
+        seen_urls.append(url)
+        return _FakeResp()
+
+    with patch.object(lpd.urllib.request, "urlopen", side_effect=_fake_urlopen):
+        read = lpd._fetch_repo_pin("nousergon/crucible-executor")
+
+    assert read.pin == "v0.124.79"
+    assert seen_urls == [
+        "https://raw.githubusercontent.com/nousergon/crucible-executor/main/requirements.in"
+    ]
+
+
+def test_pin_file_override_defaults_to_requirements_txt_for_other_repos():
+    seen_urls = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"numpy>=1.26\n"
+
+    def _fake_urlopen(url, timeout=None):
+        seen_urls.append(url)
+        return _FakeResp()
+
+    with patch.object(lpd.urllib.request, "urlopen", side_effect=_fake_urlopen):
+        lpd._fetch_repo_pin("nousergon/crucible-predictor")
+
+    assert seen_urls == [
+        "https://raw.githubusercontent.com/nousergon/crucible-predictor/main/requirements.txt"
+    ]
 
 
 def test_probe_downgrades_the_unverifiable_parity_halt_too(caplog):
