@@ -357,7 +357,7 @@ def _unknown_result(reason: str) -> dict:
     }
 
 
-def check_pipeline_contract() -> dict:
+def check_pipeline_contract(*, probe: bool = False) -> dict:
     """Assert the pipeline-contract invariants; return a dict the SF Choice reads.
 
     Reads both YAMLs from S3 (alpha-engine-config-I7281). The former ``branch``
@@ -378,6 +378,15 @@ def check_pipeline_contract() -> dict:
 
     ``has_violation=true`` only when a confirmed self-consistency /
     dangling-artifact_id breach is found. Shape mirrors ``check_lib_pin_drift``.
+
+    ``probe=True`` marks a SYNTHETIC invocation — ``infrastructure/deploy.sh``'s
+    deploy-time canary, which gates on the PRESENCE of ``has_violation``, never
+    on its value. The payload is identical either way; only the log severity of
+    a detected violation drops to WARNING so it is recorded without paging
+    (alpha-engine-config-I7954). Mirrors ``check_lib_pin_drift(probe=...)``.
+    This action ALREADY passed ``dry_run: true`` from the canary before I7954 —
+    which is exactly why threading ``dry_run`` alone was not the fix: nothing
+    carried the synthetic-invocation fact down to the log severity.
     """
     contract_raw, contract_reason, contract_mtime = _fetch_source(_CONTRACT_KEY)
     registry_raw, registry_reason, registry_mtime = _fetch_source(_REGISTRY_KEY)
@@ -427,8 +436,9 @@ def check_pipeline_contract() -> dict:
 
     has_violation = bool(violations)
     if has_violation:
-        log.error(
-            "Pipeline-contract preflight VIOLATION(S): %s", "; ".join(violations)
+        log.log(
+            logging.WARNING if probe else logging.ERROR,
+            "Pipeline-contract preflight VIOLATION(S): %s", "; ".join(violations),
         )
 
     return {

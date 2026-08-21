@@ -396,7 +396,14 @@ def handler(event: dict, context) -> dict:
     # ── Lib-pin drift check (Saturday SF early state, L4517) ────────────────
     if action == "check_lib_pin_drift":
         from inference.lib_pin_drift import check_lib_pin_drift
-        result = check_lib_pin_drift()
+        # probe=dry_run: the deploy-time canary invokes this action only to
+        # exercise its wiring and gates on the PRESENCE of has_drift. A true
+        # finding from a synthetic invocation is still logged (at WARNING) but
+        # must not page — a cross-repo lockstep pin bump is two merges, so a
+        # canary landing between them reports a real, useless, self-clearing
+        # parity break (alpha-engine-config-I7954). The SF's own invocation
+        # carries no dry_run and keeps ERROR.
+        result = check_lib_pin_drift(probe=dry_run)
         # alpha-engine-config-I7048: has_drift is OMITTED (not False) on a
         # fetch/parse miss — .get() with an "unmeasured" sentinel keeps this
         # log line from KeyError-ing on the exact degraded path it exists to
@@ -438,7 +445,9 @@ def handler(event: dict, context) -> dict:
     # ── Pipeline-contract preflight (Saturday SF early state, L4595) ─────────
     if action == "check_pipeline_contract":
         from inference.pipeline_contract_check import check_pipeline_contract
-        result = check_pipeline_contract()
+        # probe=dry_run — same canary-must-not-page contract as
+        # check_lib_pin_drift above (alpha-engine-config-I7954).
+        result = check_pipeline_contract(probe=dry_run)
         # alpha-engine-config-I7048: has_violation is OMITTED (not False) on
         # a fetch/parse miss — same .get() rationale as check_lib_pin_drift.
         # alpha-engine-config-I7316: and so are `violations` and

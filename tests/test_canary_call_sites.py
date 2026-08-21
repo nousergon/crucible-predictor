@@ -335,3 +335,71 @@ fi
     (site,) = _parse_call_sites(bad_deploy_sh)
     with pytest.raises(AssertionError, match="bare token"):
         _validate_call_site(site)
+
+
+# ── I7954: a canary invocation must be marked synthetic ──────────────────────
+
+
+def test_every_predictor_canary_payload_carries_dry_run():
+    """`dry_run: true` on every `${LAMBDA_FUNCTION}` canary payload.
+
+    alpha-engine-config-I7954. To this handler `dry_run` does not mean "writes
+    nothing" — it means SYNTHETIC INVOCATION, and two behaviours hang off it:
+
+      - `handler.py`'s `run_for_drift_gate(skip_deploy_drift=_dry_run)` /
+        `_pf.run(skip_deploy_drift=_dry_run)`, so a canary does not assert its
+        own freshly-built image SHA against live `main` HEAD — the merge-burst
+        false-failure config#1073/#2731 removed.
+      - `check_lib_pin_drift(probe=...)` / `check_pipeline_contract(probe=...)`,
+        which drop a DETECTED condition from ERROR to WARNING. `handler.py`
+        attaches flow-doctor at ERROR, so without this a probe finding from a
+        synthetic invocation emails Brian as a production incident.
+
+    Measured 2026-08-21T15:06:03Z: `check_lib_pin_drift` was the one site in
+    this matrix with no `dry_run`, and the deploy canary following
+    crucible-predictor#534 (14:59:41Z) paged a co-install parity break against
+    crucible-backtester, whose matching lockstep bump merged at 15:13:07Z. The
+    finding was true, useless, and self-cleared in 7 minutes: a cross-repo
+    lockstep pin bump is two merges and can never be atomic, so ANY canary
+    landing in that window reports a break.
+
+    This asserts the whole matrix, not the one action that failed, because the
+    next gate action added here would reintroduce the page otherwise. The
+    regime / regime-eval Lambdas are deliberately excluded: they are separate
+    functions with their own HTTP-shaped `dry_run`/`produce` actions.
+    """
+    offenders = []
+    for args in _live_call_sites():
+        func, _version, action_label, payload, _expect = args
+        if func != "${LAMBDA_FUNCTION}":
+            continue  # regime / regime-eval functions, own contract
+        payload_obj = json.loads(payload)
+        if payload_obj.get("dry_run") is not True:
+            offenders.append(f"{action_label}: {payload}")
+    assert not offenders, (
+        "predictor canary payload(s) missing `\"dry_run\": true` — a canary "
+        "invocation that is not marked synthetic asserts deploy-drift against "
+        "live main and pages on any condition its probe detects "
+        "(alpha-engine-config-I7954):\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_probe_bearing_actions_thread_dry_run_into_the_probe():
+    """The handler must pass `probe=dry_run` to every probe-bearing action.
+
+    The payload half (above) is inert without this half: `dry_run` reaching the
+    Lambda changes nothing about log severity unless the handler threads it
+    down. `check_pipeline_contract` ALREADY carried `dry_run: true` before
+    I7954 and still logged its violations at ERROR — which is why the fix is
+    not "add dry_run" alone.
+    """
+    handler_src = HANDLER_PY.read_text()
+    for call in (
+        "check_lib_pin_drift(probe=dry_run)",
+        "check_pipeline_contract(probe=dry_run)",
+    ):
+        assert call in handler_src, (
+            f"inference/handler.py no longer contains `{call}` — a probe "
+            f"invoked without its synthetic-run flag pages on every finding "
+            f"(alpha-engine-config-I7954)"
+        )

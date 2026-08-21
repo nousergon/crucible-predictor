@@ -497,7 +497,7 @@ if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action
 fi
 
 # Test check_trading_day — trading_day_gate returns {is_trading_day,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day"}' "is_trading_day"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day", "dry_run": true}' "is_trading_day"; then
   CANARY_FAILED=1
 fi
 
@@ -509,12 +509,12 @@ fi
 # A fixed `now` inside the session is passed deliberately: a wall-clock
 # canary would exercise a different branch depending on when the deploy ran,
 # and the branch that matters is the one that refuses.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_market_hours" '{"action": "check_market_hours", "now": "2026-08-12T16:00:00Z"}' "is_market_hours"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_market_hours" '{"action": "check_market_hours", "now": "2026-08-12T16:00:00Z", "dry_run": true}' "is_market_hours"; then
   CANARY_FAILED=1
 fi
 
 # Test check_weekly_run_day — trading_day_gate returns {is_weekly_run_day,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}' "is_weekly_run_day"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day", "dry_run": true}' "is_weekly_run_day"; then
   CANARY_FAILED=1
 fi
 
@@ -540,18 +540,33 @@ fi
 # (two S3 GETs); no dry_run needed. Omit `date` so it reads today's
 # artifacts, mirroring how the weekday SF's coverage-gap Choice state calls
 # it with no explicit date.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_coverage" '{"action": "check_coverage"}' "missing_count"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_coverage" '{"action": "check_coverage", "dry_run": true}' "missing_count"; then
   CANARY_FAILED=1
 fi
 
 # Test check_lib_pin_drift — lib_pin_drift.check_lib_pin_drift returns
 # {has_drift,reason,pins,offenders}. Read-only (GitHub raw-content GETs of
-# each Saturday-SF repo's requirements file); no dry_run needed, and it
-# fails open on a fetch/parse miss so a transient GitHub hiccup cannot
-# false-fail this canary.
+# each Saturday-SF repo's requirements file), and it fails open on a
+# fetch/parse miss so a transient GitHub hiccup cannot false-fail this canary.
+#
+# alpha-engine-config-I7954: `dry_run: true` was MISSING here, and the comment
+# it replaces said "no dry_run needed" — read as "this action writes nothing",
+# which is true and is not what dry_run means to this handler. It means
+# SYNTHETIC INVOCATION, and it does two things this action needed:
+#   - handler.py threads it into `run_for_drift_gate(skip_deploy_drift=...)`,
+#     so without it this one action still asserted its image SHA against live
+#     main HEAD — the merge-burst false-failure config#2731 removed everywhere
+#     else in this matrix.
+#   - handler.py threads it into `check_lib_pin_drift(probe=...)`, which drops
+#     a detected drift from ERROR to WARNING. flow-doctor is attached at ERROR,
+#     so a canary landing inside a cross-repo lockstep pin-bump window (two
+#     merges, never atomic) emailed a parity break that was true, useless and
+#     self-cleared 7 minutes later — measured 2026-08-21T15:06:03Z.
+# Every predictor action in this matrix carries dry_run for these reasons, and
+# tests/test_deploy_canary_matrix.py fails the build if a new one does not.
 #
 # `has_drift|reason`: same I7048 two-shaped contract as check_pipeline_contract.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift|reason"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift", "dry_run": true}' "has_drift|reason"; then
   CANARY_FAILED=1
 fi
 

@@ -85,7 +85,12 @@ def test_shas_match_malformed_deployed_passes():
 
 @pytest.fixture(autouse=True)
 def _no_definition_comparison_by_default():
+    # I7927 adds a THIRD source — S3 — and it must be defaulted here too, or
+    # every test that does not patch it reaches boto3 for real and passes only
+    # because that happened to fail. That is precisely the failure mode this
+    # fixture was written for.
     with patch.object(dd, "_read_sf_definition", return_value=None), \
+         patch.object(dd, "_fetch_s3_definition", return_value=None), \
          patch.object(dd, "_fetch_repo_definition", return_value=None):
         yield
 
@@ -372,12 +377,47 @@ def test_weekly_pipeline_keeps_stamp_semantics(mock_fetch, mock_tag, mock_commen
 @patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
 @patch.object(dd, "_fetch_origin_main_sha", return_value=None)
 def test_github_outage_still_omits_sf_drift(mock_fetch, mock_tag, mock_comment):
-    """config-I7048's invariant survives: with a stamp present and upstream
-    unfetchable there is nothing to compare AT, so the key is omitted and the
-    SF's IsPresent guard fails closed."""
-    result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+    """config-I7048's invariant survives: with a stamp present, upstream
+    unfetchable AND no expected definition readable, there is nothing to
+    compare, so the key is omitted and the SF's IsPresent guard fails closed.
+
+    The REASON moved with I7927 — `live_definition_unreadable` rather than
+    `upstream_sha_unavailable` — because the upstream SHA is no longer the
+    first thing the comparison needs. The invariant under test is the omission,
+    and it is unchanged.
+    """
+    with patch.object(dd, "_read_sf_definition", return_value=None):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
     assert "sf_drift" not in result
-    assert result["sf_definition_reason"] == "upstream_sha_unavailable"
+    assert result["sf_definition_compared"] is False
+    assert result["sf_definition_source"] == "none"
+    assert result["sf_definition_reason"] == "live_definition_unreadable"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=None)
+def test_a_github_outage_no_longer_stops_the_halting_verdict(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """**The point of alpha-engine-config-I7927.**
+
+    This is the exact 2026-08-21 input — stamp present, upstream unfetchable —
+    and the probe now reaches a real `sf_drift` verdict anyway, from S3, with
+    GitHub never consulted for it. On 2026-08-21 this input halted trading.
+    """
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=_DEFINITION), \
+         patch.object(dd, "_fetch_repo_definition") as gh:
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is False
+    assert result["sf_definition_compared"] is True
+    assert result["sf_definition_source"] == "s3"
+    assert result["sf_definition_reason"] == "definition_identical"
+    # GitHub was not asked for the expected definition at all.
+    gh.assert_not_called()
 
 
 # ── alpha-engine-config-I7924: the 2026-08-21 preopen halt ──────────────────
@@ -464,3 +504,101 @@ def test_a_healthy_credential_leaves_no_rejection_key(
 
     assert "github_credential_rejected" not in result
     assert "github_credential_status" not in result
+
+
+# ── alpha-engine-config-I7927: S3 is the expected definition, GitHub is not ──
+# The halting verdict must not depend on a live api.github.com call. The deploy
+# is the sole writer (sf-pipeline-policy 2.4) and already uploads the exact
+# bytes it feeds to update-state-machine, so it has already written down the
+# answer this probe was re-deriving from the upstream the deploy was built from.
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_s3_is_preferred_even_when_github_is_perfectly_available(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """Not merely a fallback — the default. If GitHub stayed on the halting
+    path whenever it happened to be up, the dependency would still be there and
+    would still fail on the one morning it mattered."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=_DEFINITION), \
+         patch.object(dd, "_fetch_repo_definition") as gh:
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_definition_source"] == "s3"
+    gh.assert_not_called()
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_a_real_definition_change_still_halts_when_read_from_s3(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """The guarantee the whole probe exists for, on the new source: a live
+    definition that differs from what the deploy published still halts."""
+    changed = json.loads(json.dumps(_DEFINITION))
+    changed["States"]["A"] = {"Type": "Fail", "Error": "HandPatched"}
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(changed, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_drift"] is True
+    assert result["has_drift"] is True
+    assert result["sf_definition_source"] == "s3"
+    assert result["sf_definition_reason"] == "definition_mismatch"
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_github_is_the_fallback_when_s3_is_unreadable(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """S3 down is not a reason to drop to the stamp while a better source is
+    still reachable — the pre-I7927 path is strictly more information."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=None), \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert result["sf_definition_compared"] is True
+    assert result["sf_definition_source"] == "github"
+    assert result["sf_drift"] is False
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=None)
+def test_both_sources_gone_still_fails_closed(mock_fetch, mock_tag, mock_comment):
+    """S3 unreadable AND no upstream SHA — strictly rarer than the 2026-08-21
+    single-source failure, and still omits sf_drift rather than granting a
+    pass (sf-pipeline-policy 2.3a rule 2)."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=None):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+
+    assert "sf_drift" not in result
+    assert result["sf_definition_source"] == "none"
+    assert result["sf_definition_reason"] == "expected_definition_unavailable"
+
+
+def test_the_s3_bucket_is_not_configurable_by_ambient_environment(monkeypatch):
+    """I7925's lesson applied one module over: a probe that can be pointed
+    somewhere else by an ambient value is a probe whose answer is not about the
+    thing you think it is."""
+    monkeypatch.setenv("DEFINITION_BUCKET", "attacker-bucket")
+    monkeypatch.setenv("S3_BUCKET", "attacker-bucket")
+    assert dd._DEFINITION_BUCKET == "alpha-engine-research"
+
+
+def test_the_s3_key_is_the_repo_path():
+    """deploy-infrastructure.sh uploads to the same key as the repo path, so
+    the two never need to be kept in sync separately."""
+    assert (dd._SF_DEFINITION_PATHS["ne-preopen-trading-pipeline"]
+            == "infrastructure/step_function_daily.json")

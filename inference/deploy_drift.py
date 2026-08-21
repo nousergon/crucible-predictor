@@ -269,6 +269,39 @@ def _read_sf_definition(state_machine_arn: str) -> Optional[dict]:
         return None
 
 
+#: Bucket the deploy uploads the stamped definitions to. Declared here rather
+#: than read from an env var so the probe cannot be pointed somewhere else by an
+#: ambient value — the class of defect alpha-engine-config-I7925 removed from
+#: this module's GitHub credential.
+_DEFINITION_BUCKET = "alpha-engine-research"
+
+
+def _fetch_s3_definition(
+    path: str, bucket: str = _DEFINITION_BUCKET,
+) -> Optional[dict]:
+    """Fetch the definition the LAST DEPLOY published, from S3.
+
+    `deploy-infrastructure.sh` uploads each stamped definition to
+    ``s3://{bucket}/{path}`` using the same key as its repo path, and uploads
+    exactly the bytes it hands to ``update-state-machine``. So this is the
+    deploy's own record of what it deployed — not a re-derivation of it from
+    the upstream the deploy was built from.
+
+    None on any failure — missing, unreadable, or unparseable. The caller
+    treats None as "could not compare from S3" and falls back; there is no
+    outcome of this function that can grant the guarantee.
+    """
+    import boto3
+    try:
+        s3 = boto3.client("s3")
+        body = s3.get_object(Bucket=bucket, Key=path)["Body"].read()
+        return json.loads(body)
+    except Exception as exc:  # noqa: BLE001 — any failure routes to None
+        log.warning("S3 definition read failed for s3://%s/%s: %s",
+                    bucket, path, exc)
+        return None
+
+
 def _fetch_repo_definition(
     repo: str, ref: str, path: str, timeout: float = 5.0,
 ) -> Optional[dict]:
@@ -372,19 +405,53 @@ def check_deploy_drift(
     sf_definition_compared = False
     sf_definition_reason = "stamp_only_pipeline"
 
+    sf_definition_source = "none"
+
     if sf_definition_path is None:
         # Weekly / unknown pipeline: stamp semantics, unchanged.
         sf_drift = stamp_drift
-    elif upstream is None:
-        # Nothing to fetch AT. Falls through to the stamp path, which is
-        # already omitted as unmeasured by sf_drift_unmeasured above.
-        sf_drift = stamp_drift
-        sf_definition_reason = "upstream_sha_unavailable"
     else:
         live_definition = _read_sf_definition(sf_arn)
-        repo_definition = _fetch_repo_definition(
-            repo, upstream, sf_definition_path,
-        )
+        # ── alpha-engine-config-I7927 ──────────────────────────────────────
+        # The EXPECTED definition comes from S3 first, and GitHub only as a
+        # fallback. This is what takes a third party off the critical path of
+        # the trading day.
+        #
+        # sf-pipeline-policy 2.4 supplies the reason it is sound: the repo is
+        # the SOLE WRITER of the live definitions, via
+        # nousergon-data/infrastructure/deploy-infrastructure.sh. That script
+        # already stamps each definition and uploads THE SAME BYTES it feeds to
+        # update-state-machine (its own comment: "the stamped JSON is what gets
+        # uploaded to S3 AND fed to update-state-machine, so S3 copy and live
+        # definition stay in lockstep"). So the deploy already wrote down the
+        # answer this probe was re-deriving from the source of truth's UPSTREAM.
+        # Measured 2026-08-21: the S3 object and the deployed definition were
+        # byte-identical, Comment included.
+        #
+        # Reading it back is same-region, inside the trust path, and needs no
+        # new grant — the predictor role already holds s3:GetObject on the whole
+        # alpha-engine-research bucket.
+        #
+        # What this does NOT do, deliberately: `deploy_stamp_stale` still asks
+        # GitHub for main's HEAD, because "has this repo merged something it has
+        # not deployed" is a question only the upstream can answer. That verdict
+        # DEGRADES rather than halts (I7799), and is omitted when unmeasured, so
+        # GitHub stays on the degrading path and leaves the halting one.
+        repo_definition = None
+        if live_definition is not None:
+            repo_definition = _fetch_s3_definition(sf_definition_path)
+            if repo_definition is not None:
+                sf_definition_source = "s3"
+            elif upstream is not None:
+                # S3 unreadable — fall back to the pre-I7927 GitHub path rather
+                # than dropping straight to the stamp. Strictly more information
+                # than the stamp, and it is what ran until today.
+                repo_definition = _fetch_repo_definition(
+                    repo, upstream, sf_definition_path,
+                )
+                if repo_definition is not None:
+                    sf_definition_source = "github"
+
         if live_definition is None or repo_definition is None:
             # Could not compare. Fall back to the STAMP verdict rather than
             # granting a pass: the stamp halts strictly more often, so the
@@ -392,10 +459,15 @@ def check_deploy_drift(
             # replaces (sf-pipeline-policy §2.3a rule 2 — a missing verdict is
             # never a pass).
             sf_drift = stamp_drift
-            sf_definition_reason = (
-                "live_definition_unreadable" if live_definition is None
-                else "repo_definition_unreachable"
-            )
+            if live_definition is None:
+                sf_definition_reason = "live_definition_unreadable"
+            elif upstream is None:
+                # Both sources gone: S3 unreadable AND no upstream SHA to fetch
+                # a GitHub copy at. This is the 2026-08-21 shape plus an S3
+                # failure — strictly rarer than it was, and still fail-closed.
+                sf_definition_reason = "expected_definition_unavailable"
+            else:
+                sf_definition_reason = "repo_definition_unreachable"
         else:
             sf_definition_compared = True
             sf_drift = (
@@ -475,6 +547,13 @@ def check_deploy_drift(
         "sf_definition_path": sf_definition_path,
         "sf_definition_compared": sf_definition_compared,
         "sf_definition_reason": sf_definition_reason,
+        # alpha-engine-config-I7927: WHICH source supplied the expected
+        # definition — "s3" (the deploy's own record, the intended path and the
+        # one with no third party on it), "github" (fallback), or "none" (no
+        # comparison happened; sf_definition_reason says why). Emitted always,
+        # because "the halting verdict quietly started depending on GitHub
+        # again" is exactly the regression this field exists to make visible.
+        "sf_definition_source": sf_definition_source,
         "stack_sha": stack_sha,
         "stack_stamp_present": stack_stamp_present,
         "cf_drift_reason": cf_drift_reason,

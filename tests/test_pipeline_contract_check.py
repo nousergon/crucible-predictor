@@ -326,9 +326,25 @@ def test_check_pipeline_contract_takes_no_branch():
 
     A `branch` parameter would invite gating a production run on an unmerged
     branch.
+
+    alpha-engine-config-I7954 narrowed this from "no parameters at all" to its
+    actual intent. `probe` was added as a keyword-only flag that moves ONLY the
+    log severity of a detected violation (asserted byte-identical payload in
+    test_probe_leaves_the_payload_identical) — it selects nothing about WHICH
+    copy is read, which is the property this test exists to protect. Any new
+    parameter must be keyword-only and must not name a source.
     """
     import inspect
-    assert list(inspect.signature(pcc.check_pipeline_contract).parameters) == []
+    params = inspect.signature(pcc.check_pipeline_contract).parameters
+    assert "branch" not in params
+    assert "ref" not in params
+    assert set(params) <= {"probe"}, (
+        f"unexpected parameter(s) on check_pipeline_contract: {sorted(params)}"
+    )
+    for name, param in params.items():
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"{name} must be keyword-only"
+        )
 
 
 # ── parse-helper sanity ──────────────────────────────────────────────────────
@@ -344,3 +360,53 @@ def test_validates_real_contract_shape():
     contract = yaml.safe_load(textwrap.dedent(_yaml(_GOOD_CONTRACT)))
     ids = pcc._registry_artifact_ids(_GOOD_REGISTRY)
     assert pcc._validate_contract(contract, ids) == []
+
+
+# ── probe=True: a synthetic invocation records, it does not page ─────────────
+# alpha-engine-config-I7954, mirroring inference/lib_pin_drift.py. This action
+# already received `dry_run: true` from `infrastructure/deploy.sh`'s canary and
+# still logged violations at ERROR, where flow-doctor is attached — which is
+# why threading `dry_run` alone was not the fix for the paging class.
+
+
+def _violating_contract():
+    return {
+        "schema_version": 1,
+        "boundaries": [
+            {**_GOOD_CONTRACT["boundaries"][0], "artifact_id": "ghost_artifact"}
+        ],
+    }
+
+
+def test_probe_downgrades_a_violation_to_warning(caplog):
+    with caplog.at_level("WARNING", logger=pcc.log.name), _patch_raw(
+        _violating_contract(), _GOOD_REGISTRY
+    ):
+        out = pcc.check_pipeline_contract(probe=True)
+    assert out["has_violation"] is True
+    records = [
+        r for r in caplog.records
+        if "Pipeline-contract preflight VIOLATION" in r.getMessage()
+    ]
+    assert records, "the finding must still be recorded, only at a lower level"
+    assert [r.levelname for r in records] == ["WARNING"]
+
+
+def test_default_invocation_still_logs_a_violation_at_error(caplog):
+    with caplog.at_level("WARNING", logger=pcc.log.name), _patch_raw(
+        _violating_contract(), _GOOD_REGISTRY
+    ):
+        pcc.check_pipeline_contract()
+    records = [
+        r for r in caplog.records
+        if "Pipeline-contract preflight VIOLATION" in r.getMessage()
+    ]
+    assert [r.levelname for r in records] == ["ERROR"]
+
+
+def test_probe_leaves_the_payload_identical():
+    with _patch_raw(_violating_contract(), _GOOD_REGISTRY):
+        as_probe = pcc.check_pipeline_contract(probe=True)
+    with _patch_raw(_violating_contract(), _GOOD_REGISTRY):
+        as_gate = pcc.check_pipeline_contract()
+    assert as_probe == as_gate
