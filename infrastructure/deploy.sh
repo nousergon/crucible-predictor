@@ -373,6 +373,48 @@ aws lambda wait function-updated \
   --function-name "${LAMBDA_FUNCTION}" \
   --region "${AWS_REGION}"
 
+# ── Step 5b: Converge the Lambda environment ─────────────────────────────────
+# alpha-engine-config-I7925. This function's environment is LIVE-ONLY state:
+# no repo, no IaC and no script ever wrote it, so a variable set by hand years
+# ago outlives every deploy and every code change that stopped needing it.
+#
+# `/alpha-engine/GITHUB_TOKEN` was one of those. It expired 2026-06-03, nothing
+# noticed, and on 2026-08-21 a first-party dependency picked it up out of
+# site-packages, sent it to GitHub, got a 401, and halted the preopen trading
+# pipeline 3.4 seconds after start (alpha-engine-config-I7924). This repo's own
+# `tests/test_no_secret_environ_reads.py` forbids reading GITHUB_TOKEN in-repo;
+# the environment carried it anyway, because nothing here declared what the
+# environment may contain.
+#
+# DENY-LIST, deliberately, not an allow-list: the live function carries
+# operator-set flags and provider keys codified nowhere, and a deploy that
+# asserted a complete key set would delete them. Codifying the full set is
+# tracked separately. Removal is read-modify-write via the shared
+# `krepis.aws remove-lambda-env` CLI — a bare `aws lambda
+# update-function-configuration --environment` REPLACES the whole variable map.
+#
+# `--defer-publish`: this edits $LATEST only, on purpose. Step 6 publishes the
+# version and step 10 moves the `live` alias, so the removal reaches traffic
+# through the deploy's own promotion. Without the flag the CLI refuses, because
+# on an alias-pinned function a $LATEST-only edit is a silent no-op (L4497).
+# `--missing-ok`: every deploy after the first finds the key already gone.
+LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN)
+
+echo ""
+echo "==> Converging Lambda environment (removing denied keys)..."
+python3 -m krepis.aws remove-lambda-env \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --region "${AWS_REGION}" \
+  --defer-publish \
+  --missing-ok \
+  "${LAMBDA_ENV_DENIED_KEYS[@]/#/--unset=}"
+
+echo ""
+echo "==> Waiting for the environment update to complete..."
+aws lambda wait function-updated \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --region "${AWS_REGION}"
+
 # ── Step 6: Publish version ──────────────────────────────────────────────────
 echo ""
 echo "==> Publishing Lambda version..."
