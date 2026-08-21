@@ -2,10 +2,12 @@
 the promotion can carry the change to traffic.
 
 alpha-engine-config-I7925. `alpha-engine-predictor-inference`'s environment is
-live-only state — no repo, no IaC and no script ever wrote it. An expired
-`/alpha-engine/GITHUB_TOKEN` survived there long after nothing needed it, was
-picked up out of site-packages by a first-party dependency, and halted the
-2026-08-21 preopen trading pipeline 3.4 seconds after start
+live-only state — no repo, no IaC and no script ever wrote it. It holds a STALE
+COPY of `/alpha-engine/GITHUB_TOKEN`: measured 2026-08-21, the SSM parameter's
+own value authenticates (`GET /user` -> 200) while the environment's copy is
+rejected with a 401. Same name, different value, nothing detecting the drift. A
+first-party dependency read that copy out of site-packages and the 401 halted
+the 2026-08-21 preopen trading pipeline 3.4 seconds after start
 (alpha-engine-config-I7924).
 
 `infrastructure/deploy.sh` now converges the environment against a deny-list.
@@ -30,7 +32,7 @@ def test_deploy_script_exists() -> None:
 
 
 def test_github_token_is_on_the_deny_list() -> None:
-    """The credential that caused I7924 must be named, not merely implied."""
+    """The variable whose stale copy caused I7924 must be named, not implied."""
     assert "LAMBDA_ENV_DENIED_KEYS=(" in _CODE, (
         "the deploy no longer declares a denied-key set — a variable set by "
         "hand now outlives every deploy again (alpha-engine-config-I7925)"
