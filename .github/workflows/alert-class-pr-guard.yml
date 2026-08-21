@@ -1,0 +1,118 @@
+name: alert-class-pr-guard
+
+# alpha-engine-config-I7896.
+#
+# A PR in THIS repo that adds a `publish_observe_alert(source=...)` (or
+# `alerts.publish` / `publish_ops_alert` / `publish_ops_digest`, or a
+# `python -m krepis.alerts publish --source ...` invocation) whose source
+# literal has no row in nousergon-data's
+# infrastructure/overseer/playbooks.yaml::alert_classes now fails ITS OWN CI.
+#
+# WHAT IT REPLACES. Until this existed, that gap surfaced days later on a
+# THIRD repo's main -- alpha-engine-config's push-to-main fleet sweep -- where
+# a red main SILENTLY EJECTS every entry from that repo's merge queue while
+# each queued PR keeps reporting a healthy state. So a missing playbook row in
+# this repo blocked merges in a repo nobody here had touched, with no message
+# anywhere naming the cause. Measured 2026-08-20: twice in one session,
+# roughly two hours of fleet merge throughput (alpha-engine-config-I7876 and
+# -I7896). That sweep is untouched and is now the backstop, not the first
+# detector. This extends the mechanism alpha-engine-config-I7860 / -PR7871
+# established for the fleet observability registry, to the second registry
+# with the same cross-repo shape.
+#
+# ONLY THE DELTA FAILS. The guard scans this repo at the PR's base and at its
+# head and fails on newly-unregistered sources only, so pre-existing drift can
+# never block an unrelated PR.
+#
+# MERGE ORDER, AND WHY IT CANNOT DEADLOCK. The row lives in nousergon-data, so
+# a PR here can never add it in the same commit. The guard's failure output
+# prints the exact file and a paste-ready row with the severity already
+# normalized to that file's vocabulary. Push that companion PR and this check
+# goes green IMMEDIATELY -- an OPEN nousergon-data PR carrying the row already
+# satisfies it; it does not have to merge first. And nothing in nousergon-data
+# is blocked by this PR, so the two can never wait on each other. (That
+# circular red is what the equivalent guard hit on its first live day,
+# alpha-engine-config-I7860 / -PR7820, and designing it out was the binding
+# constraint on this work.)
+#
+# ONE IMPLEMENTATION, CHECKED OUT RATHER THAN COPIED (policy-shared-code). The
+# guard and the scanner live in nousergon-data beside the registry they grade;
+# this workflow checks that repo out as DATA and runs the script. A reusable
+# workflow (`uses: nousergon/nousergon-data/.github/workflows/...@main`) would
+# have been three lines, but `@main` is a MUTABLE ref the fleet action-pin
+# guard rejects, and a SHA pin would freeze every caller at one revision of
+# the guard. This is byte-for-byte the shape alpha-engine-config's
+# pr-guard-observability.yml already uses against nous-ergon-ops.
+#
+# nousergon-data is PUBLIC, so no credential is involved and this works on a
+# fork PR. runs-on: ubuntu-latest, deliberately not a self-hosted runner: this
+# repo is public and gets unlimited free GitHub-hosted minutes.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  alert-class-pr-guard:
+    name: pr-added alert source must carry an alert_classes row
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # fetch-depth: 0 -- the guard materializes the PR's BASE commit as a
+      # detached `git worktree` inside this checkout, so the base commit must
+      # actually be present, not just its ref name.
+      #
+      # path: graded -- NOT the workspace root. The registry checkout below
+      # lands inside the workspace, and the guard walks its --repo-root whole;
+      # checking this repo out at the root would make the scanner walk the
+      # registry checkout as if it were part of this repo.
+      - name: Checkout the repo being graded
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          path: graded
+
+      - name: Checkout the registry and guard (nousergon-data, public)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/nousergon-data
+          path: registry
+
+      # A MISSING CHECKOUT IS A HARD FAILURE, NEVER A SKIP. Recorded in
+      # nous-ergon-ops/governance/authority.d/alpha-engine-config-check-lane-
+      # registry-coverage.yaml: an earlier cross-repo check in this fleet
+      # skipped on a missing sibling and "reported green having verified
+      # nothing on every CI run it was collected in".
+      - name: Assert the guard is present
+        run: |
+          set -euo pipefail
+          s="$GITHUB_WORKSPACE/registry/infrastructure/overseer/alert_class_pr_guard.py"
+          [ -f "$s" ] || { echo "::error::$s missing -- this check would otherwise report green having verified nothing"; exit 1; }
+          echo "guard: $s"
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install guard dependencies
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: A PR-added alert source must carry an alert_classes row
+        env:
+          # Read-only, and used for exactly one thing: listing OPEN PRs in
+          # nousergon-data so a companion row PR that has not merged yet still
+          # satisfies this check. Never used to write anything anywhere.
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          python3 "$GITHUB_WORKSPACE/registry/infrastructure/overseer/alert_class_pr_guard.py"
+          --repo "${{ github.event.repository.name }}"
+          --repo-root "$GITHUB_WORKSPACE/graded"
+          --base "${{ github.event.pull_request.base.sha }}"
+          --head "${{ github.event.pull_request.head.sha }}"
