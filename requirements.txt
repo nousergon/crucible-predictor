@@ -77,7 +77,7 @@ setuptools>=83.0.0
 # a box resolving an older krepis fails AFTER a spot instance already exists
 # and is billing — this floor is load-bearing at runtime, not only for CI
 # collection. Kept in lockstep with requirements-lambda.txt.
-krepis[flow-doctor]==0.59.23  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis[flow-doctor]==0.59.24  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 # alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
 # gitleaks/session_dlp prerequisite — it does not. No file here imports
 # `krepis.LLMClient` (`grep -rn "LLMClient" --include="*.py" .` is empty); the
