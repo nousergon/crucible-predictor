@@ -57,6 +57,21 @@ _SF_DEFINITION_PATHS = {
     "ne-postclose-trading-pipeline": "infrastructure/step_function_eod.json",
 }
 
+#: State machines this probe answers for on STAMP semantics alone — no
+#: definition body is compared, because I7799's relaxation is scoped to the
+#: weekday pipelines. Named rather than left implicit in
+#: ``_SF_DEFINITION_PATHS.get()`` returning ``None``: that fall-through cannot
+#: tell "the weekly pipeline, deliberately stamp-only" from "a name nobody
+#: declared", and the second must never quietly receive the first's semantics.
+_STAMP_ONLY_SF_NAMES = frozenset({"ne-weekly-freshness-pipeline"})
+
+#: The complete set of ``sf_name`` values a CALLER may ask for. The handler
+#: validates against this before invoking, so an unrecognised name is a loud
+#: error at the edge rather than a silent downgrade to stamp semantics deep
+#: inside the probe — the latter would answer a question about a state machine
+#: that does not exist, with a verdict a halting gate reads.
+INVOKABLE_SF_NAMES = frozenset(_SF_DEFINITION_PATHS) | _STAMP_ONLY_SF_NAMES
+
 # Pinned to the RESOLVED upstream SHA, never to `main`: raw.githubusercontent
 # serves a CDN-cached copy of a branch ref, so fetching `@main` can return a
 # body that is not the SHA we just compared against — which would make the

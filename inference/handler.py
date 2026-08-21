@@ -16,10 +16,13 @@ training exceeding Lambda's 15-minute timeout.
     whether to re-invoke `action=predict` with a `tickers` payload.
 
   action == "check_deploy_drift":
-    Compare the deployed Step Function definition + CloudFormation stack
-    SHAs against alpha-engine-data @main HEAD on GitHub. Used by the
-    weekday Step Function's first state (DeployDriftCheck) to halt the
-    pipeline when infrastructure code has been merged but not deployed.
+    Compare the deployed Step Function DEFINITION BODY against the
+    definition the last deploy published, and the CloudFormation stack SHA
+    against alpha-engine-data @main HEAD. Optional "sf_name" selects which
+    state machine (default ne-preopen-trading-pipeline; must be one of
+    deploy_drift.INVOKABLE_SF_NAMES). Used by the weekday Step Function's
+    DeployDriftCheck state to halt when the orchestration about to run
+    differs from what main describes (alpha-engine-config-I7799).
 
   action == "check_trading_day":
     NYSE holiday gate for the weekday SF (pure calendar, no preflight).
@@ -372,23 +375,52 @@ def handler(event: dict, context) -> dict:
 
     # ── Deploy-drift check (Step Function first state) ──────────────────────
     if action == "check_deploy_drift":
-        from inference.deploy_drift import check_deploy_drift
+        from inference.deploy_drift import INVOKABLE_SF_NAMES, check_deploy_drift
         account_id = (
             getattr(context, "invoked_function_arn", "").split(":")[4]
             if context is not None and getattr(context, "invoked_function_arn", "")
             else os.environ.get("AWS_ACCOUNT_ID", "")
         )
+        # alpha-engine-config-I7799 closes-when, clause 1: the canonical-JSON
+        # comparison is declared for step_function_daily.json AND
+        # step_function_eod.json, but until now no caller could ask for the
+        # second — this handler hardcoded the preopen default, so the postclose
+        # half of _SF_DEFINITION_PATHS was reachable only from unit tests. A
+        # verification path nothing can invoke is not coverage; it is code that
+        # will drift unobserved until the day it is wired to a gate.
+        #
+        # Validated against the declared set rather than passed through: an
+        # unrecognised name reaching check_deploy_drift() falls through to
+        # STAMP semantics (_SF_DEFINITION_PATHS.get -> None), which would
+        # answer confidently about a state machine that does not exist. Fail
+        # loud at the edge instead — the SF Task's Catch routes it to
+        # HandleFailure, and an absent sf_drift halts anyway (fail closed).
+        sf_name = event.get("sf_name") or "ne-preopen-trading-pipeline"
+        if sf_name not in INVOKABLE_SF_NAMES:
+            raise ValueError(
+                f"check_deploy_drift: unknown sf_name {sf_name!r}. Declared "
+                f"state machines: {sorted(INVOKABLE_SF_NAMES)}. Add the name "
+                f"(and, for a definition-compared pipeline, its repo path) to "
+                f"inference/deploy_drift._SF_DEFINITION_PATHS — never pass a "
+                f"definition path in alongside the name."
+            )
         result = check_deploy_drift(
             region=os.environ.get("AWS_REGION", "us-east-1"),
             account_id=account_id,
+            sf_name=sf_name,
         )
         # alpha-engine-config-I7048: sf_drift/cf_drift are OMITTED (not
         # False) when unmeasured (upstream fetch failed) — .get() keeps
         # this log line from KeyError-ing on that exact path.
         log.info(
-            "Deploy-drift check: upstream=%s  sf=%s(drift=%s)  cf=%s(drift=%s)",
+            "Deploy-drift check [%s]: upstream=%s  sf=%s(drift=%s, %s, "
+            "compared=%s via %s)  stamp_stale=%s  cf=%s(drift=%s)",
+            sf_name,
             (result["upstream_sha"] or "?")[:12],
             (result["sf_sha"] or "missing")[:12], result.get("sf_drift", "unmeasured"),
+            result.get("sf_drift_reason"), result.get("sf_definition_compared"),
+            result.get("sf_definition_source"),
+            result.get("deploy_stamp_stale", "unmeasured"),
             (result["stack_sha"] or "missing")[:12], result.get("cf_drift", "unmeasured"),
         )
         return result

@@ -602,3 +602,71 @@ def test_the_s3_key_is_the_repo_path():
     the two never need to be kept in sync separately."""
     assert (dd._SF_DEFINITION_PATHS["ne-preopen-trading-pipeline"]
             == "infrastructure/step_function_daily.json")
+
+
+# ── alpha-engine-config-I7799 closes-when clause 1: the postclose half ───────
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_the_postclose_pipeline_is_definition_compared_not_stamp_compared(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """`step_function_eod.json` is named in the issue's closes-when beside
+    `step_function_daily.json`. Pinned against the postclose NAME, so the
+    coverage cannot be lost by an edit to _SF_DEFINITION_PATHS that leaves the
+    preopen entry intact."""
+    with patch.object(dd, "_read_sf_definition",
+                      return_value=_stamped(_DEFINITION, "aaaa111aaaa1")), \
+         patch.object(dd, "_fetch_s3_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(
+            region="us-east-1", account_id="123",
+            sf_name="ne-postclose-trading-pipeline",
+        )
+
+    assert result["sf_definition_path"] == "infrastructure/step_function_eod.json"
+    assert result["sf_definition_compared"] is True
+    assert result["sf_drift"] is False
+    assert result["sf_drift_reason"] == "definition_identical"
+    # The stamp verdict survives under its own name — same split as preopen.
+    assert result["deploy_stamp_stale"] is True
+
+
+@patch.object(dd, "_read_sf_comment", return_value=_STALE_STAMP)
+@patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM)
+@patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM)
+def test_the_weekly_pipeline_is_stamp_only_and_says_so(
+    mock_fetch, mock_tag, mock_comment,
+):
+    """Item 2 of the ruling: only the WEEKDAY pipelines move to content
+    comparison. No definition is read for the weekly at all — asserted by the
+    S3 seam never being touched, not merely by the verdict coming out the same
+    way a stamp comparison would."""
+    with patch.object(dd, "_fetch_s3_definition") as s3, \
+         patch.object(dd, "_read_sf_definition") as live:
+        result = dd.check_deploy_drift(
+            region="us-east-1", account_id="123",
+            sf_name="ne-weekly-freshness-pipeline",
+        )
+    s3.assert_not_called()
+    live.assert_not_called()
+    assert result["sf_definition_path"] is None
+    assert result["sf_definition_compared"] is False
+    assert result["sf_definition_reason"] == "stamp_only_pipeline"
+    assert result["sf_drift"] is True          # the stamp still HALTS here
+    assert result["deploy_stamp_stale"] is True
+
+
+def test_every_invokable_name_is_either_compared_or_declared_stamp_only():
+    """A name a caller may ask for, that is in neither set, would fall through
+    `_SF_DEFINITION_PATHS.get()` to stamp semantics silently."""
+    assert dd.INVOKABLE_SF_NAMES == (
+        frozenset(dd._SF_DEFINITION_PATHS) | dd._STAMP_ONLY_SF_NAMES
+    )
+    assert not (frozenset(dd._SF_DEFINITION_PATHS) & dd._STAMP_ONLY_SF_NAMES)
+
+
+def test_the_eod_s3_key_is_the_repo_path():
+    assert (dd._SF_DEFINITION_PATHS["ne-postclose-trading-pipeline"]
+            == "infrastructure/step_function_eod.json")
