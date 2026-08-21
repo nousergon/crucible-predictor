@@ -30,7 +30,7 @@
 # now passes — load-bearing at runtime (a bootstrap on an older-krepis box
 # fails after the spot already exists and is billing), not only for CI
 # collection. Kept in lockstep with requirements.txt.
-krepis[flow-doctor]==0.59.18  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+krepis[flow-doctor]==0.59.23  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
 # alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
 # gitleaks/session_dlp prerequisite — it does not. No file here (including the
 # Lambda handlers) imports `krepis.LLMClient`; the `[flow-doctor]` extra is the
