@@ -92,3 +92,40 @@ def test_krepis_pin_can_supply_the_subcommand(req: str) -> None:
     assert parts >= (0, 59, 23), (
         f"{req} pins krepis {version}; remove-lambda-env needs >= 0.59.23"
     )
+
+
+def test_krepis_pin_does_not_need_the_deploy_role_to_list_aliases() -> None:
+    """Deploy run 32509752554 (2026-08-21 17:48 UTC) failed here:
+
+        ERROR: could not list aliases of alpha-engine-predictor-inference:
+        AccessDeniedException ... github-actions-lambda-deploy is not
+        authorized to perform: lambda:ListAliases
+
+    `remove_lambda_environment_keys` enumerated aliases even under
+    `--defer-publish`, which already asserts the caller publishes and promotes
+    itself. The image was pushed and `$LATEST` updated, then this raised, so
+    `publish-version` and the alias move never ran — a PARTIAL deploy, with
+    the `live` alias serving a stale image while main had moved on. That is
+    the SHA drift the preopen `DeployDriftGate` halts on.
+
+    krepis 0.59.24 skips the enumeration under `defer_publish` (krepis#176).
+    An older pin reintroduces the partial deploy, so the floor is pinned here
+    rather than left to memory.
+    """
+    from pathlib import Path as _P
+
+    for req in ("requirements.txt", "requirements-lambda.txt"):
+        line = next(
+            ln
+            for ln in (_P(__file__).resolve().parents[1] / req)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if ln.startswith("krepis[")
+        )
+        version = line.split("==", 1)[1].split()[0].strip()
+        parts = tuple(int(x) for x in version.split("."))
+        assert parts >= (0, 59, 24), (
+            f"{req} pins krepis {version}; --defer-publish needs >= 0.59.24 "
+            f"or the deploy fails on lambda:ListAliases and leaves a PARTIAL "
+            f"deploy (alpha-engine-config-I7925)"
+        )
