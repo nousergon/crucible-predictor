@@ -111,6 +111,83 @@ def test_handler_check_drift_dry_run_threaded_to_check_drift(
 
 # ── action="check_deploy_drift" ─────────────────────────────────────────────
 
+#: Mirrors inference.deploy_drift.INVOKABLE_SF_NAMES. The handler now validates
+#: `sf_name` against that set before invoking, and every fake deploy_drift
+#: module below is a MagicMock whose attributes are MagicMocks — `x not in
+#: MagicMock()` raises TypeError, so the set has to be supplied explicitly.
+#: test_handler_declared_sf_names_match_the_probe pins the two together.
+_INVOKABLE = frozenset({
+    "ne-preopen-trading-pipeline",
+    "ne-postclose-trading-pipeline",
+    "ne-weekly-freshness-pipeline",
+})
+
+
+def test_handler_declared_sf_names_match_the_probe():
+    """The literal above is a stand-in for the real module's set; if the probe
+    grows a state machine and this list does not, the tests below would keep
+    passing while the handler rejected the new name in production."""
+    from inference.deploy_drift import INVOKABLE_SF_NAMES
+    assert set(INVOKABLE_SF_NAMES) == set(_INVOKABLE)
+
+
+def test_handler_check_deploy_drift_forwards_the_requested_state_machine(
+    stubbed_preflight, monkeypatch,
+):
+    """alpha-engine-config-I7799 closes-when clause 1 names
+    step_function_eod.json as well as step_function_daily.json.
+    deploy_drift._SF_DEFINITION_PATHS has carried both since #538, but this
+    handler hardcoded the preopen default — so the postclose comparison was
+    reachable only from unit tests, never from a caller."""
+    fake_drift = MagicMock()
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
+    fake_drift.check_deploy_drift = MagicMock(return_value={
+        "upstream_sha": "abc1234567",
+        "sf_sha": "abc1234567",
+        "sf_drift": False,
+        "stack_sha": "abc1234567",
+        "cf_drift": False,
+    })
+    monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
+
+    import inference.handler as h
+    ctx = _fake_context(arn="arn:aws:lambda:us-east-1:123456789012:function:foo")
+    h.handler(
+        {"action": "check_deploy_drift",
+         "sf_name": "ne-postclose-trading-pipeline"},
+        ctx,
+    )
+    fake_drift.check_deploy_drift.assert_called_once_with(
+        region="us-east-1", account_id="123456789012",
+        sf_name="ne-postclose-trading-pipeline",
+    )
+
+
+def test_handler_check_deploy_drift_rejects_an_undeclared_state_machine(
+    stubbed_preflight, monkeypatch,
+):
+    """An unknown name must RAISE at the edge, never reach the probe.
+
+    check_deploy_drift resolves the definition path with
+    `_SF_DEFINITION_PATHS.get(sf_name)` and treats a None as "weekly / unknown
+    pipeline: stamp semantics, unchanged" — so a typo'd or invented name would
+    come back as a confident stamp verdict about a state machine that does not
+    exist, and DeployDriftGate reads sf_drift to decide whether to halt a
+    real-money session."""
+    fake_drift = MagicMock()
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
+    monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
+
+    import inference.handler as h
+    ctx = _fake_context(arn="arn:aws:lambda:us-east-1:123456789012:function:foo")
+    with pytest.raises(ValueError, match="unknown sf_name"):
+        h.handler(
+            {"action": "check_deploy_drift", "sf_name": "ne-typo-pipeline"},
+            ctx,
+        )
+    fake_drift.check_deploy_drift.assert_not_called()
+
+
 
 def test_handler_check_deploy_drift_uses_run_for_drift_gate(
     stubbed_preflight, monkeypatch,
@@ -123,6 +200,7 @@ def test_handler_check_deploy_drift_uses_run_for_drift_gate(
         "stack_sha": "abc1234567",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
@@ -132,6 +210,7 @@ def test_handler_check_deploy_drift_uses_run_for_drift_gate(
     assert result["sf_drift"] is False
     fake_drift.check_deploy_drift.assert_called_once_with(
         region="us-east-1", account_id="123456789012",
+        sf_name="ne-preopen-trading-pipeline",
     )
     # Drift gate should use the lighter preflight path
     stubbed_preflight.return_value.run_for_drift_gate.assert_called_once()
@@ -150,12 +229,14 @@ def test_handler_check_deploy_drift_falls_back_to_env_account(
         "stack_sha": "abc",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
     result = h.handler({"action": "check_deploy_drift"}, None)
     fake_drift.check_deploy_drift.assert_called_once_with(
         region="us-east-1", account_id="999999999999",
+        sf_name="ne-preopen-trading-pipeline",
     )
 
 
@@ -175,6 +256,7 @@ def test_handler_check_deploy_drift_never_receives_skip_even_with_dry_run(
         "stack_sha": "abc1234567",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
