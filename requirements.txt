@@ -104,3 +104,4 @@ matplotlib>=3.11.1
 
 # MLP model — only needed when model_type="mlp" (not used in Lambda)
 # torch>=2.0.0
+
