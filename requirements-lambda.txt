@@ -35,7 +35,7 @@ krepis[flow-doctor]==0.59.18  # pinned per §139 — first-party/fast-moving dep
 # gitleaks/session_dlp prerequisite — it does not. No file here (including the
 # Lambda handlers) imports `krepis.LLMClient`; the `[flow-doctor]` extra is the
 # diagnosis wiring, not LLMClient itself.
-nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.79
+nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.82
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.1
