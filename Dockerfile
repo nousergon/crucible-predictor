@@ -54,6 +54,13 @@ COPY config.py .
 # closure but missing its COPY line ModuleNotFoundErrors at runtime,
 # undetected by CI unless caught by test_dockerfile_import_closure.py.
 COPY ops_alerts.py .
+# stage_coverage_safety.py — alpha-engine-config-I8155: the shared
+# krepis.stage_coverage wrapper imported by inference/handler.py,
+# regime/handler.py and regime/retrospective_eval_handler.py. Same
+# config#1282/PR352 bug class as ops_alerts.py above: a first-party
+# module reachable from a Lambda entrypoint's import closure but missing
+# its COPY line ModuleNotFoundErrors at runtime.
+COPY stage_coverage_safety.py .
 COPY config/ config/
 COPY data/ data/
 COPY model/ model/

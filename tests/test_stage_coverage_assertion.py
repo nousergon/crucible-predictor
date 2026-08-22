@@ -68,6 +68,16 @@ _ASSERT_CALL_RE = re.compile(
     r'--window-start\s+"\$_STAGE_WINDOW_START"'
 )
 
+#: alpha-engine-config-I8155: every shell invocation must ALSO pass
+#: `--run-date "${EXECUTION_RUN_DATE:-}"` — the SF execution's own
+#: run_date, unset-safe under `set -u` (`_spot_common.sh` sets
+#: `set -euo pipefail`) so an unexported EXECUTION_RUN_DATE reaches the
+#: CLI empty (loud, via the existing observe-mode guard) rather than
+#: crashing the launcher on an unbound-variable error.
+_RUN_DATE_FLAG_RE = re.compile(
+    r'--run-date\s+"\$\{EXECUTION_RUN_DATE:-\}"'
+)
+
 _BARE_OR_TRUE_RE = re.compile(
     r'krepis\.stage_coverage\s+assert[^\n]*\|\|\s*true\b'
 )
@@ -136,6 +146,66 @@ def test_launcher_does_not_swallow_the_assertion_with_bare_or_true(script_name: 
         assert "|| echo" in line and ">&2" in line, (
             f"{script_name}: an assertion call does not end in the required "
             f"loud `|| echo ... >&2` fallback: {line!r}"
+        )
+
+
+def _all_stage_coverage_assert_lines() -> list[tuple[Path, str]]:
+    """`(path, line)` for every `krepis.stage_coverage assert` invocation
+    across ALL of `infrastructure/*.sh` — not a hardcoded three-file list,
+    so a fourth launcher gaining the call later is covered automatically
+    (alpha-engine-config-I8155).
+    """
+    lines: list[tuple[Path, str]] = []
+    for path in sorted(_INFRA.glob("*.sh")):
+        source = path.read_text()
+        for m in re.finditer(r'krepis\.stage_coverage\s+assert[^\n]*', source):
+            lines.append((path, m.group(0)))
+    return lines
+
+
+def test_scan_found_stage_coverage_invocations() -> None:
+    """Guard-the-guard: if `_all_stage_coverage_assert_lines` ever finds
+    nothing, every test below it would vacuously pass — assert the scan
+    actually found the three known invocations before trusting it.
+    """
+    found = _all_stage_coverage_assert_lines()
+    assert len(found) >= 3, (
+        f"expected at least 3 krepis.stage_coverage assert invocations "
+        f"under infrastructure/*.sh, found {len(found)}: {found!r}"
+    )
+
+
+def test_every_shell_stage_coverage_invocation_passes_run_date() -> None:
+    """alpha-engine-config-I8155: every shell invocation of
+    `krepis.stage_coverage assert` must pass
+    `--run-date "${EXECUTION_RUN_DATE:-}"` — the SF execution's own
+    run_date, never defaulted from `$RUN_DATE` or `date` (a silent
+    fall-back is the defect this fix removes).
+    """
+    for path, line in _all_stage_coverage_assert_lines():
+        assert _RUN_DATE_FLAG_RE.search(line), (
+            f"{path.name}: stage-coverage assertion does not pass "
+            f'--run-date "${{EXECUTION_RUN_DATE:-}}": {line!r}'
+        )
+
+
+def test_no_shell_stage_coverage_invocation_passes_bare_run_date() -> None:
+    """`$RUN_DATE` (unqualified) is an unreliable carrier fleet-wide — it is
+    reassigned to the trading day elsewhere (`crucible-backtester`'s
+    `_spot_common.sh`). No invocation may reference it, with or without the
+    `EXECUTION_` prefix collapsed by a typo.
+    """
+    for path, line in _all_stage_coverage_assert_lines():
+        assert "$RUN_DATE" not in line or "$EXECUTION_RUN_DATE" in line, (
+            f"{path.name}: stage-coverage assertion references a bare "
+            f"$RUN_DATE rather than $EXECUTION_RUN_DATE: {line!r}"
+        )
+        # Stronger check: the ONLY *_RUN_DATE reference on the line must be
+        # the EXECUTION_-prefixed one — a bare "$RUN_DATE}" (e.g. from a
+        # typo'd "${RUN_DATE:-}") would slip past the substring check above.
+        assert not re.search(r'(?<!EXECUTION_)\$\{?RUN_DATE\b', line), (
+            f"{path.name}: stage-coverage assertion references bare "
+            f"$RUN_DATE instead of $EXECUTION_RUN_DATE: {line!r}"
         )
 
 
