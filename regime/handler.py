@@ -55,6 +55,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any
 
 # Ensure project root on sys.path for sibling imports (regime/, etc.).
@@ -66,6 +67,7 @@ from regime.features import (
     fetch_macro_feature_history,
 )
 from krepis.logging import monitor_handler, setup_logging
+from stage_coverage_safety import safe_assert_stage_coverage
 from regime.hmm import HMMRegimeClassifier
 from regime.substrate import (
     DEFAULT_S3_BUCKET,
@@ -96,6 +98,21 @@ setup_logging(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class UnknownAction(ValueError):
+    """Raised when ``event["action"]`` names something this build cannot do.
+
+    alpha-engine-config-I7166 (class sweep). This handler already refused an
+    unrecognised action instead of falling through to `produce` — but it did
+    so by RETURNING ``{"statusCode": 400, ...}``, which is indistinguishable
+    from a successful invoke to a Step Function Task lacking a Catch keyed on
+    that shape. RegimeSubstrate's own SF state (nousergon-data
+    infrastructure/step_function.json) has a `Catch: [States.ALL]` that only
+    fires on a raised FunctionError. Raising here — mirroring
+    inference/handler.py's `UnknownAction` (config-I7111) — lets that Catch
+    do its job instead of silently converging past a run that did nothing.
+    """
 
 
 # HMM feature subset — must include PIN_FEATURE (``spy_20d_return``) and
@@ -241,6 +258,8 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     Routes ``event["action"]`` to either ``produce`` (default, writes
     to S3) or ``dry_run`` (returns payload without writing).
     """
+    # Stage-coverage window (config-I7214), captured at handler entry.
+    _started = datetime.now(timezone.utc)
     event = event or {}
     action = event.get("action", "produce")
 
@@ -258,7 +277,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
 
     if action == "produce":
         result = produce_regime_substrate(**kwargs, write=True)
-        return {
+        _response = {
             "statusCode": 200,
             "action": action,
             "run_id": result["payload"]["run_id"],
@@ -267,6 +286,29 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "hmm_argmax": result["payload"]["hmm"]["argmax"],
             "regime_change_signal": result["payload"]["bocpd"]["change_signal"],
         }
+        # Per-stage output assertion (config-I7214, sf-pipeline-policy.md
+        # §2.1) — only on the write=True path; ``dry_run`` declares by
+        # design that it writes nothing, so asserting there would be a
+        # guaranteed-false MISSING rather than a real signal. Observe
+        # mode — the handler's own outcome is unchanged on an absent
+        # module.
+        #
+        # alpha-engine-config-I8155: `result["payload"]["calendar_date"]`
+        # is the dual-tracked CYCLE date `produce_regime_substrate` computed
+        # itself (it defaults `calendar_date=None` on the live SF path —
+        # see that function's docstring) — a computed stand-in, not the
+        # execution's own run_date. Measured against
+        # nousergon-data/infrastructure/step_function.json: the SF's
+        # RegimeSubstrate Task Payload carries only `regime_action`, no
+        # date field at all, so `event.get("date"/"run_date")` is always
+        # absent on the live path today — skip loudly rather than keep
+        # reporting the cycle date under the run_date key.
+        _verdict = safe_assert_stage_coverage(
+            "RegimeSubstrate", event=event, window_start=_started, log=logger,
+        )
+        if _verdict is not None:
+            _response["stage_coverage"] = _verdict
+        return _response
     elif action == "dry_run":
         result = produce_regime_substrate(**kwargs, write=False)
         return {
@@ -275,7 +317,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "payload": result["payload"],
         }
     else:
-        return {
-            "statusCode": 400,
-            "error": f"unknown action {action!r}; expected 'produce' or 'dry_run'",
-        }
+        raise UnknownAction(
+            f"action={action!r} is not implemented by this build. "
+            f"Known actions: ['dry_run', 'produce']."
+        )

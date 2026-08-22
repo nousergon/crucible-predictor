@@ -342,3 +342,53 @@ class TestGetVetoThreshold:
         mock_load.return_value = {"veto_confidence": 0.65}
         result = get_veto_threshold("test-bucket", "sideways")
         assert result == 0.65
+
+
+# ---------------------------------------------------------------------------
+# Tests: OFFLINE-mode veto stub
+# ---------------------------------------------------------------------------
+
+class TestOfflineVetoStubTracksConfig:
+    """The OFFLINE stub must source the veto threshold, not restate it.
+
+    ``daily_predict.py``'s ``--offline`` path replaces ``get_veto_threshold``
+    with a constant so a smoke run needs no S3. That constant was the literal
+    ``0.65`` — the pre-2026-05-12 winner-probability gate, left behind when
+    PR #143 flipped confidence to ``|p_up - 0.5| * 2`` and rescaled the live
+    gate to 0.30. On the live axis 0.65 means "veto only at mean p_up >= 0.825",
+    so OFFLINE runs exercised a veto that effectively never fires and could not
+    have caught a veto regression. Pinning it to ``cfg.MIN_CONFIDENCE`` means
+    the next rescale reaches the stub without anyone remembering to come here.
+    """
+
+    def test_offline_stub_reads_min_confidence_not_a_literal(self):
+        import re
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent / "inference" / "daily_predict.py").read_text()
+        stub_lines = [
+            ln for ln in src.splitlines()
+            if "_wo.get_veto_threshold" in ln and "lambda" in ln
+        ]
+        assert len(stub_lines) == 1, f"expected one OFFLINE veto stub, found {stub_lines}"
+        stub = stub_lines[0]
+        assert "cfg.MIN_CONFIDENCE" in stub, (
+            f"OFFLINE veto stub must source the config value, got: {stub.strip()}"
+        )
+        assert not re.search(r"lambda[^:]*:\s*0?\.\d+", stub), (
+            f"OFFLINE veto stub must not hard-code a threshold: {stub.strip()}"
+        )
+
+    def test_config_min_confidence_is_on_the_live_confidence_axis(self):
+        """Guards the axis itself, not just this stub.
+
+        Confidence is ``|p_up - 0.5| * 2`` in [0, 1]. Any veto gate at or above
+        0.5 would require a mean ``p_up`` of 0.75+, which a calibrated
+        daily-direction book does not reach — a value there means the threshold
+        was written for the retired ``max(p_up, p_down)`` axis.
+        """
+        import config as cfg
+
+        assert 0.0 < cfg.MIN_CONFIDENCE < 0.5, (
+            f"MIN_CONFIDENCE={cfg.MIN_CONFIDENCE} is not on the |p_up-0.5|*2 axis"
+        )

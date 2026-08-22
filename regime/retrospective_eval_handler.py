@@ -59,6 +59,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 import pandas as pd
@@ -67,6 +68,7 @@ from botocore.exceptions import ClientError
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from krepis.logging import monitor_handler, setup_logging
+from stage_coverage_safety import safe_assert_stage_coverage
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     fetch_macro_feature_history,
@@ -104,6 +106,22 @@ setup_logging(
 )
 
 logger = logging.getLogger(__name__)
+
+
+class UnknownAction(ValueError):
+    """Raised when ``event["action"]`` names something this build cannot do.
+
+    alpha-engine-config-I7166 (class sweep). This handler already refused an
+    unrecognised action instead of falling through to `produce` — but it did
+    so by RETURNING ``{"statusCode": 400, ...}``, which is indistinguishable
+    from a successful invoke to a Step Function Task lacking a Catch keyed on
+    that shape. RegimeRetrospectiveEval's own SF state (nousergon-data
+    infrastructure/step_function.json) only fails-closed on a raised
+    FunctionError. Raising here — mirroring inference/handler.py's
+    `UnknownAction` (config-I7111) and regime/handler.py's twin — lets that
+    Catch do its job instead of silently converging past a run that did
+    nothing.
+    """
 
 
 DEFAULT_SIGNALS_PREFIX: str = "signals/"
@@ -452,6 +470,8 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
     ``dry_run``. Event payload schema documented in the module
     docstring above.
     """
+    # Stage-coverage window (config-I7214), captured at handler entry.
+    _started = datetime.now(timezone.utc)
     event = event or {}
     action = event.get("action", "produce")
 
@@ -474,7 +494,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
 
     if action == "produce":
         result = produce_t1_eval(**kwargs, write=True)
-        return {
+        _response = {
             "statusCode": 200,
             "action": action,
             "run_id": result["payload"]["run_id"],
@@ -484,6 +504,22 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "asymmetric_weighted_agreement_rate": result["payload"]["score"]["asymmetric_weighted_agreement_rate"],
             "rolling_window_score": result["payload"]["score"]["rolling_window_score"],
         }
+        # Per-stage output assertion (config-I7214, sf-pipeline-policy.md
+        # §2.1) — only on the write=True path; ``dry_run`` declares by
+        # design that it writes nothing. Observe mode — the handler's own
+        # outcome is unchanged on an absent module.
+        #
+        # alpha-engine-config-I8155: same fix as RegimeSubstrate — the
+        # payload's `calendar_date` is a computed cycle date, and the SF's
+        # RegimeRetrospectiveEval Task Payload carries only `regime_action`,
+        # no date field. Skip loudly rather than report the cycle date
+        # under the run_date key.
+        _verdict = safe_assert_stage_coverage(
+            "RegimeRetrospectiveEval", event=event, window_start=_started, log=logger,
+        )
+        if _verdict is not None:
+            _response["stage_coverage"] = _verdict
+        return _response
     elif action == "dry_run":
         result = produce_t1_eval(**kwargs, write=False)
         return {
@@ -492,7 +528,7 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
             "payload": result["payload"],
         }
     else:
-        return {
-            "statusCode": 400,
-            "error": f"unknown action {action!r}; expected 'produce' or 'dry_run'",
-        }
+        raise UnknownAction(
+            f"action={action!r} is not implemented by this build. "
+            f"Known actions: ['dry_run', 'produce']."
+        )

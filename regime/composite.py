@@ -40,18 +40,25 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 }
 
 
-def _zscore(value: float, history: pd.Series) -> float:
+def _zscore(value: float, history: pd.Series) -> float | None:
     """Standard z-score of ``value`` against ``history``'s mean + std.
 
-    Returns 0.0 when ``history`` is empty or has zero std (degenerate
-    case — no signal to extract).
+    Returns ``None`` when ``history`` is empty or has zero/non-finite std
+    (degenerate case — no signal to extract). A degenerate feature is
+    UNDEFINED, not a measured zero: ``0.0`` is exactly the value a
+    genuinely at-the-mean observation produces, so returning it here
+    would make "no cross-sectional spread" indistinguishable from
+    "this feature sits at its own mean" (config-I7272). The caller
+    excludes ``None`` features from the weighted blend rather than
+    voting a fabricated 0, matching the drop-out-of-the-renormalized-
+    blend convention already used in ``regime/drawdown.py``.
     """
     if len(history) == 0:
-        return 0.0
+        return None
     mu = float(history.mean())
     sigma = float(history.std(ddof=0))
     if sigma == 0.0 or not np.isfinite(sigma):
-        return 0.0
+        return None
     return (float(value) - mu) / sigma
 
 
@@ -84,11 +91,17 @@ def compute_composite_intensity(
     Dict with keys:
 
     - ``intensity_z``: scalar composite z-score (stress orientation —
-      positive = risk-off).
+      positive = risk-off), or ``None`` when every candidate feature was
+      missing or degenerate (config-I7272: undefined, not a fabricated
+      0.0 — the total-outage case is exceedingly rare but must not read
+      as "calm").
     - ``per_feature_z``: dict of feature name → individual z-score
-      (debugging + dashboard observability).
+      (debugging + dashboard observability). Degenerate features
+      (zero cross-sectional spread, or <1 history point) are excluded
+      — their z is undefined, not 0.0.
     - ``features_used``: list of features that contributed (excludes
-      missing-from-current or missing-from-history).
+      missing-from-current, missing-from-history, AND degenerate
+      features whose z-score is undefined).
     """
     w = dict(weights or DEFAULT_WEIGHTS)
 
@@ -113,15 +126,22 @@ def compute_composite_intensity(
             continue
         feat_history = history_window[feat].dropna()
         z = _zscore(float(value), feat_history)
+        if z is None:
+            # Degenerate — no signal to extract. Drop out of the blend
+            # rather than voting a fabricated 0.0 (config-I7272).
+            continue
         per_feature_z[feat] = z
         features_used.append(feat)
         weighted_sum += weight * z
         weight_norm += abs(weight)
 
-    intensity_z = weighted_sum / weight_norm if weight_norm > 0 else 0.0
+    # weight_norm == 0 means EVERY candidate feature was missing or
+    # degenerate — a total input outage, not a measured calm reading.
+    # Undefined, not 0.0 (config-I7272).
+    intensity_z = weighted_sum / weight_norm if weight_norm > 0 else None
 
     return {
-        "intensity_z": float(intensity_z),
+        "intensity_z": intensity_z if intensity_z is None else float(intensity_z),
         "per_feature_z": per_feature_z,
         "features_used": features_used,
     }
@@ -199,6 +219,19 @@ def compute_intensity_z_series(
         # Invert sign to match substrate.json convention
         # (positive = risk-on). The raw composite returns stress
         # orientation (positive = risk-off).
-        out[idx] = -result["intensity_z"]
+        #
+        # config-I7272: compute_composite_intensity can now return
+        # ``None`` (total feature outage — undefined). This training
+        # path intentionally keeps the PRE-EXISTING, already-documented
+        # "missing-feature → 0.0 fallback" convention (see the
+        # min_history branch above and meta_trainer.py/run_inference.py)
+        # rather than introducing a THIRD representation into the Ridge
+        # L2 feature matrix — that convention is a separate, deliberate
+        # ML choice, not this issue's scope. The honest ``None`` is
+        # preserved at the JSON-facing layer (compute_composite_intensity
+        # / regime/substrate.py), which is the observability path this
+        # issue targets.
+        z = result["intensity_z"]
+        out[idx] = 0.0 if z is None else -z
 
     return pd.Series(out, name="intensity_z")

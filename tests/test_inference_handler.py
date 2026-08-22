@@ -1,5 +1,6 @@
 """Tests for inference.handler — Lambda action dispatch."""
 
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -110,6 +111,83 @@ def test_handler_check_drift_dry_run_threaded_to_check_drift(
 
 # ── action="check_deploy_drift" ─────────────────────────────────────────────
 
+#: Mirrors inference.deploy_drift.INVOKABLE_SF_NAMES. The handler now validates
+#: `sf_name` against that set before invoking, and every fake deploy_drift
+#: module below is a MagicMock whose attributes are MagicMocks — `x not in
+#: MagicMock()` raises TypeError, so the set has to be supplied explicitly.
+#: test_handler_declared_sf_names_match_the_probe pins the two together.
+_INVOKABLE = frozenset({
+    "ne-preopen-trading-pipeline",
+    "ne-postclose-trading-pipeline",
+    "ne-weekly-freshness-pipeline",
+})
+
+
+def test_handler_declared_sf_names_match_the_probe():
+    """The literal above is a stand-in for the real module's set; if the probe
+    grows a state machine and this list does not, the tests below would keep
+    passing while the handler rejected the new name in production."""
+    from inference.deploy_drift import INVOKABLE_SF_NAMES
+    assert set(INVOKABLE_SF_NAMES) == set(_INVOKABLE)
+
+
+def test_handler_check_deploy_drift_forwards_the_requested_state_machine(
+    stubbed_preflight, monkeypatch,
+):
+    """alpha-engine-config-I7799 closes-when clause 1 names
+    step_function_eod.json as well as step_function_daily.json.
+    deploy_drift._SF_DEFINITION_PATHS has carried both since #538, but this
+    handler hardcoded the preopen default — so the postclose comparison was
+    reachable only from unit tests, never from a caller."""
+    fake_drift = MagicMock()
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
+    fake_drift.check_deploy_drift = MagicMock(return_value={
+        "upstream_sha": "abc1234567",
+        "sf_sha": "abc1234567",
+        "sf_drift": False,
+        "stack_sha": "abc1234567",
+        "cf_drift": False,
+    })
+    monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
+
+    import inference.handler as h
+    ctx = _fake_context(arn="arn:aws:lambda:us-east-1:123456789012:function:foo")
+    h.handler(
+        {"action": "check_deploy_drift",
+         "sf_name": "ne-postclose-trading-pipeline"},
+        ctx,
+    )
+    fake_drift.check_deploy_drift.assert_called_once_with(
+        region="us-east-1", account_id="123456789012",
+        sf_name="ne-postclose-trading-pipeline",
+    )
+
+
+def test_handler_check_deploy_drift_rejects_an_undeclared_state_machine(
+    stubbed_preflight, monkeypatch,
+):
+    """An unknown name must RAISE at the edge, never reach the probe.
+
+    check_deploy_drift resolves the definition path with
+    `_SF_DEFINITION_PATHS.get(sf_name)` and treats a None as "weekly / unknown
+    pipeline: stamp semantics, unchanged" — so a typo'd or invented name would
+    come back as a confident stamp verdict about a state machine that does not
+    exist, and DeployDriftGate reads sf_drift to decide whether to halt a
+    real-money session."""
+    fake_drift = MagicMock()
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
+    monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
+
+    import inference.handler as h
+    ctx = _fake_context(arn="arn:aws:lambda:us-east-1:123456789012:function:foo")
+    with pytest.raises(ValueError, match="unknown sf_name"):
+        h.handler(
+            {"action": "check_deploy_drift", "sf_name": "ne-typo-pipeline"},
+            ctx,
+        )
+    fake_drift.check_deploy_drift.assert_not_called()
+
+
 
 def test_handler_check_deploy_drift_uses_run_for_drift_gate(
     stubbed_preflight, monkeypatch,
@@ -122,6 +200,7 @@ def test_handler_check_deploy_drift_uses_run_for_drift_gate(
         "stack_sha": "abc1234567",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
@@ -131,6 +210,7 @@ def test_handler_check_deploy_drift_uses_run_for_drift_gate(
     assert result["sf_drift"] is False
     fake_drift.check_deploy_drift.assert_called_once_with(
         region="us-east-1", account_id="123456789012",
+        sf_name="ne-preopen-trading-pipeline",
     )
     # Drift gate should use the lighter preflight path
     stubbed_preflight.return_value.run_for_drift_gate.assert_called_once()
@@ -149,12 +229,14 @@ def test_handler_check_deploy_drift_falls_back_to_env_account(
         "stack_sha": "abc",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
     result = h.handler({"action": "check_deploy_drift"}, None)
     fake_drift.check_deploy_drift.assert_called_once_with(
         region="us-east-1", account_id="999999999999",
+        sf_name="ne-preopen-trading-pipeline",
     )
 
 
@@ -174,6 +256,7 @@ def test_handler_check_deploy_drift_never_receives_skip_even_with_dry_run(
         "stack_sha": "abc1234567",
         "cf_drift": False,
     })
+    fake_drift.INVOKABLE_SF_NAMES = _INVOKABLE
     monkeypatch.setitem(sys.modules, "inference.deploy_drift", fake_drift)
 
     import inference.handler as h
@@ -394,3 +477,309 @@ def test_handler_predict_supplemental_tickers_list(
     )
 
 
+
+
+# ── alpha-engine-config-I7316 ───────────────────────────────────────────────
+# The handler must survive the UNMEASURED payload of every gate probe that
+# omits keys on its fail-open path.
+#
+# What happened: alpha-engine-config-I7048 taught these probes to OMIT the
+# verdict key rather than report a false one, and guarded the handler's log
+# line for THAT key with `.get()`. -I7277 and -I7171 then extended the same
+# reasoning to the EVIDENCE lists (`violations`, `offenders`) — an empty list
+# is as much a claim as a false verdict — but the handler's bare subscripts on
+# those siblings were never updated. From that merge on, every unmeasured
+# invocation raised KeyError inside the very log line written to report it.
+#
+# Measured on the 2026-08-14T03:10 deploy canary against version 479:
+#   check_pipeline_contract: FunctionError: Unhandled, payload: 'violations'
+#   check_lib_pin_drift:     FunctionError: Unhandled, payload: 'offenders'
+# The canary refused the promote and the :live alias froze at v474.
+#
+# These tests drive the probes' REAL unmeasured payloads — built by the
+# producer's own constructor, not hand-written here — through the handler. A
+# third probe adopting the omit-the-key shape, or a fourth key joining the
+# omitted set, fails here instead of at a deploy canary.
+
+
+def _real_unknown_pipeline_contract_payload() -> dict:
+    from inference.pipeline_contract_check import _unknown_result
+    return _unknown_result("source_missing")
+
+
+def _real_unmeasured_lib_pin_payload() -> dict:
+    """The lib-pin probe's own fail-open payload, driven through the real
+    function with every upstream read unresolvable."""
+    from unittest.mock import patch as _patch
+
+    from inference import lib_pin_drift as lpd
+
+    with _patch.object(
+        lpd, "_fetch_repo_pin",
+        side_effect=lambda *a, **k: lpd.PinRead(None, lpd.UNREACHABLE, "patched"),
+    ):
+        return lpd.check_lib_pin_drift()
+
+
+def test_unmeasured_pipeline_contract_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unknown_pipeline_contract_payload()
+    # Precondition: this is the shape the bug needed. If the producer starts
+    # emitting these keys again, this test is no longer covering anything and
+    # should be re-pointed rather than silently passing.
+    assert "violations" not in payload
+    assert "has_violation" not in payload
+
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    assert result == payload, "the handler must return the probe's payload verbatim"
+
+
+def test_unmeasured_lib_pin_payload_survives_the_handler(
+    stubbed_preflight, monkeypatch,
+):
+    payload = _real_unmeasured_lib_pin_payload()
+    assert "has_drift" not in payload
+
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value=payload)
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    assert result == payload
+
+
+# ── alpha-engine-config-I7389: stage_coverage is now a real annotation ──────
+#
+# These gate tests used to assert exact equality against the probe payload
+# (`== {}` / `== {"reason": ...}`). That passed only because
+# `_record_stage_coverage` imported `nousergon_lib.stage_coverage`, a module
+# that has never existed on any released nousergon-lib, so the handler took
+# the `except ImportError` branch and annotated nothing.
+#
+# In other words: the assertion held BECAUSE the detector was broken. Fixing
+# the import (to `krepis.stage_coverage`) made four of these fail, which is the
+# correct signal and not a regression — the key they were asserting absent is
+# exactly the evidence I7214 exists to produce.
+#
+# The tests' real subject is unchanged and is restated below: the handler is a
+# reporting surface and must never turn a degraded probe into an Unhandled
+# Lambda error (alpha-engine-config-I7302). So the probe payload is compared
+# with the annotation lifted off, and the annotation is asserted SEPARATELY —
+# which makes these tests stronger than before, because they now also fail if
+# the coverage assertion silently stops running again.
+
+
+def _without_stage_coverage(result: dict) -> dict:
+    """The probe payload as the gate produced it, with the handler's own
+    stage-coverage annotation removed."""
+    return {k: v for k, v in result.items() if k != "stage_coverage"}
+
+
+def _assert_stage_coverage_ran(result: dict) -> None:
+    """The annotation must be PRESENT and carry a status.
+
+    Presence is the load-bearing half. An absent key is exactly what a broken
+    import produces AND what a healthy no-op would produce, so absence can
+    never be the unavailable signal (sf-pipeline-policy 2.3a). In CI there are
+    no AWS credentials, so the expected status is UNMEASURED with a reason —
+    a verdict, not silence.
+    """
+    assert "stage_coverage" in result, (
+        "the handler did not annotate stage_coverage — the krepis import is "
+        "broken again (alpha-engine-config-I7389) or the call site was removed"
+    )
+    coverage = result["stage_coverage"]
+    assert coverage.get("status"), (
+        f"stage_coverage carries no status: {coverage!r}. A verdict-less "
+        "annotation is indistinguishable from the detector not running."
+    )
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_a_payload_carrying_only_a_reason(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """The floor: a probe payload that carries nothing but a reason.
+
+    Generalizes past the two keys that actually broke. Any future key the
+    handler's log line reaches for must be optional, because the whole point
+    of the unmeasured shape is that it asserts as little as possible.
+    """
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={"reason": "source_missing"}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    result = h.handler({"action": action}, _fake_context())
+
+    assert _without_stage_coverage(result) == {"reason": "source_missing"}
+    _assert_stage_coverage_ran(result)
+
+
+@pytest.mark.parametrize(("action", "module_path", "func_name"), [
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract"),
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift"),
+])
+def test_gate_actions_survive_an_entirely_empty_payload(
+    stubbed_preflight, monkeypatch, action, module_path, func_name,
+):
+    """Even `reason` is not guaranteed by anything structural. The handler is
+    a reporting surface; it must never be the thing that turns a degraded
+    probe into an Unhandled Lambda error, because the SF then attributes the
+    failure to the invocation rather than to the gate
+    (alpha-engine-config-I7302)."""
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value={}))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    result = h.handler({"action": action}, _fake_context())
+
+    assert _without_stage_coverage(result) == {}
+    _assert_stage_coverage_ran(result)
+
+
+# ── alpha-engine-config-I7319: the other direction ──────────────────────────
+#
+# Every test above asserts that nothing RAISES on a payload missing its
+# evidence list. None asserts that the evidence still arrives when it exists.
+#
+# That asymmetry is a real risk here rather than a theoretical one, because
+# everything in this area has moved one way for two days: -I7048 omitted the
+# verdict key, -I7277 and -I7171 omitted the evidence lists, -I7316 guarded
+# every read. Each step was right. An edit that took the next step — dropping
+# the `offenders=` clause entirely, say, while "simplifying" the log line —
+# would pass the whole suite, because the suite only knows how to check that
+# the handler survives.
+#
+# `offenders` is what a human acts on when the gate halts the weekly SF: it
+# names the exact cross-repo pin mismatch to fix. Losing it silently costs
+# the diagnostic at precisely the moment it is needed, which is the same
+# reports-less-than-it-measured shape the whole -I7301/-I7316 arc is about.
+
+
+def _captured_gate_log(monkeypatch, h) -> list:
+    """Capture the handler's own log calls, rendered.
+
+    Deliberately NOT caplog: `handler()` reconfigures root logging on its
+    first invocation (``logging.getLogger().setLevel`` at handler.py:181,
+    plus krepis' own setup), so caplog captures nothing in whichever test
+    triggers that first — the assertion would pass or fail on collection
+    order. Patching the module logger tests the same thing (what the gate
+    line is asked to render) and cannot be perturbed by logging config.
+    """
+    rendered: list = []
+
+    def _info(fmt, *args):
+        rendered.append(fmt % args)
+
+    monkeypatch.setattr(h.log, "info", _info)
+    return rendered
+
+
+def test_lib_pin_offenders_reach_the_log_when_the_gate_measured_them(
+    stubbed_preflight, monkeypatch,
+):
+    fake_lpd = MagicMock()
+    fake_lpd.check_lib_pin_drift = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_drift": True,
+        "parity_ok": False,
+        "floor_ok": True,
+        "min_lib_version": "0.39.0",
+        "pins": {
+            "nousergon/crucible-backtester": "v0.124.5",
+            "nousergon/crucible-predictor": "v0.124.57",
+        },
+        "offenders": [
+            "co-install parity: nousergon/crucible-backtester=v0.124.5 != "
+            "nousergon/crucible-predictor=v0.124.57",
+        ],
+        "reason": "drift_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.lib_pin_drift", fake_lpd)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_lib_pin_drift"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Lib-pin drift check:"))
+    assert "offenders=co-install parity" in line
+    # the offending versions, not just the label — this line is the only
+    # place a human sees them without opening the SF execution
+    assert "v0.124.5" in line and "v0.124.57" in line
+
+
+def test_pipeline_contract_violations_reach_the_log_when_measured(
+    stubbed_preflight, monkeypatch,
+):
+    fake_pcc = MagicMock()
+    fake_pcc.check_pipeline_contract = MagicMock(return_value={
+        "status": "MEASURED",
+        "has_violation": True,
+        "violations": ["producer/consumer mismatch: predictions/{date}.json"],
+        "boundary_count": 12,
+        "reason": "violation_detected",
+    })
+    monkeypatch.setitem(sys.modules, "inference.pipeline_contract_check", fake_pcc)
+
+    import inference.handler as h
+    rendered = _captured_gate_log(monkeypatch, h)
+    h.handler({"action": "check_pipeline_contract"}, _fake_context())
+
+    line = next(m for m in rendered if m.startswith("Pipeline-contract preflight:"))
+    assert "violations=producer/consumer mismatch" in line
+    assert "boundaries=12" in line
+
+
+# alpha-engine-config-I7319, second polarity. #498 pinned that a MEASURED run
+# with findings still LOGS them. This pins the complement: a MEASURED run with
+# an EMPTY evidence list omits the clause rather than printing an empty one.
+#
+# Both halves are needed. The payload distinguishes "ran and found nothing"
+# (`status: MEASURED`, `violations: []`) from "could not run" (`status:
+# UNKNOWN`, key absent) — alpha-engine-config-I7277. If the log printed
+# `violations=` for both, the surface a human actually reads would collapse the
+# distinction the payload was changed to preserve.
+@pytest.mark.parametrize(("action", "module_path", "func_name", "payload", "clause"), [
+    ("check_lib_pin_drift", "inference.lib_pin_drift", "check_lib_pin_drift",
+     {"status": "MEASURED", "has_drift": False, "reason": "in_sync",
+      "pins": {}, "offenders": []}, "offenders="),
+    ("check_pipeline_contract", "inference.pipeline_contract_check",
+     "check_pipeline_contract",
+     {"status": "MEASURED", "has_violation": False, "reason": "in_sync",
+      "boundary_count": 5, "violations": []}, "violations="),
+])
+def test_a_clean_measured_run_omits_the_evidence_clause(
+    stubbed_preflight, monkeypatch, caplog, action, module_path, func_name,
+    payload, clause,
+):
+    fake = MagicMock()
+    setattr(fake, func_name, MagicMock(return_value=payload))
+    monkeypatch.setitem(sys.modules, module_path, fake)
+
+    import inference.handler as h
+    with caplog.at_level(logging.INFO):
+        h.handler({"action": action}, _fake_context())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert clause not in logged, (
+        f"a clean MEASURED run printed an empty {clause!r} clause — that reads "
+        "identically to a gate that could not run, which is the distinction "
+        "alpha-engine-config-I7277 changed the payload to preserve"
+    )
+    assert "in_sync" in logged

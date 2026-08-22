@@ -131,6 +131,29 @@ canary_status_ok() {
 #              they never satisfy — the 2026-07-12 v351 false-canary-fail that
 #              refused to promote a healthy image (PR #362).
 #
+#   <expect> may name SEVERAL acceptable keys separated by `|`, and accepts
+#              when ANY of them is present. This exists because two gate actions
+#              have a legitimately two-shaped contract: alpha-engine-config-I7048
+#              made check_lib_pin_drift and check_pipeline_contract OMIT their
+#              verdict key (has_drift / has_violation) on a fetch or parse miss,
+#              emitting `reason=fetch_failed` instead, so the SF's IsPresent-
+#              guarded Choice routes an unmeasured gate to its degraded path
+#              rather than reading an unmeasured state as measured-clean. A
+#              single-key expectation asserts one BRANCH of that contract, not
+#              the contract, and the branch it asserts is the one a deploy-time
+#              canary cannot guarantee — the probes fetch from github.com at
+#              invoke time. Measured 2026-08-13: it failed for three consecutive
+#              deploys (07ccccb, c699019, fb062c5), each publishing a version
+#              that was then REFUSED promotion, freezing the `live` alias at
+#              v455 while main advanced. The third of those carried the
+#              action=check_market_hours evaluator that the market-hours gate —
+#              by then already the first state of both trading pipelines —
+#              invokes, so the 2026-08-13 preopen run reached a live Lambda with
+#              no such action and failed States.Runtime with no orders placed.
+#              A canary asserts that the invoke DISPATCHED and returned this
+#              action's contract; whether the probe could reach its upstream is
+#              a domain outcome and never a deploy gate.
+#
 #   A FunctionError (unhandled exception / broken import) is checked by the
 #   caller BEFORE this and always rejects, in every mode.
 canary_accept() {
@@ -142,10 +165,19 @@ canary_accept() {
     return $?
   fi
   local k
-  for k in $present_keys; do
-    if [ "$k" = "$expect" ]; then
-      return 0
-    fi
+  local want
+  # `|`-separated alternatives; a single key is the one-element case.
+  local old_ifs="$IFS"
+  IFS='|'
+  # shellcheck disable=SC2206 — deliberate word-split on IFS='|'.
+  local wants=( $expect )
+  IFS="$old_ifs"
+  for want in "${wants[@]}"; do
+    for k in $present_keys; do
+      if [ "$k" = "$want" ]; then
+        return 0
+      fi
+    done
   done
   return 1
 }
@@ -341,6 +373,56 @@ aws lambda wait function-updated \
   --function-name "${LAMBDA_FUNCTION}" \
   --region "${AWS_REGION}"
 
+# ── Step 5b: Converge the Lambda environment ─────────────────────────────────
+# alpha-engine-config-I7925. This function's environment is LIVE-ONLY state:
+# no repo, no IaC and no script ever wrote it, so a variable set by hand years
+# ago outlives every deploy and every code change that stopped needing it.
+#
+# `GITHUB_TOKEN` was one of those, and its failure mode is the reason a
+# deny-list is not paranoia. The live environment holds a STALE COPY of
+# `/alpha-engine/GITHUB_TOKEN`, set from an older parameter version and never
+# re-derived: measured 2026-08-21, the SSM parameter's own value authenticates
+# fine (`GET /user` -> 200), while the copy in this function's environment is
+# rejected with a 401. Same name, different value, nothing detecting the
+# divergence. On 2026-08-21 a first-party dependency read that stale copy out
+# of site-packages, sent it to GitHub, and the 401 halted the preopen trading
+# pipeline 3.4 seconds after start (alpha-engine-config-I7924). This repo's own
+# `tests/test_no_secret_environ_reads.py` forbids reading GITHUB_TOKEN in-repo;
+# the environment carried a copy of it anyway, because nothing here declared
+# what the environment may contain. A credential duplicated into an
+# uncontrolled store and left to drift is the defect; removing the duplicate is
+# the fix. (Mis-attribution of the 401 to the SSM parameter itself is tracked
+# as alpha-engine-config-I7968.)
+#
+# DENY-LIST, deliberately, not an allow-list: the live function carries
+# operator-set flags and provider keys codified nowhere, and a deploy that
+# asserted a complete key set would delete them. Codifying the full set is
+# tracked separately. Removal is read-modify-write via the shared
+# `krepis.aws remove-lambda-env` CLI — a bare `aws lambda
+# update-function-configuration --environment` REPLACES the whole variable map.
+#
+# `--defer-publish`: this edits $LATEST only, on purpose. Step 6 publishes the
+# version and step 10 moves the `live` alias, so the removal reaches traffic
+# through the deploy's own promotion. Without the flag the CLI refuses, because
+# on an alias-pinned function a $LATEST-only edit is a silent no-op (L4497).
+# `--missing-ok`: every deploy after the first finds the key already gone.
+LAMBDA_ENV_DENIED_KEYS=(GITHUB_TOKEN)
+
+echo ""
+echo "==> Converging Lambda environment (removing denied keys)..."
+python3 -m krepis.aws remove-lambda-env \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --region "${AWS_REGION}" \
+  --defer-publish \
+  --missing-ok \
+  "${LAMBDA_ENV_DENIED_KEYS[@]/#/--unset=}"
+
+echo ""
+echo "==> Waiting for the environment update to complete..."
+aws lambda wait function-updated \
+  --function-name "${LAMBDA_FUNCTION}" \
+  --region "${AWS_REGION}"
+
 # ── Step 6: Publish version ──────────────────────────────────────────────────
 echo ""
 echo "==> Publishing Lambda version..."
@@ -415,12 +497,24 @@ if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_drift" '{"action
 fi
 
 # Test check_trading_day — trading_day_gate returns {is_trading_day,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day"}' "is_trading_day"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_trading_day" '{"action": "check_trading_day", "dry_run": true}' "is_trading_day"; then
+  CANARY_FAILED=1
+fi
+
+# Test check_market_hours — trading_day_gate returns {is_market_hours, verdict,
+# ...}. alpha-engine-config-I7111: this action is the FIRST state of both
+# ne-preopen-trading-pipeline and ne-postclose-trading-pipeline, so a broken
+# contract here does not degrade a pipeline — it stops one from starting at
+# all. Canaried at deploy time for the same reason check_trading_day is.
+# A fixed `now` inside the session is passed deliberately: a wall-clock
+# canary would exercise a different branch depending on when the deploy ran,
+# and the branch that matters is the one that refuses.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_market_hours" '{"action": "check_market_hours", "now": "2026-08-12T16:00:00Z", "dry_run": true}' "is_market_hours"; then
   CANARY_FAILED=1
 fi
 
 # Test check_weekly_run_day — trading_day_gate returns {is_weekly_run_day,...}.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day"}' "is_weekly_run_day"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_weekly_run_day" '{"action": "check_weekly_run_day", "dry_run": true}' "is_weekly_run_day"; then
   CANARY_FAILED=1
 fi
 
@@ -432,7 +526,12 @@ fi
 # skip ONLY the deploy-drift assertion; the contract check itself still
 # runs and fails loud on a genuine violation (config#2731, mirrors the
 # predict(dry_run) fix in config#1073).
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation"; then
+#
+# `has_violation|reason`: alpha-engine-config-I7048 made has_violation ABSENT on
+# a fetch/parse miss, with reason=fetch_failed in its place. Both shapes are the
+# contract; asserting only the measured one turned an unreachable github.com
+# into a failed deploy (see canary_accept).
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_pipeline_contract" '{"action": "check_pipeline_contract", "dry_run": true}' "has_violation|reason"; then
   CANARY_FAILED=1
 fi
 
@@ -441,16 +540,33 @@ fi
 # (two S3 GETs); no dry_run needed. Omit `date` so it reads today's
 # artifacts, mirroring how the weekday SF's coverage-gap Choice state calls
 # it with no explicit date.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_coverage" '{"action": "check_coverage"}' "missing_count"; then
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_coverage" '{"action": "check_coverage", "dry_run": true}' "missing_count"; then
   CANARY_FAILED=1
 fi
 
 # Test check_lib_pin_drift — lib_pin_drift.check_lib_pin_drift returns
 # {has_drift,reason,pins,offenders}. Read-only (GitHub raw-content GETs of
-# each Saturday-SF repo's requirements file); no dry_run needed, and it
-# fails open on a fetch/parse miss so a transient GitHub hiccup cannot
-# false-fail this canary.
-if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift"}' "has_drift"; then
+# each Saturday-SF repo's requirements file), and it fails open on a
+# fetch/parse miss so a transient GitHub hiccup cannot false-fail this canary.
+#
+# alpha-engine-config-I7954: `dry_run: true` was MISSING here, and the comment
+# it replaces said "no dry_run needed" — read as "this action writes nothing",
+# which is true and is not what dry_run means to this handler. It means
+# SYNTHETIC INVOCATION, and it does two things this action needed:
+#   - handler.py threads it into `run_for_drift_gate(skip_deploy_drift=...)`,
+#     so without it this one action still asserted its image SHA against live
+#     main HEAD — the merge-burst false-failure config#2731 removed everywhere
+#     else in this matrix.
+#   - handler.py threads it into `check_lib_pin_drift(probe=...)`, which drops
+#     a detected drift from ERROR to WARNING. flow-doctor is attached at ERROR,
+#     so a canary landing inside a cross-repo lockstep pin-bump window (two
+#     merges, never atomic) emailed a parity break that was true, useless and
+#     self-cleared 7 minutes later — measured 2026-08-21T15:06:03Z.
+# Every predictor action in this matrix carries dry_run for these reasons, and
+# tests/test_deploy_canary_matrix.py fails the build if a new one does not.
+#
+# `has_drift|reason`: same I7048 two-shaped contract as check_pipeline_contract.
+if ! run_canary_action "${LAMBDA_FUNCTION}" "${VERSION}" "check_lib_pin_drift" '{"action": "check_lib_pin_drift", "dry_run": true}' "has_drift|reason"; then
   CANARY_FAILED=1
 fi
 

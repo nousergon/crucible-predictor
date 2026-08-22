@@ -28,6 +28,16 @@ _SPOT_NAME="${_SPOT_NAME:-model-zoo-select}"
 _PROCESS_NAME="${_PROCESS_NAME:-predictor-model-zoo-select}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 
+# Stage-coverage identity (config-I7214). Only --select-only is reachable
+# from the live weekly SF (nousergon-data infrastructure/step_function.json
+# state "ModelZooSelect" runs exactly `spot_model_zoo_select.sh
+# --select-only`, verified 2026-08-13). --weekly has no corresponding state
+# in the live definition — "ModelZooWeekly" does not exist there — so it is
+# NOT asserted below; asserting an undeclared registry stage would be a
+# guaranteed-false MISSING, not a real signal. Set per-mode in the flag
+# parser.
+_COVERAGE_STAGE=""
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 MODE=""  # weekly | select-only
 
@@ -35,7 +45,7 @@ _ORIG_ARGS=("$@")
 while [ $# -gt 0 ]; do
   case "$1" in
     --weekly) MODE="weekly" ; _SPOT_NAME="model-zoo-weekly" ; _SSM_SLUG="spot-model-zoo-weekly" ; _PROCESS_NAME="predictor-model-zoo" ;;
-    --select-only) MODE="select-only" ; _SPOT_NAME="model-zoo-select" ; _SSM_SLUG="spot-model-zoo-select" ; _PROCESS_NAME="predictor-model-zoo-select" ;;
+    --select-only) MODE="select-only" ; _SPOT_NAME="model-zoo-select" ; _SSM_SLUG="spot-model-zoo-select" ; _PROCESS_NAME="predictor-model-zoo-select" ; _COVERAGE_STAGE="ModelZooSelect" ;;
     --instance-type) shift; INSTANCE_TYPE="$1" ;;
     --preflight-only) PREFLIGHT_ONLY=1 ;;
     *) echo "ERROR: unknown flag: $1" >&2; exit 2 ;;
@@ -54,7 +64,7 @@ if [ -n "$INSTANCE_TYPE" ]; then
 fi
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
-check_config_exists "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
+resolve_or_stage_predictor_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  MODEL-ZOO $(echo "$MODE" | tr 'a-z' 'A-Z') — $(date +%Y-%m-%d)"
@@ -91,7 +101,8 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter (alpha-engine-config-I7380)" >&2; exit 1; }
+PY=python3.12
 cat > /tmp/spot-model-zoo-weekly.py <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
@@ -138,6 +149,9 @@ ZOO
 )" "${MAX_RUNTIME_SECONDS}"
 
   emit_heartbeat
+  # No stage-coverage assertion here — see the "_COVERAGE_STAGE" comment
+  # above the flag parser: --weekly has no live SF state to assert against
+  # (config-I7214).
   echo ""
   echo "==> Model-zoo rotation complete. Instance will be terminated."
   exit 0
@@ -151,7 +165,8 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter (alpha-engine-config-I7380)" >&2; exit 1; }
+PY=python3.12
 cat > /tmp/spot-model-zoo-select.py <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
@@ -198,6 +213,18 @@ ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}"
 
   emit_heartbeat
+
+  # Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+  # assert THIS stage wrote what it declared, at the boundary where the fact
+  # becomes knowable. OBSERVE MODE — it can never fail the stage.
+# alpha-engine-config-I8155: pass the SF execution's own run_date via
+# EXECUTION_RUN_DATE, never $RUN_DATE — RUN_DATE is reassigned to the
+# trading day elsewhere in the fleet (crucible-backtester _spot_common.sh),
+# so it is not a reliable carrier of the execution identity. No fallback:
+# an unset EXECUTION_RUN_DATE must reach the CLI empty so it exits loudly
+# under the observe-mode guard below rather than writing under run_date="".
+  "$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" --run-date "${EXECUTION_RUN_DATE:-}" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+
   echo ""
   echo "==> Model-zoo select complete. Instance will be terminated."
   exit 0

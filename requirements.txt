@@ -1,14 +1,14 @@
 # Core inference dependencies (Lambda zip deployment)
-numpy>=2.5.1,<3
+numpy>=2.5.2,<3
 pandas>=2.0.0,<3
-yfinance>=1.5.2
-boto3>=1.43.65
+yfinance>=1.6.0
+boto3>=1.43.76
 scipy>=1.18.0
 hmmlearn>=0.3.3
 tqdm>=4.68.4
-pyarrow>=25.0.0
+pyarrow>=25.0.1
 requests>=2.34.2
-lxml>=6.1.1
+lxml>=6.1.2
 lightgbm>=4.7.0
 scikit-learn>=1.9.0
 psutil>=7.2.2
@@ -24,6 +24,24 @@ setuptools>=83.0.0
 # NOTE: flow-doctor extra is HYPHENATED — setuptools normalizes the lib's
 # `flow_doctor` extra to `Provides-Extra: flow-doctor`; older pip doesn't
 # normalize underscore->hyphen, so `[flow_doctor]` silently drops it (config#1178).
+#
+# This note sat directly above a `krepis[flow_doctor]` line for months and the
+# hazard it names took down the weekly pipeline anyway (config#6963). The rule
+# is now mechanical, not advisory: `scripts/lint_extras.py` (CI, `ci.yml`) fails
+# the build on any underscored extra in either requirements file, and the spot
+# bootstrap raises on pip's dropped-extra WARNING instead of printing it.
+#
+# Measured boundary, 2026-08-12 — `krepis[flow_doctor]==0.38.0`, dry-run resolve:
+#   pip 23.2.1  -> 18 packages, "WARNING: krepis 0.38.0 does not provide the
+#                  extra 'flow_doctor'", exit 0. flow-doctor ABSENT.
+#   pip 23.3.2  -> 30 packages, flow-doctor present.
+#   pip 24.0    -> 30 packages, flow-doctor present.
+#   pip 25.0    -> 30 packages, flow-doctor present.
+# AL2023's `python3.12-pip` is 23.2.1 — the spot bootstrap installs on the
+# broken side of that boundary, which is why this repo hit it in production
+# while the Docker-based consumers (newer pip in their base images) did not.
+# The hyphenated form resolves correctly on EVERY pip version, so it is the
+# form to use unconditionally rather than a workaround for old pip.
 #
 # Dual-import (config#1269, mirrors crucible-evaluator #69): non-edge commodity
 # modules (secrets/dates/logging/trading_calendar/alerts/email_sender/metrics +
@@ -44,11 +62,30 @@ setuptools>=83.0.0
 # `aws lambda invoke`. The invoke is now LOAD-BEARING, so krepis must be
 # importable in the deploy environment — this floor makes it a hard dep. Kept
 # in lockstep with requirements-lambda.txt.
-krepis[flow_doctor]==0.38.0  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
-nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@c907a044bb1553815225327bc56644050543b6f2
+# Bumped to 0.51.0 (config#7009): `krepis.ec2_spot relaunch-decision` grew
+# `--json` in krepis-PR133 (released 0.51.0). The spot-cleanup call sites
+# migrated off the exit-code contract onto the JSON verdict field. Kept in
+# lockstep with requirements-lambda.txt.
+# Bumped to 0.59.6 (alpha-engine-config-I4992/I6922/I7372, G16 spot-bootstrap
+# cutover): 0.59.6 is the first published krepis carrying
+# `krepis.spot_bootstrap.scan_for_inline_bootstraps` (this repo's anti-fork
+# test, tests/test_no_inline_spot_bootstrap.py, imports it directly) and the
+# `--max-runtime-seconds` render flag (infrastructure/_spot_common.sh's
+# bootstrap_spot() now passes it, called by both infrastructure/spot_train.sh
+# and every other spot launcher in this repo). Below 0.59.6 the flag is
+# unrecognized by `python -m krepis.spot_bootstrap render`, so a bootstrap on
+# a box resolving an older krepis fails AFTER a spot instance already exists
+# and is billing — this floor is load-bearing at runtime, not only for CI
+# collection. Kept in lockstep with requirements-lambda.txt.
+krepis[flow-doctor]==0.59.24  # pinned per §139 — first-party/fast-moving deps are pinned, never floored
+# alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
+# gitleaks/session_dlp prerequisite — it does not. No file here imports
+# `krepis.LLMClient` (`grep -rn "LLMClient" --include="*.py" .` is empty); the
+# `[flow-doctor]` extra pulled in is the diagnosis wiring, not LLMClient itself.
+nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.83
 
 # Training dependencies (not needed in Lambda)
-arcticdb>=6.21.0
+arcticdb>=6.23.0
 # Floor bumped >=1.2.0 -> >=1.2.8 (numpy-2 migration, config#2815): catboost
 # 1.2.6/1.2.7 pinned numpy<2.0, incompatible with the numpy>=2.5.1 floor above.
 # >=1.2.0 alone still resolves today (pip picks the newest satisfying release),
@@ -67,3 +104,4 @@ matplotlib>=3.11.1
 
 # MLP model — only needed when model_type="mlp" (not used in Lambda)
 # torch>=2.0.0
+

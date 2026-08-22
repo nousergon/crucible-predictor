@@ -30,7 +30,10 @@ def _healthy_predictions(n: int = 27):
             "p_flat": 0.0,
             "predicted_alpha": (p_up - 0.5) * 0.05,
             "predicted_direction": "UP" if p_up >= 0.5 else "DOWN",
-            "prediction_confidence": round(max(p_up, 1 - p_up), 4),
+            # |p_up - 0.5| * 2 — the live axis since PR #143. These fixtures
+            # carried the retired max(p_up, p_down) form, which the gate's
+            # confidence-semantics check now rejects.
+            "prediction_confidence": round(abs(p_up - 0.5) * 2.0, 4),
         })
     return preds
 
@@ -51,7 +54,7 @@ def _degenerate_predictions():
                 "p_flat": 0.0,
                 "predicted_alpha": -0.001,
                 "predicted_direction": direction,
-                "prediction_confidence": max(p_up, 1 - p_up),
+                "prediction_confidence": round(abs(p_up - 0.5) * 2.0, 4),
             })
             i += 1
     return preds

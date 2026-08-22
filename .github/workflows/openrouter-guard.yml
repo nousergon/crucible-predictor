@@ -1,0 +1,32 @@
+name: OpenRouter direct-linkage guard
+
+# Thin caller — all scan behavior lives in the reusable workflow. Edit it
+# there, not here: nousergon/nousergon-lib/.github/workflows/openrouter-guard.yml
+#
+# alpha-engine-config-I7864 (epic I6367, Brian's 2026-08-03 ruling: no agent
+# may be directly linked to OpenRouter). Baseline of pre-existing matches:
+# .openrouter-allowlist.yaml.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # `caller-` prefix is load-bearing, not cosmetic: inside a CALLED workflow
+  # `github.workflow` resolves to THIS workflow's name, so a callee declaring
+  # the same expression lands in the same concurrency group and GitHub kills
+  # the run with zero jobs and no check (alpha-engine-config-I7836/I7862).
+  # Enforced by alpha-engine-config's scripts/check_workflow_shape.py
+  # ::check_caller_concurrency_group.
+  group: caller-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    uses: nousergon/nousergon-lib/.github/workflows/openrouter-guard.yml@5a28d15032933f31266d466a51baf764f3282b73  # nousergon-lib#334, merged 2026-08-19

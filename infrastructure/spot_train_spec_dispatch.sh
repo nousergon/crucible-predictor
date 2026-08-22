@@ -32,6 +32,14 @@ _SSM_SLUG="${_SSM_SLUG:-spot-model-zoo-spec}"
 _PROCESS_NAME="${_PROCESS_NAME:-predictor-model-zoo-spec}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-5400}"
 
+# Stage-coverage identity (config-I7214). This script IS the SF's
+# TrainSpecDispatch Map-iteration Task (nousergon-data
+# infrastructure/step_function.json,
+# ResearchPredictorParallel/ModelZooTrainMap/TrainSpecDispatch) — NOT
+# "ResolveZooSpecs", which is a separate inline `python -m training.model_zoo
+# list-rotation-specs` SSM command with no launcher script of its own.
+_COVERAGE_STAGE="TrainSpecDispatch"
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 MODEL_ZOO_SPEC_ID=""
 
@@ -60,7 +68,7 @@ fi
 MZ_SPEC_EXPORT="export MODEL_ZOO_SPEC_ID=${MODEL_ZOO_SPEC_ID}"$'\n'
 
 # ── Preflight checks ─────────────────────────────────────────────────────────
-check_config_exists "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
+resolve_or_stage_predictor_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "  MODEL-ZOO TRAIN ONE SPEC: ${MODEL_ZOO_SPEC_ID}"
@@ -96,7 +104,8 @@ set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
 export ALPHA_ENGINE_DEPLOYED=1 ALPHA_ENGINE_EXPERIMENT_ID=reference S3_BUCKET=alpha-engine-research
 cd /home/ec2-user/predictor
-command -v python3.12 >/dev/null && PY=python3.12 || PY=python3
+command -v python3.12 >/dev/null 2>&1 || { echo "ERROR: python3.12 not found — bootstrap_spot() should have installed it; refusing to fall back to a different interpreter (alpha-engine-config-I7380)" >&2; exit 1; }
+PY=python3.12
 cat > /tmp/spot-model-zoo-spec.py <<'PYEOF'
 import os, sys
 sys.path.insert(0, '.')
@@ -137,6 +146,17 @@ ZOOSPEC
 )" "${MAX_RUNTIME_SECONDS}"
 
 emit_heartbeat
+
+# Per-stage output assertion (config-I7214, sf-pipeline-policy.md §2.1):
+# assert THIS stage wrote what it declared, at the boundary where the fact
+# becomes knowable. OBSERVE MODE — it can never fail the stage.
+# alpha-engine-config-I8155: pass the SF execution's own run_date via
+# EXECUTION_RUN_DATE, never $RUN_DATE — RUN_DATE is reassigned to the
+# trading day elsewhere in the fleet (crucible-backtester _spot_common.sh),
+# so it is not a reliable carrier of the execution identity. No fallback:
+# an unset EXECUTION_RUN_DATE must reach the CLI empty so it exits loudly
+# under the observe-mode guard below rather than writing under run_date="".
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" --run-date "${EXECUTION_RUN_DATE:-}" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 echo ""
 echo "==> Model-zoo train-spec ${MODEL_ZOO_SPEC_ID} complete. Instance will be terminated."

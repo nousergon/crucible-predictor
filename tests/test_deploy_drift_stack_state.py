@@ -149,7 +149,10 @@ def _patch_all(stack_read, sf_comment="[git:abc123d] ok",
     """Context manager composing all patches needed for check_deploy_drift."""
     return (
         patch("inference.deploy_drift._read_stack_tag", return_value=stack_read),
-        patch("inference.deploy_drift._read_sf_comment", return_value=sf_comment),
+        # I8142: the stamp is read out of the live definition document, from
+        # the single describe_state_machine call that also feeds sf_drift.
+        patch("inference.deploy_drift._read_live_definition",
+              return_value={"Comment": sf_comment}),
         patch("inference.deploy_drift._fetch_origin_main_sha", return_value=upstream_sha),
     )
 

@@ -17,12 +17,28 @@ _ALIGNED = {
     "nousergon/crucible-predictor": "v0.53.0",
     "nousergon/nousergon-data": "v0.39.0",      # == floor → passes
     "nousergon/crucible-research": "v0.42.0",
+    "nousergon/crucible-executor": "v0.124.79",  # alpha-engine-config-I7966
 }
 
 
 def _patch_pins(mapping):
-    """Patch _fetch_repo_pin to resolve from `mapping` (repo → pin|None)."""
-    return patch.object(lpd, "_fetch_repo_pin", side_effect=lambda repo, **_: mapping.get(repo))
+    """Patch _fetch_repo_pin to resolve from `mapping`.
+
+    Values may be a pin string, `None` (shorthand for an unreachable fetch —
+    the historical meaning, preserved so existing cases read unchanged), or a
+    ready-made `PinRead` when a test cares WHICH miss occurred
+    (alpha-engine-config-I7171).
+    """
+
+    def _resolve(repo, **_):
+        value = mapping.get(repo)
+        if isinstance(value, lpd.PinRead):
+            return value
+        if value is None:
+            return lpd.PinRead(None, lpd.UNREACHABLE, "patched: no pin")
+        return lpd.PinRead(value, None)
+
+    return patch.object(lpd, "_fetch_repo_pin", side_effect=_resolve)
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
@@ -97,8 +113,11 @@ def test_fetch_failure_fails_open():
     pins["nousergon/crucible-research"] = None  # GitHub unreachable / parse miss
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
-    # The checker's own fragility must NEVER halt the weekly run.
-    assert out["has_drift"] is False
+    # The checker's own fragility must NEVER halt the weekly run — but must
+    # also never report a definite verdict it never measured.
+    # alpha-engine-config-I7048: has_drift is OMITTED, not False, so the
+    # SF's IsPresent-guarded Choice routes to the visible degraded path.
+    assert "has_drift" not in out
     assert out["reason"] == "fetch_failed"
 
 
@@ -108,9 +127,377 @@ def test_parity_mismatch_below_floor_combined():
         "nousergon/crucible-predictor": "v0.49.0",   # parity break
         "nousergon/nousergon-data": "v0.30.0",        # below floor
         "nousergon/crucible-research": "v0.42.0",
+        "nousergon/crucible-executor": "v0.124.79",
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
     assert out["has_drift"] is True
     assert out["parity_ok"] is False and out["floor_ok"] is False
     assert len(out["offenders"]) >= 2
+
+
+# ── I7171: a miss is named, not lumped into "fetch_failed" ───────────────────
+#
+# The 2026-08-13 incident: crucible-predictor has pinned nousergon-lib by
+# commit SHA since crucible-predictor#422, which _LIB_PIN_RE does not match.
+# The probe reported that as reason=fetch_failed — a permanent contract
+# mismatch wearing a transient's name — on 59 of 68 measured invocations from
+# 2026-07-31 onward, reading as intermittent GitHub flakiness the whole time.
+
+
+_SHA_PIN_LINE = (
+    "nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ "
+    "git+https://github.com/nousergon/nousergon-lib"
+    "@c907a044bb1553815225327bc56644050543b6f2"
+)
+
+
+def test_a_sha_pin_is_recognised_not_treated_as_a_parse_miss():
+    # The real line from crucible-predictor/requirements.txt:70.
+    assert lpd._parse_pin(_SHA_PIN_LINE) is None          # not a vX.Y.Z pin
+    match = lpd._LIB_SHA_PIN_RE.search(_SHA_PIN_LINE)     # but IS recognised
+    assert match is not None
+    assert match.group(1) == "c907a044bb1553815225327bc56644050543b6f2"
+
+
+def test_sha_pinned_repo_reports_sha_pinned_not_fetch_failed():
+    # A FLOOR-ONLY repo (research) is SHA-pinned. The floor is the advisory
+    # half of the invariant, so this stays fail-open — the case this test was
+    # written for. The co-install-pair equivalent halts instead: see the
+    # I7301 block below.
+    pins = {
+        "nousergon/crucible-backtester": "v0.53.0",
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": lpd.PinRead(
+            None, lpd.SHA_PINNED, "c907a044bb1553815225327bc56644050543b6f2"
+        ),
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out          # still unmeasured, still fail-open
+    assert out["reason"] == "sha_pinned"   # but the reason is now true
+    assert out["unresolved"]["nousergon/crucible-research"]["problem"] == "sha_pinned"
+    assert out["unresolved"]["nousergon/crucible-research"]["detail"].startswith("c907a04")
+
+
+def test_a_permanent_problem_outranks_a_transient_one_in_the_reason():
+    # A SHA pin and an unreachable repo at once. Reporting "fetch_failed"
+    # would bury the condition that is still here tomorrow behind the one
+    # that resolves itself. Both on non-pair repos, so the fail-open path is
+    # the one under test.
+    pins = {
+        "nousergon/crucible-backtester": "v0.53.0",
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": None,        # unreachable
+        "nousergon/crucible-research": lpd.PinRead(None, lpd.SHA_PINNED, "c907a04"),
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["reason"] == "sha_pinned"
+    # ...and the transient one is still recorded, just not the headline.
+    assert out["unresolved"]["nousergon/nousergon-data"]["problem"] == "unreachable"
+
+
+def test_a_file_with_no_lib_pin_at_all_is_its_own_reason():
+    pins = {
+        "nousergon/crucible-backtester": "v0.53.0",
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": lpd.PinRead(None, lpd.UNRECOGNISED, None),
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["reason"] == "unrecognised_pin"
+
+
+def test_a_genuine_outage_still_reads_as_fetch_failed():
+    # The one transient of the three keeps its historical reason string, so
+    # nothing downstream keying on it regresses.
+    pins = {
+        "nousergon/crucible-backtester": None,
+        "nousergon/crucible-predictor": "v0.53.0",
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": "v0.53.0",
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["reason"] == "fetch_failed"
+    assert "has_drift" not in out
+
+
+# ── I7301: a permanent problem on the CO-INSTALL PAIR is a finding, not a gap ─
+#
+# The 2026-08-13 arc. `crucible-predictor` pinned by SHA since #422, so
+# `parity_ok` came back None on every invocation and the SF fail-open fired
+# every run. Underneath it, real drift: backtester v0.124.5 against a predictor
+# SHA sitting ~v0.124.16 — the exact co-install shape the gate exists to catch,
+# invisible for 13 days behind an alert that could not be cleared by waiting.
+#
+# The distinction this section pins down: an unreachable GitHub means we do not
+# know the pin (fail open). A SHA or unrecognised pin ON A PAIR MEMBER means we
+# read the file and the invariant is structurally unverifiable until a human
+# edits it (halt). Floor-only repos keep the fail-open — see the tests above.
+
+
+def test_sha_pinned_co_install_member_halts_with_a_named_offender():
+    pins = {
+        "nousergon/crucible-backtester": "v0.124.5",
+        "nousergon/crucible-predictor": lpd.PinRead(
+            None, lpd.SHA_PINNED, "c907a044bb1553815225327bc56644050543b6f2"
+        ),
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": "v0.53.0",
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["status"] == lpd.STATUS_MEASURED
+    assert out["reason"] == "co_install_pin_unverifiable"
+    # The offender names the repo, the problem, the SHA, and the other half of
+    # the pair it could not be compared against — everything the FAILED SNS
+    # alert must carry for a human to act without opening the execution.
+    joined = " ".join(out["offenders"])
+    assert "crucible-predictor" in joined
+    assert "sha_pinned" in joined
+    assert "c907a044bb1553815225327bc56644050543b6f2" in joined
+    assert "v0.124.5" in joined
+
+
+def test_the_halt_does_not_claim_a_parity_mismatch_it_never_measured():
+    # has_drift=True says the invariant does not hold as VERIFIED. It must not
+    # be accompanied by parity_ok=False, which asserts a measured mismatch —
+    # the same fabrication (in the opposite direction) that this whole arc
+    # exists to remove.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = lpd.PinRead(None, lpd.SHA_PINNED, "abc1234")
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["parity_ok"] is None
+    assert out["floor_ok"] is None
+
+
+def test_unrecognised_pin_on_a_co_install_member_also_halts():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-backtester"] = lpd.PinRead(None, lpd.UNRECOGNISED, None)
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["reason"] == "co_install_pin_unverifiable"
+    assert "crucible-backtester" in " ".join(out["offenders"])
+
+
+def test_an_unreachable_co_install_member_still_fails_open():
+    # The line I7048 drew and I7301 does not cross: a transient outage on a
+    # pair member is an unknown pin, not a defect. Inverting it would let a
+    # GitHub blip halt the weekly run.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = None   # unreachable
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN
+    assert out["reason"] == "fetch_failed"
+
+
+def test_a_permanent_pair_problem_outranks_a_transient_pair_outage():
+    # Backtester unreachable AND predictor SHA-pinned. The permanent one wins:
+    # even once GitHub recovers, the comparison still cannot be made.
+    pins = {
+        "nousergon/crucible-backtester": None,
+        "nousergon/crucible-predictor": lpd.PinRead(None, lpd.SHA_PINNED, "abc1234"),
+        "nousergon/nousergon-data": "v0.53.0",
+        "nousergon/crucible-research": "v0.53.0",
+    }
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["reason"] == "co_install_pin_unverifiable"
+    # the transient one is still on the record
+    assert out["unresolved"]["nousergon/crucible-backtester"]["problem"] == "unreachable"
+
+
+def test_a_permanent_floor_only_problem_does_not_halt_the_pair_check():
+    # research SHA-pinned, pair intact and matching. Nothing load-bearing is
+    # unverifiable, so this must stay fail-open — a halt here would block the
+    # weekly on the advisory half of the invariant.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-research"] = lpd.PinRead(None, lpd.SHA_PINNED, "abc1234")
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN
+
+
+# ── probe=True: a synthetic invocation records, it does not page ─────────────
+# alpha-engine-config-I7954. `handler.py` attaches flow-doctor at ERROR, so
+# the log LEVEL of a detected condition is the difference between an entry in
+# CloudWatch and an email. `infrastructure/deploy.sh`'s canary invokes this
+# action purely to exercise its wiring and gates on the PRESENCE of
+# `has_drift`, never on its value — so a true finding from that invocation is
+# noise. It fired for real on 2026-08-21T15:06:03Z, in the 13.5-minute window
+# between the two halves of a cross-repo lockstep pin bump.
+
+
+def _drifting_pins():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = "v0.52.1"
+    return pins
+
+
+def test_probe_downgrades_a_detected_drift_to_warning(caplog):
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(_drifting_pins()):
+        lpd.check_lib_pin_drift(probe=True)
+    records = [r for r in caplog.records if "Lib-pin drift DETECTED" in r.getMessage()]
+    assert records, "the finding must still be recorded, only at a lower level"
+    assert [r.levelname for r in records] == ["WARNING"]
+
+
+def test_default_invocation_still_logs_a_detected_drift_at_error(caplog):
+    # The Step Function's own pre-spend invocation passes no `probe`. A real
+    # drift there is spend about to be wasted: it must still halt AND page.
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(_drifting_pins()):
+        lpd.check_lib_pin_drift()
+    records = [r for r in caplog.records if "Lib-pin drift DETECTED" in r.getMessage()]
+    assert [r.levelname for r in records] == ["ERROR"]
+
+
+def test_probe_leaves_the_payload_identical():
+    # The canary gates on the payload; changing it would change what the
+    # deploy promotes on. `probe` may only move the log level.
+    with _patch_pins(_drifting_pins()):
+        as_probe = lpd.check_lib_pin_drift(probe=True)
+    with _patch_pins(_drifting_pins()):
+        as_gate = lpd.check_lib_pin_drift()
+    assert as_probe == as_gate
+    assert as_probe["has_drift"] is True
+
+
+# ── I7966: crucible-executor joins the checker's scope ───────────────────────
+#
+# The executor pinned nousergon-lib by bare SHA and was in neither tuple this
+# module reads, so its pin was never looked at at all — not merely
+# unverifiable. Added to _FLOOR_REPOS (it never co-installs with the
+# predictor, unlike the backtester) with its pin read from requirements.in
+# rather than requirements.txt (see _PIN_FILE_OVERRIDES: the executor's
+# requirements.txt is a uv-compiled lockfile that always resolves the VCS
+# ref to a commit SHA, by design, regardless of what tag is pinned).
+
+
+def test_executor_is_in_the_floor_repo_set_not_the_pair():
+    assert "nousergon/crucible-executor" in lpd._FLOOR_REPOS
+    assert "nousergon/crucible-executor" not in lpd._CO_INSTALL_PAIR
+
+
+def test_executor_appears_in_the_reported_pins_map_when_aligned():
+    # The acceptance signal named in the issue: a live check_lib_pin_drift
+    # invocation must list nousergon/crucible-executor in its `pins` map —
+    # not just that a constant somewhere changed.
+    with _patch_pins(_ALIGNED):
+        out = lpd.check_lib_pin_drift()
+    assert "nousergon/crucible-executor" in out["pins"]
+    assert out["pins"]["nousergon/crucible-executor"] == "v0.124.79"
+    assert out["has_drift"] is False
+
+
+def test_executor_below_floor_halts_and_names_offender():
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-executor"] = "v0.30.0"  # regressed below floor
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["floor_ok"] is False
+    assert any(
+        "below floor" in o and "crucible-executor" in o and "v0.30.0" in o
+        for o in out["offenders"]
+    )
+    # Not a co-install-pair invariant: parity itself is unaffected.
+    assert out["parity_ok"] is True
+
+
+def test_executor_sha_pin_stays_fail_open_it_is_floor_only():
+    # A SHA pin on a floor-only repo is the advisory half of the invariant —
+    # unlike a SHA pin on a CO_INSTALL_PAIR member (I7301), it must not halt.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-executor"] = lpd.PinRead(
+        None, lpd.SHA_PINNED, "fb383a98da36249c09aae3778c96b5ef92325ce1"
+    )
+    with _patch_pins(pins):
+        out = lpd.check_lib_pin_drift()
+    assert "has_drift" not in out
+    assert out["status"] == lpd.STATUS_UNKNOWN
+    assert out["unresolved"]["nousergon/crucible-executor"]["problem"] == lpd.SHA_PINNED
+    # But it is still IN the report — the whole point of I7966.
+    assert "nousergon/crucible-executor" in out["unresolved"]
+
+
+def test_pin_file_override_reads_requirements_in_for_the_executor():
+    # Proves the override actually changes which file is fetched, not just
+    # that the constant exists. urlopen is mocked; only the URL matters here.
+    seen_urls = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return (
+                b"nousergon-lib[flow-doctor,contracts] @ "
+                b"git+https://github.com/nousergon/nousergon-lib@v0.124.79\n"
+            )
+
+    def _fake_urlopen(url, timeout=None):
+        seen_urls.append(url)
+        return _FakeResp()
+
+    with patch.object(lpd.urllib.request, "urlopen", side_effect=_fake_urlopen):
+        read = lpd._fetch_repo_pin("nousergon/crucible-executor")
+
+    assert read.pin == "v0.124.79"
+    assert seen_urls == [
+        "https://raw.githubusercontent.com/nousergon/crucible-executor/main/requirements.in"
+    ]
+
+
+def test_pin_file_override_defaults_to_requirements_txt_for_other_repos():
+    seen_urls = []
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"numpy>=1.26\n"
+
+    def _fake_urlopen(url, timeout=None):
+        seen_urls.append(url)
+        return _FakeResp()
+
+    with patch.object(lpd.urllib.request, "urlopen", side_effect=_fake_urlopen):
+        lpd._fetch_repo_pin("nousergon/crucible-predictor")
+
+    assert seen_urls == [
+        "https://raw.githubusercontent.com/nousergon/crucible-predictor/main/requirements.txt"
+    ]
+
+
+def test_probe_downgrades_the_unverifiable_parity_halt_too(caplog):
+    # The second ERROR site: a co-install-pair member pinned by SHA is a
+    # permanently unverifiable parity invariant (I7301). Same reasoning — the
+    # canary is not the consumer of that verdict.
+    pins = dict(_ALIGNED)
+    pins["nousergon/crucible-predictor"] = lpd.PinRead(
+        None, lpd.SHA_PINNED, "patched: 1a2b3c4d"
+    )
+    with caplog.at_level("WARNING", logger=lpd.log.name), _patch_pins(pins):
+        out = lpd.check_lib_pin_drift(probe=True)
+    assert out["has_drift"] is True
+    records = [r for r in caplog.records if "Lib-pin drift HALT" in r.getMessage()]
+    assert [r.levelname for r in records] == ["WARNING"]

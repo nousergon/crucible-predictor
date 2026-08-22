@@ -1,4 +1,4 @@
-"""Every variable the bootstrap reads must be one the launcher supplies.
+"""Every value the render call needs must be one the launcher guarantees.
 
 The failure this pins (2026-08-11, `ne-weekly-freshness-pipeline` execution
 `watch-rerun-2026-08-10-7`)::
@@ -6,19 +6,17 @@ The failure this pins (2026-08-11, `ne-weekly-freshness-pipeline` execution
     Using: Python 3.12.12
     fatal: repository '' does not exist
 
-``bootstrap_spot()`` sends a **single-quoted** heredoc, so its body is literal
-on the spot instance — nothing in it is expanded launcher-side. Variables
-therefore reach the instance only through the ``_spot_env_export`` prefix. The
-body read ``${REPO_URL}``; the prefix exported ``S3_STAGING``, ``BRANCH`` and
-``ALPHA_ENGINE_EXPERIMENT_ID`` but not ``REPO_URL``, so the clone ran against
-the empty string.
-
-The comment directly above the function claimed otherwise —
-
-    the launcher-side export prefix sets S3_STAGING/BRANCH/REPO_URL
-
-— which is exactly why nobody caught it by reading: the documentation and the
-code disagreed, and the code won.
+The bootstrap heredoc that produced this is gone (alpha-engine-config-I4992/
+I6922 cutover): ``bootstrap_spot()`` now builds a ``krepis.spot_bootstrap
+render`` CLI invocation and hands the RENDERED script to ``run_ssm``. The
+env-closure class this test guards moved with it — from "does the exported
+launcher-side prefix cover every ``${VAR}`` the heredoc body reads" to "does
+every ``$VAR``/``${VAR}`` the render call's OWN arguments reference resolve to
+something guaranteed non-empty before ``bootstrap_spot()`` runs". A value the
+renderer needs that is unset is exactly as fatal as before — it just fails
+inside ``python -m krepis.spot_bootstrap render`` (a required ``--repo-url ''``
+argument) instead of inside a spot-side ``git clone``, and this test still
+catches it statically, before either happens.
 
 This was the THIRD defect in this bootstrap in one day, each revealed by fixing
 the one ahead of it (#461 watchdog hang, #462 missing python3.12, this). A step
@@ -29,116 +27,83 @@ a check on the whole class rather than one more literal.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 import pytest
 
-_COMMON = Path(__file__).resolve().parents[1] / "infrastructure" / "_spot_common.sh"
-_TEXT = _COMMON.read_text(encoding="utf-8")
+from tests._spot_bootstrap_render_support import (
+    bootstrap_spot_block,
+    render_args,
+    render_invocation,
+    resolve,
+    spot_common_text,
+)
 
-# Set by the SSM/Lambda runtime or by the heredoc's own `export` line, so the
-# launcher does not have to supply them.
-_AMBIENT = {
-    "HOME", "PATH", "PWD", "USER", "SHELL", "TMPDIR",
-    "AWS_REGION", "AWS_DEFAULT_REGION", "XDG_CACHE_HOME",
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_EXECUTION_ENV",
-}
-
-
-def _bootstrap_parts() -> tuple[str, str]:
-    """(export_prefix, heredoc_body) for bootstrap_spot()."""
-    fn = re.search(r"bootstrap_spot\(\)\s*\{(.*?)\n\}", _TEXT, re.S)
-    assert fn, "bootstrap_spot() not found in _spot_common.sh"
-    block = fn.group(1)
-
-    prefix = re.search(r'_spot_env_export="export ([^"]*)"', block)
-    assert prefix, "the launcher-side export prefix is gone — every variable the heredoc reads is now unset"
-
-    body = re.search(r"<<'BOOTSTRAP'\n(.*?)\nBOOTSTRAP", block, re.S)
-    assert body, "the BOOTSTRAP heredoc is gone or is no longer single-quoted"
-    return prefix.group(1), body.group(1)
+_TEXT = spot_common_text()
+_BLOCK = bootstrap_spot_block(_TEXT)
+_INVOCATION = render_invocation(_BLOCK)
+_ARGS = render_args(_INVOCATION)
 
 
-def _exported_names(prefix: str) -> set[str]:
-    return set(re.findall(r"(\w+)=", prefix))
+def test_the_render_invocation_exists():
+    """The premise of this whole check: bootstrap_spot() calls the renderer."""
+    assert _ARGS, "no krepis.spot_bootstrap render arguments found"
 
 
-def _read_names(body: str) -> set[str]:
-    """Variables the body READS without a `${X:-default}` fallback.
+@pytest.mark.parametrize("flag,raw", _ARGS)
+def test_every_render_argument_resolves_to_a_guaranteed_value(flag, raw):
+    """Every ``$VAR``/``${VAR}`` the render call passes must be resolvable.
 
-    A defaulted read is safe by construction — the point of this check is the
-    bare `${X}` that silently becomes the empty string.
+    ``resolve()`` raises when a referenced variable has neither a static
+    top-of-file default nor a declared runtime-only source (``_S3_STAGING``,
+    set by ``spot_launch()`` before ``bootstrap_spot()`` can run) — the same
+    failure mode that shipped ``REPO_URL`` as the empty string on
+    2026-08-11, just caught here instead of on a live spot.
     """
-    names = set()
-    for match in re.finditer(r"\$\{(\w+)([^}]*)\}", body):
-        name, tail = match.group(1), match.group(2)
-        if tail.startswith(":-") or tail.startswith("-"):
-            continue  # has a default
-        names.add(name)
-    for match in re.finditer(r"\$(\w+)\b", body):
-        names.add(match.group(1))
-    return names
+    resolve(raw, _TEXT)  # raises AssertionError with the gap named, on failure
 
 
-def _assigned_in_body(body: str) -> set[str]:
-    return set(re.findall(r"^\s*(?:export\s+)?(\w+)=", body, re.M)) | set(
-        re.findall(r"export ([\w= ]+)", body)
+def test_repo_url_specifically_is_passed_and_resolves():
+    """Anchored assertion on the argument that broke (crucible-predictor#463)."""
+    repo_url_args = [raw for flag, raw in _ARGS if flag == "repo-url"]
+    assert repo_url_args, "--repo-url is not passed to krepis.spot_bootstrap render"
+    resolved = resolve(repo_url_args[0], _TEXT)
+    assert resolved, "the --repo-url argument resolves to an empty string"
+    assert resolved.startswith("https://") or resolved.startswith("git@"), (
+        f"--repo-url resolved to {resolved!r}, which does not look like a repo "
+        "URL — this is the crucible-predictor#463 class: a value that reaches "
+        "the renderer as an empty or garbage string"
     )
 
 
-def test_the_heredoc_is_single_quoted():
-    """The premise of this whole check: nothing expands launcher-side."""
-    _bootstrap_parts()  # asserts the <<'BOOTSTRAP' form
+def test_s3_staging_export_is_passed_and_resolves():
+    """The staging export is load-bearing: the config-copy step reads it."""
+    export_args = [raw for flag, raw in _ARGS if flag == "export"]
+    staging = [raw for raw in export_args if raw.startswith("S3_STAGING=")]
+    assert staging, "no --export S3_STAGING=... argument passed to the renderer"
+    resolved = resolve(staging[0], _TEXT)
+    assert resolved != "S3_STAGING=", "S3_STAGING resolves to an empty value"
 
 
-@pytest.mark.parametrize("name", sorted(_read_names(_bootstrap_parts()[1])))
-def test_every_variable_the_bootstrap_reads_is_supplied(name):
-    prefix, body = _bootstrap_parts()
-    if name in _AMBIENT:
-        return
+def test_max_runtime_seconds_is_passed_and_resolves():
+    """The spot-side hard-timeout timer must not be silently un-shipped.
 
-    exported = _exported_names(prefix)
-    assigned = set()
-    for line in body.splitlines():
-        assigned |= set(re.findall(r"^\s*(?:export\s+)?(\w+)=", line))
-        assigned |= set(re.findall(r"export\s+((?:\w+=\S*\s*)+)", line) and
-                        re.findall(r"(\w+)=", line) or [])
-
-    assert name in exported or name in assigned, (
-        f"the bootstrap heredoc reads ${{{name}}} but the launcher never exports "
-        f"it and the body never assigns it. The heredoc is single-quoted, so it "
-        f"resolves to the EMPTY STRING on the instance — that is how the clone "
-        f"ran as `git clone ... ''` and died with "
-        f"`fatal: repository '' does not exist` (2026-08-11). Add {name} to "
-        f"_spot_env_export, or give the read a ${{{name}:-default}}."
-    )
-
-
-def test_repo_url_specifically_is_exported():
-    """Anchored assertion on the variable that broke."""
-    prefix, _ = _bootstrap_parts()
-    assert "REPO_URL=" in prefix, (
-        "REPO_URL is not in the launcher-side export prefix; the clone will run "
-        "against the empty string"
-    )
-
-
-def test_the_note_above_the_function_matches_what_is_exported():
-    """The stale comment is what made this survive review.
-
-    It listed REPO_URL as exported while the code did not export it. A comment
-    that names the mechanism must track it.
+    krepis 0.59.6 added --max-runtime-seconds (alpha-engine-config-I7372):
+    bootstrap_spot() now passes it through so the hard-timeout timer this
+    file's bootstrap previously had NO equivalent for at all is armed
+    alongside the SSM-liveness watchdog — a separate guarantee, neither
+    replaces the other. MAX_RUNTIME_SECONDS is declared empty at the top of
+    _spot_common.sh on purpose (per-stage identity, never defaulted there),
+    so its real value is only guaranteed by spot_launch()'s precondition
+    check — exactly like _S3_STAGING — which is why both are declared
+    runtime-only stand-ins rather than resolved off a static default.
     """
-    note = re.search(r"export prefix sets ([^\n]*)", _TEXT)
-    if not note:
-        pytest.skip("the explanatory NOTE was removed; nothing to keep honest")
-    prefix, _ = _bootstrap_parts()
-    exported = _exported_names(prefix)
-    for claimed in re.findall(r"[A-Z][A-Z0-9_]+", note.group(1)):
-        assert claimed in exported, (
-            f"the NOTE above bootstrap_spot() claims {claimed} is exported, but "
-            f"the prefix exports {sorted(exported)}. The code won that "
-            f"disagreement once already (2026-08-11); fix whichever is wrong."
-        )
+    runtime_args = [raw for flag, raw in _ARGS if flag == "max-runtime-seconds"]
+    assert runtime_args, (
+        "no --max-runtime-seconds argument passed to krepis.spot_bootstrap "
+        "render — the spot-side hard-timeout timer is unshipped"
+    )
+    resolved = resolve(runtime_args[0], _TEXT)
+    assert resolved and resolved.isdigit() and int(resolved) > 0, (
+        f"--max-runtime-seconds resolved to {resolved!r}, not a positive "
+        "integer — the renderer's transient-timer arm will fail loud (by "
+        "design) but the value must be real before it ever reaches a spot"
+    )

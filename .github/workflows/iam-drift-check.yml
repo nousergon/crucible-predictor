@@ -43,6 +43,13 @@ permissions:
 
 jobs:
   drift-check:
+    # Skip on PR events — the circularity fix from config#3495.
+    # A PR that codifies new IAM is, by definition, ahead of live AWS
+    # (apply.sh hasn't run yet), so comparing codified-vs-live as a PR
+    # check is structurally guaranteed to show drift.  The post-merge
+    # workflow (iam-drift-post-merge.yml) handles reconciliation on
+    # merge; this scheduled+dispatch run catches out-of-band live edits.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7

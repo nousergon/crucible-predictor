@@ -122,3 +122,61 @@ def test_empty_batch():
         [], enabled=True, calibrator=None, label_clip=0.15,
     )
     assert block["applied"] is False
+
+
+# ── config-I7337 layer 3: the anchor is declared by the step that establishes
+# it ────────────────────────────────────────────────────────────────────────
+#
+# The executor's optimizer compares every alpha against a SPY = 0.0 anchor,
+# which is only meaningful for a market-relative alpha. `assert_optimizer_
+# anchor` (crucible-executor/executor/alpha_contract.py) REFUSES a batch whose
+# numeric `predicted_alpha` carries no `alpha_anchor`, so an unstamped batch
+# fails the whole solve closed — measured 2026-08-14: 22 of 23 live records
+# raised AlphaAnchorError.
+
+
+def test_enabled_stamps_the_optimizer_anchor_on_every_record():
+    batch = _batch([0.02, -0.04, 0.01])
+    block = apply_cross_sectional_neutralization(
+        batch, enabled=True, calibrator=None, label_clip=0.15,
+    )
+    assert all(p["alpha_anchor"] == "market_relative_21d_log" for p in batch)
+    assert block["alpha_anchor"] == "market_relative_21d_log"
+
+
+def test_disabled_stamps_NOTHING_because_the_anchor_does_not_hold():
+    """Load-bearing. With the transform off, `predicted_alpha` is the model's
+    raw output carrying the batch's common-mode level — the optimizer's
+    SPY = 0.0 anchor does not apply to it. An unstamped batch is REFUSED
+    downstream, which is the correct outcome; stamping here would assert a
+    property the number does not have and hand the solver a silently wrong
+    alpha."""
+    batch = _batch([0.02, -0.04, 0.01])
+    block = apply_cross_sectional_neutralization(
+        batch, enabled=False, calibrator=None, label_clip=0.15,
+    )
+    assert all("alpha_anchor" not in p for p in batch)
+    assert block["alpha_anchor"] is None
+
+
+def test_degenerate_cross_section_stamps_nothing():
+    """n < 2 skips the transform entirely — centering one name against its own
+    mean would zero it. No transform, no anchor."""
+    batch = _batch([0.02])
+    block = apply_cross_sectional_neutralization(
+        batch, enabled=True, calibrator=None, label_clip=0.15,
+    )
+    assert "alpha_anchor" not in batch[0]
+    assert block.get("alpha_anchor") is None
+
+
+def test_anchor_string_matches_the_executors_contract():
+    """Consumer contract. The literal is duplicated in
+    `crucible-executor/executor/alpha_contract.py::OPTIMIZER_ALPHA_ANCHOR`
+    deliberately — the two repos deploy independently, so a shared import
+    would make the executor's contract wait on a predictor release. This pin
+    is what makes the duplication safe: a rename on either side fails here,
+    not at 05:15 PT on a trading morning."""
+    from inference.level_neutralization import OPTIMIZER_ALPHA_ANCHOR
+
+    assert OPTIMIZER_ALPHA_ANCHOR == "market_relative_21d_log"

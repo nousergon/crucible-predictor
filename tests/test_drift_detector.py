@@ -10,11 +10,13 @@ check_prediction_drift returns a list of STRUCTURED alert dicts
 alert is self-describing (severity + distance-from-threshold + trend + cause +
 action). ``check_drift`` keeps ``alerts`` as a backward-compatible list[str]
 (the rendered ``line`` of each) and adds ``severity``, ``alert_details`` and
-``skipped_checks`` (always empty now — retained for output-shape stability).
+``skipped_checks`` (checks that could not RUN — currently only the confidence
+relative-drop check before its trailing baseline exists; never a finding, and
+never raises ``status`` to ``alert``).
 """
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -22,7 +24,9 @@ import pytest
 
 from monitoring.drift_detector import (
     ALPHA_MIN_STDEV,
-    CONFIDENCE_MIN_MEAN,
+    CONFIDENCE_BASELINE_MIN_DAYS,
+    CONFIDENCE_DEGENERATE_MEAN,
+    CONFIDENCE_RELATIVE_DROP,
     CONSECUTIVE_DAYS_THRESHOLD,
     CRITICAL,
     DIRECTION_CLUSTER_THRESHOLD,
@@ -104,11 +108,17 @@ def test_max_severity_orders_correctly():
 
 
 def _make_preds(directions=None, confidences=None, alphas=None, n=20):
-    """Build a predictions JSON payload."""
+    """Build a predictions JSON payload.
+
+    Confidence values are on the LIVE axis — ``|p_up - 0.5| * 2`` ∈ [0, 1], zero
+    at coin-flip (PR #143). A healthy daily book sits around 0.10–0.20; fixtures
+    in the old ``max(p_up, p_down)`` ∈ [0.5, 1.0] range describe a predictor that
+    has not existed since 2026-05-12.
+    """
     if directions is None:
         directions = ["UP"] * n
     if confidences is None:
-        confidences = [0.6] * n
+        confidences = [0.15] * n
     if alphas is None:
         alphas = [0.05] * n
     preds = []
@@ -170,36 +180,63 @@ def test_check_prediction_drift_persistent_clustering_alert():
     assert str(CONSECUTIVE_DAYS_THRESHOLD) in persistent[0]["line"]
 
 
-def test_confidence_collapse_chronic_is_warn():
-    """Below the floor every recent day → CHRONIC, WARN (standing weak model)."""
+_MIXED_DIRECTIONS = ["UP", "DOWN"] * 11  # diversified so clustering never fires
+
+
+def _conf_routes(target: str, conf_by_offset, n_days: int = 25):
+    """Routes for ``n_days`` consecutive calendar days back from ``target``.
+
+    ``conf_by_offset(offset) -> float`` gives that day's per-ticker confidence.
+    Consecutive calendar days (weekends included) keep the fixture readable —
+    the detector only cares that a key exists.
+    """
     routes = {}
-    for d in ["2026-04-15", "2026-04-14", "2026-04-13", "2026-04-12", "2026-04-11"]:
+    t = date.fromisoformat(target)
+    for offset in range(n_days):
+        d = (t - timedelta(days=offset)).isoformat()
         routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
-            directions=["UP", "DOWN", "FLAT"] * 7,  # diversified to avoid clustering
-            confidences=[0.27] * 21,                # chronically below floor
+            directions=_MIXED_DIRECTIONS,
+            confidences=[conf_by_offset(offset)] * 21,
             n=21,
         ))
-    s3 = _s3_with_routes(routes)
+    return routes
+
+
+def test_low_but_stable_confidence_is_not_an_alert():
+    """The regression pin for alpha-engine-config#6952.
+
+    A live book sits near 0.11 mean confidence — that is ``|p_up - 0.5| * 2``
+    with p_up ≈ 0.555, an ordinary calibrated daily-direction edge, not a
+    collapse. The retired absolute floor (0.45, authored against the pre-2026-
+    04-15 3-class max-class-probability convention) rated exactly this batch
+    CRITICAL every trading day from 2026-05-12 onward. A detector must not fire
+    on the system's normal operating point.
+    """
+    s3 = _s3_with_routes(_conf_routes("2026-04-15", lambda _o: 0.11))
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
+    assert [a for a in alerts if a["code"].startswith("confidence")] == []
+
+
+def test_confidence_collapse_chronic_is_warn():
+    """Well under the book's own baseline for days → CHRONIC, WARN."""
+    # Baseline days at 0.20; the recent 5 at 0.05 — far below the 50%-of-median bar.
+    s3 = _s3_with_routes(_conf_routes(
+        "2026-04-15", lambda o: 0.05 if o < 5 else 0.20))
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc, "expected a confidence_collapse alert"
     assert cc[0]["trend"] == "chronic"
     assert cc[0]["severity"] == WARN
     assert "CHRONIC" in cc[0]["line"]
-    # carries the distance from threshold for triage
-    assert cc[0]["pct_below_threshold"] == pytest.approx((0.45 - 0.27) / 0.45, abs=0.01)
+    assert cc[0]["baseline"] == pytest.approx(0.20, abs=0.005)
+    assert cc[0]["threshold"] == pytest.approx(0.20 * CONFIDENCE_RELATIVE_DROP, abs=0.005)
+    assert cc[0]["pct_below_threshold"] == pytest.approx((0.20 - 0.05) / 0.20, abs=0.01)
 
 
 def test_confidence_collapse_acute_is_critical():
-    """Healthy prior days, only today collapses → ACUTE, CRITICAL."""
-    routes = {
-        "predictor/predictions/2026-04-15.json": ("json", _make_preds(
-            directions=["UP", "DOWN", "FLAT"] * 7, confidences=[0.20] * 21, n=21)),
-    }
-    for d in ["2026-04-14", "2026-04-13", "2026-04-12"]:
-        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
-            directions=["UP", "DOWN", "FLAT"] * 7, confidences=[0.70] * 21, n=21))
-    s3 = _s3_with_routes(routes)
+    """Healthy prior days, only today drops → ACUTE, CRITICAL."""
+    s3 = _s3_with_routes(_conf_routes(
+        "2026-04-15", lambda o: 0.05 if o == 0 else 0.20))
     alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc and cc[0]["trend"] == "acute"
@@ -207,10 +244,47 @@ def test_confidence_collapse_acute_is_critical():
     assert "ACUTE" in cc[0]["line"]
 
 
+def test_confidence_collapse_baseline_excludes_today():
+    """Today must not lower the bar it is judged against.
+
+    With a 25-day window a single collapsed day would barely move a median that
+    included it, but the exclusion is the property worth pinning: the baseline
+    is reported over prior days only.
+    """
+    s3 = _s3_with_routes(_conf_routes(
+        "2026-04-15", lambda o: 0.05 if o == 0 else 0.20))
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["baseline"] == pytest.approx(0.20, abs=0.005)
+    assert cc[0]["baseline_days"] == 24
+
+
+def test_confidence_degenerate_is_critical():
+    """Mean at coin-flip → p_up ≡ 0.5 → no directional signal at all."""
+    s3 = _s3_with_routes(_conf_routes(
+        "2026-04-15", lambda o: 0.0 if o == 0 else 0.20))
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
+    deg = [a for a in alerts if a["code"] == "confidence_degenerate"]
+    assert deg and deg[0]["severity"] == CRITICAL
+    assert deg[0]["threshold"] == CONFIDENCE_DEGENERATE_MEAN
+    # Degenerate supersedes the relative check — one finding, not two.
+    assert "confidence_collapse" not in _codes(alerts)
+
+
+def test_confidence_relative_check_is_recorded_as_skipped_without_a_baseline():
+    """Too little history to judge → recorded as unrun, NOT as clean."""
+    s3 = _s3_with_routes(_conf_routes("2026-04-15", lambda _o: 0.11, n_days=3))
+    skipped: list[dict] = []
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15", skipped)
+    assert [a for a in alerts if a["code"].startswith("confidence")] == []
+    assert [s["check"] for s in skipped] == ["confidence_relative_drop"]
+    assert str(CONFIDENCE_BASELINE_MIN_DAYS) in skipped[0]["reason"]
+
+
 def test_check_prediction_drift_flags_alpha_degeneration():
     preds = _make_preds(
-        directions=["UP", "DOWN", "FLAT"] * 7,
-        confidences=[0.6] * 21,
+        directions=_MIXED_DIRECTIONS,
+        confidences=[0.15] * 21,
         alphas=[0.05] * 21,  # zero stdev
     )
     s3 = _s3_with_routes({
@@ -224,8 +298,8 @@ def test_check_prediction_drift_flags_alpha_degeneration():
 def test_check_prediction_drift_clean_no_alerts():
     rng = np.random.default_rng(7)
     preds = _make_preds(
-        directions=list(rng.choice(["UP", "DOWN", "FLAT"], 30)),
-        confidences=list(rng.uniform(0.55, 0.85, 30)),
+        directions=list(rng.choice(["UP", "DOWN"], 30)),
+        confidences=list(rng.uniform(0.05, 0.25, 30)),
         alphas=list(rng.normal(0.0, 0.02, 30)),
         n=30,
     )
@@ -240,7 +314,7 @@ def test_check_prediction_drift_ignores_none_directions():
     """A prediction with predicted_direction=None should NOT contribute to clustering counts."""
     payload = {"predictions": [
         {"ticker": f"T{i}", "predicted_direction": None,
-         "prediction_confidence": 0.6, "predicted_alpha": 0.05}
+         "prediction_confidence": 0.15, "predicted_alpha": 0.05}
         for i in range(20)
     ]}
     s3 = _s3_with_routes({
@@ -257,7 +331,7 @@ def test_check_drift_ok_when_no_alerts():
     rng = np.random.default_rng(11)
     preds = _make_preds(
         directions=list(rng.choice(["UP", "DOWN"], 30)),
-        confidences=list(rng.uniform(0.55, 0.85, 30)),
+        confidences=list(rng.uniform(0.05, 0.25, 30)),
         alphas=list(rng.normal(0.0, 0.02, 30)),
         n=30,
     )
@@ -273,9 +347,10 @@ def test_check_drift_ok_when_no_alerts():
     assert result["n_alerts"] == 0
     assert result["severity"] is None
     assert result["date"] == "2026-04-15"
-    # prediction-drift-only producer: no conditional-skip arm anymore, but the
-    # key is retained in the output shape for backward compatibility.
-    assert result["skipped_checks"] == []
+    # One day of predictions is not a baseline, so the relative-drop check has
+    # no verdict — recorded as unrun, and NOT counted as a finding: status stays
+    # "ok" and severity stays None.
+    assert [s["check"] for s in result["skipped_checks"]] == ["confidence_relative_drop"]
     # Result persisted to S3
     fake_s3.put_object.assert_called_once()
     args = fake_s3.put_object.call_args.kwargs
@@ -289,7 +364,7 @@ def test_check_drift_dry_run_skips_s3_write():
     rng = np.random.default_rng(11)
     preds = _make_preds(
         directions=list(rng.choice(["UP", "DOWN"], 30)),
-        confidences=list(rng.uniform(0.55, 0.85, 30)),
+        confidences=list(rng.uniform(0.05, 0.25, 30)),
         alphas=list(rng.normal(0.0, 0.02, 30)),
         n=30,
     )
@@ -382,3 +457,149 @@ def test_format_alert_report_is_severity_led():
     # each alert renders its labeled block
     assert "Likely cause:" in report
     assert "Action:" in report
+
+
+# ── champion-replacement availability (alpha-engine-config#7536) ────────────
+
+
+_SF_KEY_PREFIX = "_sf_completion/ne-weekly-freshness-pipeline"
+
+
+def _sf_route(cycle: str, status: str, wrapped: bool = True):
+    """One `_sf_completion` record. Real records are DOUBLE-encoded — the body
+    is a JSON string containing the JSON object — so the fixture is too."""
+    payload = {"sf": "ne-weekly-freshness-pipeline", "status": status,
+               "cycle_key": cycle}
+    return {f"{_SF_KEY_PREFIX}/{cycle}.json": (
+        "json", json.dumps(payload) if wrapped else payload)}
+
+
+def _collapse_routes(target="2026-04-15"):
+    """Prediction routes that force a chronic confidence_collapse on `target`."""
+    return _conf_routes(target, lambda o: 0.05 if o < 5 else 0.20)
+
+
+def _degenerate_alpha_routes(target="2026-04-15"):
+    routes = {}
+    t = date.fromisoformat(target)
+    for offset in range(25):
+        d = (t - timedelta(days=offset)).isoformat()
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=_MIXED_DIRECTIONS, confidences=[0.15] * 21,
+            alphas=[0.05] * 21, n=21))  # zero stdev
+    return routes
+
+
+def test_fresh_training_keeps_the_champion_replacement_prescription():
+    # 2026-04-11 is the Saturday on/before 2026-04-15.
+    routes = {**_collapse_routes(), **_sf_route("2026-04-11", "SUCCEEDED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc, "expected a confidence_collapse alert"
+    assert "champion replacement (the challenger pipeline)" in cc[0]["action"]
+    assert cc[0]["champion_remedy_available"] is True
+    assert cc[0]["last_successful_training_cycle"] == "2026-04-11"
+
+
+def test_stale_training_names_the_pipeline_instead_of_prescribing_into_it():
+    """The 2026-08-08..08-12 shape: the weekly SF has not completed, so the
+    remedy the alert would prescribe cannot run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "FAILED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc
+    action = cc[0]["action"]
+    assert "do NOT reach for champion replacement" in action
+    assert "ne-weekly-freshness-pipeline" in action
+    assert "champion replacement (the challenger pipeline), not an" not in action
+    assert cc[0]["champion_remedy_available"] is False
+
+
+def test_one_missed_cycle_is_not_yet_stale():
+    """Staleness is two missed cycles, not one — a single failed Saturday is a
+    miss, and the remedy is still reachable on the next run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "SUCCEEDED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is True
+    assert cc[0]["last_successful_training_cycle"] == "2026-04-04"
+
+
+def test_no_completion_records_at_all_reads_as_stale():
+    """Absence is not health. With no SUCCEEDED cycle in the lookback the alert
+    must not prescribe the remedy."""
+    alerts = check_prediction_drift(
+        _s3_with_routes(_collapse_routes()), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is False
+    assert "no SUCCEEDED cycle" in cc[0]["action"]
+    assert cc[0]["last_successful_training_cycle"] is None
+
+
+def test_degraded_status_does_not_count_as_a_successful_cycle():
+    """A DEGRADED terminal is a real weekly-SF outcome (2026-08-13). It is not
+    SUCCEEDED, so it cannot vouch for champion replacement having run."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "DEGRADED"),
+              **_sf_route("2026-04-04", "DEGRADED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is False
+
+
+def test_every_alert_prescribing_champion_replacement_consults_freshness():
+    """Not just confidence_collapse — persistent clustering and alpha
+    degeneration carry the same prescription and must not disagree with it."""
+    routes = {}
+    t = date.fromisoformat("2026-04-15")
+    for offset in range(25):
+        d = (t - timedelta(days=offset)).isoformat()
+        # All-UP (clustering) AND constant alpha (degeneration) on every day.
+        routes[f"predictor/predictions/{d}.json"] = ("json", _make_preds(
+            directions=["UP"] * 21, confidences=[0.15] * 21,
+            alphas=[0.05] * 21, n=21))
+    routes.update(_sf_route("2026-04-11", "FAILED"))
+    routes.update(_sf_route("2026-04-04", "FAILED"))
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    codes = _codes(alerts)
+    assert "persistent_direction_clustering" in codes
+    assert "alpha_degeneration" in codes
+    for a in alerts:
+        if a["code"] in ("persistent_direction_clustering", "alpha_degeneration"):
+            assert a["champion_remedy_available"] is False
+            assert "do NOT reach for champion replacement" in a["action"]
+
+
+def test_double_encoded_completion_record_is_unwrapped():
+    """The live records are a JSON string containing JSON. Reading `.get()` off
+    the undecoded string returns nothing and raises nothing — a freshness check
+    that silently always-passes. Pin the unwrap."""
+    from monitoring.drift_detector import _load_json_maybe_wrapped
+
+    wrapped = _s3_with_routes(_sf_route("2026-04-11", "SUCCEEDED", wrapped=True))
+    got = _load_json_maybe_wrapped(
+        wrapped, "bucket", f"{_SF_KEY_PREFIX}/2026-04-11.json")
+    assert isinstance(got, dict) and got["status"] == "SUCCEEDED"
+
+    # A plain (non-wrapped) object must still work.
+    plain = _s3_with_routes(_sf_route("2026-04-11", "SUCCEEDED", wrapped=False))
+    got = _load_json_maybe_wrapped(
+        plain, "bucket", f"{_SF_KEY_PREFIX}/2026-04-11.json")
+    assert isinstance(got, dict) and got["status"] == "SUCCEEDED"
+
+
+def test_acute_confidence_drop_keeps_its_own_remedy():
+    """An acute drop points at today's served model, not at champion
+    replacement — the substitution must not leak into unrelated actions."""
+    routes = {**_conf_routes("2026-04-15", lambda o: 0.05 if o == 0 else 0.20),
+              **_sf_route("2026-04-11", "FAILED"),
+              **_sf_route("2026-04-04", "FAILED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["trend"] == "acute"
+    assert "served model" in cc[0]["action"]
+    assert "do NOT reach for champion replacement" not in cc[0]["action"]

@@ -4495,6 +4495,27 @@ def run_meta_training(
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
+                # alpha-engine-config-I7502: the L4565 directional
+                # standardize+winsorize scaler (mean/std/winsor bounds per
+                # directional column, plus the column list — see
+                # MetaModel.metrics()/_build_scaler). ``None`` when the model
+                # was fit without standardization (META_STANDARDIZE_ENABLED
+                # off, or <20 valid rows). The scaler ALSO travels inside the
+                # meta_model.pkl payload (correctness-critical for inference —
+                # see model/meta_model.py's _PICKLE_SCHEMA v3 note), but that
+                # bytes-only channel is opaque to any consumer that cannot
+                # unpickle it (e.g. crucible-backtester's
+                # analysis/contribution_lift/groups/predictor_ensemble.py,
+                # which reconstructs the L2 input space from JSON). manifest.json
+                # is written UNCONDITIONALLY every training run (see the
+                # put_object below, outside the now-permanently-False
+                # ``if promoted:`` gate) — unlike the meta_model.pkl.meta.json
+                # sidecar, which that dead gate stopped refreshing once
+                # training went challenger-first (``gate_passed = promoted;
+                # promoted = False`` above). This key is the single fresh,
+                # JSON-readable source of truth for the fitted scaler; do not
+                # reintroduce a second sidecar-based path for it.
+                "meta_scaler": meta_model._scaler,
                 # Audit Phase 2a (2026-05-07): output-distribution gate
                 # result. Persisted regardless of pass/fail so a borderline
                 # pass over multiple training cycles is itself a useful
@@ -4921,6 +4942,10 @@ def run_meta_training(
         # contract safety.
         "meta_model_promotion_stats": promotion_stats,
         "meta_coefficients": meta_model._coefficients,
+        # alpha-engine-config-I7502: mirrors the persisted manifest's
+        # meta_scaler (see the comment at that dict literal) into the
+        # run-result / training_summary so both S3 records agree.
+        "meta_scaler": meta_model._scaler,
         "meta_importance": meta_model._importance,
         "horizon_diagnostic": {
             # Backwards-compat scalars (existing consumers):

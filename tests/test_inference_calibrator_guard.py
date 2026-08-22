@@ -74,10 +74,18 @@ def test_rescaling_runs_without_calibrator():
     ctx = _StubCtx(calibrator=None, predictions=preds)
     _rescale_cross_sectional(ctx)
 
-    # Linear heuristic produces symmetric output: alpha=0 → p_up=0.5, confidence=0.5.
+    # Linear heuristic produces symmetric output: alpha=0 → p_up=0.5, and
+    # confidence = |p_up - 0.5| * 2 = 0.0 — a coin-flip carries ZERO conviction
+    # under the live semantics (PR #143). This branch emitted the retired
+    # winner-probability form (0.5 here) until the semantics migration was
+    # completed; nothing downstream could have told, because the veto gate and
+    # the executor's sizing map read the [0, 1] axis either way.
     bbb = next(p for p in ctx.predictions if p["ticker"] == "BBB")
     assert abs(bbb["p_up"] - 0.5) < 1e-6, (
         f"Fallback rescaling expected p_up≈0.5 at alpha=0, got {bbb['p_up']}"
+    )
+    assert bbb["prediction_confidence"] == pytest.approx(0.0, abs=1e-6), (
+        f"coin-flip must carry zero confidence, got {bbb['prediction_confidence']}"
     )
 
     # With max_abs=0.008 and META_ALPHA_CLIP floor=0.05 (post 2026-05-10 21d
@@ -88,6 +96,9 @@ def test_rescaling_runs_without_calibrator():
         f"Fallback rescaling with floor clip expected p_up≈0.58 for alpha=0.008, got {aaa['p_up']}"
     )
     assert aaa["predicted_direction"] == "UP"
+    # |0.58 - 0.5| * 2 = 0.16 — same formula the calibrated path uses, so the
+    # two paths cannot put confidence on two different axes.
+    assert aaa["prediction_confidence"] == pytest.approx(0.16, abs=1e-4)
 
 
 def test_rescaling_handles_empty_predictions():
