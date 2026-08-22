@@ -661,6 +661,64 @@ MODEL_ZOO_PROMOTE_MARGIN = float(_cfg.get("model_zoo_promote_margin", 0.01))
 # whose leak-free-CPCV mean IC is <= MODEL_ZOO_PROMOTE_MIN_IC, even if it's best-of-N
 # (a best-of-N with non-positive predictive IC is noise, not edge). Default 0.0.
 MODEL_ZOO_PROMOTE_MIN_IC = float(_cfg.get("model_zoo_promote_min_ic", 0.0))
+
+# ── alpha-engine-config-I8175 / -I8195 — the NO-GOOD-ARM state ──────────────
+# ONE configuration point resolved by BOTH the ENTRANCE gate (#8195: no candidate
+# clears the absolute bar) and the EXIT gate (#8175: the incumbent is demoted for
+# showing no realized edge). They read the same symbol so the two can never
+# disagree about what the system does when nothing is good enough — a demote into
+# a state the promotion gate would have refused is the failure this prevents.
+#
+# DELIBERATELY UN-DEFAULTED (None). This is a live-trading-risk decision reserved
+# to the operator (`principles.md` §3.2 human authority): flat / reduced size /
+# hold the incumbent / revert to last-known-good are materially different risk
+# postures and no default is safe. ``training/model_zoo.py::resolve_no_good_arm_state``
+# RAISES when a gate that needs it runs with this unset — it never guesses.
+# Legal values: "hold_incumbent" | "flat" | "reduced_size" | "last_known_good".
+MODEL_ZOO_NO_GOOD_ARM_STATE = _cfg.get("model_zoo_no_good_arm_state", None)
+
+# alpha-engine-config-I8175 — master switch for the realized-edge AUTO-DEMOTE
+# gate (L4539). OFF by default: the gate must not arm before the no-good-arm
+# state above is ruled, because an auto-demote with no defined fallback moves
+# capital automatically to whatever happens to be next. Flipping this True with
+# MODEL_ZOO_NO_GOOD_ARM_STATE unset RAISES rather than defaulting.
+MODEL_ZOO_REALIZED_EDGE_DEMOTE_ENABLE = _flag_env_or_yaml(
+    "MODEL_ZOO_REALIZED_EDGE_DEMOTE_ENABLE",
+    _cfg.get("model_zoo_realized_edge_demote_enable", False),
+)
+
+# alpha-engine-config-I8175 / -I8195 — the REALIZED-edge floor, in 21d rank-IC.
+# The single shared bar: the EXIT gate demotes when the serving champion's own
+# ATTRIBUTED realized rank-IC is at or below it, and the ENTRANCE gate refuses to
+# admit a new arm into live capital while the slot sits at or below it. One
+# number, both directions, so entrance and exit cannot disagree.
+#
+# DELIBERATELY UN-DEFAULTED (None) — reserved to the operator. Measured
+# 2026-08-22 over the model_zoo history: promotion-time ``cpcv_mean_ic`` has NO
+# measurable relationship with later realized 21d rank-IC (n=6 attributed
+# champion eras, Spearman +0.03, exact permutation p=0.90), so any number picked
+# from that history would be a guess wearing a number. See -I8195.
+MODEL_ZOO_REALIZED_EDGE_FLOOR = _cfg.get("model_zoo_realized_edge_floor", None)
+
+# alpha-engine-config-I8175 — WHICH attributed read the exit gate acts on:
+# "version" (the serving champion's own matured predictions) or "line" (every
+# version sharing its model_version prefix). Un-defaulted, and the choice is
+# consequential rather than cosmetic: measured 2026-08-22, the champion rotates
+# WEEKLY while a 21-trading-day forward window takes ~30 calendar days to close,
+# so the serving VERSION reads no_matured_outcomes essentially always and a
+# version-scoped gate would never fire. Scoping to the line makes the gate
+# firable but grades an architecture, not the arm. Reserved to the operator.
+MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE = _cfg.get(
+    "model_zoo_demote_attribution_scope", None
+)
+
+# alpha-engine-config-I8175 — hysteresis (`champion-challenger-policy` §5.2):
+# consecutive realized-edge observations at/below the floor required before the
+# EXIT gate acts. Demoting a sitting champion on one bad reading oscillates on
+# noise. Un-defaulted for the same reason as the floor.
+MODEL_ZOO_REALIZED_EDGE_DEMOTE_CONSECUTIVE = _cfg.get(
+    "model_zoo_realized_edge_demote_consecutive", None
+)
 # L4582: CSCV-PBO target for the rotation's selection step (Bailey-LdP 2014,
 # probability the in-sample winner lands in the bottom half out-of-sample).
 # OBSERVE-only — logged to the leaderboard, not gating; <0.2 is the bar any
