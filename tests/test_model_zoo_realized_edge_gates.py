@@ -30,7 +30,11 @@ from analysis.observe_leaderboard import (
 
 # ── the single shared configuration point ───────────────────────────────────
 
-def _configure(monkeypatch, *, state=None, floor=None, consecutive=None, enable=True):
+def _configure(monkeypatch, *, state=None, floor=None, consecutive=None, enable=True,
+               scope="version"):
+    monkeypatch.setattr(
+        cfg, "MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE", scope, raising=False
+    )
     monkeypatch.setattr(cfg, "MODEL_ZOO_NO_GOOD_ARM_STATE", state, raising=False)
     monkeypatch.setattr(cfg, "MODEL_ZOO_REALIZED_EDGE_FLOOR", floor, raising=False)
     monkeypatch.setattr(
@@ -48,6 +52,7 @@ def test_no_good_arm_state_is_unset_by_default_and_never_guessed():
     assert getattr(cfg, "MODEL_ZOO_REALIZED_EDGE_FLOOR", "MISSING") is None
     assert getattr(cfg, "MODEL_ZOO_REALIZED_EDGE_DEMOTE_CONSECUTIVE", "MISSING") is None
     assert getattr(cfg, "MODEL_ZOO_REALIZED_EDGE_DEMOTE_ENABLE", "MISSING") is False
+    assert getattr(cfg, "MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE", "MISSING") is None
 
 
 def test_resolve_no_good_arm_state_raises_when_unset(monkeypatch):
@@ -80,12 +85,19 @@ def test_realized_edge_floor_and_hysteresis_raise_when_unset(monkeypatch):
 
 # ── the EXIT gate ───────────────────────────────────────────────────────────
 
-def _payload(ic, *, vid="v-serving", status="attributed", n=40, day="2026-08-21"):
+def _payload(ic, *, vid="v-serving", status="attributed", n=40, day="2026-08-21",
+             line_ic="__same__"):
     return {
         "trading_day": day,
         "serving_champion_attributed": {
             "version_id": vid,
             "realized_rank_ic": ic,
+            "n_matured_outcomes": n,
+            "attribution_status": status,
+        },
+        "serving_line_attributed": {
+            "line": "v3.0-meta",
+            "realized_rank_ic": ic if line_ic == "__same__" else line_ic,
             "n_matured_outcomes": n,
             "attribution_status": status,
         },
@@ -336,3 +348,60 @@ def test_champion_version_id_resolver_returns_none_not_a_stale_literal(monkeypat
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("registry down")),
     )
     assert wo._resolve_champion_version_id("test-bucket") is None
+
+
+# ── attribution SCOPE: the cadence arithmetic that decides whether the gate can
+#    fire at all ───────────────────────────────────────────────────────────────
+
+def test_armed_gate_with_unset_attribution_scope_raises(monkeypatch):
+    _configure(monkeypatch, state="hold_incumbent", floor=0.0, consecutive=1,
+               scope=None)
+    with pytest.raises(gates.RealizedEdgeFloorUnset) as exc:
+        gates.evaluate_realized_edge_exit([_payload(-0.26)])
+    assert "VERSION or the serving LINE" in str(exc.value)
+
+
+def test_version_scope_reads_the_version_number_line_scope_reads_the_line(monkeypatch):
+    """The two scopes must be able to disagree, or the config point is decorative."""
+    payloads = [_payload(None, status="no_matured_outcomes", n=0, line_ic=-0.26)]
+
+    _configure(monkeypatch, state="hold_incumbent", floor=0.0, consecutive=1,
+               scope="version")
+    v = gates.evaluate_realized_edge_exit(payloads)
+    assert v["status"] == "unmeasurable", (
+        "the serving VERSION has no matured outcomes — under weekly rotation "
+        "against a 21d horizon this is the permanent state, and a version-scoped "
+        "gate correctly never fires rather than firing on someone else's number"
+    )
+
+    _configure(monkeypatch, state="hold_incumbent", floor=0.0, consecutive=1,
+               scope="line")
+    v = gates.evaluate_realized_edge_exit(payloads)
+    assert v["status"] == "demote"
+    assert v["attribution_scope"] == "line"
+
+
+def test_champion_line_of_strips_the_dated_version_suffix():
+    from analysis.observe_leaderboard import champion_line_of
+
+    assert champion_line_of("v3.0-meta-2026-08-14-119e069b") == "v3.0-meta"
+    assert champion_line_of("spec-residual-mom-2026-07-17-f478ece3") == "spec-residual-mom"
+    assert champion_line_of(None) is None
+
+
+def test_line_attribution_pools_every_version_on_the_line():
+    """alpha-engine-config-I8175 — measured 2026-08-22, every v3.0-meta champion
+    from 2026-07-24 onward had zero matured outcomes of its own while the LINE had
+    been serving continuously. The line read is what makes the gate firable."""
+    from analysis.observe_leaderboard import _attributed_line_realized_rank_ic
+
+    pairs = (
+        _pairs("v3.0-meta-2026-07-24-aaa", 1.0, 15, date="2026-07-24")
+        + _pairs("v3.0-meta-2026-07-31-bbb", 1.0, 15, date="2026-07-31")
+        + _pairs("spec-residual-mom-2026-07-17-ccc", -1.0, 30, date="2026-07-17")
+    )
+    res = _attributed_line_realized_rank_ic(pairs, "v3.0-meta-2026-08-14-119e069b")
+    assert res["attribution_status"] == "attributed"
+    assert res["line"] == "v3.0-meta"
+    assert res["n_versions"] == 2
+    assert res["realized_rank_ic"] > 0, "the spec-residual-mom line must not leak in"

@@ -700,6 +700,18 @@ MODEL_ZOO_REALIZED_EDGE_DEMOTE_ENABLE = _flag_env_or_yaml(
 # from that history would be a guess wearing a number. See -I8195.
 MODEL_ZOO_REALIZED_EDGE_FLOOR = _cfg.get("model_zoo_realized_edge_floor", None)
 
+# alpha-engine-config-I8175 — WHICH attributed read the exit gate acts on:
+# "version" (the serving champion's own matured predictions) or "line" (every
+# version sharing its model_version prefix). Un-defaulted, and the choice is
+# consequential rather than cosmetic: measured 2026-08-22, the champion rotates
+# WEEKLY while a 21-trading-day forward window takes ~30 calendar days to close,
+# so the serving VERSION reads no_matured_outcomes essentially always and a
+# version-scoped gate would never fire. Scoping to the line makes the gate
+# firable but grades an architecture, not the arm. Reserved to the operator.
+MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE = _cfg.get(
+    "model_zoo_demote_attribution_scope", None
+)
+
 # alpha-engine-config-I8175 — hysteresis (`champion-challenger-policy` §5.2):
 # consecutive realized-edge observations at/below the floor required before the
 # EXIT gate acts. Demoting a sitting champion on one bad reading oscillates on

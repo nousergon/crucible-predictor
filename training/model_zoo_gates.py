@@ -183,6 +183,53 @@ def resolve_demote_consecutive() -> int:
     return n
 
 
+ATTRIBUTION_SCOPES: tuple[str, ...] = ("version", "line")
+
+#: The monitor payload field each scope reads.
+_SCOPE_FIELD = {
+    "version": "serving_champion_attributed",
+    "line": "serving_line_attributed",
+}
+
+
+def resolve_attribution_scope() -> str:
+    """WHICH attributed realized read the EXIT gate acts on.
+
+    ``version`` — the serving champion's own matured predictions. Correct in the
+    narrow sense and, measured 2026-08-22, essentially never available: the
+    champion rotates weekly while a 21-trading-day window takes ~30 calendar days
+    to close, so a version's first matured outcome lands four or five rotations
+    after it stopped serving. A version-scoped gate reports ``unmeasurable``
+    forever — honest, but it never fires.
+
+    ``line`` — every version sharing the serving champion's ``model_version``
+    prefix. The unit that has actually been trading capital continuously
+    (``v3.0-meta`` since 2026-07-24), and the coarser unit a gate can realistically
+    read. It grades an architecture rather than one retrain.
+
+    Un-defaulted and reserved: this is a choice about what the system is allowed to
+    demote FOR, and neither answer is free.
+    """
+    raw = getattr(cfg, "MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE", None)
+    if raw is None or str(raw).strip() == "":
+        raise RealizedEdgeFloorUnset(
+            "alpha-engine-config-I8175: MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE is UNSET. "
+            "The exit gate must be told whether it grades the serving VERSION or the "
+            "serving LINE. Measured 2026-08-22: weekly rotation against a 21d horizon "
+            "means the serving version has matured outcomes essentially never, so a "
+            "version-scoped gate would never fire — a gate that reads as coverage "
+            "while doing nothing (champion-challenger-policy §7.4). Legal values: "
+            f"{list(ATTRIBUTION_SCOPES)}."
+        )
+    scope = str(raw).strip()
+    if scope not in ATTRIBUTION_SCOPES:
+        raise RealizedEdgeFloorUnset(
+            f"alpha-engine-config-I8175: MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE={scope!r} "
+            f"is not recognised. Legal values: {list(ATTRIBUTION_SCOPES)}."
+        )
+    return scope
+
+
 def demote_gate_enabled() -> bool:
     """Whether the realized-edge AUTO-DEMOTE gate (L4539) is armed."""
     return bool(getattr(cfg, "MODEL_ZOO_REALIZED_EDGE_DEMOTE_ENABLE", False))
@@ -236,6 +283,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
     floor = resolve_realized_edge_floor()
     need = resolve_demote_consecutive()
     state = resolve_no_good_arm_state()
+    scope = resolve_attribution_scope()
     if state not in ACTUATOR_IMPLEMENTED:
         raise NoGoodArmActuatorMissing(
             f"alpha-engine-config-I8175: the realized-edge auto-demote gate is armed "
@@ -247,12 +295,14 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
             f"gate that cannot act."
         )
 
+    field = _SCOPE_FIELD[scope]
     readings: list[dict] = []
     for payload in monitor_history[:need]:
-        attributed = (payload or {}).get("serving_champion_attributed") or {}
+        attributed = (payload or {}).get(field) or {}
         readings.append({
             "trading_day": (payload or {}).get("trading_day"),
-            "version_id": attributed.get("version_id"),
+            "scope": scope,
+            "version_id": attributed.get("version_id") or attributed.get("line"),
             "realized_rank_ic": attributed.get("realized_rank_ic"),
             "n_matured_outcomes": attributed.get("n_matured_outcomes"),
             "attribution_status": attributed.get("attribution_status"),
@@ -264,6 +314,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
             "status": "unmeasurable",
             "floor": floor,
             "consecutive_required": need,
+            "attribution_scope": scope,
             "no_good_arm_state": state,
             "readings": readings,
             "reason": (
@@ -282,6 +333,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
             "floor": floor,
             "consecutive_required": need,
             "n_attributed_readings": len(usable),
+            "attribution_scope": scope,
             "no_good_arm_state": state,
             "readings": readings,
             "reason": (
@@ -300,6 +352,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
                 "consecutive_required": need,
                 "realized_rank_ic": latest,
                 "version_id": usable[0].get("version_id"),
+                "attribution_scope": scope,
                 "no_good_arm_state": state,
                 "readings": readings,
                 "reason": (
@@ -314,6 +367,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
             "consecutive_below": len(below),
             "realized_rank_ic": latest,
             "version_id": usable[0].get("version_id"),
+            "attribution_scope": scope,
             "no_good_arm_state": state,
             "readings": readings,
             "reason": (
@@ -330,6 +384,7 @@ def evaluate_realized_edge_exit(monitor_history: list[dict]) -> dict:
         "consecutive_below": len(below),
         "realized_rank_ic": float(usable[0]["realized_rank_ic"]),
         "version_id": usable[0].get("version_id"),
+        "attribution_scope": scope,
         "demote_to": state,
         "no_good_arm_state": state,
         "readings": readings,

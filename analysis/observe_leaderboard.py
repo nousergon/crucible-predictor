@@ -328,6 +328,100 @@ def _attributed_realized_rank_ic(
     }
 
 
+def champion_line_of(version_id: str | None) -> str | None:
+    """The champion LINE a registry version belongs to — its model_version prefix.
+
+    ``v3.0-meta-2026-08-14-119e069b`` -> ``v3.0-meta``;
+    ``spec-residual-mom-2026-07-17-f478ece3`` -> ``spec-residual-mom``.
+
+    alpha-engine-config-I8175. The line matters because of a cadence arithmetic
+    that makes per-VERSION attribution unusable as a gate input on its own: the
+    champion rotates WEEKLY, while a 21-trading-day forward window takes ~30
+    calendar days to close. A version promoted at T therefore has its first
+    matured outcome around T+30, by which point four or five further rotations
+    have happened and it is long out of service. The version currently serving
+    will read ``no_matured_outcomes`` essentially always — the system rotates
+    faster than it can measure.
+
+    Measured 2026-08-22: every ``v3.0-meta`` champion from 2026-07-24 onward had
+    ZERO matured outcomes, while the line itself had served continuously since
+    2026-07-24. The line is what has actually been trading capital, and it is the
+    coarser unit an exit gate can realistically read.
+
+    Which of the two an exit gate consumes is a reserved decision, not a default —
+    see ``cfg.MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE``.
+    """
+    if not version_id:
+        return None
+    parts = str(version_id).split("-")
+    # Version ids are "<model_version>-<YYYY>-<MM>-<DD>-<sha>"; strip the dated
+    # suffix by finding the first 4-digit year-looking component.
+    for i, part in enumerate(parts):
+        if len(part) == 4 and part.isdigit():
+            return "-".join(parts[:i]) or None
+    return str(version_id)
+
+
+def _attributed_line_realized_rank_ic(
+    pairs: list[dict], serving_version_id: str | None
+) -> dict:
+    """The realized 21d rank-IC of the serving champion's LINE — every version
+    sharing its ``model_version`` prefix. See ``champion_line_of`` for why this
+    exists alongside the per-version read (alpha-engine-config-I8175)."""
+    line = champion_line_of(serving_version_id)
+    if line is None:
+        return {
+            "line": None,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": 0,
+            "n_weeks_coverage": 0,
+            "n_versions": 0,
+            "attribution_status": "version_unknown",
+            "reason": "the serving champion's version_id could not be resolved",
+        }
+    own = [p for p in pairs if champion_line_of(p.get("champion_version_id")) == line]
+    if not own:
+        return {
+            "line": line,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": 0,
+            "n_weeks_coverage": 0,
+            "n_versions": 0,
+            "attribution_status": "unstamped_predictions",
+            "reason": (
+                "no prediction in the window is stamped with a version on this line — "
+                "these artifacts predate the champion_version_id stamp"
+            ),
+        }
+    versions = {p.get("champion_version_id") for p in own}
+    ic, n, weeks = _realized_rank_ic(own)
+    if ic is None:
+        return {
+            "line": line,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": n,
+            "n_weeks_coverage": weeks,
+            "n_versions": len(versions),
+            "attribution_status": "no_matured_outcomes",
+            "reason": (
+                f"the {line} line has {n} matured outcome(s) in the window (need >= "
+                f"{_MIN_PAIRS_FOR_IC} for a rank-IC)"
+            ),
+        }
+    return {
+        "line": line,
+        "realized_rank_ic": ic,
+        "n_matured_outcomes": n,
+        "n_weeks_coverage": weeks,
+        "n_versions": len(versions),
+        "attribution_status": "attributed",
+        "reason": (
+            f"realized 21d rank-IC {ic:+.4f} over {n} matured outcomes / {weeks} "
+            f"weeks produced by {len(versions)} version(s) of the {line} line"
+        ),
+    }
+
+
 def _realized_rank_ic_by_version(pairs: list[dict]) -> list[dict]:
     """Per-version realized 21d rank-IC over the window — the diagnostic that makes
     a mis-attributed aggregate visible instead of arguable
@@ -437,6 +531,7 @@ def build_champion_realized_monitor(
             bucket, s3_client=s3_client
         )
     attributed = _attributed_realized_rank_ic(live_pairs, serving_version_id)
+    line_attributed = _attributed_line_realized_rank_ic(live_pairs, serving_version_id)
     by_version = _realized_rank_ic_by_version(live_pairs)
 
     # chasing_noise verdict: only assertable once enough outcomes have matured.
@@ -478,8 +573,15 @@ def build_champion_realized_monitor(
             # arm named by `serving_champion_attributed` below.
             "scope": "champion_slot_aggregate_unattributed",
         },
-        # The per-version read the auto-demote gate consumes.
+        # The per-VERSION read: the serving champion's own matured predictions.
+        # Under weekly rotation against a 21d horizon this is `no_matured_outcomes`
+        # essentially always — the system rotates faster than it can measure.
         "serving_champion_attributed": attributed,
+        # The per-LINE read: every version sharing the serving champion's
+        # model_version prefix. The coarser unit an exit gate can realistically
+        # read. Which of the two the gate consumes is a reserved decision
+        # (cfg.MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE) — see alpha-engine-config-I8175.
+        "serving_line_attributed": line_attributed,
         # Every version with matured outcomes in the window, so a mis-attributed
         # aggregate is visible rather than arguable.
         "realized_rank_ic_by_version": by_version,
