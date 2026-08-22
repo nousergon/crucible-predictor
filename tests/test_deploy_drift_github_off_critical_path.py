@@ -75,11 +75,17 @@ def _run(*, live_sha=_SHA, s3_definition=..., stack_sha=_SHA, upstream=None,
         s3_definition = _stamped(_SHA)
     if live_definition is ...:
         live_definition = _stamped(_SHA)
-    with patch.object(dd, "_read_sf_comment",
-                      return_value=f"[git:{live_sha}] preopen" if live_sha else "no stamp"), \
-         patch.object(dd, "_read_stack_tag", return_value=stack_sha), \
+    # I8142: ONE describe_state_machine supplies both the [git:] stamp and the
+    # definition body, so the two seams became one. The stamp the caller asked
+    # for is written into the document this returns.
+    if isinstance(live_definition, dict):
+        live_definition = dict(live_definition)
+        live_definition["Comment"] = (
+            f"[git:{live_sha}] preopen" if live_sha else "no stamp"
+        )
+    with patch.object(dd, "_read_stack_tag", return_value=stack_sha), \
          patch.object(dd, "_fetch_origin_main_sha", return_value=upstream), \
-         patch.object(dd, "_read_sf_definition", return_value=live_definition), \
+         patch.object(dd, "_read_live_definition", return_value=live_definition), \
          patch.object(dd, "_fetch_s3_definition", return_value=s3_definition), \
          patch.object(dd, "_fetch_repo_definition", return_value=None) as gh:
         result = dd.check_deploy_drift(region="us-east-1", account_id="711398986525")
@@ -212,7 +218,8 @@ def test_the_weekly_pipeline_keeps_stamp_semantics():
     """No market-open deadline there — a lost weekly run costs a rerun, not a
     session — so neither the S3 definition read nor the in-region cf_drift
     reference applies."""
-    with patch.object(dd, "_read_sf_comment", return_value=f"[git:{_SHA}] weekly"), \
+    with patch.object(dd, "_read_live_definition",
+                      return_value={"Comment": f"[git:{_SHA}] weekly"}), \
          patch.object(dd, "_read_stack_tag", return_value=_SHA), \
          patch.object(dd, "_fetch_origin_main_sha", return_value=_OTHER), \
          patch.object(dd, "_fetch_s3_definition") as s3:
