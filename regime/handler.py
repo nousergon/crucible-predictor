@@ -67,6 +67,7 @@ from regime.features import (
     fetch_macro_feature_history,
 )
 from krepis.logging import monitor_handler, setup_logging
+from stage_coverage_safety import safe_assert_stage_coverage
 from regime.hmm import HMMRegimeClassifier
 from regime.substrate import (
     DEFAULT_S3_BUCKET,
@@ -291,15 +292,22 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
         # guaranteed-false MISSING rather than a real signal. Observe
         # mode — the handler's own outcome is unchanged on an absent
         # module.
-        try:
-            from krepis.stage_coverage import assert_stage_coverage
-            _response["stage_coverage"] = assert_stage_coverage(
-                "RegimeSubstrate",
-                run_date=result["payload"].get("calendar_date"),
-                window_start=_started,
-            )
-        except ImportError as exc:
-            logger.error("stage-coverage assertion unavailable: %s", exc)
+        #
+        # alpha-engine-config-I8155: `result["payload"]["calendar_date"]`
+        # is the dual-tracked CYCLE date `produce_regime_substrate` computed
+        # itself (it defaults `calendar_date=None` on the live SF path —
+        # see that function's docstring) — a computed stand-in, not the
+        # execution's own run_date. Measured against
+        # nousergon-data/infrastructure/step_function.json: the SF's
+        # RegimeSubstrate Task Payload carries only `regime_action`, no
+        # date field at all, so `event.get("date"/"run_date")` is always
+        # absent on the live path today — skip loudly rather than keep
+        # reporting the cycle date under the run_date key.
+        _verdict = safe_assert_stage_coverage(
+            "RegimeSubstrate", event=event, window_start=_started, log=logger,
+        )
+        if _verdict is not None:
+            _response["stage_coverage"] = _verdict
         return _response
     elif action == "dry_run":
         result = produce_regime_substrate(**kwargs, write=False)

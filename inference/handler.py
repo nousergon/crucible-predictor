@@ -104,6 +104,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 # BEFORE the Python interpreter starts. Other secrets are pulled lazily
 # from SSM via krepis.secrets.get_secret() (per-process cached).
 from krepis.logging import setup_logging, monitor_handler
+from stage_coverage_safety import safe_assert_stage_coverage
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = os.path.join(
     os.environ.get(
@@ -263,13 +264,19 @@ def handler(event: dict, context) -> dict:
         # COVERED_NO_OUTPUT for it. Loud, not silent, if the module is
         # absent at the pinned nousergon-lib SHA: the handler's own outcome
         # is unchanged (observe mode).
-        try:
-            from krepis.stage_coverage import assert_stage_coverage
-            _r["stage_coverage"] = assert_stage_coverage(
-                "WeeklyRunDayGate", run_date=_r.get("check_date"), window_start=_started,
-            )
-        except ImportError as exc:
-            log.error("stage-coverage assertion unavailable: %s", exc)
+        #
+        # alpha-engine-config-I8155: run_date is the event's own `date`
+        # (see `stage_coverage_safety.resolve_event_run_date`), never
+        # `_r["check_date"]` — when `event.get("date")` is absent,
+        # `check_weekly_run_day` computes `check_date` from
+        # `datetime.now(_NYSE)`, which is exactly the self-computed
+        # stand-in this fix removes: it would report a real-looking
+        # run_date for an execution whose own identity was never supplied.
+        _verdict = safe_assert_stage_coverage(
+            "WeeklyRunDayGate", event=event, window_start=_started, log=log,
+        )
+        if _verdict is not None:
+            _r["stage_coverage"] = _verdict
         return _r
 
     # Preflight — fail fast on env / connectivity / ArcticDB freshness
@@ -463,15 +470,20 @@ def handler(event: dict, context) -> dict:
         # positively-declared no-output gate stage — the lib returns
         # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
-        try:
-            from krepis.stage_coverage import assert_stage_coverage
-            result["stage_coverage"] = assert_stage_coverage(
-                "LibPinDriftCheck",
-                run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
-                window_start=_started,
-            )
-        except ImportError as exc:
-            log.error("stage-coverage assertion unavailable: %s", exc)
+        #
+        # alpha-engine-config-I8155: `date_str or datetime.now(...)` was the
+        # forbidden silent fall-back — measured against
+        # nousergon-data/infrastructure/step_function.json, the SF's
+        # LibPinDriftCheck Task Payload carries only `action`, so date_str
+        # is always None on the live path and the `now()` half always fired,
+        # writing every real invocation's verdict under a self-computed date
+        # nobody could join back to the execution. Skip the assertion loudly
+        # instead when the event carries no run_date.
+        _verdict = safe_assert_stage_coverage(
+            "LibPinDriftCheck", event=event, window_start=_started, log=log,
+        )
+        if _verdict is not None:
+            result["stage_coverage"] = _verdict
         return result
 
     # ── Pipeline-contract preflight (Saturday SF early state, L4595) ─────────
@@ -497,15 +509,17 @@ def handler(event: dict, context) -> dict:
         # positively-declared no-output gate stage — the lib returns
         # COVERED_NO_OUTPUT for it. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
-        try:
-            from krepis.stage_coverage import assert_stage_coverage
-            result["stage_coverage"] = assert_stage_coverage(
-                "PipelineContractCheck",
-                run_date=date_str or datetime.now(timezone.utc).date().isoformat(),
-                window_start=_started,
-            )
-        except ImportError as exc:
-            log.error("stage-coverage assertion unavailable: %s", exc)
+        #
+        # alpha-engine-config-I8155: same fix as LibPinDriftCheck above —
+        # the SF's PipelineContractCheck Task Payload also carries only
+        # `action`, so `date_str or datetime.now(...)` always took the
+        # `now()` half in production. Skip loudly instead when the event
+        # carries no run_date.
+        _verdict = safe_assert_stage_coverage(
+            "PipelineContractCheck", event=event, window_start=_started, log=log,
+        )
+        if _verdict is not None:
+            result["stage_coverage"] = _verdict
         return result
 
     # ── Numeric self-test (alpha-engine-config-I7262) ───────────────────────

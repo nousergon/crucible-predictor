@@ -68,6 +68,7 @@ from botocore.exceptions import ClientError
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from krepis.logging import monitor_handler, setup_logging
+from stage_coverage_safety import safe_assert_stage_coverage
 from regime.features import (
     DEFAULT_PRICE_CACHE_PREFIX,
     fetch_macro_feature_history,
@@ -507,15 +508,17 @@ def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
         # §2.1) — only on the write=True path; ``dry_run`` declares by
         # design that it writes nothing. Observe mode — the handler's own
         # outcome is unchanged on an absent module.
-        try:
-            from krepis.stage_coverage import assert_stage_coverage
-            _response["stage_coverage"] = assert_stage_coverage(
-                "RegimeRetrospectiveEval",
-                run_date=result["payload"].get("calendar_date"),
-                window_start=_started,
-            )
-        except ImportError as exc:
-            logger.error("stage-coverage assertion unavailable: %s", exc)
+        #
+        # alpha-engine-config-I8155: same fix as RegimeSubstrate — the
+        # payload's `calendar_date` is a computed cycle date, and the SF's
+        # RegimeRetrospectiveEval Task Payload carries only `regime_action`,
+        # no date field. Skip loudly rather than report the cycle date
+        # under the run_date key.
+        _verdict = safe_assert_stage_coverage(
+            "RegimeRetrospectiveEval", event=event, window_start=_started, log=logger,
+        )
+        if _verdict is not None:
+            _response["stage_coverage"] = _verdict
         return _response
     elif action == "dry_run":
         result = produce_t1_eval(**kwargs, write=False)
