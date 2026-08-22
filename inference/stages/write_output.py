@@ -405,6 +405,44 @@ def _merge_predictions(
     return merged
 
 
+def _resolve_champion_version_id(s3_bucket: str) -> str | None:
+    """The registry ``version_id`` of the champion currently serving live weights.
+
+    alpha-engine-config-I8175 — stamped onto every predictions artifact so a
+    realized-outcome read can be ATTRIBUTED to the arm that produced it. Returns
+    None when the registry cannot be read: an honest absence that the monitor
+    reports as ``unattributed``, never a hardcoded architecture literal that goes
+    stale the moment the champion rotates (`champion-challenger-policy` §7.5).
+
+    Best-effort by design. This runs on the live inference write path and a
+    registry read failure must not cost the day's predictions — but the failure is
+    logged LOUD and the resulting None is visible in the artifact, so silence and
+    a genuine value never render identically.
+    """
+    try:
+        import boto3
+
+        from model.registry import list_versions
+
+        champs = list_versions(boto3.client("s3"), s3_bucket, stage="champion")
+    except Exception:  # noqa: BLE001 — see docstring: never fails the write path
+        log.warning(
+            "write_predictions: could not resolve the champion version_id from the "
+            "registry — predictions will carry champion_version_id=None and the "
+            "realized-edge monitor will report them UNATTRIBUTED "
+            "(alpha-engine-config-I8175)",
+            exc_info=True,
+        )
+        return None
+    if not champs:
+        log.warning(
+            "write_predictions: registry lists NO champion-stage version — "
+            "champion_version_id=None (alpha-engine-config-I8175)"
+        )
+        return None
+    return champs[0].get("version_id")
+
+
 def write_predictions(
     predictions: list[dict],
     date_str: str,
@@ -558,6 +596,21 @@ def write_predictions(
     output = {
         "date": date_str,
         "model_version": metrics.get("model_version", "unknown"),
+        # alpha-engine-config-I8175 — the registry version_id of the champion that
+        # ACTUALLY produced this batch. `model_version` above is an ARCHITECTURE
+        # literal ("meta-v3.0-8models") and stays identical across every champion
+        # rotation, so nothing downstream could tell which arm emitted a given
+        # prediction. Measured 2026-08-22: predictions from 2026-07-06 through
+        # 2026-08-21 all carried `model_version: meta-v3.0-8models` while the
+        # serving champion moved through spec-residual-mom, spec-sota-combine and
+        # four v3.0-meta vintages — the artifact asserting something false about
+        # its own origin (`champion-challenger-policy` §7.5).
+        #
+        # Without this field the realized-edge monitor can only pool the whole
+        # champion SLOT, and the model_zoo auto-demote gate (L4539) would act on a
+        # number belonging to a predecessor. None when the registry is unreadable —
+        # honest absence, never a stale literal.
+        "champion_version_id": _resolve_champion_version_id(s3_bucket),
         "model_hit_rate_30d": metrics.get("hit_rate_30d_rolling", None),
         "n_predictions": len(predictions),
         "n_high_confidence": n_high_confidence,

@@ -131,12 +131,19 @@ def _load_shadow_pairs(bucket: str, version_id: str, n_days: int, s3_client=None
             data = json.loads(obj["Body"].read())
         except Exception:  # noqa: BLE001 — most days have no file; skip cleanly
             continue
+        # alpha-engine-config-I8175 — the arm that produced this day's batch.
+        # Carried per pair so the realized rank-IC can be ATTRIBUTED to a version
+        # instead of pooled across whatever the champion slot happened to hold.
+        # None on artifacts written before the stamp shipped — reported as
+        # unattributed, never silently folded into the serving champion's number.
+        champion_version_id = data.get("champion_version_id")
         for p in data.get("predictions", []):
             pairs.append({
                 "date": data.get("date") or d.isoformat(),
                 "ticker": p.get("ticker"),
                 ALPHA_FIELD: p.get(ALPHA_FIELD),
                 "realized_alpha": None,
+                "champion_version_id": champion_version_id,
             })
     return pairs
 
@@ -233,6 +240,133 @@ def _write_payload(payload: dict, bucket: str, trading_day: str | None,
     return key
 
 
+def _attributed_realized_rank_ic(
+    pairs: list[dict], serving_version_id: str | None
+) -> dict:
+    """The realized 21d rank-IC of the SERVING champion's OWN matured predictions.
+
+    alpha-engine-config-I8175. The pooled read this module has always emitted is
+    an unattributed SLOT aggregate, and under weekly rotation it structurally
+    cannot describe the arm currently serving:
+
+      * the window is the last ``DEFAULT_WINDOW_DAYS`` (42) calendar days of live
+        predictions, with no version filter;
+      * only pairs whose 21d forward window has CLOSED contribute to the IC;
+      * so the matured subset is the OLDEST ~3 weeks of a 6-week window, while the
+        champion rotates weekly — the serving version's own predictions are all
+        still unmatured and contribute NOTHING.
+
+    Measured 2026-08-22 against the live history: the ``-0.2626`` that raised
+    alpha-engine-config-I8175 is attributable to ``spec-residual-mom-2026-07-17``
+    (era mean realized IC -0.31) and ``spec-residual-mom-2026-07-10`` (-0.06), NOT
+    to the serving ``v3.0-meta-2026-08-14-119e069b``, which has never had a single
+    matured outcome. Gating a demote on the aggregate would remove a champion for
+    its predecessors' results (`champion-challenger-policy` §7.5).
+
+    Returns a dict carrying an explicit ``attribution_status`` — one of
+    ``attributed`` / ``no_matured_outcomes`` / ``version_unknown`` /
+    ``unstamped_predictions``. ``realized_rank_ic`` is None for every status but
+    the first: an unmeasured statistic is reported as unmeasured, never as zero
+    and never as the aggregate wearing the serving version's name.
+    """
+    if not serving_version_id:
+        return {
+            "version_id": None,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": 0,
+            "n_weeks_coverage": 0,
+            "attribution_status": "version_unknown",
+            "reason": (
+                "the serving champion's registry version_id could not be resolved, "
+                "so no prediction can be attributed to it"
+            ),
+        }
+
+    stamped = [p for p in pairs if p.get("champion_version_id") is not None]
+    if not stamped:
+        return {
+            "version_id": serving_version_id,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": 0,
+            "n_weeks_coverage": 0,
+            "attribution_status": "unstamped_predictions",
+            "reason": (
+                "no prediction in the window carries champion_version_id — these "
+                "artifacts predate the stamp (alpha-engine-config-I8175). The "
+                "aggregate below is a SLOT read and must not be attributed to any "
+                "one version."
+            ),
+        }
+
+    own = [p for p in stamped if p.get("champion_version_id") == serving_version_id]
+    ic, n, weeks = _realized_rank_ic(own) if own else (None, 0, 0)
+    if ic is None:
+        return {
+            "version_id": serving_version_id,
+            "realized_rank_ic": None,
+            "n_matured_outcomes": n,
+            "n_weeks_coverage": weeks,
+            "attribution_status": "no_matured_outcomes",
+            "reason": (
+                f"the serving champion has {n} matured outcome(s) of its own in the "
+                f"window (need >= {_MIN_PAIRS_FOR_IC} for a rank-IC). Under weekly "
+                "rotation against a 21d horizon this is the EXPECTED state for a "
+                "recently-promoted champion — it is not a verdict, and no gate may "
+                "read it as one."
+            ),
+        }
+    return {
+        "version_id": serving_version_id,
+        "realized_rank_ic": ic,
+        "n_matured_outcomes": n,
+        "n_weeks_coverage": weeks,
+        "attribution_status": "attributed",
+        "reason": (
+            f"realized 21d rank-IC {ic:+.4f} over {n} matured outcomes / {weeks} "
+            f"weeks produced by {serving_version_id} itself"
+        ),
+    }
+
+
+def _realized_rank_ic_by_version(pairs: list[dict]) -> list[dict]:
+    """Per-version realized 21d rank-IC over the window — the diagnostic that makes
+    a mis-attributed aggregate visible instead of arguable
+    (alpha-engine-config-I8175)."""
+    buckets: dict = {}
+    for p in pairs:
+        buckets.setdefault(p.get("champion_version_id"), []).append(p)
+    out = []
+    for vid, rows in buckets.items():
+        ic, n, weeks = _realized_rank_ic(rows)
+        out.append({
+            "version_id": vid,
+            "realized_rank_ic": ic,
+            "n_matured_outcomes": n,
+            "n_weeks_coverage": weeks,
+        })
+    return sorted(out, key=lambda r: (r["version_id"] is None, str(r["version_id"])))
+
+
+def _resolve_serving_champion_version_id(bucket: str, s3_client=None) -> str | None:
+    """The registry version_id of the champion serving right now. None (honest
+    absence) when the registry is unreadable."""
+    try:
+        import boto3
+
+        from model.registry import list_versions
+
+        champs = list_versions(s3_client or boto3.client("s3"), bucket, stage="champion")
+    except Exception:  # noqa: BLE001 — monitor is observability; absence is reported
+        log.warning(
+            "champion_monitor: could not resolve the serving champion version_id — "
+            "the attributed read will report version_unknown "
+            "(alpha-engine-config-I8175)",
+            exc_info=True,
+        )
+        return None
+    return champs[0].get("version_id") if champs else None
+
+
 def build_champion_realized_monitor(
     bucket: str | None = None,
     n_days: int = DEFAULT_WINDOW_DAYS,
@@ -245,6 +379,7 @@ def build_champion_realized_monitor(
     live_pairs: list[dict] | None = None,
     prices_by_ticker: dict | None = None,
     sector_map: dict | None = None,
+    serving_version_id: str | None = None,
 ) -> dict:
     """NOISE-CHASING MONITOR of the PROMOTED champion (config#671/#673/#1052).
 
@@ -292,6 +427,18 @@ def build_champion_realized_monitor(
     )
     champ_ic, champ_n, champ_weeks = _realized_rank_ic(live_pairs)
 
+    # alpha-engine-config-I8175 — the ATTRIBUTED read: the serving champion's own
+    # matured predictions only. This is the ONLY quantity the auto-demote gate
+    # (L4539) may act on; `champion` below stays the unattributed SLOT aggregate
+    # it has always been, kept for continuity of the existing series and for the
+    # noise-watch alert, but it is now labelled as such.
+    if serving_version_id is None:
+        serving_version_id = _resolve_serving_champion_version_id(
+            bucket, s3_client=s3_client
+        )
+    attributed = _attributed_realized_rank_ic(live_pairs, serving_version_id)
+    by_version = _realized_rank_ic_by_version(live_pairs)
+
     # chasing_noise verdict: only assertable once enough outcomes have matured.
     # Non-positive realized rank-IC on >= MIN_REALIZED_OUTCOMES matured pairs ⇒ the
     # promoted champion shows no realized predictive edge → likely chasing noise.
@@ -326,7 +473,16 @@ def build_champion_realized_monitor(
             "realized_rank_ic": champ_ic,
             "n_matured_outcomes": champ_n,
             "n_weeks_coverage": champ_weeks,
+            # alpha-engine-config-I8175 — say what this number is. It pools every
+            # champion that served in the window, so it describes the SLOT, not the
+            # arm named by `serving_champion_attributed` below.
+            "scope": "champion_slot_aggregate_unattributed",
         },
+        # The per-version read the auto-demote gate consumes.
+        "serving_champion_attributed": attributed,
+        # Every version with matured outcomes in the window, so a mis-attributed
+        # aggregate is visible rather than arguable.
+        "realized_rank_ic_by_version": by_version,
         "chasing_noise": chasing_noise,
         "verdict_reason": verdict_reason,
         "note": (
