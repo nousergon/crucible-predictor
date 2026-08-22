@@ -1659,7 +1659,11 @@ def _alert_realized_edge_gate(bucket, date_str, verdict: dict) -> None:
 
         publish_ops_alert(
             message=msg, severity=severity,
-            source="alpha-engine-predictor/training/model_zoo.py::select_and_finalize",
+            # Same registered alert class as the rotation's other alerts
+            # (nousergon-data playbooks.yaml::alert_classes/predictor_model_zoo).
+            # One class per logical producer, not one per function — the
+            # chasing-noise alert beside this one declares the same source.
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
             dedup_key=f"model_zoo_realized_edge_gate_{status}_{date_str}",
         )
     except Exception:  # noqa: BLE001 — alert failure must not fail the SF
