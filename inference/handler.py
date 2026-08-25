@@ -443,14 +443,16 @@ def handler(event: dict, context) -> dict:
         # break (alpha-engine-config-I7954). The SF's own invocation is not
         # synthetic and keeps ERROR.
         #
-        # alpha-engine-config-I8155: `probe=dry_run` alone did not deliver
-        # that — measured on `infrastructure/deploy.sh`, THIS action's canary
-        # payload is `{"action": "check_lib_pin_drift"}` with no `dry_run`, so
-        # probe was False on every canary and I7954's suppression never
-        # applied to the call site its own comment names. `dry_run` is a
-        # per-payload literal and drifted; `invocation_kind` is stamped by
-        # `run_canary_action` itself and cannot. Keep the `dry_run` term so an
-        # explicit hand-invoked dry run still suppresses.
+        # alpha-engine-config-I8155: the OR is belt-and-braces, not a repair.
+        # `dry_run` is present on every canary payload today and
+        # `test_every_predictor_canary_payload_carries_dry_run` asserts the
+        # whole matrix — but it got there by way of I7954, after THIS action
+        # was added to the matrix without it and a canary paged a real,
+        # useless, self-clearing cross-repo parity break (2026-08-21). A
+        # per-payload literal is a per-site marker and can be omitted at a new
+        # site; `invocation_kind` is stamped by `run_canary_action` itself and
+        # cannot. Keep the `dry_run` term so an explicit hand-invoked dry run
+        # still suppresses even when the marker is absent.
         result = check_lib_pin_drift(probe=dry_run or is_synthetic_invocation(event))
         # alpha-engine-config-I7048: has_drift is OMITTED (not False) on a
         # fetch/parse miss — .get() with an "unmeasured" sentinel keeps this

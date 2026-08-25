@@ -210,9 +210,14 @@ run_canary_action() {
   #
   # Stamped HERE, in the one function every canary call site goes through,
   # rather than in each payload literal — a per-site marker is a per-site
-  # drift, and the payload literals below already show that drift: `dry_run`
-  # is set on the check_drift and check_pipeline_contract canaries and absent
-  # from the check_weekly_run_day and check_lib_pin_drift ones.
+  # drift, and `dry_run` is the standing evidence: `check_lib_pin_drift` was
+  # added to this matrix without it and stayed that way until a canary paged a
+  # real, useless, self-clearing cross-repo parity break
+  # (alpha-engine-config-I7954, 2026-08-21). Every payload carries `dry_run`
+  # today and `test_every_predictor_canary_payload_carries_dry_run` asserts the
+  # whole matrix, so that particular hole is closed — but it took a page to
+  # find, and the NEXT per-site marker would start the same way. This one
+  # cannot: there is nowhere for a call site to omit it.
   payload=$(python3 -c '
 import json, sys
 try:
