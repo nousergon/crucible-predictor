@@ -30,7 +30,19 @@
 # now passes — load-bearing at runtime (a bootstrap on an older-krepis box
 # fails after the spot already exists and is billing), not only for CI
 # collection. Kept in lockstep with requirements.txt.
-krepis[flow-doctor]==0.59.31  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it
+# Bumped 0.59.31 -> 0.59.33 (alpha-engine-config-I8298): 0.59.33 is the first
+# published krepis declaring `flow-doctor>=0.16.0`. Below that floor,
+# `TelegramNotifier.validate()` raises a TRANSPORT failure as a config error on
+# the IMPORT path -- `krepis.setup_logging` is called at module level in
+# `inference/handler.py` and `_is_deployed()` makes flow-doctor's `strict` True
+# in Lambda -- and `TimeoutError` is not a `URLError` subclass, so a read timeout
+# escaped the handler entirely and propagated out of `FlowDoctor.__init__`.
+# On 2026-08-24 roughly 90s of an unresponsive api.telegram.org failed THIS
+# function's import five times, and the postclose trading pipeline ran with
+# MarketHoursGate and DeployDriftCheck both degraded (incident
+# nous-ergon-ops-I855). krepis-PR184's floor is inert for a consumer pinned
+# below it, so this pin is what actually delivers the fix to the runtime.
+krepis[flow-doctor]==0.59.33  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it
 # alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
 # gitleaks/session_dlp prerequisite — it does not. No file here (including the
 # Lambda handlers) imports `krepis.LLMClient`; the `[flow-doctor]` extra is the
