@@ -384,22 +384,46 @@ def test_every_predictor_canary_payload_carries_dry_run():
     )
 
 
-def test_probe_bearing_actions_thread_dry_run_into_the_probe():
-    """The handler must pass `probe=dry_run` to every probe-bearing action.
+def test_probe_bearing_actions_thread_the_synthetic_marker_into_the_probe():
+    """The handler must pass a synthetic-run `probe` to every probe-bearing action.
 
-    The payload half (above) is inert without this half: `dry_run` reaching the
-    Lambda changes nothing about log severity unless the handler threads it
-    down. `check_pipeline_contract` ALREADY carried `dry_run: true` before
-    I7954 and still logged its violations at ERROR — which is why the fix is
-    not "add dry_run" alone.
+    A probe flag reaching the Lambda changes nothing about log severity unless
+    the handler threads it down. `check_pipeline_contract` ALREADY carried
+    `dry_run: true` before I7954 and still logged its violations at ERROR —
+    which is why the fix was never "add dry_run" alone.
+
+    alpha-engine-config-I8155: nor was `probe=dry_run` alone enough. This test
+    pinned that expression while the OTHER half — `dry_run` present in the
+    payload literal — was pinned nowhere, and `check_lib_pin_drift`'s canary
+    payload never carried it. The guard passed for I7954's entire life on a
+    call site where I7954's suppression did not apply. Both probe sites now
+    read `invocation_kind`, which `run_canary_action` stamps centrally and no
+    payload literal can drift out of; `dry_run` is kept as an OR so an
+    explicit hand-invoked dry run still suppresses.
     """
     handler_src = HANDLER_PY.read_text()
-    for call in (
-        "check_lib_pin_drift(probe=dry_run)",
-        "check_pipeline_contract(probe=dry_run)",
-    ):
-        assert call in handler_src, (
-            f"inference/handler.py no longer contains `{call}` — a probe "
-            f"invoked without its synthetic-run flag pages on every finding "
-            f"(alpha-engine-config-I7954)"
+    for call in ("check_lib_pin_drift(", "check_pipeline_contract("):
+        index = handler_src.find(call)
+        assert index != -1, f"inference/handler.py no longer calls `{call}`"
+        window = handler_src[index : index + 200]
+        assert "dry_run or is_synthetic_invocation(event)" in window, (
+            f"`{call}` no longer threads the synthetic marker into its probe — "
+            f"a probe invoked without it pages on every finding "
+            f"(alpha-engine-config-I7954, I8155)"
         )
+
+
+def test_the_canary_helper_stamps_the_synthetic_marker_on_every_payload():
+    """The half I7954 left unpinned, pinned at the chokepoint this time.
+
+    Asserting it on the helper rather than on each payload literal is the
+    point: a per-site declaration is a per-site drift.
+    """
+    deploy_src = DEPLOY_SH.read_text()
+    helper_start = deploy_src.index("run_canary_action() {")
+    helper = deploy_src[helper_start : deploy_src.index("\n}", helper_start)]
+    assert 'obj["invocation_kind"] = "canary"' in helper, (
+        "run_canary_action no longer stamps invocation_kind — every canary "
+        "then reaches the handlers indistinguishable from a real Step "
+        "Functions invocation (alpha-engine-config-I8155)"
+    )

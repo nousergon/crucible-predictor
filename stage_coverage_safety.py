@@ -32,6 +32,37 @@ path. It returns `None` only for a manual or off-SF invocation that supplied
 none — and the correct behaviour there is to record UNMEASURED loudly rather
 than fabricate a stand-in, which is the substitution this whole arc removes.
 
+**Synthetic invocations carry no execution identity, by design.**
+`infrastructure/deploy.sh`'s canary matrix invokes three of these handlers
+(`check_weekly_run_day`, `check_lib_pin_drift`, `check_pipeline_contract`)
+against a freshly published Lambda VERSION, off the Step Function entirely.
+Such an invocation has no `$.run_date` to thread and must never acquire one:
+it is not a run, so it has no run to be attributed to. Measured on the live
+log group 2026-08-25: every predictor deploy emitted three `log.error` lines
+from the `run_date is None` branch below, one per canaried gate action
+(versions 528, 529, 530, 531 — one burst per deploy). `handler.py` attaches
+flow-doctor's handler at ERROR, so each burst became three pages against a
+`max_alerts_per_day: 10` budget (`flow-doctor.yaml`) — a detector spending
+30% of the day's alert budget on invocations that are healthy by
+construction, and training its reader to ignore the one shape it exists to
+catch.
+
+The fix is a DECLARATION, not a silence: `run_canary_action` stamps
+`invocation_kind: "canary"` into every canary payload (one chokepoint, so no
+call site can drift out of it), and this module refuses to assert coverage
+for any synthetic invocation — before it even looks for a run_date, so a
+synthetic invocation that somehow carried one still cannot write a verdict
+into a real execution's prefix. A real SF invocation missing its run_date is
+untouched by this and still pages, which is the half that had to survive.
+
+First adoption of the marker is this repo. `policy-shared-code`'s trigger
+is the SECOND adoption: when another repo's canary needs to declare itself,
+the stamp lifts into `krepis.aws.invoke-canary` — which is the only place
+that knows an invocation is a canary without being told — rather than being
+copied into a second `deploy.sh`. Checked 2026-08-25: no other fleet repo
+calls `safe_assert_stage_coverage` or an equivalent, so there is nothing to
+lift for yet.
+
 **krepis is changing in the same arc**: `run_date` becomes a required
 keyword and a blank value raises `krepis.stage_coverage
 .StageCoverageContractError`. krepis merges LAST, so this repo must be
@@ -52,6 +83,35 @@ from typing import Any
 #: (the pinned SHA may predate the module entirely — see
 #: `resolve_event_run_date`'s ImportError path).
 STATUS_UNMEASURED = "UNMEASURED"
+
+#: Event key carrying the KIND of this invocation. Absent on every Step
+#: Functions Task Payload (the SF threads `run_date`, not this) and stamped
+#: by `infrastructure/deploy.sh::run_canary_action` on every canary payload.
+INVOCATION_KIND_KEY = "invocation_kind"
+
+#: Invocation kinds that are synthetic — a probe of the deployed artifact
+#: rather than a run of the pipeline. Closed set: anything else, including an
+#: absent/blank value, is treated as a real invocation, so a new probe kind
+#: has to be added here deliberately rather than inheriting the exemption.
+SYNTHETIC_INVOCATION_KINDS = frozenset({"canary"})
+
+
+def invocation_kind(event: dict[str, Any]) -> str:
+    """Return `event`'s declared invocation kind, normalized (`""` if absent)."""
+    value = event.get(INVOCATION_KIND_KEY)
+    return str(value).strip().lower() if isinstance(value, str) else ""
+
+
+def is_synthetic_invocation(event: dict[str, Any]) -> bool:
+    """True when `event` DECLARES itself a probe of the deployed artifact.
+
+    Read before `resolve_event_run_date`, deliberately: the rule is not "a
+    canary may skip the assertion when it happens to lack a run_date" but
+    "a synthetic invocation never produces a coverage verdict at all". A
+    canary that somehow carried a run_date would otherwise write a verdict
+    into a real execution's prefix and count toward its denominator.
+    """
+    return invocation_kind(event) in SYNTHETIC_INVOCATION_KINDS
 
 
 def resolve_event_run_date(event: dict[str, Any]) -> str | None:
@@ -121,12 +181,35 @@ def safe_assert_stage_coverage(
 
     Returns the verdict dict to merge into the handler's response under
     `stage_coverage`, an UNMEASURED dict (see `unmeasured_stage_coverage`)
-    when the event carries no run_date or the call itself raised, or `None`
+    when the invocation declares itself synthetic (see
+    `is_synthetic_invocation`), when the event carries no run_date, or when
+    the call itself raised, or `None`
     when `krepis.stage_coverage` is not importable at all (the pinned SHA
     predates it) — in which case the caller should log and leave
     `stage_coverage` out of the response entirely, matching the existing
     ImportError convention at every call site.
     """
+    if is_synthetic_invocation(event):
+        # Not a defect and not a run: a deploy-time canary probing the freshly
+        # published Lambda version. INFO, not ERROR — `handler.py` attaches
+        # flow-doctor at ERROR, and this path fires on every deploy by
+        # construction (see the module docstring's measurement).
+        log.info(
+            "stage-coverage assertion not applicable for %s: invocation_kind=%r "
+            "is synthetic (alpha-engine-config-I8155) — a probe of the deployed "
+            "artifact, not a pipeline run, so there is no execution to attribute "
+            "a verdict to. No verdict written.",
+            stage, invocation_kind(event),
+        )
+        return unmeasured_stage_coverage(
+            stage,
+            f"synthetic invocation (invocation_kind="
+            f"{invocation_kind(event)!r}) for stage {stage!r} — a probe of the "
+            "deployed artifact carries no execution identity by design "
+            "(alpha-engine-config-I8155)",
+            window_start=window_start,
+        )
+
     run_date = resolve_event_run_date(event)
     if run_date is None:
         log.error(
