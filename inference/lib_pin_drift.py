@@ -107,6 +107,7 @@ _FLOOR_REPOS = (
     "nousergon/crucible-backtester",
     "nousergon/crucible-research",
     "nousergon/crucible-executor",
+    "nousergon/crucible-dashboard",
 )
 
 # Lifted from {predictor,backtester}/tests/test_lib_pin_lockstep.py (the pin
@@ -157,8 +158,21 @@ _RAW_FILE_URL = "https://raw.githubusercontent.com/{repo}/{branch}/{filename}"
 # the human-authored, tag-pinned source of truth for that repo (its own
 # `test_git_pinned_deps_match_pyproject_exactly` treats it the same way), so
 # it — not `requirements.txt` — is what this probe reads for the executor.
+#
+# crucible-dashboard is here for the same structural reason and was added on
+# 2026-08-24 (alpha-engine-config-I8309). Until then it was in NEITHER tuple,
+# so — exactly as the executor was before I7966 — its nousergon-lib pin was
+# never looked at at all. That is not a repo nobody depends on: nousergon-data's
+# CI installs this lock to run its pipeline-status registry drift test, and the
+# Saturday and postclose Step Functions run `alpha_engine_lib.transparency` out
+# of that venv. Its `requirements.txt` became a `uv pip compile` lockfile in
+# crucible-dashboard-PR774, which resolves the VCS ref to a commit SHA by
+# design, so `requirements.in` — which its own
+# `tests/test_flow_doctor_wiring.py::test_requirements_in_pins_lib_to_stable_tag`
+# asserts carries the vX.Y.Z tag — is what this probe reads for it too.
 _PIN_FILE_OVERRIDES = {
     "nousergon/crucible-executor": "requirements.in",
+    "nousergon/crucible-dashboard": "requirements.in",
 }
 
 # Why a pin could not be resolved. `None` means it was.
