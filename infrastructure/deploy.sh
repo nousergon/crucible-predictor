@@ -198,6 +198,39 @@ run_canary_action() {
   local payload="$4"
   local expect="${5:-statusCode}"
 
+  # ── Declare the invocation synthetic (alpha-engine-config-I8155) ───────────
+  # A canary invokes a freshly published Lambda VERSION directly, off the Step
+  # Function, so it carries no `$.run_date` and must never acquire one: it is a
+  # probe of the deployed artifact, not a pipeline run. Handlers that assert
+  # stage coverage read this marker (`stage_coverage_safety
+  # .is_synthetic_invocation`) and record UNMEASURED at INFO instead of the
+  # ERROR that `handler.py`'s flow-doctor handler turns into a page. Measured
+  # 2026-08-25: three ERROR pages per deploy against a 10/day alert budget,
+  # every one of them healthy by construction.
+  #
+  # Stamped HERE, in the one function every canary call site goes through,
+  # rather than in each payload literal — a per-site marker is a per-site
+  # drift, and the payload literals below already show that drift: `dry_run`
+  # is set on the check_drift and check_pipeline_contract canaries and absent
+  # from the check_weekly_run_day and check_lib_pin_drift ones.
+  payload=$(python3 -c '
+import json, sys
+try:
+    obj = json.loads(sys.argv[1])
+except json.JSONDecodeError as exc:
+    sys.exit(f"canary payload is not valid JSON: {exc}")
+if not isinstance(obj, dict):
+    sys.exit(f"canary payload must be a JSON object, got {type(obj).__name__}")
+declared = obj.get("invocation_kind")
+if declared not in (None, "canary"):
+    sys.exit(f"canary payload already declares invocation_kind={declared!r}")
+obj["invocation_kind"] = "canary"
+print(json.dumps(obj))
+' "$payload") || {
+    echo "  ${action}: FAILED — could not stamp invocation_kind on payload"
+    return 1
+  }
+
   local canary_out
   canary_out=$(mktemp)
   local canary_meta
