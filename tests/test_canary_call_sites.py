@@ -384,22 +384,66 @@ def test_every_predictor_canary_payload_carries_dry_run():
     )
 
 
-def test_probe_bearing_actions_thread_dry_run_into_the_probe():
-    """The handler must pass `probe=dry_run` to every probe-bearing action.
+def test_probe_bearing_actions_thread_the_synthetic_marker_into_the_probe():
+    """The handler must pass a synthetic-run `probe` to every probe-bearing action.
 
-    The payload half (above) is inert without this half: `dry_run` reaching the
-    Lambda changes nothing about log severity unless the handler threads it
-    down. `check_pipeline_contract` ALREADY carried `dry_run: true` before
-    I7954 and still logged its violations at ERROR — which is why the fix is
-    not "add dry_run" alone.
+    A probe flag reaching the Lambda changes nothing about log severity unless
+    the handler threads it down. `check_pipeline_contract` ALREADY carried
+    `dry_run: true` before I7954 and still logged its violations at ERROR —
+    which is why the fix was never "add dry_run" alone.
+
+    alpha-engine-config-I8155 widened it. `probe=dry_run` works today and BOTH
+    halves are pinned — this test for the handler side, and
+    `test_every_predictor_canary_payload_carries_dry_run` for the payload side.
+    But `dry_run` is a per-payload literal, and its own history is the argument
+    against relying on one: `check_lib_pin_drift` was added to the matrix
+    WITHOUT it and stayed that way until a canary paged a real, useless,
+    self-clearing cross-repo parity break on 2026-08-21 (I7954). The payload
+    guard was written in response to that page, not before it.
+
+    Both probe sites therefore also read `invocation_kind`, which
+    `run_canary_action` stamps at the one chokepoint every call site passes
+    through — a new gate action cannot be added without it, so this class
+    cannot recur even once. `dry_run` is kept as an OR so an explicit
+    hand-invoked dry run still suppresses when no marker is present.
+
+    NOTE, recorded because the error is instructive: I8155's PR body and commit
+    message claimed `check_lib_pin_drift`'s canary payload carried no `dry_run`
+    and that I7954's suppression had never applied to it. That was FALSE when
+    written — I7954 (PR537, commit 3158c27) had already added it, four days
+    earlier. The claim came from reading `infrastructure/deploy.sh` in the
+    shared checkout, which was 35 commits behind `origin/main`, and not
+    re-reading it in the worktree. The `invocation_kind` fix is unaffected and
+    live-verified; only its stated rationale was wrong.
     """
     handler_src = HANDLER_PY.read_text()
-    for call in (
-        "check_lib_pin_drift(probe=dry_run)",
-        "check_pipeline_contract(probe=dry_run)",
-    ):
-        assert call in handler_src, (
-            f"inference/handler.py no longer contains `{call}` — a probe "
-            f"invoked without its synthetic-run flag pages on every finding "
-            f"(alpha-engine-config-I7954)"
+    for call in ("check_lib_pin_drift(", "check_pipeline_contract("):
+        index = handler_src.find(call)
+        assert index != -1, f"inference/handler.py no longer calls `{call}`"
+        window = handler_src[index : index + 200]
+        assert "dry_run or is_synthetic_invocation(event)" in window, (
+            f"`{call}` no longer threads the synthetic marker into its probe — "
+            f"a probe invoked without it pages on every finding "
+            f"(alpha-engine-config-I7954, I8155)"
         )
+
+
+def test_the_canary_helper_stamps_the_synthetic_marker_on_every_payload():
+    """The marker is stamped once, where no call site can omit it.
+
+    Asserting it on the helper rather than on each payload literal is the
+    point: a per-site declaration is a per-site drift, and `dry_run` — which
+    IS asserted per-payload, by
+    `test_every_predictor_canary_payload_carries_dry_run` — only got that
+    guard after a missing literal paged Brian (I7954, 2026-08-21). A guard
+    that can only be written after the omission is a guard that permits the
+    first one.
+    """
+    deploy_src = DEPLOY_SH.read_text()
+    helper_start = deploy_src.index("run_canary_action() {")
+    helper = deploy_src[helper_start : deploy_src.index("\n}", helper_start)]
+    assert 'obj["invocation_kind"] = "canary"' in helper, (
+        "run_canary_action no longer stamps invocation_kind — every canary "
+        "then reaches the handlers indistinguishable from a real Step "
+        "Functions invocation (alpha-engine-config-I8155)"
+    )

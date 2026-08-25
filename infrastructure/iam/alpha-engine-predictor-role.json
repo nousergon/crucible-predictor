@@ -25,7 +25,8 @@
             "Resource": [
                 "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-inference:*",
                 "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-substrate:*",
-                "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-retrospective-eval:*"
+                "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-regime-retrospective-eval:*",
+        "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-predictor-health-check:*"
             ]
         },
         {
@@ -38,7 +39,8 @@
             "Resource": [
                 "arn:aws:cloudformation:us-east-1:711398986525:stack/alpha-engine-orchestration/*",
                 "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
-                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
+                "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
             ]
         },
         {

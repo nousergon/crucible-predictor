@@ -18,6 +18,7 @@ _ALIGNED = {
     "nousergon/nousergon-data": "v0.39.0",      # == floor → passes
     "nousergon/crucible-research": "v0.42.0",
     "nousergon/crucible-executor": "v0.124.79",  # alpha-engine-config-I7966
+    "nousergon/crucible-dashboard": "v0.124.86",  # alpha-engine-config-I8309
 }
 
 
@@ -128,6 +129,7 @@ def test_parity_mismatch_below_floor_combined():
         "nousergon/nousergon-data": "v0.30.0",        # below floor
         "nousergon/crucible-research": "v0.42.0",
         "nousergon/crucible-executor": "v0.124.79",
+        "nousergon/crucible-dashboard": "v0.124.86",
     }
     with _patch_pins(pins):
         out = lpd.check_lib_pin_drift()
@@ -501,3 +503,44 @@ def test_probe_downgrades_the_unverifiable_parity_halt_too(caplog):
     assert out["has_drift"] is True
     records = [r for r in caplog.records if "Lib-pin drift HALT" in r.getMessage()]
     assert [r.levelname for r in records] == ["WARNING"]
+
+
+# ── I8309: crucible-dashboard joins the checker's scope ──────────────────────
+#
+# Same shape as I7966 above, and found the same way: an audit of which repos
+# the probe actually reads. crucible-dashboard was in NEITHER tuple, so its
+# nousergon-lib pin was never looked at — while nousergon-data's CI installs
+# that lock and the Saturday/postclose SFs run `alpha_engine_lib.transparency`
+# out of its venv. Read from requirements.in for the executor's reason: its
+# requirements.txt is a uv lockfile that resolves the ref to a commit SHA.
+
+
+def test_dashboard_is_in_the_floor_repo_set_not_the_pair():
+    assert "nousergon/crucible-dashboard" in lpd._FLOOR_REPOS
+    assert "nousergon/crucible-dashboard" not in lpd._CO_INSTALL_PAIR
+
+
+def test_dashboard_pin_is_read_from_requirements_in_not_the_lockfile():
+    """The lockfile always reads as sha_pinned, so reading it would report
+    permanent unverifiability rather than the tag the repo actually declares."""
+    assert lpd._PIN_FILE_OVERRIDES["nousergon/crucible-dashboard"] == "requirements.in"
+
+
+def test_dashboard_appears_in_the_reported_pins_map_when_aligned():
+    # The acceptance signal: a live check_lib_pin_drift invocation must list
+    # the dashboard in its `pins` map — not just that a constant changed.
+    with _patch_pins(_ALIGNED):
+        out = lpd.check_lib_pin_drift()
+    assert "nousergon/crucible-dashboard" in out["pins"]
+    assert out["pins"]["nousergon/crucible-dashboard"] == "v0.124.86"
+
+
+def test_a_below_floor_dashboard_pin_is_caught():
+    """The property that matters: being in the map is not the same as being
+    CHECKED. A pin under MIN_LIB_VERSION must actually make the run drift."""
+    below = dict(_ALIGNED, **{"nousergon/crucible-dashboard": "v0.38.0"})
+    with _patch_pins(below):
+        out = lpd.check_lib_pin_drift()
+    assert out["has_drift"] is True
+    assert out["floor_ok"] is False
+    assert any("crucible-dashboard" in str(o) for o in out["offenders"])

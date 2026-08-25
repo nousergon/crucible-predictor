@@ -1228,6 +1228,13 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
             "promotion_baseline_ic": leaderboard.get("promotion_baseline_ic"),
             "promotion_baseline_source": leaderboard.get("promotion_baseline_source"),
             "trial_log_status": leaderboard.get("trial_log_status"),
+            # alpha-engine-config-I8195 — which absolute bar was applied and whether
+            # the candidate cleared it, so a future reader can tell a GATED promotion
+            # from an ungated one. `promote_min_ic` above records the number
+            # faithfully but cannot say whether it was a bar or a sign check.
+            "absolute_bar": leaderboard.get("absolute_bar"),
+            # Present only when the entrance gate refused this rotation's promotion.
+            "promotion_refused": leaderboard.get("promotion_refused"),
         },
         # Wall-clock write time (NOT a trade-decision key — run_date above is
         # the pipeline's trading_day per DATE_CONVENTIONS).
@@ -1476,6 +1483,191 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
         )
     except Exception:  # noqa: BLE001
         log.warning("model_zoo: observe alert failed", exc_info=True)
+
+
+from training.model_zoo_gates import (  # noqa: E402
+    NoGoodArmActuatorMissing,
+    NoGoodArmStateUnset,
+    RealizedEdgeFloorUnset,
+)
+
+# alpha-engine-config-I8175 — the exit gate's reserved-configuration failures.
+# Listed explicitly so the rotation's observability try/except cannot swallow them.
+_GATE_CONFIG_ERRORS = (
+    NoGoodArmStateUnset,
+    NoGoodArmActuatorMissing,
+    RealizedEdgeFloorUnset,
+)
+
+_OBSERVE_PREFIX = "predictor/model_zoo/observe_leaderboard"
+
+
+def _latest_attributed_slot_read(s3, bucket: str) -> dict:
+    """The most recent ATTRIBUTED realized-edge reading for the champion slot.
+
+    The ENTRANCE gate's input (alpha-engine-config-I8195). Deliberately the
+    PRIOR run's monitor: this runs before the promote, and the current run's
+    monitor is computed after it. Best-effort — an unreadable monitor yields an
+    empty dict, which the bar recorder renders as ``unmeasurable``, never a pass.
+    """
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{_OBSERVE_PREFIX}/latest.json")
+        payload = json.loads(obj["Body"].read())
+    except Exception:  # noqa: BLE001 — absence is reported as unmeasurable
+        log.warning(
+            "model_zoo: no readable observe_leaderboard/latest.json — the entrance "
+            "absolute bar will record slot_bar=unmeasurable "
+            "(alpha-engine-config-I8195)",
+            exc_info=True,
+        )
+        return {}
+    return (payload or {}).get("serving_champion_attributed") or {}
+
+
+def _read_monitor_history(s3, bucket: str, *, limit: int, latest: dict | None = None) -> list[dict]:
+    """The most recent champion realized-edge monitor payloads, NEWEST FIRST.
+
+    ``latest`` (this run's freshly-computed monitor) is placed at the head — it may
+    not have been listed yet by the time we read back. Best-effort: a read failure
+    yields the shortest honest history, which makes the gate report
+    ``unmeasurable``, never a pass (alpha-engine-config-I8175)."""
+    history: list[dict] = [latest] if latest else []
+    if limit <= len(history):
+        return history[:limit]
+    try:
+        keys: list[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{_OBSERVE_PREFIX}/"):
+            for obj in page.get("Contents", []) or []:
+                k = obj.get("Key", "")
+                if k.endswith("/latest.json") or not k.endswith(".json"):
+                    continue
+                keys.append(k)
+        seen = {(latest or {}).get("trading_day")}
+        for key in sorted(keys, reverse=True):
+            if len(history) >= limit:
+                break
+            payload = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            if payload.get("trading_day") in seen:
+                continue
+            seen.add(payload.get("trading_day"))
+            history.append(payload)
+    except Exception:  # noqa: BLE001 — a short history reports unmeasurable, not pass
+        log.warning(
+            "model_zoo: could not read the realized-edge monitor history — the "
+            "auto-demote gate will report unmeasurable (alpha-engine-config-I8175)",
+            exc_info=True,
+        )
+    return history[:limit]
+
+
+def _last_known_good_version(s3, bucket: str, history: list[dict], floor: float) -> str | None:
+    """The most recent champion version whose OWN attributed realized 21d rank-IC
+    cleared ``floor`` — the target of a ``last_known_good`` demote. None when no
+    version in the retained history ever cleared it, which is itself a verdict the
+    caller must surface rather than paper over."""
+    for payload in history:
+        for row in (payload or {}).get("realized_rank_ic_by_version") or []:
+            vid = row.get("version_id")
+            ic = row.get("realized_rank_ic")
+            if vid and isinstance(ic, (int, float)) and float(ic) > floor:
+                return vid
+    return None
+
+
+def _apply_realized_edge_demote(s3, bucket: str, date_str, verdict: dict, history: list[dict]) -> dict:
+    """Execute the EXIT gate's verdict (alpha-engine-config-I8175 / L4539).
+
+    Only reached with ``status == "demote"``, which is only reachable once the
+    operator has ruled the no-good-arm state AND that state has an actuator here.
+    Records what it did on the verdict — a demote that cannot record itself is the
+    fleet's dominant bug class (a record asserting an action that never happened),
+    so an execution failure is recorded and alarmed, never swallowed silently."""
+    state = verdict.get("demote_to")
+    if state == "hold_incumbent":
+        verdict["action"] = "held_incumbent"
+        verdict["action_detail"] = (
+            "no-good-arm state is hold_incumbent: the champion keeps serving and "
+            "keeps being measured. The gate fired and the ruled response is to do "
+            "nothing to the pointer — recorded so a reader can tell this apart from "
+            "a gate that never fired."
+        )
+        return verdict
+
+    if state == "last_known_good":
+        target = _last_known_good_version(s3, bucket, history, float(verdict["floor"]))
+        if not target:
+            verdict["action"] = "no_last_known_good"
+            verdict["action_detail"] = (
+                "no-good-arm state is last_known_good, but NO champion version in the "
+                "retained monitor history ever cleared the floor with its own "
+                "attributed realized edge — there is nothing good to revert to. The "
+                "incumbent is held and this is escalated rather than resolved."
+            )
+            return verdict
+        try:
+            from model.registry import promote_to_champion
+
+            promote_to_champion(s3, bucket, target)
+            verdict["action"] = "reverted_to_last_known_good"
+            verdict["action_target_version_id"] = target
+            verdict["action_detail"] = (
+                f"live weights reverted to {target}, the most recent version whose own "
+                f"attributed realized 21d rank-IC cleared the floor."
+            )
+        except Exception as exc:  # noqa: BLE001 — recorded + alarmed, never silent
+            verdict["action"] = "revert_failed"
+            verdict["action_error"] = str(exc)
+            verdict["action_detail"] = (
+                f"attempted revert to {target} FAILED — the champion is unchanged and "
+                f"still has no realized edge. This needs operator eyes."
+            )
+            log.error(
+                "model_zoo L4539: realized-edge demote to %s FAILED: %s",
+                target, exc, exc_info=True,
+            )
+        return verdict
+
+    # Unreachable: evaluate_realized_edge_exit refuses to arm on an unimplemented
+    # state. Fail loud rather than return a verdict claiming an action.
+    raise RuntimeError(
+        f"alpha-engine-config-I8175: no actuator for no-good-arm state {state!r} — "
+        "the arming check should have refused this."
+    )
+
+
+def _alert_realized_edge_gate(bucket, date_str, verdict: dict) -> None:
+    """Surface the EXIT gate's verdict on the operator channels whenever it did
+    anything or could not measure. A gate whose verdict lands only in
+    leaderboard.json is the half-finished automation #8175 was filed about."""
+    try:
+        status = verdict.get("status")
+        if status in ("disabled", "pass"):
+            return
+        severity = "critical" if status == "demote" else "warning"
+        msg = (
+            f"[predictor] Realized-edge EXIT gate ({date_str}) — status={status}.\n"
+            f"  {verdict.get('reason')}\n"
+            f"  action={verdict.get('action')} {verdict.get('action_detail') or ''}\n"
+            f"  floor={verdict.get('floor')} consecutive_required="
+            f"{verdict.get('consecutive_required')} "
+            f"no_good_arm_state={verdict.get('no_good_arm_state')}\n"
+            f"  Detail: predictor/model_zoo/leaderboard/{date_str}.json "
+            f"(realized_edge_exit_gate)."
+        )
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
+            message=msg, severity=severity,
+            # Same registered alert class as the rotation's other alerts
+            # (nousergon-data playbooks.yaml::alert_classes/predictor_model_zoo).
+            # One class per logical producer, not one per function — the
+            # chasing-noise alert beside this one declares the same source.
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_realized_edge_gate_{status}_{date_str}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: realized-edge gate alert failed", exc_info=True)
 
 
 def _alert_champion_chasing_noise(bucket, date_str, monitor) -> None:
@@ -2026,6 +2218,56 @@ def select_and_finalize(
         refresh_vid = leaderboard.get("champion_arch_refresh_version_id")
         promote_vid = winner_vid or refresh_vid
         promote_kind = "challenger" if winner_vid else ("champion-arch-refresh" if refresh_vid else None)
+
+        # ── ENTRANCE gate (alpha-engine-config-I8195) ────────────────────────────
+        # Record, on EVERY rotation, which absolute bar was applied and whether the
+        # candidate cleared it. Until now `promote_min_ic: 0.0` was recorded
+        # faithfully and read as a bar, when a zero floor is a sign check — a gated
+        # and an ungated promotion were indistinguishable in the artifact.
+        #
+        # The gate resolves the SAME realized-edge floor and the SAME no-good-arm
+        # state as the exit gate (training/model_zoo_gates.py), which is how the
+        # entrance and the exit are held consistent: the system cannot demote into a
+        # state promotion would have refused, because there is one state and one
+        # bar, read by both.
+        from training.model_zoo_gates import evaluate_absolute_bar
+
+        _slot = _latest_attributed_slot_read(s3, bucket) if s3 is not None else {}
+        _bar = evaluate_absolute_bar(
+            promote_min_ic=float(leaderboard.get("promote_min_ic") or 0.0),
+            candidate_cpcv_ic=(_candidate_by_vid(leaderboard, promote_vid) or {}).get(
+                "cpcv_mean_ic"
+            ) if promote_vid else None,
+            slot_realized_rank_ic=_slot.get("realized_rank_ic"),
+            slot_attribution_status=_slot.get("attribution_status"),
+        )
+        leaderboard["absolute_bar"] = _bar
+
+        _slot_bar = _bar.get("slot_bar") or {}
+        if promote_vid and _slot_bar.get("is_gating") and _slot_bar.get("clears") is False:
+            # The slot itself has no demonstrated realized edge. Admitting a new,
+            # unproven arm to live capital is not the answer to that — the ruled
+            # no-good-arm state is. Refusing here rather than promoting is what
+            # makes "none of these is good enough" an expressible outcome
+            # (champion-challenger-policy §5: promotion is a decision against a
+            # stated bar, not a ranking).
+            _state = _slot_bar.get("no_good_arm_state")
+            leaderboard["promotion_refused"] = {
+                "would_have_promoted": promote_vid,
+                "would_have_been_kind": promote_kind,
+                "no_good_arm_state": _state,
+                "reason": (
+                    f"ENTRANCE gate: {_slot_bar.get('reason')} — no arm is admitted to "
+                    f"live capital while the slot sits at or below the floor the exit "
+                    f"gate demotes for. No-good-arm state: {_state}."
+                ),
+            }
+            log.error(
+                "model_zoo ENTRANCE gate (alpha-engine-config-I8195): REFUSING to "
+                "promote %s — %s", promote_vid, _slot_bar.get("reason"),
+            )
+            promote_vid, promote_kind = None, None
+
         if promote_vid and auto_promote_winner:
             try:
                 from model.registry import promote_to_champion
@@ -2098,6 +2340,48 @@ def select_and_finalize(
             # remediation (rotate / retrain / hold) depends on the operator SEEING this.
             if _mon.get("chasing_noise") is True:
                 _alert_champion_chasing_noise(bucket, date_str, _mon)
+
+            # alpha-engine-config-I8175 (L4539) — the EXIT gate. Distinct from the
+            # noise-watch alert above in the only way that matters: it reads the
+            # ATTRIBUTED per-version realized edge, never the slot aggregate, and it
+            # is allowed to ACT. Both this gate and the ENTRANCE bar recorded below
+            # resolve the same no-good-arm state from
+            # training/model_zoo_gates.py, so the exit can never move the system
+            # into a state the entrance would refuse.
+            from training.model_zoo_gates import (
+                evaluate_realized_edge_exit,
+                resolve_demote_consecutive,
+            )
+
+            try:
+                _need = resolve_demote_consecutive()
+            except Exception:  # noqa: BLE001 — unarmed gate needs no history
+                _need = 1
+            _history = _read_monitor_history(s3, bucket, limit=max(_need, 1), latest=_mon)
+            _verdict = evaluate_realized_edge_exit(_history)
+            if _verdict.get("status") == "demote":
+                _verdict = _apply_realized_edge_demote(
+                    s3, bucket, date_str, _verdict, _history
+                )
+            leaderboard["realized_edge_exit_gate"] = _verdict
+            _alert_realized_edge_gate(bucket, date_str, _verdict)
+            log.info(
+                "model_zoo L4539 exit gate: status=%s action=%s — %s",
+                _verdict.get("status"), _verdict.get("action"), _verdict.get("reason"),
+            )
+        except _GATE_CONFIG_ERRORS:
+            # alpha-engine-config-I8175 — NOT swallowed. The realized-edge gate is
+            # ARMED but its reserved configuration (no-good-arm state / floor /
+            # hysteresis) is unset or has no actuator. That is a deployment defect,
+            # not observability: swallowing it would leave an armed gate that
+            # silently never fires, which is the exact "detected and paged" half-
+            # automation this work exists to remove. Fail the rotation loudly.
+            log.error(
+                "model_zoo L4539: the realized-edge exit gate is ARMED but its "
+                "reserved configuration is unset or unactuatable — raising",
+                exc_info=True,
+            )
+            raise
         except Exception:  # noqa: BLE001 — monitor is observability off a path that already promoted
             log.warning("model_zoo: champion realized-edge monitor failed", exc_info=True)
     finally:
