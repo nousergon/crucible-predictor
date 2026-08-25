@@ -392,14 +392,29 @@ def test_probe_bearing_actions_thread_the_synthetic_marker_into_the_probe():
     `dry_run: true` before I7954 and still logged its violations at ERROR —
     which is why the fix was never "add dry_run" alone.
 
-    alpha-engine-config-I8155: nor was `probe=dry_run` alone enough. This test
-    pinned that expression while the OTHER half — `dry_run` present in the
-    payload literal — was pinned nowhere, and `check_lib_pin_drift`'s canary
-    payload never carried it. The guard passed for I7954's entire life on a
-    call site where I7954's suppression did not apply. Both probe sites now
-    read `invocation_kind`, which `run_canary_action` stamps centrally and no
-    payload literal can drift out of; `dry_run` is kept as an OR so an
-    explicit hand-invoked dry run still suppresses.
+    alpha-engine-config-I8155 widened it. `probe=dry_run` works today and BOTH
+    halves are pinned — this test for the handler side, and
+    `test_every_predictor_canary_payload_carries_dry_run` for the payload side.
+    But `dry_run` is a per-payload literal, and its own history is the argument
+    against relying on one: `check_lib_pin_drift` was added to the matrix
+    WITHOUT it and stayed that way until a canary paged a real, useless,
+    self-clearing cross-repo parity break on 2026-08-21 (I7954). The payload
+    guard was written in response to that page, not before it.
+
+    Both probe sites therefore also read `invocation_kind`, which
+    `run_canary_action` stamps at the one chokepoint every call site passes
+    through — a new gate action cannot be added without it, so this class
+    cannot recur even once. `dry_run` is kept as an OR so an explicit
+    hand-invoked dry run still suppresses when no marker is present.
+
+    NOTE, recorded because the error is instructive: I8155's PR body and commit
+    message claimed `check_lib_pin_drift`'s canary payload carried no `dry_run`
+    and that I7954's suppression had never applied to it. That was FALSE when
+    written — I7954 (PR537, commit 3158c27) had already added it, four days
+    earlier. The claim came from reading `infrastructure/deploy.sh` in the
+    shared checkout, which was 35 commits behind `origin/main`, and not
+    re-reading it in the worktree. The `invocation_kind` fix is unaffected and
+    live-verified; only its stated rationale was wrong.
     """
     handler_src = HANDLER_PY.read_text()
     for call in ("check_lib_pin_drift(", "check_pipeline_contract("):
@@ -414,10 +429,15 @@ def test_probe_bearing_actions_thread_the_synthetic_marker_into_the_probe():
 
 
 def test_the_canary_helper_stamps_the_synthetic_marker_on_every_payload():
-    """The half I7954 left unpinned, pinned at the chokepoint this time.
+    """The marker is stamped once, where no call site can omit it.
 
     Asserting it on the helper rather than on each payload literal is the
-    point: a per-site declaration is a per-site drift.
+    point: a per-site declaration is a per-site drift, and `dry_run` — which
+    IS asserted per-payload, by
+    `test_every_predictor_canary_payload_carries_dry_run` — only got that
+    guard after a missing literal paged Brian (I7954, 2026-08-21). A guard
+    that can only be written after the omission is a guard that permits the
+    first one.
     """
     deploy_src = DEPLOY_SH.read_text()
     helper_start = deploy_src.index("run_canary_action() {")
