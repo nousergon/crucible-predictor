@@ -170,12 +170,49 @@ class TestEmailIcHeader:
             )
 
     def test_realized_ic_preferred(self):
+        """The realized reading wins over the training-time one.
+
+        The LABEL changed with alpha-engine-config-I8701: "IC (30d)" was wrong
+        in two ways at once — the producer's window is `lookback_days` (60 at
+        forward_days=21, never 30), and the pool is version-unattributed while
+        the row above it names a model version.
+        """
         _, html, plain = self._email(
             {"model_version": "m", "inference_mode": "meta",
              "ic_30d": 0.1234, "meta_val_ic": 0.346}
         )
-        assert "IC (30d)" in html and "0.1234" in html
-        assert "IC (30d)" in plain
+        assert "0.1234" in html
+        assert "IC (realized" in html
+        assert "IC (30d)" not in html, "the unqualified 30d label is a false claim"
+        assert "Version-unattributed" in html
+        assert "IC (realized" in plain
+        assert "Version-unattributed" in plain
+
+    def test_realized_ic_label_states_the_real_window(self):
+        """With the descriptor block present (crucible-backtester-PR733) the
+        label carries the ACTUAL lookback, not the misnomer."""
+        _, html, plain = self._email(
+            {"model_version": "m", "inference_mode": "meta", "ic_30d": -0.0768,
+             "realized_ic": {"value": -0.0768, "window_days": 60,
+                             "horizon_days": 21, "n_rows": 547,
+                             "n_effective": 2}}
+        )
+        assert "IC (60d realized)" in html
+        assert "547 graded rows" in html
+        assert "~2 independent 21d window(s)" in html
+        assert "canonical_predicted_alpha" in html
+        assert "IC (60d realized)" in plain
+
+    def test_realized_caveat_survives_a_producer_without_the_block(self):
+        """A metrics artifact written before PR733 carries no `realized_ic`.
+        The attribution caveat is true regardless and must still appear —
+        otherwise the honest label depends on a deploy ordering."""
+        _, html, _ = self._email(
+            {"model_version": "m", "inference_mode": "meta", "ic_30d": 0.05}
+        )
+        assert "IC (realized, rolling)" in html
+        assert "Version-unattributed" in html
+        assert "IC (30d)" not in html
 
     def test_meta_val_ic_fallback(self):
         _, html, _ = self._email(
@@ -183,6 +220,10 @@ class TestEmailIcHeader:
              "ic_30d": None, "meta_val_ic": 0.3461}
         )
         assert "IC (val)" in html and "0.3461" in html
+        # I8701: the fallback is an in-training estimate, and the brief must
+        # say so — it is the one reading that IS attributable to the named
+        # model, and a reader cannot tell that from "IC (val)" alone.
+        assert "not realized live skill" in html
 
     def test_dash_when_neither(self):
         _, html, _ = self._email({"model_version": "m", "inference_mode": "meta"})
