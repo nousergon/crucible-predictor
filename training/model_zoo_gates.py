@@ -498,3 +498,145 @@ def evaluate_absolute_bar(
     }
     record["gated"] = True
     return record
+
+
+# ── The OBSERVE-mode floor sweep (alpha-engine-config-I8195 deliverable 1) ────
+#
+# Everything above is built, correct, and inert. Five reserved values stand
+# between it and arming: the no-good-arm state, the realized-edge floor, the
+# hysteresis count, the attribution scope, and the master switch. Four of the
+# five are a genuine operator decision and the modules say so.
+#
+# But `MODEL_ZOO_REALIZED_EDGE_FLOOR` is a NUMBER, and asking an operator to
+# nominate a number is asking for a guess. -I8195 deliverable 1 says so
+# outright: "a threshold picked without this is a guess wearing a number."
+#
+# This is the measurement that answers it. On every rotation it records what
+# BOTH gates WOULD have decided, across a range of candidate floors, both
+# attribution scopes, and each hysteresis count — from the same attributed
+# readings the armed gates would read. It never resolves a reserved value, never
+# consults the master switch, and returns a verdict for exactly one purpose: so
+# the ruling is a pick from a measured curve rather than a nomination.
+#
+# It cannot act. There is no code path from this function to a promotion, a
+# demotion, or a weights write, and `test_floor_sweep_cannot_act` pins that.
+
+#: Candidate floors swept, in realized 21d rank-IC. Spans "demote only on a
+#: clearly negative reading" through "demote unless the arm is measurably
+#: positive". Deliberately NOT a recommendation — the point is to show the
+#: operator what each choice would have done.
+FLOOR_SWEEP: tuple[float, ...] = (-0.15, -0.10, -0.05, -0.02, 0.0, 0.02, 0.05)
+
+#: Hysteresis counts swept (champion-challenger-policy §5.2).
+CONSECUTIVE_SWEEP: tuple[int, ...] = (1, 2, 3)
+
+
+def evaluate_floor_sweep(monitor_history: list[dict]) -> dict:
+    """What the entrance and exit gates WOULD do, per (scope, floor, hysteresis).
+
+    Pure observability. Never raises, never resolves a reserved config value,
+    never acts. Returns a record for the leaderboard artifact.
+
+    ``monitor_history`` is newest-first, the same input
+    ``evaluate_realized_edge_exit`` takes.
+    """
+    max_need = max(CONSECUTIVE_SWEEP)
+    scopes: dict[str, dict] = {}
+
+    for scope in ATTRIBUTION_SCOPES:
+        field = _SCOPE_FIELD[scope]
+        readings = []
+        for payload in (monitor_history or [])[:max_need]:
+            attributed = (payload or {}).get(field) or {}
+            readings.append({
+                "trading_day": (payload or {}).get("trading_day"),
+                "version_id": attributed.get("version_id") or attributed.get("line"),
+                "realized_rank_ic": attributed.get("realized_rank_ic"),
+                "n_matured_outcomes": attributed.get("n_matured_outcomes"),
+                "attribution_status": attributed.get("attribution_status"),
+            })
+        usable = [
+            r for r in readings
+            if isinstance(r.get("realized_rank_ic"), (int, float))
+        ]
+
+        if not usable:
+            scopes[scope] = {
+                "status": "unmeasurable",
+                "n_attributed_readings": 0,
+                "readings": readings,
+                "reason": (
+                    f"no attributed realized-edge reading at scope {scope!r}. "
+                    "Reported, never rendered as a pass "
+                    "(champion-challenger-policy §5.1)."
+                ),
+                "grid": [],
+            }
+            continue
+
+        grid = []
+        for floor in FLOOR_SWEEP:
+            below = [r for r in usable if float(r["realized_rank_ic"]) <= floor]
+            latest_below = float(usable[0]["realized_rank_ic"]) <= floor
+            row = {
+                "floor": floor,
+                "latest_realized_rank_ic": float(usable[0]["realized_rank_ic"]),
+                "n_readings_at_or_below": len(below),
+                # The ENTRANCE gate reads only the latest slot value, with no
+                # hysteresis — it refuses to admit a new arm while the slot sits
+                # at or below the floor.
+                "entrance_would_refuse": latest_below,
+                "exit_would_demote": {},
+            }
+            for need in CONSECUTIVE_SWEEP:
+                if len(usable) < need:
+                    row["exit_would_demote"][str(need)] = "unmeasurable"
+                else:
+                    row["exit_would_demote"][str(need)] = bool(
+                        len([
+                            r for r in usable[:need]
+                            if float(r["realized_rank_ic"]) <= floor
+                        ]) >= need
+                    )
+            grid.append(row)
+
+        scopes[scope] = {
+            "status": "measured",
+            "n_attributed_readings": len(usable),
+            "readings": readings,
+            "grid": grid,
+        }
+
+    # Which reserved values are still outstanding. Recorded so the artifact
+    # answers "what is this waiting on?" without a reader opening config.py.
+    outstanding = []
+    for name, resolver in (
+        ("MODEL_ZOO_REALIZED_EDGE_FLOOR", resolve_realized_edge_floor),
+        ("MODEL_ZOO_REALIZED_EDGE_DEMOTE_CONSECUTIVE", resolve_demote_consecutive),
+        ("MODEL_ZOO_NO_GOOD_ARM_STATE", resolve_no_good_arm_state),
+        ("MODEL_ZOO_DEMOTE_ATTRIBUTION_SCOPE", resolve_attribution_scope),
+    ):
+        try:
+            resolver()
+        except (RealizedEdgeFloorUnset, NoGoodArmStateUnset):
+            outstanding.append(name)
+
+    return {
+        "kind": "realized_edge_floor_sweep",
+        "mode": "observe",
+        "acts": False,
+        "gate_armed": demote_gate_enabled(),
+        "floors_swept": list(FLOOR_SWEEP),
+        "consecutive_swept": list(CONSECUTIVE_SWEEP),
+        "scopes": scopes,
+        "reserved_values_outstanding": outstanding,
+        "note": (
+            "OBSERVE ONLY — this record has no path to a promotion, a demotion or "
+            "a weights write. It exists so the reserved realized-edge floor "
+            "(alpha-engine-config-I8195) is ruled from a measured curve rather "
+            "than nominated. `entrance_would_refuse` and `exit_would_demote` are "
+            "counterfactuals over the SAME attributed readings the armed gates "
+            "read; `unmeasurable` means the history is shorter than that "
+            "hysteresis count, never a pass."
+        ),
+    }

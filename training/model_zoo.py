@@ -2357,7 +2357,45 @@ def select_and_finalize(
                 _need = resolve_demote_consecutive()
             except Exception:  # noqa: BLE001 — unarmed gate needs no history
                 _need = 1
-            _history = _read_monitor_history(s3, bucket, limit=max(_need, 1), latest=_mon)
+            # alpha-engine-config-I8195 deliverable 1 — the OBSERVE-mode floor
+            # sweep. Read enough history for the widest hysteresis in the sweep,
+            # not just the (possibly unset, defaulted-to-1) armed count: the
+            # sweep's whole value is showing what a LONGER hysteresis would have
+            # done, and it cannot show that from one reading.
+            from training.model_zoo_gates import (
+                CONSECUTIVE_SWEEP,
+                evaluate_floor_sweep,
+            )
+
+            _history = _read_monitor_history(
+                s3, bucket,
+                limit=max(_need, max(CONSECUTIVE_SWEEP)),
+                latest=_mon,
+            )
+            # Runs BEFORE the armed gate and outside its raise path: the sweep is
+            # what makes the reserved floor rulable, so it must be produced on
+            # exactly the runs where that configuration is still missing.
+            try:
+                leaderboard["realized_edge_floor_sweep"] = evaluate_floor_sweep(_history)
+                log.info(
+                    "model_zoo I8195 floor sweep (observe): outstanding=%s",
+                    leaderboard["realized_edge_floor_sweep"].get(
+                        "reserved_values_outstanding"
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — pure observability; the armed
+                # gate below is the load-bearing path and must not be blocked by
+                # a defect in a counterfactual recorder. Recorded on the
+                # leaderboard so the absence is a fact, not a silence.
+                log.warning(
+                    "model_zoo I8195 floor sweep failed — recorded as errored",
+                    exc_info=True,
+                )
+                leaderboard["realized_edge_floor_sweep"] = {
+                    "kind": "realized_edge_floor_sweep",
+                    "mode": "observe",
+                    "status": "error",
+                }
             _verdict = evaluate_realized_edge_exit(_history)
             if _verdict.get("status") == "demote":
                 _verdict = _apply_realized_edge_demote(
