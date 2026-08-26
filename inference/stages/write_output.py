@@ -829,15 +829,75 @@ def _build_predictor_email(
 
     model_version = metrics.get("model_version", "unknown")
 
-    # IC header (config#1815): prefer the realized 30d IC (backtester-owned
-    # rolling field, carried forward by the metrics build); fall back to the
+    # IC header (config#1815): prefer the realized rolling IC (backtester-owned
+    # field, carried forward by the metrics build); fall back to the
     # training-time CPCV validation IC with an honest label; dash if neither.
-    val_ic   = metrics.get("ic_30d")          # realized, 30d rolling
+    val_ic   = metrics.get("ic_30d")          # realized, rolling
     ic_label = "IC (30d)"
     if not isinstance(val_ic, (int, float)):
         val_ic   = metrics.get("meta_val_ic")  # training-time CPCV val IC
         ic_label = "IC (val)"
     n_total = len(predictions)
+
+    # alpha-engine-config-I8701 — the header LABEL must describe the number.
+    # Two defects, both live on the 2026-08-26 brief, which rendered
+    # "Model: meta-v3.0-8models / IC (30d): -0.0768" as two rows of one table:
+    #
+    #   1. "30d" is wrong. The producer's window is `lookback_days`
+    #      (60 calendar days at forward_days=21), never 30 — the field name
+    #      `ic_30d` is a back-compat misnomer, and the label inherited it.
+    #   2. The number is NOT the named model's. The realized pool is
+    #      version-unattributed: it spans every prediction graded in the
+    #      window while the champion rotates WEEKLY, and only pairs whose
+    #      21d forward window has CLOSED are scored — so the matured subset
+    #      is structurally the OLDEST weeks of the window and contains zero
+    #      predictions from the version currently serving
+    #      (alpha-engine-config-I8219). Printing it beside `Model` is
+    #      champion-challenger-policy §7.5: an artifact asserting something
+    #      false about its own origin.
+    #
+    # Both are fixed by describing the number honestly, not by hiding it. The
+    # value stays on the brief — it is real, it is just not what the old label
+    # claimed. The structural fix (attributing realized skill to the serving
+    # version) is I8219 and is not available from this artifact.
+    # The attribution caveat does NOT depend on the descriptor block: it is true
+    # of the realized IC whether or not `realized_ic` is present (the block
+    # arrives with crucible-backtester-PR733). Only the sample detail and the
+    # corrected window are conditional, so this label stays honest on a metrics
+    # artifact written by either version of the producer.
+    _ric = metrics.get("realized_ic")
+    ic_caveat = ""
+    if ic_label == "IC (30d)":
+        _bits = []
+        if isinstance(_ric, dict):
+            _window = _ric.get("window_days")
+            if isinstance(_window, int):
+                ic_label = f"IC ({_window}d realized)"
+            _nrows, _neff = _ric.get("n_rows"), _ric.get("n_effective")
+            if isinstance(_nrows, int):
+                _bits.append(f"{_nrows} graded rows")
+            if isinstance(_neff, int):
+                _bits.append(
+                    f"~{_neff} independent {_ric.get('horizon_days', 21)}d window(s)"
+                )
+        else:
+            # No descriptor block: the producer predates PR733. The label is
+            # still wrong about its window, so say the window is unstated
+            # rather than repeating the "30d" claim as if it were checked.
+            ic_label = "IC (realized, rolling)"
+        ic_caveat = (
+            "Version-unattributed: pooled across every champion that served in "
+            "the window, which is not the model named above — the serving "
+            "version's own 21d forward windows have not closed yet. "
+            + ("Sample: " + ", ".join(_bits) + ". " if _bits else "")
+            + "Signal leg is the derived direction probability, not "
+            "canonical_predicted_alpha."
+        )
+    elif ic_label == "IC (val)":
+        ic_caveat = (
+            "Training-time CPCV validation IC — an in-training estimate for this "
+            "model, not realized live skill. No realized reading was available."
+        )
 
     # Counts for subject + summary
     ups   = [p for p in predictions if p.get("predicted_direction") == "UP"]
@@ -901,7 +961,15 @@ def _build_predictor_email(
 
     summary_rows_html = [
         f'<tr><td {TD}>Model</td><td {TD}>{model_version}</td></tr>',
-        f'<tr><td {TD}>{ic_label}</td><td {TD}>{ic_str}</td></tr>',
+        # alpha-engine-config-I8701: the caveat rides in the SAME cell as the
+        # number. A footnote elsewhere in the body is a different reading —
+        # the value and its provenance must not be separable by a skim.
+        f'<tr><td {TD}>{ic_label}</td><td {TD}>{ic_str}'
+        + (
+            f'<div style="font-size:11px; color:#777; margin-top:3px; '
+            f'line-height:1.4;">{ic_caveat}</div>' if ic_caveat else ""
+        )
+        + '</td></tr>',
         f'<tr><td {TD}>Mode</td><td {TD}>{metrics.get("inference_mode", "mse")}</td></tr>',
         f'<tr><td {TD}>Universe</td><td {TD}>{n_total} tickers</td></tr>',
         f'<tr><td {TD}>UP / DOWN</td><td {TD}>{len(ups)} / {len(downs)}</td></tr>',
@@ -962,6 +1030,10 @@ def _build_predictor_email(
         f"UP / DOWN: {len(ups)} / {len(downs)}"
         + (f"  Vetoes: {n_vetoed}" if n_vetoed else "")
         + (f"  Regime: {market_regime.upper()}" if market_regime else "")
+        # alpha-engine-config-I8701: the plain-text leg carries the same caveat.
+        # A reader on a text client must not get the number without its
+        # provenance while the HTML reader gets both.
+        + (f"\n{ic_label}: {ic_caveat}" if ic_caveat else "")
         + "\n\n"
         f"{warning_plain}"
         f"Full morning briefing: {url}\n"
