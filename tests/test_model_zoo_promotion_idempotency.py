@@ -53,6 +53,21 @@ class _FakeS3:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.puts = {}
+        # alpha-engine-config-I9018 — model the POST-FIX world: the live manifest
+        # is a POINTER (``served_version``) and the incumbent's CPCV lives in
+        # that version's immutable registry bundle. A fixture that says "the
+        # serving champion scores X" therefore still means that. An explicit
+        # served_version or bundle in ``objects`` is left untouched.
+        _live_key = getattr(cfg, "META_MANIFEST_KEY", None)
+        _live = self.objects.get(_live_key)
+        if isinstance(_live, dict):
+            _vid = _live.get("served_version") or "v-serving-incumbent"
+            _live = dict(_live)
+            _live["served_version"] = _vid
+            self.objects[_live_key] = _live
+            self.objects.setdefault(
+                f"predictor/registry/{_vid}/manifest.json", dict(_live)
+            )
 
     def get_object(self, Bucket, Key):  # noqa: N803
         if Key not in self.objects:

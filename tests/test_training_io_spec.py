@@ -18,11 +18,13 @@ import pytest
 from training.io_spec import TrainingIOSpec
 
 
-# The live champion artifact paths a shadow run must NEVER write.
+# The live champion artifact paths NO training run may write — shadow or live.
+# alpha-engine-config-I9018: `live()` used to point straight at these.
 _LIVE_WEIGHTS_PREFIX = "predictor/weights/meta/"
 _LIVE_MANIFEST = "predictor/weights/meta/manifest.json"
 _LIVE_FEATURE_LIST = "predictor/weights/meta/feature_list.json"
 _LIVE_SUMMARY_LATEST = "predictor/metrics/training_summary_latest.json"
+_STAGING_PREFIX = "predictor/weights/meta_staging/"
 
 
 @pytest.fixture
@@ -33,6 +35,7 @@ def fake_config(monkeypatch):
     mod.META_WEIGHTS_PREFIX = _LIVE_WEIGHTS_PREFIX
     mod.META_MANIFEST_KEY = _LIVE_MANIFEST
     mod.META_FEATURE_LIST_KEY = _LIVE_FEATURE_LIST
+    mod.META_STAGING_PREFIX = _STAGING_PREFIX
     monkeypatch.setitem(sys.modules, "config", mod)
     return mod
 
@@ -46,11 +49,23 @@ def test_live_reads_canonical_universe_and_close(fake_config):
     assert io.shadow_basis is None
 
 
-def test_live_writes_live_champion_paths(fake_config):
+def test_live_writes_the_staging_prefix_never_the_serving_prefix(fake_config):
+    """alpha-engine-config-I9018 — the load-bearing assertion of the staging split.
+
+    RED against the pre-fix code: `live()` set all three of these to the live
+    serving prefix, so the Saturday retrain replaced the served model's manifest
+    and feature contract as a side effect of training. Nothing gated it, nothing
+    reported it, and it silently undid any rollback.
+    """
     io = TrainingIOSpec.live()
-    assert io.weights_prefix == _LIVE_WEIGHTS_PREFIX
-    assert io.manifest_key == _LIVE_MANIFEST
-    assert io.feature_list_key == _LIVE_FEATURE_LIST
+    assert io.weights_prefix == _STAGING_PREFIX
+    assert io.manifest_key == f"{_STAGING_PREFIX}manifest.json"
+    assert io.feature_list_key == f"{_STAGING_PREFIX}feature_list.json"
+    for path in (io.weights_prefix, io.manifest_key, io.feature_list_key):
+        assert not path.startswith(_LIVE_WEIGHTS_PREFIX), (
+            f"{path!r} is under the live serving prefix — training must never "
+            f"be able to write there (alpha-engine-config-I9018)"
+        )
     assert io.summary_key("2026-06-30") == (
         "predictor/metrics/training_summary_2026-06-30.json"
     )
@@ -59,6 +74,37 @@ def test_live_writes_live_champion_paths(fake_config):
         "predictor/diagnostics/oos_rows/2026-06-30.parquet"
     )
     assert io.oos_rows_latest_key == "predictor/diagnostics/oos_rows/latest.parquet"
+
+
+def test_live_for_run_scopes_by_date_and_model_version(fake_config):
+    """Two specs in the same rotation must not share an output prefix.
+
+    The dated archive held a model that was never champion (I9028) precisely
+    because several specs wrote one date-keyed directory in a single rotation.
+    Scoping by model_version as well as date makes that unrepresentable.
+    """
+    io = TrainingIOSpec.live()
+    a = io.for_run(date_str="2026-08-29", model_version="v3.0-meta")
+    b = io.for_run(date_str="2026-08-29", model_version="spec-resid")
+    assert a.weights_prefix == f"{_STAGING_PREFIX}2026-08-29/v3.0-meta/"
+    assert a.manifest_key == f"{a.weights_prefix}manifest.json"
+    assert a.feature_list_key == f"{a.weights_prefix}feature_list.json"
+    assert a.weights_prefix != b.weights_prefix
+    # Dated diagnostics/summary paths are deliberately NOT run-scoped.
+    assert a.summary_latest_key == _LIVE_SUMMARY_LATEST
+
+
+def test_for_run_refuses_an_unscoped_prefix(fake_config):
+    io = TrainingIOSpec.live()
+    with pytest.raises(ValueError, match="for_run requires"):
+        io.for_run(date_str="", model_version="v3.0-meta")
+    with pytest.raises(ValueError, match="for_run requires"):
+        io.for_run(date_str="2026-08-29", model_version="")
+
+
+def test_shadow_for_run_is_identity():
+    io = TrainingIOSpec.shadow("crsp")
+    assert io.for_run(date_str="2026-08-29", model_version="v3.0-meta") is io
 
 
 def test_live_is_promotable(fake_config):

@@ -930,10 +930,31 @@ MACRO_NORM_WINDOW = 252
 # Regime predictor uses macro series directly (not GBM features)
 # Research calibrator uses signals.json fields (not price features)
 
-# S3 keys for meta-model weights
+# ── The LIVE SERVING contract (read by inference) ────────────────────────────
+# alpha-engine-config-I9018/-I9028: this prefix is READ-ONLY to training. The
+# ONLY writer of the model contract under it is
+# ``model.registry.promote_to_champion``, which copies an immutable registry
+# bundle in. Training writes to META_STAGING_PREFIX below.
+#
+# Until 2026-08-28 the weekly retrain used this prefix as its scratch space:
+# ``TrainingIOSpec.live()`` pointed weights_prefix / manifest_key /
+# feature_list_key straight at it, so every spec in the Saturday rotation
+# overwrote the SERVED model's manifest and feature contract as a side effect of
+# training — which is why (a) the promotion gate read the candidate's own CPCV
+# back as the incumbent's (I9018), and (b) ``weights/meta/archive/{date}/``
+# captured whichever spec wrote last rather than the outgoing champion (I9028).
 META_WEIGHTS_PREFIX = "predictor/weights/meta/"
 META_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
 META_FEATURE_LIST_KEY = "predictor/weights/meta/feature_list.json"
+
+# ── The TRAINING STAGING root (written by training, never served) ────────────
+# Every live training run writes its artifacts under
+# ``{META_STAGING_PREFIX}{date}/{model_version_label}/`` — scoped by BOTH the
+# rotation date and the spec's version label, so two specs training in the same
+# weekly Map iteration can never overwrite each other's output. The registry
+# bundle is snapshotted from that per-run prefix; promotion is the only thing
+# that moves bytes from a bundle into META_WEIGHTS_PREFIX.
+META_STAGING_PREFIX = "predictor/weights/meta_staging/"
 
 # ── Feature engineering parameters ───────────────────────────────────────────
 FEATURE_CFG: dict = _cfg["features"]
