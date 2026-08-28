@@ -650,6 +650,7 @@ def write_predictions(
     veto_threshold: float | None = None,
     fd=None,
     level_neutralization: dict | None = None,
+    calibration_degradation: dict | None = None,
     n_universe: int | None = None,
     n_universe_covered: int | None = None,
     n_intended: int | None = None,
@@ -954,6 +955,17 @@ def write_predictions(
         # diff. When its `applied` is True the predictions' predicted_alpha is
         # already centered (the optimizer + gbm_veto inherit it).
         "level_neutralization": level_neutralization,
+        # Calibration-degradation block (alpha-engine-config-I9086). When
+        # `degraded` is True the served p_up/direction/confidence on this batch
+        # did NOT come from the calibrator — they come from the linear-heuristic
+        # rescale that `_rescale_cross_sectional` engages on a collapsed
+        # calibrator or a missing one. Before this field existed the fallback
+        # was an ERROR in a Lambda log and nothing else: the artifact was
+        # indistinguishable from a fully-calibrated batch, so the executor, the
+        # optimizer, the dashboard and EOD all consumed a degraded batch as a
+        # healthy one. Additive per the S3 schema contract; consumers that do
+        # not know the field treat the batch exactly as they do today.
+        "calibration_degradation": calibration_degradation,
         "predictions": predictions,
     }
 
@@ -1001,6 +1013,10 @@ def write_predictions(
         # Cross-sectional level-neutralization observe block (L4487) — forensic
         # trail alongside the gate (the two share the same skew→flush root).
         "level_neutralization": level_neutralization,
+        # Mirrored onto metrics/latest.json so a monitor can read the
+        # degradation without pulling the full prediction batch
+        # (alpha-engine-config-I9086).
+        "calibration_degradation": calibration_degradation,
     }
 
     predictions_json = json.dumps(output, indent=2)
@@ -1778,6 +1794,7 @@ def run(ctx: PipelineContext) -> None:
     write_predictions(ctx.predictions, ctx.date_str, ctx.bucket, metrics,
                       dry_run=ctx.dry_run, veto_threshold=veto_thresh, fd=ctx.fd,
                       level_neutralization=getattr(ctx, "level_neutralization", None),
+                      calibration_degradation=getattr(ctx, "calibration_degradation", None),
                       n_universe=n_universe, n_universe_covered=n_universe_covered,
                       n_intended=n_intended, n_intended_covered=n_intended_covered,
                       intended_source=intended_source)

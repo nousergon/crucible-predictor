@@ -429,6 +429,36 @@ def validate_live_batch_invariant_health(
         float(conf_violations / conf_checked) if conf_checked else 0.0
     )
 
+    # --- Direction-coherence invariant (OBSERVE-ONLY) -------------------------
+    # `predicted_direction` comes from `derive_direction(predicted_alpha)` while
+    # `p_up` comes from the calibrator. An isotonic calibrator whose step
+    # boundaries do not straddle 0.5 at alpha=0 makes the two disagree: a row can
+    # be `DOWN` with `p_up > 0.5`. The executor's veto reads direction and its
+    # sizing map reads confidence (derived from p_up), so a disagreeing row is
+    # sized on one belief and vetoed on the other.
+    #
+    # Measured on the live artifacts, 1-5 rows per session on all eight sessions
+    # 2026-08-19..28 (4/30 on 2026-08-28: THC, CART, ANF, RNR). It is therefore
+    # CHRONIC, and promoting it to a halt today would stop the book on a
+    # standing condition rather than a new one — so it is recorded here on the
+    # same observe-only boundary this module already uses for the isotonic shape
+    # stats (config#1373). Making it blocking is tracked separately; do not
+    # silence it by widening a tolerance (alpha-engine-config-I9088).
+    dir_checked = 0
+    dir_incoherent = 0
+    for p in predictions:
+        _pu, _d = p.get("p_up"), p.get("predicted_direction")
+        if not isinstance(_pu, (int, float)) or not isinstance(_d, str):
+            continue
+        if not math.isfinite(float(_pu)):
+            continue
+        dir_checked += 1
+        if (float(_pu) >= 0.5) != (_d.upper() == "UP"):
+            dir_incoherent += 1
+    dir_incoherence_rate = (
+        float(dir_incoherent / dir_checked) if dir_checked else 0.0
+    )
+
     # --- Observe-only isotonic-p_up shape stats (NEVER drive the verdict) -----
     if p_ups.size:
         rounded_p = np.round(p_ups, 6)
@@ -457,6 +487,10 @@ def validate_live_batch_invariant_health(
         "n_confidence_checked": conf_checked,
         "confidence_semantic_violation_rate": round(conf_violation_rate, 4),
         "confidence_semantic_max_delta": round(worst_conf_delta, 6),
+        # Direction coherence (OBSERVE-ONLY — does NOT drive the verdict):
+        "n_direction_checked": dir_checked,
+        "direction_incoherent_count": dir_incoherent,
+        "direction_incoherence_rate": round(dir_incoherence_rate, 4),
         # Observe-only isotonic shape stats (do NOT drive the verdict):
         "n_unique_p_up": n_unique_p_up,
         "modal_fraction": round(p_up_modal_fraction, 4),

@@ -53,6 +53,24 @@ def _sample_predictions():
     ]
 
 
+# The calibration-bearing fields — the ones the guard exists to protect. The
+# healthy path additionally STAMPS `calibration_basis: "calibrator"` on each row
+# (alpha-engine-config-I9086), so whole-dict equality would now fail for a
+# purely additive provenance field. Comparing the protected fields explicitly
+# says what the guard actually means and stays true as additive fields are
+# added, which is the S3 schema contract this repo already follows.
+_CALIBRATION_FIELDS = (
+    "p_up", "p_down", "predicted_direction", "prediction_confidence",
+    "predicted_alpha",
+)
+
+
+def _calibration_view(predictions):
+    return [
+        {k: p.get(k) for k in _CALIBRATION_FIELDS} for p in predictions
+    ]
+
+
 def test_rescaling_is_noop_with_calibrator():
     from inference.stages.run_inference import _rescale_cross_sectional
 
@@ -61,9 +79,12 @@ def test_rescaling_is_noop_with_calibrator():
 
     _rescale_cross_sectional(ctx)
 
-    assert ctx.predictions == original, (
+    assert _calibration_view(ctx.predictions) == _calibration_view(original), (
         "Calibrator was loaded; cross-sectional rescaling must not rewrite predictions."
     )
+    assert all(
+        p["calibration_basis"] == "calibrator" for p in ctx.predictions
+    ), "Healthy calibrated path must stamp the per-row calibration basis."
 
 
 def test_rescaling_runs_without_calibrator():
@@ -216,7 +237,7 @@ def test_variance_fallback_suppressed_for_small_batch():
     _rescale_cross_sectional(ctx)
 
     # No rewrite — calibrator's collapsed output is preserved untouched.
-    assert ctx.predictions == original, (
+    assert _calibration_view(ctx.predictions) == _calibration_view(original), (
         "Variance gate should be suppressed for small batches (N < 5). "
         "A 4-ticker batch with 1 unique p_up bin must NOT trigger the "
         "linear-fallback rewrite — that would clobber calibrator output "
@@ -249,7 +270,7 @@ def test_variance_fallback_clears_for_healthy_batch():
     _rescale_cross_sectional(ctx)
 
     # Healthy batch — calibrator output preserved, no rewrite.
-    assert ctx.predictions == original, (
+    assert _calibration_view(ctx.predictions) == _calibration_view(original), (
         "Healthy batch (5 unique p_up bins, N=27) should skip "
         "cross-sectional rescaling and preserve calibrator output. "
         f"Got {len({p['p_up'] for p in ctx.predictions})} unique "

@@ -1045,8 +1045,7 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     for i, p in enumerate(ctx.predictions):
         p["combined_rank"] = i + 1
 
-    _rescale_cross_sectional(ctx)
-    _apply_level_neutralization(ctx)
+    _finalize_calibration(ctx)
     _set_feature_drift_ks(ctx, drift_feature_rows)
     log.info(
         "Meta-inference complete: %d predictions, %d skipped, "
@@ -1159,6 +1158,15 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
                 "for today's batch.",
                 unique_count, n_preds, _MIN_UNIQUE_P_UP_BINS,
             )
+            ctx.calibration_degradation = {
+                "degraded": True,
+                "basis": "linear_heuristic_fallback",
+                "reason": "calibrator_collapse",
+                "n_unique_p_up_pre_fallback": unique_count,
+                "threshold": _MIN_UNIQUE_P_UP_BINS,
+                "batch_size": n_preds,
+                "calibrator_method": getattr(_cal, "method", None),
+            }
             # Fall through to the linear rescaling block below.
         else:
             log.info(
@@ -1166,6 +1174,17 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
                 "active (method=%s, ECE_after=%.4f, unique_p_up_bins=%d)",
                 _cal.method, _cal._ece_after or 0.0, unique_count,
             )
+            ctx.calibration_degradation = {
+                "degraded": False,
+                "basis": "calibrator",
+                "reason": None,
+                "n_unique_p_up_pre_fallback": unique_count,
+                "threshold": _MIN_UNIQUE_P_UP_BINS,
+                "batch_size": n_preds,
+                "calibrator_method": getattr(_cal, "method", None),
+            }
+            for p in ctx.predictions:
+                p["calibration_basis"] = "calibrator"
             return
     else:
         log.warning(
@@ -1173,6 +1192,15 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
             "rescaling. This path should only fire before the first "
             "post-migration retrain ships an isotonic calibrator to S3."
         )
+        ctx.calibration_degradation = {
+            "degraded": True,
+            "basis": "linear_heuristic_fallback",
+            "reason": "no_calibrator_loaded",
+            "n_unique_p_up_pre_fallback": None,
+            "threshold": _MIN_UNIQUE_P_UP_BINS,
+            "batch_size": len(ctx.predictions),
+            "calibrator_method": None,
+        }
     # Floor for the batch max_abs alpha when the linear-heuristic rescale
     # is engaged (no calibrator OR calibrator-collapse variance fallback).
     # Sized for the expected magnitude of cohort-level alpha at the active
@@ -1208,6 +1236,41 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction
         p["prediction_confidence"] = round(confidence, 4)
+        # The served p_up on this row did NOT come from the calibrator. Stamped
+        # per-row so a consumer that reads one prediction (executor sizing, the
+        # veto, the dashboard) can see the basis without reading batch-level
+        # metadata (alpha-engine-config-I9086).
+        p["calibration_basis"] = "linear_heuristic_fallback"
+
+
+def _finalize_calibration(ctx: "PipelineContext") -> None:
+    """Run the two calibration-finalizing transforms in the ONE correct order.
+
+    ORDER IS LOAD-BEARING (alpha-engine-config-I9086), which is why it lives in
+    a named function with its own test rather than as two adjacent calls in a
+    1200-line pipeline body.
+
+    ``_apply_level_neutralization`` must run FIRST. It re-derives
+    ``p_up``/``p_down``/``predicted_direction``/``prediction_confidence`` from
+    the centered alpha via ``calibrate_prediction``. ``_rescale_cross_sectional``
+    must run SECOND, so that:
+
+      * the calibrator-collapse variance gate counts the p_up bins that are
+        actually SERVED, not bins derived from the pre-centering alpha; and
+      * when that gate engages the linear-heuristic fallback, the fallback's
+        output is the last word on the batch.
+
+    Before 2026-08-28 the order was reversed. The consequence was measured on
+    the live 2026-08-28 batch: ``_rescale_cross_sectional`` detected the
+    collapse (2 unique bins across 30 tickers), logged the ERROR promising to
+    "recover variance for today's batch", recomputed every p_up from the linear
+    heuristic — and ``_apply_level_neutralization`` then overwrote all four
+    fields from the SAME collapsed calibrator. The recovery the ERROR announced
+    never reached the artifact, and the served batch was indistinguishable from
+    a healthy one.
+    """
+    _apply_level_neutralization(ctx)
+    _rescale_cross_sectional(ctx)
 
 
 def _apply_level_neutralization(ctx: "PipelineContext") -> None:
@@ -1229,6 +1292,7 @@ def _apply_level_neutralization(ctx: "PipelineContext") -> None:
             enabled=enabled,
             calibrator=getattr(ctx, "calibrator", None),
             label_clip=label_clip,
+            shadow_calibrator=getattr(ctx, "shadow_calibrator", None),
         )
     except Exception:  # noqa: BLE001 — observe transform must not kill inference
         log.warning(

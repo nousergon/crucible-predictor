@@ -40,12 +40,13 @@ inherit ONE corrected value — no per-consumer re-derivation.
     the inference loop used (``calibrator.calibrate_prediction``); ``gbm_veto``
     + the optimizer inherit it downstream.
 
-Limitation (documented): when the rare calibrator-collapse linear fallback in
-``_rescale_cross_sectional`` engaged, the live direction came from a batch
-``meta_clip`` rather than per-ticker ``calibrate_prediction``. The centered
-re-derivation here always uses ``calibrate_prediction`` (a monotonic,
-ranking-preserving mapping), so the two can differ slightly on that degraded
-path. Harmless while disabled (no live mutation); validated before cutover.
+Ordering (alpha-engine-config-I9086): this transform runs BEFORE
+``_rescale_cross_sectional``. The previous order ran the calibrator-collapse
+variance gate first, so it counted p_up bins derived from the RAW alpha and its
+linear-heuristic recovery was then overwritten here by
+``calibrate_prediction(centered)`` — the same collapsed calibrator it existed to
+route around. Neutralizing first means the variance gate counts the bins that
+are actually served, and a fallback it engages is the last word on the batch.
 """
 from __future__ import annotations
 
@@ -107,6 +108,7 @@ def apply_cross_sectional_neutralization(
     enabled: bool,
     calibrator,
     label_clip: float,
+    shadow_calibrator=None,
 ) -> dict:
     """Mutate ``predictions`` in place and return an observe block.
 
@@ -136,6 +138,7 @@ def apply_cross_sectional_neutralization(
         return block
 
     mean_raw = cross_sectional_mean(predictions)
+    lc_for_shadow = label_clip if (label_clip and label_clip > 0) else 0.15
 
     # Skew the gate currently sees (from the LIVE predicted_direction — raw when
     # disabled). Compared apples-to-apples against the centered re-derivation.
@@ -154,6 +157,39 @@ def apply_cross_sectional_neutralization(
 
         der = _derive(centered, calibrator, label_clip)
         centered_dirs.append(der["predicted_direction"])
+
+        # Shadow-Platt must be re-derived on the SAME alpha vintage the live
+        # p_up is derived from, or the config#1176 soak compares two different
+        # vectors (alpha-engine-config-I9086). `p_up_platt` was stamped in the
+        # per-ticker inference loop from the RAW alpha; once centering is the
+        # live transform, comparing Platt(raw) against isotonic(centered)
+        # measures the batch's common-mode macro level, not the calibration
+        # method. Measured on 2026-08-28: Platt(raw) put all 30 names above 0.5
+        # (direction_skew 1.00) while the served isotonic(centered) batch split
+        # 15/15. The pre-centering value is preserved additively so the soak
+        # keeps its history.
+        if enabled and shadow_calibrator is not None:
+            try:
+                if p.get("p_up_platt") is not None:
+                    p["p_up_platt_raw"] = p["p_up_platt"]
+                    p["p_up_platt"] = round(
+                        float(
+                            shadow_calibrator.calibrate_prediction(
+                                centered, label_clip=lc_for_shadow
+                            )["p_up"]
+                        ),
+                        4,
+                    )
+            except Exception:  # noqa: BLE001
+                # Observe-only field. A shadow-calibrate failure must not take
+                # the live batch with it; the pre-centering value is left in
+                # place and the mismatch is visible because `p_up_platt_raw`
+                # is absent on exactly the rows that failed.
+                log.warning(
+                    "Shadow-Platt re-derivation failed for %s — leaving the "
+                    "pre-centering p_up_platt in place",
+                    p.get("ticker"), exc_info=True,
+                )
 
         if enabled:
             p["predicted_alpha"] = round(centered, 6)
@@ -190,6 +226,11 @@ def apply_cross_sectional_neutralization(
         # What the optimizer will read off each record — published so an
         # operator can see the declared anchor without opening a prediction.
         "alpha_anchor": OPTIMIZER_ALPHA_ANCHOR if enabled else None,
+        # Whether `p_up_platt` on each row is the centered re-derivation (so the
+        # shadow gate is comparable to the live gate) or the raw-vintage value.
+        "shadow_platt_basis": (
+            "centered" if (enabled and shadow_calibrator is not None) else "raw"
+        ),
     }
     log.info(
         "Level-neutralization %s: mean_removed=%.6f  flips=%d  "
