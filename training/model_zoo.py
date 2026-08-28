@@ -727,6 +727,77 @@ def _selection_pbo(candidates: list[dict], manifests: dict) -> dict:
     return out
 
 
+def _resolve_rescored_serving_ic(manifests: dict, champ_arch_vid: str | None,
+                                 incumbent_vid: str | None) -> dict:
+    """The incumbent's CPCV over THIS rotation's folds, if any run computed it.
+
+    alpha-engine-config-I9024 §2. ``training/incumbent_rescore.py`` evaluates the
+    incumbent's FROZEN weights over each training run's own folds and writes the
+    result to that run's manifest under ``incumbent_rescore``. This picks the
+    right one and refuses the wrong ones.
+
+    Preference order, and each rule is load-bearing:
+
+      1. the CHAMPION-ARCH run's block, because champion-arch is already the
+         vintage-consistent baseline (#679ii) — its folds are the folds the
+         rotation is judged on;
+      2. failing that, any candidate's block, taken in a deterministic order so
+         two readers of the same leaderboard never disagree.
+
+    A block is used ONLY when ``status == "ok"`` AND it names the incumbent this
+    rotation actually resolved. A block naming a DIFFERENT incumbent is a run
+    that raced a promotion, and scoring against it would compare the candidate
+    to a model that is not serving.
+
+    Returns ``{"ic": float|None, "basis": str, "reason": str|None,
+    "source_version_id": str|None, "block": dict|None}``.
+    """
+    def _usable(vid):
+        block = (manifests.get(vid) or {}).get("incumbent_rescore") or {}
+        if not isinstance(block, dict) or block.get("status") != "ok":
+            return None, block
+        if block.get("mean_ic") is None:
+            return None, block
+        if incumbent_vid and block.get("incumbent_version_id") != incumbent_vid:
+            return None, {
+                **block,
+                "status": "wrong_incumbent",
+                "reason": (
+                    f"re-scored {block.get('incumbent_version_id')!r}, but this "
+                    f"rotation resolved the incumbent as {incumbent_vid!r} — a "
+                    f"run that raced a promotion. Refused."
+                ),
+            }
+        return block, block
+
+    order = ([champ_arch_vid] if champ_arch_vid else []) + sorted(
+        v for v in manifests if v != champ_arch_vid)
+    rejected: list[str] = []
+    for vid in order:
+        if not vid:
+            continue
+        block, seen = _usable(vid)
+        if block is not None:
+            return {
+                "ic": float(block["mean_ic"]), "basis": "rescored_current_vintage",
+                "reason": None, "source_version_id": vid, "block": block,
+            }
+        if seen:
+            rejected.append(
+                f"{vid}: {seen.get('status')} ({seen.get('reason') or 'no reason recorded'})"
+            )
+    return {
+        "ic": None, "basis": "stored_training_vintage",
+        "reason": (
+            "no training run in this rotation produced a usable re-score of the "
+            "serving incumbent on the current vintage"
+            + (f" — {'; '.join(rejected)}" if rejected else
+               " (no manifest carried an incumbent_rescore block at all)")
+        ),
+        "source_version_id": None, "block": None,
+    }
+
+
 def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
     """Resolve the SERVING champion's identity and CPCV from its own immutable
     registry bundle. alpha-engine-config-I9018.
@@ -933,16 +1004,23 @@ def _second_opinion_verdict_class(second_opinion: dict | None,
 
 def select_winner(
     s3, bucket: str, *, trained: list[dict], margin: float | None = None,
-    n_trials_cumulative: int | None = None,
+    n_trials_cumulative: int | None = None, date_str: str | None = None,
 ) -> dict:
     """Rank freshly-trained challengers by leak-free-CPCV mean IC and pick a
     winner that beats the VINTAGE-CONSISTENT baseline by ``margin``. Returns a
     leaderboard dict with three labeled groups (serving_champion / champion_arch /
     challengers); ``winner_version_id`` is the best eligible CHALLENGER or None.
 
-    alpha-engine-config-I9024 s1 — ``winner_version_id`` is the ONLY promotion
-    output. There is no second path: the champion-arch refresh (which promoted
-    the fresh retrain whenever no challenger won) has been deleted.
+    TWO promotion outputs, in strict precedence (alpha-engine-config-I9061):
+    ``winner_version_id`` — a challenger that won its comparison — and, only when
+    that is None, ``champion_arch_refresh_version_id`` — the fresh champion-arch
+    retrain, promotable ONLY when it beats the SERVING incumbent's own immutable
+    registry-bundle CPCV by ``margin`` AND has cleared every gate a challenger
+    clears (join integrity, the served-slice behavioral veto, the horizon filter,
+    the positive floor). I9024 s1 had deleted this path because its old test was
+    the tautology ``x >= x``; the comparison is honest now (I9018) and the gates
+    are real, and without it a champion no challenger has ever beaten is frozen
+    indefinitely. See the block that computes it for the full rationale.
 
     config#671/#673/#1052 + #679(ii) — TRUE FRESH-BEST-WINS promotion.
 
@@ -952,10 +1030,11 @@ def select_winner(
     apples same-vintage comparison; we fall back to the serving snapshot ONLY when no
     champion-arch trained this run (logged, and now read from the incumbent's own
     immutable registry bundle rather than the live manifest — I9018). The
-    champion-arch row is the baseline, so it is NEVER a winner (it can't beat
-    itself) — it carries reason ``champion_arch_baseline`` and, since I9024 s1,
-    it cannot promote itself by any other route either. When no challenger wins,
-    the sitting champion keeps serving however stale it is.
+    champion-arch row is the baseline, so it is NEVER a CHALLENGER winner (it
+    can't beat itself) — it carries reason ``champion_arch_baseline``. It can
+    still refresh the live model when no challenger wins, via the separate
+    ``champion_arch_refresh_version_id`` path above, which compares it against
+    the SERVING incumbent rather than against itself.
 
     The absolute DSR-0.95 hurdle (``_gate_pass``) is NO LONGER a promotion blocker:
     both estimates are equally data-starved on ~1 independent 21d block, so the
@@ -985,6 +1064,7 @@ def select_winner(
     )
     from training.promotion_behavioral_veto import evaluate_behavioral_veto
     from training.realized_ic_second_opinion import evaluate_second_opinion_gate
+    from training.served_slice_dispersion import served_slice_metrics
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
     # alpha-engine-config-I9018 — resolved from the INCUMBENT'S OWN REGISTRY
@@ -1030,6 +1110,85 @@ def select_winner(
         (r for r in trained if r.get("spec_id") == "champion-arch"), None)
     champ_arch_vid = champ_arch_rec.get("version_id") if champ_arch_rec else None
     champ_arch_ic = _cpcv_mean(manifests.get(champ_arch_vid)) if champ_arch_vid else None
+
+    # ── alpha-engine-config-I9024 §2 — SCORE THE INCUMBENT ON THIS VINTAGE ────
+    #
+    # I9018 fixed WHERE the incumbent's number is read from. It did not fix WHEN
+    # the number was computed: the bundle's CPCV is the score the incumbent
+    # earned during its OWN training run, weeks ago, on that vintage's folds,
+    # while every candidate here is scored on today's. That is a cross-vintage
+    # comparison and it is unfair in BOTH directions — a decayed incumbent keeps
+    # a flattering old score, and one that trained through a hard regime carries
+    # a pessimistic one and is displaced by a challenger that never faced it.
+    #
+    # ``training/incumbent_rescore.py`` evaluates the incumbent's FROZEN weights
+    # over this rotation's folds — same meta_X, meta_y, dates, embargo, groups
+    # and k — inside each training run, and records it on that run's manifest.
+    # Here it is resolved and, when usable, BECOMES ``serving_ic``.
+    #
+    # Both numbers survive on the leaderboard. The gap between what the incumbent
+    # scored when trained and what it scores on current data is the MODEL-DECAY
+    # signal this loop has never had.
+    serving_ic_stored = serving_ic
+    _rescore = _resolve_rescored_serving_ic(
+        manifests, champ_arch_vid, serving_bundle_vid)
+    serving_ic_rescored = _rescore["ic"]
+    serving_ic_basis = _rescore["basis"]
+    serving_ic_basis_reason = _rescore["reason"]
+    serving_ic_decay = (
+        round(float(serving_ic_stored) - float(serving_ic_rescored), 6)
+        if serving_ic_stored is not None and serving_ic_rescored is not None
+        else None
+    )
+    if serving_ic_rescored is not None:
+        serving_ic = serving_ic_rescored
+        log.info(
+            "model_zoo select: alpha-engine-config-I9024 §2 the incumbent %s is "
+            "compared on THIS vintage's folds — CPCV %.6f (re-scored, frozen "
+            "weights, from %s) against %s stored on its own training vintage; "
+            "decay %s. serving_ic_basis=rescored_current_vintage.",
+            serving_bundle_vid, serving_ic_rescored,
+            _rescore["source_version_id"], serving_ic_stored, serving_ic_decay,
+        )
+        # ── A RESIDUAL ASYMMETRY, stated rather than hidden ───────────────────
+        #
+        # The re-score removes the VINTAGE asymmetry (a stale number against
+        # fresh ones) and introduces a smaller one in its place: the incumbent's
+        # number is its FROZEN weights evaluated out-of-sample, while every
+        # candidate's ``cpcv_mean_ic`` REFITS that candidate's architecture
+        # inside each fold. Frozen-evaluation and refit-per-fold are different
+        # quantities, and the refit one is systematically higher.
+        #
+        # Measured on the real 2026-08-21 artifacts, same folds, same rows:
+        #     incumbent v3.0-meta-2026-08-14  frozen  -0.008690  (stored 0.131924)
+        #     candidate v3.0-meta-2026-08-21  frozen  -0.032277  (stored 0.305594)
+        # On a frozen-vs-frozen basis the candidate LOSES to the incumbent; on
+        # the frozen-vs-refit basis in force here it wins by a wide margin.
+        #
+        # So this basis makes promotion EASIER, in every rotation, and that is a
+        # safety-relevant property of the loop that no reader should have to
+        # derive. It is recorded on the leaderboard and it is why the behavioral
+        # veto (I9024 §4 / I9061) is the load-bearing guard rather than the IC
+        # comparison. Closing it means re-scoring every CANDIDATE's frozen
+        # bundle on the same folds too — tracked, not done here.
+        log.warning(
+            "model_zoo select: alpha-engine-config-I9024 §2 comparison "
+            "asymmetry — the incumbent's %s is a FROZEN-weights evaluation "
+            "while every candidate's CPCV REFITS per fold. The refit quantity "
+            "is systematically higher, so this basis makes promotion easier "
+            "than a frozen-vs-frozen comparison would. Recorded on the "
+            "leaderboard as comparison_symmetry; the behavioral veto is what "
+            "actually guards the serving slot.", serving_ic_rescored,
+        )
+    else:
+        log.warning(
+            "model_zoo select: alpha-engine-config-I9024 §2 the incumbent could "
+            "NOT be re-scored on this vintage (%s) — falling back to its STORED "
+            "training-vintage CPCV %s. The comparison is cross-vintage and the "
+            "leaderboard says so: serving_ic_basis=stored_training_vintage. "
+            "This is a labelled fallback, never a silent substitution.",
+            serving_ic_basis_reason, serving_ic_stored,
+        )
 
     # alpha-engine-config-I9018 / -I9024 §6 — the integrity assertions run BEFORE
     # any eligibility is derived, so a rotation whose numbers cannot be told apart
@@ -1085,6 +1244,45 @@ def select_winner(
             champ_arch_vid,
         )
 
+    # alpha-engine-config-I9061 — the SERVED-SLICE measurement, taken ONCE for
+    # the whole rotation: every candidate plus the incumbent, scored over ONE
+    # common real feature panel, sliced to the top-N the executor would trade.
+    #
+    # This is what makes the behavioral veto (I9024 s4) able to see the
+    # 2026-08-21 collapse. The manifest's ``stdev_p_up`` is a 25-point synthetic
+    # sweep through the calibrator alone — it read 1.145x the incumbent's for a
+    # candidate whose traded batch then collapsed 4-6x. See
+    # ``training/served_slice_dispersion.py`` for the full derivation and the
+    # measured numbers.
+    #
+    # Non-blocking on failure, per champion-challenger-policy §5.1: an
+    # unmeasurable statistic is reported ``uncomputable`` and named on the
+    # leaderboard. It is never a pass, and it never fails the rotation.
+    served_slice = served_slice_metrics(
+        s3, bucket,
+        list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
+        date_str=date_str,
+    )
+    served_by_vid = served_slice.get("metrics") or {}
+    incumbent_served = served_by_vid.get(serving_bundle_vid)
+    if served_slice.get("status") != "measured":
+        log.warning(
+            "model_zoo select: alpha-engine-config-I9061 the served-slice "
+            "dispersion measurement is UNCOMPUTABLE this rotation (%s). The "
+            "behavioral veto falls back to the manifests' synthetic-sweep "
+            "metrics, which are known NOT to see a served-batch collapse. "
+            "Reported, non-blocking, and NOT a pass.", served_slice.get("reason"),
+        )
+    elif incumbent_served is None:
+        log.warning(
+            "model_zoo select: alpha-engine-config-I9061 no served-slice "
+            "measurement for the INCUMBENT %s (%s) — every dispersion RATIO is "
+            "therefore uncomputable this rotation, since a served number must "
+            "never be ranked against a synthetic-sweep one.",
+            serving_bundle_vid,
+            (served_slice.get("errors") or {}).get(serving_bundle_vid),
+        )
+
     candidates: list[dict] = []
     for rec in trained:
         vid = rec.get("version_id")
@@ -1105,9 +1303,9 @@ def select_winner(
         # config#671/#673/#1052 + #679(ii) — RELATIVE-BEST CHALLENGER eligibility
         # chain. The baseline is the FRESH champion-arch CPCV (vintage-consistent),
         # NOT the stale serving snapshot. The champion-arch row itself is the
-        # baseline — it is NEVER a winner (it can't beat itself); it is marked
-        # ``champion_arch_baseline`` and, since I9024 s1, has no refresh path to
-        # promote itself by either.
+        # baseline — it is NEVER a CHALLENGER winner (it can't beat itself); it
+        # is marked ``champion_arch_baseline``. Its separate refresh path (I9061)
+        # compares it against the SERVING incumbent, never against itself.
         #   join-integrity failure → second_opinion_join_integrity (I9030; first,
         #                            and independent of the enforce flag)
         #   dispersion collapse    → behavioral_veto (I9024 s4; absolute, and
@@ -1154,7 +1352,11 @@ def select_winner(
         # the incumbent, on the invariant the executor consumes (dispersion),
         # not on a transform of it. Absolute: no flag gates it, and it outranks
         # the CPCV ranking entirely.
-        behavioral = evaluate_behavioral_veto(manifest, serving_manifest)
+        behavioral = evaluate_behavioral_veto(
+            manifest, serving_manifest,
+            candidate_served_metrics=served_by_vid.get(vid),
+            incumbent_served_metrics=incumbent_served,
+        )
         behavioral_vetoed = behavioral.get("status") == "veto"
         if behavioral_vetoed:
             log.error(
@@ -1301,6 +1503,14 @@ def select_winner(
             ],
             "behavioral_veto_metrics": behavioral.get("measured"),
             "behavioral_veto_uncomputable": behavioral.get("uncomputable"),
+            # alpha-engine-config-I9061 — which of the veto's metrics were
+            # decided on the SERVED slice rather than on a manifest number, and
+            # the raw served-slice measurement for this candidate. Present so a
+            # reader can tell a verdict about the traded batch from a verdict
+            # about a synthetic calibrator sweep.
+            "behavioral_veto_served_slice_metrics": behavioral.get("served_slice_metrics"),
+            "served_slice": served_by_vid.get(vid),
+            "served_slice_error": (served_slice.get("errors") or {}).get(vid),
             "eligible": eligible, "reason": reason,
         })
 
@@ -1310,27 +1520,105 @@ def select_winner(
     eligibles = [c for c in candidates if c["eligible"]]
     winner = max(eligibles, key=lambda c: c["cpcv_mean_ic"], default=None)
 
-    # alpha-engine-config-I9024 §1 — the CHAMPION-ARCH REFRESH path is DELETED.
+    # ── CHAMPION-ARCH REFRESH (alpha-engine-config-I9061; Brian's ruling
+    # 2026-08-28: "restore the refresh path now") ────────────────────────────
     #
-    # It was a second, privileged way to become champion: when no challenger won,
-    # the fresh champion-arch retrain took the pointer anyway on the grounds that
-    # the live model should not go stale. Its test was
-    # ``champ_arch_ic >= serving_ic + margin`` with margin 0.0 against a
-    # ``serving_ic`` the same run had overwritten (I9018) — i.e. ``x >= x``,
-    # always true. All four promotions 2026-08-07 → 2026-08-21 took it; no
-    # challenger won any of them.
+    # HISTORY. I9024 §1 deleted this path because it promoted unconditionally:
+    # its test was ``champ_arch_ic >= serving_ic + margin`` with margin 0.0
+    # against a ``serving_ic`` the same run had overwritten (I9018) — i.e.
+    # ``x >= x``, always true. All four promotions 2026-08-07 → 2026-08-21 took
+    # it and no challenger won any of them.
     #
-    # STALENESS IS NOT EVIDENCE. A retrain of the champion architecture is just
-    # another arm and is scored as one — it remains the vintage-consistent
-    # promotion BASELINE (#679ii, which is correct and is kept above), it simply
-    # no longer promotes itself. After this there is exactly ONE way to become
-    # champion: ``winner_version_id`` set by a challenger that actually won.
-    if winner is None:
+    # WHY IT COMES BACK. Deleting it left exactly one way to displace a champion
+    # — a challenger beating champion-arch — and no challenger has ever done so;
+    # the 2026-08-21 board has champion-arch at 0.3056 against the best
+    # challenger's 0.1634, roughly half. A 21-day-alpha model whose only exit is
+    # an event that has never occurred is frozen indefinitely, which is a worse
+    # failure than the one I9024 §1 closed.
+    #
+    # WHAT MAKES IT SAFE NOW, and each of these is load-bearing:
+    #
+    #   * The comparison is HONEST. ``serving_ic`` is read from the incumbent's
+    #     own immutable registry bundle (I9018), an artifact this run
+    #     structurally cannot write. The tautology is gone, and this path does
+    #     not reintroduce it — it consumes the fixed number, it does not restore
+    #     the old source.
+    #   * The refresh clears EVERY gate a challenger clears. It is refused by
+    #     the second-opinion join-integrity block (I9030), by the behavioral veto
+    #     (I9024 §4) now measuring the SERVED slice (I9061), by the horizon
+    #     filter and by the positive floor — enforced below by requiring the
+    #     champion-arch row to have survived the eligibility chain with the
+    #     ``champion_arch_baseline`` label, which is reachable only after those
+    #     blocks have passed. It is additionally subject to the ENTRANCE gate in
+    #     ``select_and_finalize``, which sees ``promote_vid`` regardless of kind.
+    #   * A CHALLENGER WIN STILL TAKES PRECEDENCE. The refresh is considered only
+    #     when ``winner`` is None, so the two are mutually exclusive.
+    #
+    # This is NOT an incumbency hurdle for challengers and it is not a demotion
+    # path: nothing here can revert a champion without a human
+    # (``overseer-policy.md`` §8 reserves model-selection decisions).
+    #
+    # On the 2026-08-21 rotation this path would have been REFUSED, at the
+    # behavioral veto, on the served-slice measurement — that is the acceptance
+    # test in tests/test_promotion_served_slice_veto.py.
+    champ_arch_refresh = None
+    refresh_refused_reason = None
+    if winner is not None:
+        refresh_refused_reason = "challenger_won"
+    elif champ_arch_vid is None or champ_arch_ic is None:
+        refresh_refused_reason = "no_champion_arch_this_run"
+    else:
+        arch_cand = next(
+            (c for c in candidates if c["version_id"] == champ_arch_vid), None)
+        if arch_cand is None:
+            refresh_refused_reason = "champion_arch_not_ranked"
+        elif arch_cand.get("reason") != "champion_arch_baseline":
+            # The arch row was stopped by a BLOCKING check ahead of the group
+            # label — join integrity or the behavioral veto. Carry that reason
+            # through verbatim so the leaderboard says which one.
+            refresh_refused_reason = arch_cand.get("reason")
+        elif baseline_join_integrity_failed:
+            refresh_refused_reason = "baseline_join_integrity"
+        elif arch_cand.get("forward_days") != champ_fwd:
+            refresh_refused_reason = "non_canonical_horizon"
+        elif champ_arch_ic <= min_ic:
+            refresh_refused_reason = "below_floor"
+        elif enforce_second_opinion and arch_cand.get("second_opinion_divergence"):
+            refresh_refused_reason = "second_opinion_diverges"
+        elif serving_ic is None:
+            # champion-challenger-policy §9.1 — bootstrap. There is no incumbent
+            # (no live manifest at all), so there is no comparison to win and
+            # the alternative is no production behaviour. Named explicitly
+            # rather than falling out of an ``or``, because "no incumbent" and
+            # "beat the incumbent" must never be the same branch again.
+            champ_arch_refresh = champ_arch_vid
+            refresh_refused_reason = None
+            log.warning(
+                "model_zoo select: BOOTSTRAP refresh — there is no incumbent to "
+                "compare against, so champion-arch %s (CPCV %.4f) takes the "
+                "serving slot under champion-challenger-policy §9.1. This is "
+                "NOT a won comparison and is logged as such.",
+                champ_arch_vid, champ_arch_ic,
+            )
+        elif champ_arch_ic < serving_ic + margin:
+            refresh_refused_reason = "below_serving_incumbent_plus_margin"
+        else:
+            champ_arch_refresh = champ_arch_vid
+            log.info(
+                "model_zoo select: no challenger won — FRESH champion-arch %s "
+                "(CPCV %.4f) beats the SERVING incumbent %s (CPCV %s, read from "
+                "its own registry bundle) by margin %s and cleared every gate a "
+                "challenger clears, so it refreshes the live model "
+                "(alpha-engine-config-I9061).",
+                champ_arch_vid, champ_arch_ic, serving_bundle_vid, serving_ic,
+                margin,
+            )
+    if winner is None and champ_arch_refresh is None:
         log.info(
             "model_zoo select: no challenger beat the champion-arch baseline "
-            "(%s, CPCV %s) — the live model is UNCHANGED. A stale champion that "
-            "nothing has beaten keeps serving; that is the intended outcome "
-            "(alpha-engine-config-I9024 §1).", champ_arch_vid, champ_arch_ic,
+            "(%s, CPCV %s) and the champion-arch refresh was refused (%s) — the "
+            "live model is UNCHANGED.",
+            champ_arch_vid, champ_arch_ic, refresh_refused_reason,
         )
 
     selection_pbo = _selection_pbo(candidates, manifests)
@@ -1373,6 +1661,41 @@ def select_winner(
             ),
             "incumbent_version_id": serving_bundle_vid,
             "served_version": serving_version, "served_date": serving_date,
+            # alpha-engine-config-I9024 §2 — WHICH comparison actually happened.
+            # ``cpcv_mean_ic`` above is the number the rotation was decided on;
+            # these say where it came from and what the other one was. An
+            # unlabelled fallback is the shape of the original I9018 bug.
+            "serving_ic_basis": serving_ic_basis,
+            "serving_ic_basis_reason": serving_ic_basis_reason,
+            "serving_ic_stored": serving_ic_stored,
+            "serving_ic_rescored": serving_ic_rescored,
+            # stored minus re-scored: positive = the incumbent scores WORSE on
+            # current data than it did when trained. The model-decay signal.
+            "serving_ic_decay": serving_ic_decay,
+            "rescore_source_version_id": _rescore["source_version_id"],
+            "rescore_block": _rescore["block"],
+            # alpha-engine-config-I9024 §2 — the residual asymmetry, named on
+            # the artifact so no reader has to derive it. See the log.warning
+            # above for the measured 2026-08-21 evidence.
+            "comparison_symmetry": {
+                "incumbent_basis": (
+                    "frozen_weights_evaluated"
+                    if serving_ic_rescored is not None
+                    else "stored_training_vintage_refit_per_fold"
+                ),
+                "candidate_basis": "refit_per_fold",
+                "symmetric": serving_ic_rescored is None,
+                "note": (
+                    "A refit-per-fold CPCV is systematically higher than a "
+                    "frozen-weights evaluation of the same model, so a "
+                    "rescored (frozen) incumbent is an EASIER bar for a "
+                    "candidate than a stored (refit) one. Measured 2026-08-21: "
+                    "incumbent frozen -0.008690 vs stored 0.131924; candidate "
+                    "frozen -0.032277 vs stored 0.305594. Closing this means "
+                    "re-scoring every candidate's frozen bundle on the same "
+                    "folds."
+                ),
+            },
         },
         # CHAMPION-ARCH = the champion ARCHITECTURE retrained THIS run on the
         # current vintage. Its CPCV is the vintage-consistent promotion BASELINE.
@@ -1393,6 +1716,17 @@ def select_winner(
         # The CHALLENGER winner (a rotated spec that beat the champion-arch
         # baseline). champion-arch is excluded from this set by construction.
         "winner_version_id": winner["version_id"] if winner else None,
+        # alpha-engine-config-I9061 — when no challenger wins, the fresh
+        # champion-arch may refresh the live model, but ONLY on a won comparison
+        # against the SERVING incumbent's own immutable CPCV and only after
+        # clearing every gate a challenger clears. Mutually exclusive with
+        # ``winner_version_id`` by construction. ``..._refused_reason`` names why
+        # it did not fire, so "no refresh" is never an unexplained silence.
+        "champion_arch_refresh_version_id": champ_arch_refresh,
+        "champion_arch_refresh_refused_reason": refresh_refused_reason,
+        # alpha-engine-config-I9061 — the rotation's served-slice measurement:
+        # status, the panel it was measured over, and the per-version numbers.
+        "served_slice_dispersion": served_slice,
         # alpha-engine-config-I9030 — the baseline's own join-integrity verdict.
         # True means no comparison against it was measurable this rotation.
         "baseline_second_opinion_verdict_class": baseline_so_class,
@@ -1500,6 +1834,11 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
         "promoted": promoted,
         "promoted_kind": leaderboard.get("promoted_kind"),
         "winner_version_id": leaderboard.get("winner_version_id"),
+        # alpha-engine-config-I9061 — recorded alongside the winner so a reader
+        # of the marker alone can tell WHICH of the two promotion paths moved
+        # the pointer, without re-deriving it from ``promoted_kind``.
+        "champion_arch_refresh_version_id": leaderboard.get(
+            "champion_arch_refresh_version_id"),
         "prior_champion_version_id": prior_champ_vid,
         # The registry version_id that should be SERVING after this rotation:
         # the promoted vid on a cutover, else the (unchanged) prior champion.
@@ -1618,8 +1957,21 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
                 f"may be understated by a partially-starved universe. "
                 f"config#2882.\n"
             )
+        # alpha-engine-config-I9061 — two promotion paths now exist, and the
+        # operator must be able to tell them apart from the alert alone: a
+        # challenger that beat champion-arch, or the champion-arch retrain that
+        # beat the serving incumbent. They carry different revert reasoning.
+        _kind = leaderboard.get("promoted_kind") or "?"
+        _kind_txt = (
+            "a CHALLENGER (beat the fresh champion-arch baseline)"
+            if _kind == "challenger" else
+            "the FRESH CHAMPION-ARCH retrain (no challenger won; it beat the "
+            "SERVING incumbent by margin and cleared every challenger gate)"
+            if _kind == "champion-arch-refresh" else _kind
+        )
         msg = (
             f"[predictor] Model-zoo AUTO-PROMOTED a new champion ({date_str}).\n"
+            f"  path: {_kind_txt}\n"
             f"  {prior_vid or '?'}  →  {winner_vid}  (spec: {spec})\n"
             f"  CPCV mean IC: {champ_ic}  →  {new_ic}  (margin {leaderboard.get('margin')}, "
             f"floor {leaderboard.get('promote_min_ic')})\n"
@@ -1755,8 +2107,14 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
     try:
         win = _candidate_by_vid(leaderboard, winner_vid)
         champ_ic = (leaderboard.get("champion") or {}).get("cpcv_mean_ic")
+        # alpha-engine-config-I9061 — name the path. A champion-arch refresh is
+        # not a challenger win and must not read as one.
+        _kind = (
+            "challenger" if leaderboard.get("winner_version_id") == winner_vid
+            else "champion-arch refresh"
+        )
         msg = (
-            f"[predictor] Model-zoo OBSERVE ({date_str}): challenger {winner_vid} "
+            f"[predictor] Model-zoo OBSERVE ({date_str}): {_kind} {winner_vid} "
             f"(spec {win.get('spec_id','?')}) beat the champion "
             f"(CPCV {champ_ic} → {win.get('cpcv_mean_ic')}) but auto-promote is OFF — "
             f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
@@ -2026,11 +2384,14 @@ def _digest_subject(leaderboard: dict, date_str: str | None) -> str:
     # #679(ii): the headline challenger count excludes the champion-arch baseline.
     n_chal = sum(1 for c in cands if c.get("group") != "champion_arch")
     winner = leaderboard.get("winner_version_id")
+    refresh = leaderboard.get("champion_arch_refresh_version_id")
     promoted = leaderboard.get("promoted")
     if promoted:
         promo = f"promoted: {promoted}"
     elif winner:
         promo = f"recommended: {winner} (observe)"
+    elif refresh:
+        promo = f"champion-arch refresh: {refresh} (observe)"
     else:
         promo = "promoted: none"
     return (
@@ -2105,6 +2466,8 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
     # never co-mingled with the challengers (eliminates the duplicative look).
     challengers = [c for c in all_cands if c.get("group") != "champion_arch"]
     winner = leaderboard.get("winner_version_id")
+    refresh = leaderboard.get("champion_arch_refresh_version_id")
+    refresh_refused = leaderboard.get("champion_arch_refresh_refused_reason")
     promoted = leaderboard.get("promoted")
     promoted_kind = leaderboard.get("promoted_kind")
     reverted_from = leaderboard.get("reverted_from")
@@ -2129,7 +2492,11 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
 
     # ── PROMOTION line ──
     if promoted:
-        kind_txt = "a CHALLENGER"
+        kind_txt = (
+            "a CHALLENGER" if promoted_kind == "challenger"
+            else "the FRESH champion-arch (no challenger won; it beat the "
+                 "SERVING incumbent and cleared every challenger gate)"
+        )
         promo_plain = (
             f"PROMOTED {kind_txt}: {reverted_from or '?'} -> {promoted}\n"
             f"  (relative-best vs the {baseline_label} CPCV {_fmt_ic(baseline_ic)} "
@@ -2144,9 +2511,10 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
             f'floor {floor}; revert: <code>python -m model.registry --bucket '
             f'{bucket} --promote {reverted_from or "&lt;prior-id&gt;"}</code></span></p>'
         )
-    elif winner:
-        rec = winner
-        kind_txt = "challenger"
+    elif winner or refresh:
+        rec = winner or refresh
+        kind_txt = ("challenger" if winner else
+                    "fresh champion-arch refresh (no challenger won)")
         promo_plain = (
             f"No promotion executed (mode={mode}). Recommended {kind_txt}: {rec} "
             f"(beats the {baseline_label} baseline; observe — promote manually if "
@@ -2159,16 +2527,17 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         )
     else:
         promo_plain = (
-            "No promotion — no challenger beat the champion-arch baseline this "
-            "rotation. The sitting champion keeps serving; a retrain of the "
-            "champion architecture does not displace it (I9024 s1: staleness is "
-            "not evidence)."
+            f"No promotion — no challenger beat the champion-arch baseline this "
+            f"rotation, and the champion-arch refresh was refused "
+            f"({refresh_refused or 'no reason recorded'}). The sitting champion "
+            f"keeps serving."
         )
+        _refused_txt = refresh_refused or "no reason recorded"
         promo_html = (
-            '<p style="color:#555;">No promotion — no challenger beat the '
-            'champion-arch baseline this rotation. The sitting champion keeps '
-            'serving; a retrain of the champion architecture does not displace '
-            'it (I9024 s1: staleness is not evidence).</p>'
+            f'<p style="color:#555;">No promotion — no challenger beat the '
+            f'champion-arch baseline this rotation, and the champion-arch '
+            f'refresh was refused (<code>{_refused_txt}</code>). The sitting '
+            f'champion keeps serving.</p>'
         )
 
     # ── CHALLENGER table (champion-arch excluded — it's the baseline, shown above) ──
@@ -2489,19 +2858,28 @@ def select_and_finalize(
     try:
         leaderboard = select_winner(
             s3, bucket, trained=trained, n_trials_cumulative=_n_trials_cum,
+            date_str=date_str,
         )
         leaderboard["date"] = date_str
         leaderboard["mode"] = mode
         leaderboard["trial_log_status"] = _trial_log_status
 
         winner_vid = leaderboard.get("winner_version_id")
-        # alpha-engine-config-I9024 §1 — there is exactly ONE way to become
-        # champion: a challenger that won a comparison. The champion-arch refresh
-        # path (an unconditional weekly "keep the vintage fresh" promotion that
-        # took all four cutovers 2026-08-07 → 2026-08-21 on a tautological test)
-        # is deleted. Staleness is not evidence.
-        promote_vid = winner_vid
-        promote_kind = "challenger" if winner_vid else None
+        # alpha-engine-config-I9061 — the version that will actually become
+        # champion. A CHALLENGER win takes precedence; otherwise the fresh
+        # champion-arch may refresh the live model, having beaten the SERVING
+        # incumbent's own immutable CPCV by margin and cleared every gate a
+        # challenger clears (join integrity, the served-slice behavioral veto,
+        # the horizon filter, the positive floor). The two are mutually
+        # exclusive by construction — the refresh is only ever set when no
+        # challenger won (see select_winner). Both then face the ENTRANCE gate
+        # below, which reads ``promote_vid`` regardless of kind.
+        refresh_vid = leaderboard.get("champion_arch_refresh_version_id")
+        promote_vid = winner_vid or refresh_vid
+        promote_kind = (
+            "challenger" if winner_vid
+            else ("champion-arch-refresh" if refresh_vid else None)
+        )
 
         # ── ENTRANCE gate (alpha-engine-config-I8195) ────────────────────────────
         # Record, on EVERY rotation, which absolute bar was applied and whether the
@@ -2578,9 +2956,11 @@ def select_and_finalize(
                 _alert_observe_recommendation(bucket, date_str, leaderboard, promote_vid)
             else:
                 log.info(
-                    "model_zoo: no challenger beat the champion-arch baseline — "
-                    "live model unchanged (alpha-engine-config-I9024 §1: a "
-                    "champion is displaced only by a won comparison)"
+                    "model_zoo: no challenger beat the champion-arch baseline "
+                    "and the champion-arch refresh was refused (%s) — live "
+                    "model unchanged. A champion is displaced only by a won "
+                    "comparison (alpha-engine-config-I9024 §1, -I9061).",
+                    leaderboard.get("champion_arch_refresh_refused_reason"),
                 )
 
         _write_leaderboard(s3, bucket, date_str, leaderboard)

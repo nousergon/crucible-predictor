@@ -102,30 +102,57 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
 
 
 class TestBaseInPool:
-    def test_base_arch_is_baseline_and_CANNOT_promote_itself(self, monkeypatch):
-        """alpha-engine-config-I9024 s1 — the one-way ratchet.
+    def test_base_arch_is_never_a_challenger_winner_but_CAN_refresh(self, monkeypatch):
+        """alpha-engine-config-I9061 — the refresh is back, behind a real test.
 
         #679(ii) still holds: champion-arch (0.30) is the vintage-consistent
         BASELINE and the variant (0.15) does not clear baseline+margin, so no
-        challenger wins. What changed is what happens next: NOTHING. Pre-fix the
-        fresh champion-arch promoted itself on `champ_arch_ic >= serving_ic + 0`
-        — against a serving_ic the same run had overwritten, i.e. `x >= x` — and
-        that path took all four cutovers 2026-08-07 -> 2026-08-21.
+        CHALLENGER wins and champion-arch is never `winner_version_id` — it
+        cannot beat itself.
 
-        RED against the pre-fix code, which promoted `base-today` here.
+        What I9024 s1 deleted, and what Brian's 2026-08-28 ruling restores, is
+        the SEPARATE refresh path: champion-arch may take the serving slot when
+        it beats the SERVING incumbent (0.10 here, read from that incumbent's own
+        immutable registry bundle) by margin. The old version of this test
+        asserted `champion_arch_refresh_version_id not in board`, which is the
+        state that froze the deployed model — no challenger has ever beaten
+        champion-arch, so nothing could ever displace a champion.
+
+        The tautology I9024 s1 actually killed is NOT restored: the comparison
+        is against the incumbent's bundle CPCV (I9018), re-scored on this
+        vintage where possible (I9024 s2), never against a number this run wrote.
         """
         board, promotes, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                            base_ic=0.30, variant_ic=0.15)
         ids = {c["spec_id"] for c in board["candidates"]}
         assert "champion-arch" in ids            # base IS in the pool
-        # champion-arch is the BASELINE — never a winner.
+        # champion-arch is the BASELINE — never a CHALLENGER winner.
         assert board["winner_version_id"] is None
         assert board["promotion_baseline_source"] == "champion_arch_fresh"
         arch_cand = next(c for c in board["candidates"] if c["spec_id"] == "champion-arch")
         assert arch_cand["reason"] == "champion_arch_baseline"
         assert arch_cand["eligible"] is False
-        # …and there is no second path by which it becomes champion.
-        assert "champion_arch_refresh_version_id" not in board
+        # …but it DOES refresh the live model, on a comparison it actually won.
+        assert board["champion_arch_refresh_version_id"] == "base-today"
+        assert board["champion_arch_refresh_refused_reason"] is None
+        assert board["promoted"] == "base-today"
+        assert board["promoted_kind"] == "champion-arch-refresh"
+        assert promotes == ["base-today"]
+
+    def test_a_refresh_that_does_not_beat_the_incumbent_is_refused(self, monkeypatch):
+        """RED against the PRE-I9024 tree, where `x >= x + 0` promoted this.
+
+        champion-arch scores 0.05 against a serving incumbent at 0.10. Before
+        I9018 the incumbent's number was read back off the prefix this run had
+        already overwritten, so the comparison was the candidate against itself
+        and this promoted. Now it is refused, and the leaderboard says why.
+        """
+        board, promotes, _ = _pool_fixture(monkeypatch, auto_promote=True,
+                                           base_ic=0.05, variant_ic=0.03)
+        assert board["winner_version_id"] is None
+        assert board["champion_arch_refresh_version_id"] is None
+        assert (board["champion_arch_refresh_refused_reason"]
+                == "below_serving_incumbent_plus_margin")
         assert board["promoted"] is None
         assert board.get("promoted_kind") is None
         assert promotes == []                    # the live model is UNCHANGED
@@ -138,21 +165,29 @@ class TestBaseInPool:
         assert board["winner_version_id"] == "resid-v"
         assert board["promoted_kind"] == "challenger"
 
-    def test_the_only_promotion_path_requires_a_winner(self, monkeypatch):
-        """No arrangement of the pool promotes without `winner_version_id`.
+    def test_the_refresh_fires_exactly_when_it_beats_the_serving_incumbent(self, monkeypatch):
+        """The sweep that used to prove "nothing ever promotes" now proves the
+        refresh tracks the SERVING incumbent's score rather than its own.
 
-        Sweeps the champion-arch score across the whole range against a variant
-        that never clears the baseline. Pre-fix, every one of these promoted the
-        champion-arch; post-fix none of them promote anything.
+        The serving incumbent is at CPCV 0.10 throughout; the variant never
+        clears the baseline, so `winner_version_id` is None in every case and the
+        only thing that can move the pointer is the refresh. Pre-I9024 EVERY one
+        of these promoted, including 0.05, because the test was `x >= x`.
         """
+        margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
         for base_ic in (0.05, 0.15, 0.30, 0.90):
             board, promotes, _ = _pool_fixture(
                 monkeypatch, auto_promote=True, base_ic=base_ic,
                 variant_ic=base_ic - 0.02,
             )
             assert board["winner_version_id"] is None, base_ic
-            assert board["promoted"] is None, base_ic
-            assert promotes == [], base_ic
+            should_refresh = base_ic >= 0.10 + margin
+            assert (board["champion_arch_refresh_version_id"] == "base-today") \
+                is should_refresh, base_ic
+            assert promotes == (["base-today"] if should_refresh else []), base_ic
+            if not should_refresh:
+                assert (board["champion_arch_refresh_refused_reason"]
+                        == "below_serving_incumbent_plus_margin"), base_ic
 
 
 class TestPromotionAlert:
