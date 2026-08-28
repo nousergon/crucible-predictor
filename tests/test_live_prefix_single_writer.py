@@ -203,12 +203,20 @@ def test_promote_to_champion_writes_the_live_prefix():
         def get_object(self, Bucket, Key):  # noqa: N803
             import io as _io
             if Key.endswith("_lineage.json"):
+                # I9028 — a real bundle attests to its own contents, and
+                # promote_to_champion verifies that before copying.
                 return {"Body": _io.BytesIO(json.dumps(
                     {"version_id": "v-new", "stage": "challenger",
-                     "date": "2026-08-29"}).encode())}
+                     "date": "2026-08-29",
+                     "file_etags": {f: f"etag-{f}" for f in (
+                         "manifest.json", "feature_list.json", "meta_model.pkl")}
+                     }).encode())}
             if Key == f"{_LIVE}manifest.json":
                 return {"Body": _io.BytesIO(json.dumps({"date": "2026-08-29"}).encode())}
             raise KeyError(Key)
+
+        def head_object(self, Bucket, Key):  # noqa: N803
+            return {"ETag": '"etag-' + Key.rsplit("/", 1)[-1] + '"'}
 
         def copy_object(self, Bucket, Key, CopySource):  # noqa: N803
             self.copied.append(Key)

@@ -379,6 +379,71 @@ def register_to_observe(
             "prior_stage": prior}
 
 
+def verify_bundle(
+    s3,
+    bucket: str,
+    version_id: str,
+    *,
+    registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
+) -> dict:
+    """Verify a registry bundle against the per-file ETags in its own lineage.
+
+    alpha-engine-config-I9028. A bundle is content-addressed, so it can check
+    itself: ``_lineage.json`` carries ``file_etags``, and every listed object
+    must still have that ETag. Returns a summary dict on success; raises
+    ``RegistryError`` naming the offending files otherwise.
+
+    This exists because the OTHER model store — the legacy
+    ``predictor/weights/meta/archive/{date}/`` — could not do this and was
+    measured on 2026-08-28 to hold a model that was never champion (its
+    ``meta_model.pkl`` matched neither the champion it displaced nor the one
+    that replaced it). Restoring from an unverified store points live inference
+    at a contract nobody chose. Promotion calls this first so the check is
+    structural rather than a matter of operator discipline.
+    """
+    src = f"{registry_prefix}{version_id}/"
+    try:
+        lineage = json.loads(
+            s3.get_object(Bucket=bucket, Key=f"{src}_lineage.json")["Body"].read()
+        )
+    except Exception as e:
+        raise RegistryError(
+            f"cannot verify {version_id!r}: no registry bundle / _lineage.json ({e})"
+        )
+
+    expected = lineage.get("file_etags") or {}
+    if not expected:
+        raise RegistryError(
+            f"refusing to trust {version_id!r} — its _lineage.json carries no "
+            f"file_etags, so the bundle cannot attest to its own contents. An "
+            f"unverifiable bundle is not a safe promotion source."
+        )
+
+    mismatched, unreadable = [], []
+    for fname, want in sorted(expected.items()):
+        try:
+            got = _etag(s3, bucket, f"{src}{fname}")
+        except Exception:  # noqa: BLE001 — recorded, then raised below
+            unreadable.append(fname)
+            continue
+        if got != want:
+            mismatched.append(fname)
+
+    if mismatched or unreadable:
+        raise RegistryError(
+            f"refusing to trust {version_id!r} — bundle does not match its own "
+            f"_lineage.json: mismatched ETags {mismatched or 'none'}, unreadable "
+            f"{unreadable or 'none'}. Live inference must never run a contract "
+            f"whose bytes drifted from the ones that were registered."
+        )
+
+    return {
+        "version_id": version_id,
+        "files_verified": sorted(expected),
+        "registry_prefix": registry_prefix,
+    }
+
+
 def promote_to_champion(
     s3,
     bucket: str,
@@ -421,6 +486,11 @@ def promote_to_champion(
             f"refusing to promote {version_id!r} — incomplete bundle, missing "
             f"{missing}; live inference must never run an unreproducible contract."
         )
+
+    # alpha-engine-config-I9028 — completeness is not integrity. Verify the
+    # bundle against its own recorded ETags BEFORE any byte reaches the live
+    # prefix, so a drifted bundle cannot become the served contract.
+    verify_bundle(s3, bucket, version_id, registry_prefix=registry_prefix)
 
     for k in contract:
         fname = k.rsplit("/", 1)[-1]

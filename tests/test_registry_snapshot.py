@@ -17,6 +17,7 @@ from model.registry import (
     list_versions,
     promote_to_champion,
     snapshot_to_registry,
+    verify_bundle,
 )
 
 _PREFIX = "predictor/weights/meta/"
@@ -183,10 +184,17 @@ def test_list_versions_filters_by_stage_and_sorts_newest_first():
     assert len(list_versions(s3, "bkt")) == 3  # no filter → all
 
 
-def _promote_s3(*, bundle_files, prior_champion=None):
+def _promote_s3(*, bundle_files, prior_champion=None, etag_overrides=None,
+                unreadable=(), file_etags_present=True):
     """S3 mock for promote_to_champion: a challenger bundle under
     registry/{vid}/ plus an optional prior champion, with paginate keyed on
-    Prefix (bundle listing vs registry-wide lineage listing)."""
+    Prefix (bundle listing vs registry-wide lineage listing).
+
+    alpha-engine-config-I9028: the bundle now carries `file_etags` and
+    promotion verifies against them, so the mock serves head_object too.
+    `etag_overrides` makes a named file's live ETag drift from its recorded
+    one; `unreadable` makes head_object raise for a file.
+    """
     vid = "v-2026-06-06-newchamp"
     reg = "predictor/registry/"
     src = f"{reg}{vid}/"
@@ -204,7 +212,21 @@ def _promote_s3(*, bundle_files, prior_champion=None):
     pag.paginate.side_effect = _paginate
     s3.get_paginator.return_value = pag
 
-    lineages = {f"{src}_lineage.json": {"version_id": vid, "stage": "challenger"}}
+    contract_names = [f for f in bundle_files if f != "_lineage.json"]
+    recorded = {f: f"etag-{f}" for f in contract_names}
+    _lin = {"version_id": vid, "stage": "challenger"}
+    if file_etags_present:
+        _lin["file_etags"] = recorded
+    lineages = {f"{src}_lineage.json": _lin}
+
+    def _head(Bucket, Key):
+        fname = Key.rsplit("/", 1)[-1]
+        if fname in unreadable:
+            raise RuntimeError(f"cannot read {Key}")
+        live = dict(recorded, **(etag_overrides or {}))
+        return {"ETag": '"' + live.get(fname, f"etag-{fname}") + '"'}
+
+    s3.head_object.side_effect = _head
     if prior_champion:
         lineages[f"{reg}{prior_champion}/_lineage.json"] = \
             {"version_id": prior_champion, "stage": "champion"}
@@ -335,3 +357,60 @@ class TestResolveCodeSha:
         assert argv[:3] == ["git", "-c", f"safe.directory={reg._REPO_ROOT}"]
         assert argv[-2:] == ["rev-parse", "HEAD"]
         assert run.call_args.kwargs["cwd"] == str(reg._REPO_ROOT)
+
+
+# ── alpha-engine-config-I9028 — a bundle verifies against its own lineage ─────
+# The legacy weights archive could not do this and was measured on 2026-08-28
+# to hold a model that was never champion. Completeness is not integrity, so
+# promotion verifies ETags BEFORE any byte reaches the live prefix.
+
+def test_verify_bundle_passes_when_every_etag_matches():
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+    )
+    out = verify_bundle(s3, "bkt", vid)
+    assert out["version_id"] == vid
+    assert out["files_verified"] == ["feature_list.json", "manifest.json", "meta_model.pkl"]
+
+
+def test_verify_bundle_refuses_a_drifted_file():
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+        etag_overrides={"meta_model.pkl": "etag-SOMETHING-ELSE"},
+    )
+    with pytest.raises(RegistryError, match="does not match its own"):
+        verify_bundle(s3, "bkt", vid)
+
+
+def test_verify_bundle_refuses_an_unreadable_file():
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+        unreadable=("manifest.json",),
+    )
+    with pytest.raises(RegistryError, match="unreadable"):
+        verify_bundle(s3, "bkt", vid)
+
+
+def test_verify_bundle_refuses_a_lineage_with_no_file_etags():
+    """An unverifiable bundle is not a safe promotion source — it must not
+    silently pass just because the check has nothing to compare against."""
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+        file_etags_present=False,
+    )
+    with pytest.raises(RegistryError, match="no file_etags"):
+        verify_bundle(s3, "bkt", vid)
+
+
+def test_promote_refuses_a_drifted_bundle_before_writing_the_live_prefix():
+    """The guard is structural: nothing reaches predictor/weights/meta/ when
+    the bundle fails its own attestation."""
+    s3, vid = _promote_s3(
+        bundle_files=["meta_model.pkl", "feature_list.json", "manifest.json", "_lineage.json"],
+        prior_champion="v-old-champ",
+        etag_overrides={"feature_list.json": "etag-DRIFTED"},
+    )
+    with pytest.raises(RegistryError, match="does not match its own"):
+        promote_to_champion(s3, "bkt", vid)
+    assert s3.copy_object.call_args_list == []
+    assert s3.put_object.call_args_list == []
