@@ -983,6 +983,7 @@ def select_winner(
     enforce_second_opinion = bool(
         getattr(cfg, "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE", False)
     )
+    from training.promotion_behavioral_veto import evaluate_behavioral_veto
     from training.realized_ic_second_opinion import evaluate_second_opinion_gate
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
@@ -1109,6 +1110,8 @@ def select_winner(
         # promote itself by either.
         #   join-integrity failure → second_opinion_join_integrity (I9030; first,
         #                            and independent of the enforce flag)
+        #   dispersion collapse    → behavioral_veto (I9024 s4; absolute, and
+        #                            independent of the CPCV ranking)
         #   champion-arch row      → champion_arch_baseline (not a challenger)
         #   wrong horizon          → non_canonical_horizon
         #   no usable CPCV mean IC → no_cpcv
@@ -1147,6 +1150,28 @@ def select_winner(
                 enforce_second_opinion,
             )
 
+        # alpha-engine-config-I9024 s4 — the BEHAVIORAL veto. Measured against
+        # the incumbent, on the invariant the executor consumes (dispersion),
+        # not on a transform of it. Absolute: no flag gates it, and it outranks
+        # the CPCV ranking entirely.
+        behavioral = evaluate_behavioral_veto(manifest, serving_manifest)
+        behavioral_vetoed = behavioral.get("status") == "veto"
+        if behavioral_vetoed:
+            log.error(
+                "model_zoo select: alpha-engine-config-I9024 s4 BEHAVIORAL VETO "
+                "for %s (spec=%s) — %s. Refused regardless of CPCV IC.",
+                vid, rec.get("spec_id"),
+                "; ".join(v.get("reason", "") for v in behavioral.get("vetoes", [])),
+            )
+        elif behavioral.get("status") == "insufficient":
+            log.warning(
+                "model_zoo select: alpha-engine-config-I9024 s4 behavioral veto "
+                "is UNCOMPUTABLE for %s (spec=%s) — none of %s is carried by "
+                "both the candidate manifest and the incumbent bundle. Reported "
+                "insufficient, NOT a pass (champion-challenger-policy s5.1).",
+                vid, rec.get("spec_id"), behavioral.get("uncomputable"),
+            )
+
         group = "champion_arch" if is_champ_arch else "challenger"
         if so_blocks_unconditionally:
             # alpha-engine-config-I9030 — FIRST in the chain, ahead of the group
@@ -1156,6 +1181,12 @@ def select_winner(
             # records WHY a row is unusable rather than masking it behind
             # ``champion_arch_baseline``.
             eligible, reason = False, "second_opinion_join_integrity"
+        elif behavioral_vetoed:
+            # I9024 s4 — ahead of the group label and the score, for the same
+            # reason as the join-integrity check above: the leaderboard must
+            # record WHY a row is unusable, including for the champion-arch
+            # baseline row (whose collapse is what happened on 2026-08-21).
+            eligible, reason = False, "behavioral_veto"
         elif is_champ_arch:
             eligible, reason = False, "champion_arch_baseline"
         elif fwd != champ_fwd:
@@ -1260,6 +1291,16 @@ def select_winner(
             # ``insufficient`` never blocks (policy §5.1).
             "second_opinion_verdict_class": so_class,
             "second_opinion_blocks_unconditionally": so_blocks_unconditionally,
+            # alpha-engine-config-I9024 s4 — the behavioral verdict, always
+            # surfaced. ``uncomputable`` names the metrics no producer writes
+            # onto the manifest yet, so the gap is a fact on the artifact rather
+            # than a silence.
+            "behavioral_veto_status": behavioral.get("status"),
+            "behavioral_veto_reasons": [
+                v.get("reason") for v in behavioral.get("vetoes", [])
+            ],
+            "behavioral_veto_metrics": behavioral.get("measured"),
+            "behavioral_veto_uncomputable": behavioral.get("uncomputable"),
             "eligible": eligible, "reason": reason,
         })
 
@@ -1402,6 +1443,18 @@ class PromotionStateDivergenceError(RuntimeError):
     This is a divergence needing operator eyes — never a silent re-apply."""
 
 
+def _live_weights_prefix() -> str:
+    """The live serving prefix, read from its single owner.
+
+    alpha-engine-config-I9018 — training must not carry its own copy of this
+    string. ``model.registry`` owns it and is the only writer of it; everything
+    else that needs to NAME it resolves it from there.
+    """
+    from model.registry import DEFAULT_LIVE_PREFIX
+
+    return DEFAULT_LIVE_PREFIX
+
+
 def _promotion_marker_key(date_str: str) -> str:
     return f"{_PROMOTIONS_PREFIX}/{date_str}.json"
 
@@ -1452,7 +1505,9 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
         # the promoted vid on a cutover, else the (unchanged) prior champion.
         # This is the field the re-run verification compares against.
         "champion_version_id_after": promoted if promoted else prior_champ_vid,
-        "live_weights_prefix": "predictor/weights/meta/",
+        # Sourced from the promoter itself so the marker can never disagree
+        # with where a promotion actually lands (alpha-engine-config-I9018).
+        "live_weights_prefix": _live_weights_prefix(),
         "registry_bundle_prefix": f"{_REGISTRY_PREFIX}/{promoted}/" if promoted else None,
         "decision_summary": {
             "n_candidates": len(leaderboard.get("candidates") or []),
@@ -1672,7 +1727,7 @@ def _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc) -> 
         f"NOT advance this rotation.\n"
         f"  attempted: {promote_kind or '?'} {promote_vid}\n"
         f"  error: {exc}\n"
-        f"  Live weights (predictor/weights/meta/meta_model.pkl) are UNCHANGED — "
+        f"  Live weights ({_live_weights_prefix()}meta_model.pkl) are UNCHANGED — "
         f"Monday inference will serve last week's champion. This is retryable "
         f"(config#2252: no promotion marker was written) but requires an "
         f"operator to investigate + re-run the promote."
