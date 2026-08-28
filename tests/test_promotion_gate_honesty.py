@@ -188,22 +188,43 @@ def test_served_version_naming_a_missing_bundle_raises(monkeypatch):
             s3, "bkt", trained=_trained(("champion-arch", CANDIDATE_VID)))
 
 
-# ── I9024 section 1: the arch-refresh promotion path no longer exists ─────────
+# ── I9024 s1 / I9061: the arch-refresh path, restored behind a real test ─────
 
 
-def test_the_arch_refresh_path_is_gone_from_the_source():
-    """RED pre-fix: every one of these symbols existed and was reachable."""
+def test_the_arch_refresh_never_reads_a_number_this_run_wrote():
+    """The TAUTOLOGY stays dead even though the PATH is back.
+
+    alpha-engine-config-I9061 restores the champion-arch refresh (Brian's ruling
+    2026-08-28), because deleting it left a champion no challenger has ever
+    beaten frozen indefinitely. What must NOT come back is the thing I9024 s1
+    actually diagnosed: the comparison `champ_arch_ic >= serving_ic + margin`
+    against a `serving_ic` re-read from `predictor/weights/meta/`, the prefix
+    every spec in the rotation had already trained into — `x >= x`.
+
+    RED pre-I9018: `_resolve_incumbent_from_bundle` did not exist and the
+    serving CPCV came from cfg.META_MANIFEST_KEY's own cpcv fields.
+    """
     import inspect
-    src = inspect.getsource(mz)
-    assert "champion_arch_refresh_version_id" not in src
-    assert "champion-arch-refresh" not in src
+    src = inspect.getsource(mz.select_winner)
+    # the refresh path exists again…
+    assert "champ_arch_refresh" in src
+    # …and it is compared against the incumbent bundle's number, not a re-read.
+    assert "_resolve_incumbent_from_bundle" in src
+    assert "serving_ic + margin" in src
+    # the L4544 live-contract snapshot/restore hazard stays deleted.
     assert not hasattr(mz, "_snapshot_live_contract")
     assert not hasattr(mz, "_restore_live_contract")
 
 
-def test_a_champion_arch_only_rotation_promotes_nothing(monkeypatch):
-    """RED pre-fix: this is the 2026-08-21 rotation exactly — no challenger won,
-    and the champion-arch promoted itself anyway on `x >= x + 0`.
+def test_a_champion_arch_only_rotation_refreshes_on_a_won_comparison(monkeypatch):
+    """The 2026-08-21 rotation on IC alone: no challenger won, and the fresh
+    champion-arch DOES beat the serving incumbent (0.3056 vs 0.1319).
+
+    That is the comparison the refresh is allowed to win, and this test records
+    that it wins it — which is precisely why deliverable 2 (the served-slice
+    behavioral veto) has to be the thing that refuses this candidate. IC is
+    rank-only and says promote; the traded batch says otherwise. See
+    tests/test_promotion_served_slice_veto.py.
     """
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     s3 = _s3(
@@ -213,11 +234,84 @@ def test_a_champion_arch_only_rotation_promotes_nothing(monkeypatch):
     board = mz.select_winner(
         s3, "bkt", trained=_trained(("champion-arch", CANDIDATE_VID)), margin=0.0)
     assert board["winner_version_id"] is None
-    assert "champion_arch_refresh_version_id" not in board
     arch = next(c for c in board["candidates"] if c["version_id"] == CANDIDATE_VID)
     assert arch["eligible"] is False
-    # …even though it scored 2.3x the incumbent.
+    assert arch["reason"] == "champion_arch_baseline"
     assert arch["cpcv_mean_ic"] > board["serving_champion"]["cpcv_mean_ic"]
+    assert board["champion_arch_refresh_version_id"] == CANDIDATE_VID
+
+
+def test_a_champion_arch_below_the_incumbent_does_not_refresh(monkeypatch):
+    """RED pre-I9018: this promoted, because the incumbent's 0.131924 was read
+    back as the candidate's own number and `x >= x` is always true."""
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _s3(
+        incumbent=_manifest(mean_ic=INCUMBENT_IC),
+        candidates={"arch-v": _manifest(mean_ic=0.05)},
+    )
+    board = mz.select_winner(
+        s3, "bkt", trained=_trained(("champion-arch", "arch-v")), margin=0.0)
+    assert board["winner_version_id"] is None
+    assert board["champion_arch_refresh_version_id"] is None
+    assert (board["champion_arch_refresh_refused_reason"]
+            == "below_serving_incumbent_plus_margin")
+
+
+def test_a_behaviorally_vetoed_champion_arch_cannot_refresh(monkeypatch):
+    """The refresh clears EVERY gate a challenger clears — including the veto.
+
+    RED against BOTH prior trees: pre-I9024 the refresh existed and no
+    behavioral veto did, so this promoted; between I9024 and I9061 the refresh
+    did not exist at all, so the assertion had nothing to bind to.
+    """
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _s3(
+        incumbent=_manifest(mean_ic=INCUMBENT_IC, stdev_p_up=0.191),
+        candidates={"arch-v": _manifest(mean_ic=0.90, stdev_p_up=0.060)},
+    )
+    board = mz.select_winner(
+        s3, "bkt", trained=_trained(("champion-arch", "arch-v")), margin=0.0)
+    arch = next(c for c in board["candidates"] if c["version_id"] == "arch-v")
+    assert arch["reason"] == "behavioral_veto"
+    # …and the refresh carries that same reason through, rather than firing.
+    assert board["champion_arch_refresh_version_id"] is None
+    assert board["champion_arch_refresh_refused_reason"] == "behavioral_veto"
+
+
+def test_a_join_integrity_failed_champion_arch_cannot_refresh(monkeypatch):
+    """I9030's unconditional block reaches the refresh path too."""
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    monkeypatch.setattr(
+        cfg, "MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE", False, raising=False)
+    s3 = _s3(
+        incumbent=_manifest(mean_ic=INCUMBENT_IC),
+        candidates={"arch-v": _manifest(
+            mean_ic=0.90, second_opinion=LOW_MATCH_SECOND_OPINION)},
+    )
+    board = mz.select_winner(
+        s3, "bkt", trained=_trained(("champion-arch", "arch-v")), margin=0.0)
+    assert board["champion_arch_refresh_version_id"] is None
+    assert (board["champion_arch_refresh_refused_reason"]
+            == "second_opinion_join_integrity")
+
+
+def test_a_challenger_win_takes_precedence_over_the_refresh(monkeypatch):
+    monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
+    s3 = _s3(
+        incumbent=_manifest(mean_ic=INCUMBENT_IC),
+        candidates={
+            "arch-v": _manifest(mean_ic=0.20),
+            "chal-v": _manifest(mean_ic=0.40),
+        },
+    )
+    board = mz.select_winner(
+        s3, "bkt",
+        trained=_trained(("champion-arch", "arch-v"), ("resid", "chal-v")),
+        margin=0.0,
+    )
+    assert board["winner_version_id"] == "chal-v"
+    assert board["champion_arch_refresh_version_id"] is None
+    assert board["champion_arch_refresh_refused_reason"] == "challenger_won"
 
 
 # ── I9030: join integrity blocks with the enforce flag OFF ───────────────────

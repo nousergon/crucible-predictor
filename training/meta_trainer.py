@@ -2358,6 +2358,10 @@ def run_meta_training(
     leakfree_meta_ic = {"status": "not_run"}
     cpcv_meta_ic = {"status": "not_run"}
     promotion_stats = {"status": "not_run"}
+    # alpha-engine-config-I9024 §2 — the SERVING incumbent, re-scored on THIS
+    # rotation's folds with its own frozen weights. Computed here and nowhere
+    # else, because the folds only exist here. See training/incumbent_rescore.py.
+    incumbent_rescore = {"status": "not_run"}
     _lf_oos_preds = _lf_oos_true = _lf_oos_dates = None  # W5 capture (below)
     try:
         from training.leakfree_meta_ic import (
@@ -2436,6 +2440,44 @@ def run_meta_training(
             cpcv_meta_ic.get("n_combos"), cpcv_meta_ic.get("n_backtest_paths"),
             cpcv_meta_ic.get("n_groups"), cpcv_meta_ic.get("k_test"),
         )
+        # alpha-engine-config-I9024 §2 — the SERVING incumbent, evaluated over
+        # the SAME meta_X / meta_y / dates / folds / embargo / group parameters
+        # this candidate just used, with its own FROZEN weights (predict-only,
+        # never a refit). Without this the weekly comparison is cross-vintage: a
+        # score the incumbent earned weeks ago against candidates scored today.
+        #
+        # Deliberately AFTER the candidate's own CPCV and outside its try-scope
+        # for failure, so nothing about this can change the candidate's number.
+        # Never raises: a feature-contract mismatch (any feature addition causes
+        # one) reports its status and select_winner falls back to the bundle's
+        # stored CPCV, LABELLED as such.
+        try:
+            from training.incumbent_rescore import (
+                rescore_incumbent_on_current_vintage,
+            )
+            import boto3 as _b3_rescore
+            incumbent_rescore = rescore_incumbent_on_current_vintage(
+                _b3_rescore.client("s3"), bucket,
+                meta_X=meta_X, meta_y=meta_y, row_dates=_meta_dates,
+                train_meta_features=TRAIN_META_FEATURES,
+                forward_days=cfg.FORWARD_DAYS,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+                n_groups=getattr(cfg, "WF_CPCV_N_GROUPS", 6),
+                k_test=getattr(cfg, "WF_CPCV_K_TEST", 2),
+            )
+        except Exception:  # noqa: BLE001 — labelled fallback, never fails training
+            log.warning(
+                "alpha-engine-config-I9024 §2 incumbent re-score raised at its "
+                "call site — recorded as an error status; select_winner falls "
+                "back to the incumbent's STORED training-vintage CPCV and says "
+                "so on the leaderboard. NOT a pass.", exc_info=True,
+            )
+            incumbent_rescore = {
+                "status": "error",
+                "reason": "incumbent re-score raised at its call site",
+                "fit_mode": "frozen_predict_only",
+            }
+
         # config#2889 (Brian's 2026-07-18 Decision Queue Option-B ruling): an
         # INDEPENDENT second-party IC recomputation from realized outcomes, so
         # the promotion gate + report-card grade no longer rest on ONE
@@ -4516,6 +4558,14 @@ def run_meta_training(
                 "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
                 "dead_l1_observe": dead_l1_observe,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
+                # alpha-engine-config-I9024 §2 — the SERVING incumbent's frozen
+                # weights evaluated over THESE folds. The apples-to-apples
+                # number select_winner compares this candidate against, in place
+                # of the score the incumbent earned on its own training vintage.
+                # ``status`` names why it is absent when it is; a non-``ok``
+                # status makes select_winner fall back to the stored number and
+                # LABEL the comparison ``stored_training_vintage``.
+                "incumbent_rescore": incumbent_rescore,
                 "meta_model_promotion_stats": promotion_stats,
                 "meta_coefficients": meta_model._coefficients,
                 # alpha-engine-config-I7502: the L4565 directional
@@ -4939,6 +4989,8 @@ def run_meta_training(
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.
         # NOT gated. Additive per S3 contract safety.
         "meta_model_oos_ic_cpcv": cpcv_meta_ic,
+        # alpha-engine-config-I9024 §2 — see the manifest block above.
+        "incumbent_rescore": incumbent_rescore,
         # W1.3 (L4469, OBSERVE): two-lens promotion battery on the leak-free IC
         # series. `downside` = the house skilled-risk lens (Sortino-of-IC +
         # CVaR-of-IC + frac_negative_ic — Sortino/CVaR/maxDD basket, Sharpe is
