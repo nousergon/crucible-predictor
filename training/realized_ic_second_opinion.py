@@ -18,7 +18,8 @@ replay history (Option D's cost). Instead it takes the CPCV pipeline's own
 held-out test predictions (``cpcv_meta_oos_ic``'s ``_oos_preds``/``_oos_ids``/
 ``_oos_dates``, captured via ``return_preds=True``) and independently
 re-derives the ground-truth label for each (ticker, score_date) pair via a
-FRESH read of ``score_performance_outcomes`` in research.db — bypassing the
+FRESH read of ``universe_returns`` in research.db (alpha-engine-config-I9038;
+was ``score_performance_outcomes``, whose seeder died 2026-07-10) — bypassing the
 trainer's own ``meta_y``/``actual_fwd_canonical`` array entirely. A
 mislabeled/stale/leaked training-side ground truth cannot also poison this
 check, since it never touches ``meta_y``.
@@ -58,11 +59,18 @@ log = logging.getLogger(__name__)
 # "diverges". Mirrors the CPCV/WF modules' own min-sample floors.
 MIN_MATCHED_FOR_VERDICT = 30
 
-# Below this fraction of OOS rows successfully rejoined to
-# score_performance_outcomes, the MATCH ITSELF is suspect — a join/label
-# integrity problem (stale outcome store, symbol-format mismatch, wrong
-# horizon), not just "the model is weak". Surfaced as its own divergence
-# reason rather than silently folded into a low IC.
+# Below this fraction of IN-COVERAGE OOS rows successfully rejoined to the
+# ground truth, the MATCH ITSELF is suspect — a join/label integrity problem
+# (symbol-format mismatch, wrong horizon, a key change), not just "the model is
+# weak". Surfaced as its own divergence reason rather than silently folded into
+# a low IC.
+#
+# alpha-engine-config-I9038: the denominator is IN-COVERAGE rows, not all OOS
+# rows. Rows predating the ground truth's earliest resolved date cannot match
+# no matter how sound the join is, and folding them in turned this threshold
+# into an archive-depth check that no rotation could pass — blocking every
+# promotion from 2026-07-24 onward. Coverage shortfall is reported separately
+# as ``coverage_fraction``.
 MIN_MATCH_RATE = 0.5
 
 # A self-reported CPCV mean IC exceeding the independently-sourced
@@ -74,46 +82,95 @@ MIN_MATCH_RATE = 0.5
 DEFAULT_MAX_IC_GAP = 0.05
 
 
+# alpha-engine-config-I9038 — the ground truth is read from ``universe_returns``,
+# NOT ``score_performance_outcomes``.
+#
+# Measured 2026-08-28. ``score_performance_outcomes`` is derived from
+# ``score_performance``, whose seeder stopped on 2026-07-10 (the same date the
+# retired six-team Research LangGraph's other tables stop — see
+# alpha-engine-config-I8757). It holds 534 rows for horizon 21 spanning
+# 2026-03-04..2026-07-10, against CPCV OOS sets of ~150k rows spanning
+# 2025-07-02..2026-03-02 — a 0-8% match, every rotation since 2026-07-24. The
+# outcome producer itself is healthy; its INPUT is dead.
+#
+# ``universe_returns`` is the live source both stores derive from: 1.6M rows
+# carrying ``log_return_{h}d`` and ``log_spy_return_{h}d``, and
+# ``log_alpha = log_return - log_spy_return`` reproduces the stored
+# ``score_performance_outcomes.log_alpha`` EXACTLY — verified on all 534
+# overlapping rows, agreement 534/534 to 1e-9. So this is the same number from
+# a source that is still being written, not a looser substitute.
+def _horizon_columns(horizon_days: int) -> tuple[str, str]:
+    """The (stock, spy) log-return column pair for a horizon."""
+    return f"log_return_{int(horizon_days)}d", f"log_spy_return_{int(horizon_days)}d"
+
+
 def _fetch_realized_outcomes(
     db_path: str, tickers, score_dates, horizon_days: int,
-) -> dict[tuple[str, str], float]:
-    """Fresh, independent read of ``score_performance_outcomes.log_alpha``
-    keyed by ``(symbol, score_date)`` — bypasses the trainer's in-process
-    ``meta_y``/``actual_fwd_canonical`` array entirely so a labeling bug
-    there can't also poison this check."""
+) -> tuple[dict[tuple[str, str], float], tuple[str | None, str | None]]:
+    """Fresh, independent read of realized log-alpha keyed by
+    ``(ticker, eval_date)``, plus the ground truth's own COVERAGE WINDOW.
+
+    Bypasses the trainer's in-process ``meta_y``/``actual_fwd_canonical`` array
+    entirely, so a labeling bug there cannot also poison this check — the whole
+    point of the second opinion (config#2889).
+
+    Returns ``(realized, (cov_min, cov_max))``. The window is the min/max
+    ``eval_date`` at which this horizon actually resolves, and it is what lets
+    the caller tell "the join is broken" apart from "the archive does not reach
+    back that far" — two different findings with two different fixes, which the
+    pre-I9038 code collapsed into one `low_match_rate` verdict.
+    """
+    ret_col, spy_col = _horizon_columns(horizon_days)
     keys = {
         (str(t), str(d)[:10])
         for t, d in zip(tickers, score_dates)
         if t is not None and d is not None
     }
     if not keys:
-        return {}
+        return {}, (None, None)
     conn = sqlite3.connect(str(db_path))
     try:
-        has_store = conn.execute(
+        has_table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='score_performance_outcomes'"
+            "AND name='universe_returns'"
         ).fetchone()
-        if not has_store:
+        if not has_table:
             log.warning(
-                "second_opinion: score_performance_outcomes ABSENT from "
-                "research.db — cannot compute an independent IC this cycle"
+                "second_opinion: universe_returns ABSENT from research.db — "
+                "cannot compute an independent IC this cycle"
             )
-            return {}
+            return {}, (None, None)
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(universe_returns)")}
+        missing = [c for c in (ret_col, spy_col) if c not in cols]
+        if missing:
+            # A horizon the returns collector does not populate. Honest absence,
+            # NOT a join failure — the caller degrades to a non-blocking verdict.
+            log.warning(
+                "second_opinion: universe_returns has no %s for horizon %sd — "
+                "cannot compute an independent IC this cycle", missing, horizon_days,
+            )
+            return {}, (None, None)
+
+        cov = conn.execute(
+            f"SELECT MIN(eval_date), MAX(eval_date) FROM universe_returns "
+            f"WHERE {ret_col} IS NOT NULL AND {spy_col} IS NOT NULL"
+        ).fetchone()
+        cov_min = str(cov[0])[:10] if cov and cov[0] else None
+        cov_max = str(cov[1])[:10] if cov and cov[1] else None
+
         rows = conn.execute(
-            "SELECT symbol, score_date, log_alpha FROM "
-            "score_performance_outcomes WHERE horizon_days = ? "
-            "AND log_alpha IS NOT NULL",
-            (int(horizon_days),),
+            f"SELECT ticker, eval_date, {ret_col} - {spy_col} FROM universe_returns "
+            f"WHERE {ret_col} IS NOT NULL AND {spy_col} IS NOT NULL"
         ).fetchall()
     finally:
         conn.close()
     out: dict[tuple[str, str], float] = {}
-    for symbol, score_date, log_alpha in rows:
-        key = (str(symbol), str(score_date)[:10])
+    for ticker, eval_date, log_alpha in rows:
+        key = (str(ticker), str(eval_date)[:10])
         if key in keys and log_alpha is not None:
             out[key] = float(log_alpha)
-    return out
+    return out, (cov_min, cov_max)
 
 
 def compute_second_opinion_ic(
@@ -161,7 +218,9 @@ def compute_second_opinion_ic(
         }
 
     try:
-        realized = _fetch_realized_outcomes(db_path, ids, dates, horizon_days)
+        realized, (cov_min, cov_max) = _fetch_realized_outcomes(
+            db_path, ids, dates, horizon_days
+        )
     except Exception:  # noqa: BLE001 — best-effort: a DB read failure must not
         # crash training; the gate below treats "unavailable" as non-blocking.
         log.warning("second_opinion: research.db read failed", exc_info=True)
@@ -170,16 +229,53 @@ def compute_second_opinion_ic(
             "n_oos_rows": n_oos, "n_matched": 0, "match_rate": None,
         }
 
+    # alpha-engine-config-I9038 — match_rate is measured over the OOS rows the
+    # ground truth COULD cover, not over every OOS row.
+    #
+    # An OOS row dated before the archive's earliest resolved date can never
+    # match, however healthy the join is. Counting it as a miss makes
+    # ``match_rate`` a measure of ARCHIVE DEPTH rather than of join integrity —
+    # and since ``low_match_rate`` blocks promotion unconditionally (I9030),
+    # that conflation makes a short archive permanently indistinguishable from
+    # a broken key. Measured 2026-08-28: 34,901 of 35,178 in-coverage OOS pairs
+    # matched (99.2%), against 23.3% of all 150,000 OOS pairs — the join is
+    # sound and the archive is short. Different findings, different fixes; the
+    # horizon-vs-retention one is its own class (champion-challenger-policy 7.1)
+    # and is reported through ``coverage_fraction`` rather than folded in here.
+    in_coverage = 0
     matched_pred: list[float] = []
     matched_real: list[float] = []
     for pred, tid, d in zip(preds, ids, dates):
-        val = realized.get((str(tid), str(d)[:10]))
+        day = str(d)[:10]
+        if cov_min is not None and cov_max is not None and cov_min <= day <= cov_max:
+            in_coverage += 1
+        val = realized.get((str(tid), day))
         if val is not None and np.isfinite(pred):
             matched_pred.append(float(pred))
             matched_real.append(val)
 
     n_matched = len(matched_pred)
-    match_rate = (n_matched / n_oos) if n_oos else 0.0
+    # Denominator is the coverable rows. Falls back to n_oos when the window is
+    # unknown (no ground truth at all), preserving the old, stricter behaviour
+    # for the genuinely-unavailable case rather than dividing by zero.
+    denom = in_coverage if in_coverage > 0 else n_oos
+    match_rate = (n_matched / denom) if denom else 0.0
+    coverage_fraction = (in_coverage / n_oos) if n_oos else 0.0
+
+    if coverage_fraction < 1.0:
+        log.warning(
+            "second_opinion: ground truth covers %.1f%% of OOS rows (%d/%d, "
+            "window %s..%s) — the rest predate the archive and are excluded "
+            "from match_rate; see alpha-engine-config-I9038",
+            100 * coverage_fraction, in_coverage, n_oos, cov_min, cov_max,
+        )
+
+    coverage_fields = {
+        "n_in_coverage": in_coverage,
+        "coverage_fraction": round(coverage_fraction, 4),
+        "coverage_window": [cov_min, cov_max],
+        "ground_truth_source": "universe_returns",
+    }
 
     if n_matched < min_matched:
         return {
@@ -188,6 +284,7 @@ def compute_second_opinion_ic(
             "n_oos_rows": n_oos,
             "n_matched": n_matched,
             "match_rate": round(match_rate, 4),
+            **coverage_fields,
         }
 
     sp = spearmanr(matched_pred, matched_real).correlation
@@ -195,8 +292,9 @@ def compute_second_opinion_ic(
     status = "ok" if match_rate >= min_match_rate else "low_match_rate"
 
     log.info(
-        "second_opinion: IC=%s over %d/%d matched OOS rows (match_rate=%.2f, "
-        "status=%s)", ic, n_matched, n_oos, match_rate, status,
+        "second_opinion: IC=%s over %d/%d matched in-coverage OOS rows "
+        "(match_rate=%.2f, coverage=%.2f of %d total, status=%s)",
+        ic, n_matched, denom, match_rate, coverage_fraction, n_oos, status,
     )
     return {
         "status": status,
@@ -204,6 +302,7 @@ def compute_second_opinion_ic(
         "n_oos_rows": n_oos,
         "n_matched": n_matched,
         "match_rate": round(match_rate, 4),
+        **coverage_fields,
     }
 
 
