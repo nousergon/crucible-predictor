@@ -136,6 +136,67 @@ def resolve_event_run_date(event: dict[str, Any]) -> str | None:
     return value or None
 
 
+def resolve_coverage_partition_date(event: dict[str, Any]) -> str | None:
+    """Return the S3 PARTITION date for `event`'s coverage verdict.
+
+    This is `resolve_event_run_date` normalized to the cycle's TRADING day —
+    the one partition family `_stage_coverage/` has
+    (`alpha-engine-config-I8809`, `partition_family: trading_day`).
+
+    **Why the two dates had to be separated (alpha-engine-config-I8984).**
+    The weekly Step Function normalizes `$.run_date` once, at
+    `NormalizeRunDates`. `WeeklyRunDayGate` runs strictly BEFORE that state
+    by construction — its only entry is `CheckWeeklyRunDayGate`, whose
+    `Default` IS the normalizer — so the event reaching this Lambda on that
+    path still carries the CALENDAR date. That is correct and deliberate for
+    the gate's own arithmetic: it asks "was YESTERDAY the week's last trading
+    session", and the trading day is the answer it computes, never its input.
+    Its S3 prefix is a different question, and the payload conflated them.
+    Measured on the 2026-08-22 cycle: `WeeklyRunDayGate.json` under BOTH
+    `_stage_coverage/2026-08-21/` and `_stage_coverage/2026-08-22/`.
+
+    **Why this is not the config-I8155 substitution.** I8155 forbids a value
+    this PROCESS computed — `datetime.now()`, a self-invented stand-in for an
+    execution identity that was never supplied. This is a pure, total,
+    deterministic function OF the event's own date; it invents nothing, and
+    `None` in still yields `None` out. `resolve_event_run_date` keeps its
+    verbatim meaning for every non-partition reader.
+
+    **Why at this chokepoint rather than in the WeeklyRunDayGate branch.**
+    `krepis.dates.resolve_trading_day` is IDEMPOTENT BY CONTRACT — a
+    trading-day input returns unchanged — so every already-normalized call
+    site (LibPinDriftCheck, PipelineContractCheck, RegimeSubstrate,
+    RegimeRetrospectiveEval, all downstream of `NormalizeRunDates`) is a
+    no-op, and a fifth handler adopting `safe_assert_stage_coverage` inherits
+    the partition family instead of re-deciding it. Fixing only the one
+    branch would fix the instance and leave the class.
+
+    Degrades to the raw value, loudly, if krepis cannot normalize it — never
+    to today's date, which is the failure mode this whole arc removes.
+    """
+    run_date = resolve_event_run_date(event)
+    if run_date is None:
+        return None
+    try:
+        from krepis.dates import resolve_trading_day
+
+        return resolve_trading_day(run_date)
+    except Exception:  # noqa: BLE001
+        # Recorded, not swallowed (fleet "fail loud" rule): (a) the failure
+        # mode is an unparseable/uncalendarable event date or a krepis SHA
+        # predating `resolve_trading_day`; (b) the handler's own deliverable
+        # — the gate verdict — is unaffected, this is an observability side
+        # effect; (c) recorded on the handler's log group at ERROR, which
+        # flow-doctor pages from.
+        logging.getLogger(__name__).error(
+            "coverage partition normalization failed for run_date=%r "
+            "(alpha-engine-config-I8984); using the raw event date. The "
+            "verdict may land in the calendar partition and read as `absent`.",
+            run_date, exc_info=True,
+        )
+        return run_date
+
+
 def unmeasured_stage_coverage(
     stage: str, reason: str, *, window_start: datetime | None = None
 ) -> dict[str, Any]:
@@ -210,7 +271,11 @@ def safe_assert_stage_coverage(
             window_start=window_start,
         )
 
-    run_date = resolve_event_run_date(event)
+    # alpha-engine-config-I8984: the PARTITION date, not the event's raw
+    # date. See `resolve_coverage_partition_date` for why they differ on the
+    # WeeklyRunDayGate path, and why normalizing here is not the I8155
+    # substitution this module exists to prevent.
+    run_date = resolve_coverage_partition_date(event)
     if run_date is None:
         log.error(
             "stage-coverage assertion skipped for %s: event carries no "
