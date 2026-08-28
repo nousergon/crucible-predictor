@@ -9,10 +9,18 @@ live champion / model-zoo registry at all.
 Two factories:
 
   * :meth:`TrainingIOSpec.live` — the production default. Reads the canonical
-    ``universe`` library, labels off ``Close``, writes to the live
-    ``predictor/weights/meta/`` + ``predictor/metrics/`` prefixes, and is
-    eligible for champion promotion + model-zoo registration. A run built
-    from ``live()`` is byte-identical to the pre-shadow behaviour.
+    ``universe`` library, labels off ``Close``, writes its weight contract to
+    the TRAINING STAGING root ``predictor/weights/meta_staging/`` (scoped per
+    run by :meth:`for_run`) and its metrics to ``predictor/metrics/``, and is
+    eligible for champion promotion + model-zoo registration.
+
+    alpha-engine-config-I9018: ``live()`` deliberately does NOT write to
+    ``predictor/weights/meta/``. That prefix is the LIVE SERVING contract and
+    has exactly one writer, ``model.registry.promote_to_champion``. Until
+    2026-08-28 ``live()`` pointed straight at it, so the Saturday retrain
+    replaced the served model's manifest and feature contract as a side effect
+    of training — no promotion decision required, and no way to roll back that
+    survived the next rotation.
 
   * :meth:`TrainingIOSpec.shadow` — an evidence-only run on an alternate basis
     (e.g. ``crsp`` total-return). Reads the SCRATCH ``universe_crsp`` library,
@@ -33,7 +41,7 @@ PR7-step-7b of epic config#1433 / config#1434. Cross-repo dependency: the
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # Supported shadow bases → (universe library, label close column). The only
 # basis today is the CRSP total-return rebuild; adding a basis is a one-line
@@ -58,9 +66,12 @@ class TrainingIOSpec:
     close_col: str = "Close"
 
     # ── Output paths ──────────────────────────────────────────────────────
-    weights_prefix: str = "predictor/weights/meta/"
-    manifest_key: str = "predictor/weights/meta/manifest.json"
-    feature_list_key: str = "predictor/weights/meta/feature_list.json"
+    # alpha-engine-config-I9018 — the defaults are the TRAINING STAGING root,
+    # never the live serving prefix. Training must not be able to reach
+    # ``predictor/weights/meta/`` even by forgetting to pass a spec.
+    weights_prefix: str = "predictor/weights/meta_staging/"
+    manifest_key: str = "predictor/weights/meta_staging/manifest.json"
+    feature_list_key: str = "predictor/weights/meta_staging/feature_list.json"
     summary_key_tmpl: str = "predictor/metrics/training_summary_{date}.json"
     summary_latest_key: str = "predictor/metrics/training_summary_latest.json"
     oos_rows_prefix: str = "predictor/diagnostics/oos_rows/"
@@ -82,6 +93,12 @@ class TrainingIOSpec:
     # Non-None marks this as a shadow run (e.g. "crsp").
     shadow_basis: str | None = None
 
+    # alpha-engine-config-I9018 — when True, :meth:`for_run` scopes the output
+    # paths by ``{date}/{model_version}/`` so two specs in the same weekly Map
+    # iteration cannot overwrite each other. False for a shadow run, whose
+    # prefixes are already disjoint from everything else by construction.
+    run_scoped_outputs: bool = True
+
     @property
     def is_shadow(self) -> bool:
         return self.shadow_basis is not None
@@ -96,6 +113,40 @@ class TrainingIOSpec:
     def oos_rows_latest_key(self) -> str:
         return f"{self.oos_rows_prefix}latest.parquet"
 
+    def for_run(self, *, date_str: str, model_version: str) -> "TrainingIOSpec":
+        """Return this spec with its WEIGHT-CONTRACT paths scoped to one run.
+
+        alpha-engine-config-I9018. The weekly rotation trains several specs, in
+        parallel Step Functions Map iterations, against one bucket. Sharing a
+        single output prefix between them is what let the dated archive capture
+        "whichever spec wrote last" instead of the model it was labelled with
+        (I9028), and it is why a per-run prefix — not merely a non-serving one —
+        is the fix.
+
+        Scoped by BOTH the rotation date and the spec's ``MODEL_VERSION_LABEL``,
+        so the path is deterministic and an operator can find a given run's
+        output without a listing. Returns ``self`` unchanged for a shadow spec
+        (already disjoint) or when scoping is switched off.
+
+        Summary / OOS-diagnostic paths are deliberately NOT scoped: they are
+        dated artifacts with their own freshness SLAs and their own consumers.
+        """
+        if not self.run_scoped_outputs:
+            return self
+        if not date_str or not model_version:
+            raise ValueError(
+                "TrainingIOSpec.for_run requires a non-empty date_str and "
+                "model_version — an unscoped training output prefix is the "
+                "defect this exists to prevent (alpha-engine-config-I9018)."
+            )
+        root = f"{self.weights_prefix}{date_str}/{model_version}/"
+        return replace(
+            self,
+            weights_prefix=root,
+            manifest_key=f"{root}manifest.json",
+            feature_list_key=f"{root}feature_list.json",
+        )
+
     @classmethod
     def live(cls) -> "TrainingIOSpec":
         """The production default — reads ``config`` for the live keys so any
@@ -106,9 +157,15 @@ class TrainingIOSpec:
         return cls(
             universe_lib="universe",
             close_col="Close",
-            weights_prefix=cfg.META_WEIGHTS_PREFIX,
-            manifest_key=cfg.META_MANIFEST_KEY,
-            feature_list_key=cfg.META_FEATURE_LIST_KEY,
+            # alpha-engine-config-I9018 — the STAGING root, NOT
+            # cfg.META_WEIGHTS_PREFIX. ``predictor/weights/meta/`` is the live
+            # serving contract and is written by exactly one caller,
+            # ``model.registry.promote_to_champion``. A training run that could
+            # write there swaps the served model as a side effect of training,
+            # which is what happened every Saturday until 2026-08-28.
+            weights_prefix=cfg.META_STAGING_PREFIX,
+            manifest_key=f"{cfg.META_STAGING_PREFIX}manifest.json",
+            feature_list_key=f"{cfg.META_STAGING_PREFIX}feature_list.json",
             summary_key_tmpl="predictor/metrics/training_summary_{date}.json",
             summary_latest_key="predictor/metrics/training_summary_latest.json",
             oos_rows_prefix="predictor/diagnostics/oos_rows/",
@@ -117,6 +174,7 @@ class TrainingIOSpec:
             register_in_zoo=True,
             write_side_artifacts=True,
             shadow_basis=None,
+            run_scoped_outputs=True,
         )
 
     @classmethod
@@ -151,6 +209,7 @@ class TrainingIOSpec:
             register_in_zoo=False,
             write_side_artifacts=False,
             shadow_basis=key,
+            run_scoped_outputs=False,
         )
 
     @classmethod

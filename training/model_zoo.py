@@ -234,28 +234,19 @@ def train_one_spec(
     failure (and only this spec's) without aborting siblings — the key robustness
     property. Returns the train result dict on success.
     """
-    # G2 — snapshot the live contract before the challenger train overwrites it.
-    # Only for the real trainer (train_fn is None) on a non-dry run; an injected
-    # test train_fn does no live writes, so there's nothing to restore.
-    saved_contract: dict = {}
-    if not dry_run and train_fn is None:
-        if s3 is None:
-            try:
-                import boto3
-                s3 = boto3.client("s3")
-            except Exception:  # noqa: BLE001 — G2 is best-effort
-                log.warning("model_zoo train-spec G2: no S3 client — live-contract restore skipped", exc_info=True)
-        if s3 is not None:
-            saved_contract = _snapshot_live_contract(s3, bucket)
-    try:
-        return train_spec(
-            spec_id, bucket, date_str=date_str, dry_run=dry_run,
-            specs=specs, train_fn=train_fn,
-        )
-    finally:
-        # G2 — always restore, even if the train raised mid-way.
-        if saved_contract and s3 is not None:
-            _restore_live_contract(s3, bucket, saved_contract)
+    # alpha-engine-config-I9018 — the G2 snapshot/restore of the live contract is
+    # GONE, together with the hazard it patched over. Training now writes a
+    # per-run staging prefix (``TrainingIOSpec.for_run``), so a challenger train
+    # cannot overwrite the live manifest/feature_list and there is nothing to
+    # restore. Keeping G2 would also have left a SECOND writer of
+    # ``predictor/weights/meta/`` — restoring bytes is still writing them — and
+    # the invariant this PR establishes is that exactly one caller writes there:
+    # ``model.registry.promote_to_champion``. ``s3`` stays in the signature for
+    # the callers that pass it; it is unused here.
+    return train_spec(
+        spec_id, bucket, date_str=date_str, dry_run=dry_run,
+        specs=specs, train_fn=train_fn,
+    )
 
 
 def train_all_active(
@@ -376,53 +367,19 @@ def _list_registry_versions(bucket: str) -> list:
         return []
 
 
-# ── Rotation isolation (L4544 G2) ───────────────────────────────────────────
-# A zoo rotation trains CHALLENGER variants — it must NOT disturb the live
-# champion. One hazard remains in meta_trainer:
-#   • feature_list.json + manifest.json are written to the LIVE keys
-#     UNCONDITIONALLY (model WEIGHTS are gated on `promoted`, but the two
-#     contract files are not) → a challenger train leaves the live champion's
-#     contract describing the challenger.
-# G2 restores the live contract after the rotation. (The former G1 — forcing
-# TRAINING_AUTO_PROMOTE_ENABLED=False so no spec self-promoted — is GONE: since
-# config#1052/#679 training is UNCONDITIONALLY challenger-first, so a spec can
-# never self-promote and there is nothing to force. Promotion is decided solely
-# by the `select_winner` selection step below.) G2 is localized here (no
-# meta_trainer surgery — the champion path is freshly stabilized by #240).
-
-
-def _live_contract_keys() -> list[str]:
-    """The live champion contract objects meta_trainer overwrites unconditionally."""
-    return [getattr(cfg, "META_MANIFEST_KEY"), getattr(cfg, "META_FEATURE_LIST_KEY")]
-
-
-def _snapshot_live_contract(s3, bucket: str) -> dict:
-    """G2 — read the live champion contract into memory for post-rotation
-    restore. Best-effort: a missing/unreadable key just isn't restored."""
-    saved: dict = {}
-    for key in _live_contract_keys():
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            saved[key] = (obj["Body"].read(), obj.get("ContentType", "application/json"))
-        except Exception:  # noqa: BLE001 — best-effort capture
-            log.warning("model_zoo G2: could not snapshot live contract key %s", key, exc_info=True)
-    return saved
-
-
-def _restore_live_contract(s3, bucket: str, saved: dict) -> None:
-    """G2 — restore the captured live champion contract after the rotation. A
-    restore failure is logged LOUDLY (the live contract may describe a
-    challenger), but #240 embeds feature_names in the meta pickle so inference
-    stays aligned regardless — so we warn, never raise, on this best-effort path."""
-    for key, (body, ctype) in saved.items():
-        try:
-            s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=ctype)
-        except Exception:  # noqa: BLE001
-            log.warning(
-                "model_zoo G2: FAILED to restore live contract key %s — the live "
-                "champion contract may describe a challenger (mitigated by "
-                "feature_names-in-pickle #240); investigate.", key, exc_info=True,
-            )
+# ── Rotation isolation (was L4544 G2 — now structural) ──────────────────────
+# A zoo rotation trains CHALLENGER variants and must not disturb the live
+# champion. It used to disturb it: meta_trainer wrote manifest.json and
+# feature_list.json to the LIVE keys unconditionally, so a challenger train left
+# the live champion's contract describing the challenger. G2 papered over that by
+# snapshotting those two objects before the rotation and writing them back after.
+#
+# alpha-engine-config-I9018 removes the hazard instead of restoring after it:
+# ``TrainingIOSpec.live()`` now writes to a per-run staging prefix, so nothing in
+# training can reach ``predictor/weights/meta/``. G2 is deleted with it — a
+# restore is itself a write to the serving prefix, and the invariant now is that
+# ``model.registry.promote_to_champion`` is that prefix's only writer
+# (asserted by tests/test_live_prefix_single_writer.py).
 
 
 def train_weekly_rotation(
@@ -458,39 +415,20 @@ def train_weekly_rotation(
         budget, len(selected), n_active, selected,
     )
 
-    # G2 — snapshot the live contract before any challenger train overwrites it.
-    # Auto-create the client only for the REAL trainer (train_fn is None); a test
-    # that injects a fake train_fn does no live writes, so there's nothing to
-    # restore and we must not touch S3 (keeps unit tests pure).
-    saved_contract: dict = {}
-    if not dry_run:
-        if s3 is None and train_fn is None:
-            try:
-                import boto3
-                s3 = boto3.client("s3")
-            except Exception:  # noqa: BLE001 — G2 is best-effort
-                log.warning("model_zoo G2: no S3 client — live-contract restore skipped", exc_info=True)
-        if s3 is not None:
-            saved_contract = _snapshot_live_contract(s3, bucket)
-
-    # Training is unconditionally challenger-first (config#1052/#679), so no spec
-    # can self-promote — the former G1 guard is gone. Promotion is decided only by
-    # the `select_winner` selection step downstream.
+    # alpha-engine-config-I9018 — no G2 snapshot/restore: training writes a
+    # per-run staging prefix and cannot touch the live contract at all. Training
+    # is unconditionally challenger-first (config#1052/#679), so no spec can
+    # self-promote; promotion is decided only by `select_winner` downstream.
     results: dict = {}
-    try:
-        for sid in selected:
-            try:
-                results[sid] = train_spec(
-                    sid, bucket, date_str=date_str, dry_run=dry_run,
-                    specs=specs, train_fn=train_fn,
-                )
-            except Exception as exc:  # noqa: BLE001 — one variant must not block the rest
-                log.warning("model_zoo: spec %s failed (continuing): %s", sid, exc, exc_info=True)
-                results[sid] = {"status": "error", "error": str(exc)}
-    finally:
-        # G2 — always restore the live contract, even if the rotation raised mid-way.
-        if saved_contract and s3 is not None:
-            _restore_live_contract(s3, bucket, saved_contract)
+    for sid in selected:
+        try:
+            results[sid] = train_spec(
+                sid, bucket, date_str=date_str, dry_run=dry_run,
+                specs=specs, train_fn=train_fn,
+            )
+        except Exception as exc:  # noqa: BLE001 — one variant must not block the rest
+            log.warning("model_zoo: spec %s failed (continuing): %s", sid, exc, exc_info=True)
+            results[sid] = {"status": "error", "error": str(exc)}
     return results
 
 
@@ -574,6 +512,16 @@ def _read_registry_manifest(s3, bucket: str, version_id: str) -> dict:
 
 
 def _read_live_manifest(s3, bucket: str) -> dict:
+    """Read the LIVE serving manifest.
+
+    alpha-engine-config-I9018 — POINTER READ ONLY. The one field any caller may
+    take from this object is ``served_version`` (and the horizon/served-date
+    metadata beside it). Its CPCV fields must never feed a promotion decision:
+    until the staging split, every spec of the rotation trained into this prefix
+    before ``select_winner`` ran, so the "incumbent" score read back was the
+    candidate's own. Use ``_resolve_incumbent_from_bundle`` to get an incumbent
+    score.
+    """
     obj = s3.get_object(Bucket=bucket, Key=getattr(cfg, "META_MANIFEST_KEY"))
     return json.loads(obj["Body"].read())
 
@@ -779,6 +727,210 @@ def _selection_pbo(candidates: list[dict], manifests: dict) -> dict:
     return out
 
 
+def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
+    """Resolve the SERVING champion's identity and CPCV from its own immutable
+    registry bundle. alpha-engine-config-I9018.
+
+    Two reads, in this order, and neither may be substituted:
+
+      1. ``predictor/weights/meta/manifest.json`` → ``served_version``. This is
+         the live manifest, but ONLY the ``served_version`` POINTER is taken
+         from it — never a score. Since the staging split (I9018, same PR) the
+         sole writer of that file is
+         ``model.registry.promote_to_champion``, so the pointer is a true
+         statement of what is being served.
+      2. ``predictor/registry/{served_version}/manifest.json`` → the CPCV. The
+         bundle is immutable and content-addressed, so this run cannot write
+         the number it is about to be compared against.
+
+    Reading the CPCV out of the live manifest — the pre-fix behaviour — read
+    the CANDIDATE'S OWN score back, because every spec in the rotation trained
+    into that prefix first. There is therefore NO fallback to it: a missing
+    ``served_version``, or one naming a bundle that does not exist, RAISES.
+    Degrading to the live manifest is the original bug, exactly.
+
+    The one non-raising case is a bucket with no live manifest at all — a
+    bootstrap rotation with nothing yet serving (champion-challenger-policy
+    §9.1). That returns ``(None, {})`` and is logged loudly.
+    """
+    try:
+        live_manifest = _read_live_manifest(s3, bucket)
+    except Exception as exc:  # noqa: BLE001 — bootstrap: nothing is serving yet
+        log.warning(
+            "model_zoo select: no readable live manifest at %s (%s) — treating "
+            "this as a BOOTSTRAP rotation with no incumbent. The serving CPCV "
+            "is reported as unavailable; it is NEVER read out of the live "
+            "manifest (alpha-engine-config-I9018).",
+            getattr(cfg, "META_MANIFEST_KEY", "?"), exc,
+        )
+        return None, {}
+
+    served_version = live_manifest.get("served_version")
+    if not served_version:
+        raise PromotionInputIntegrityError(
+            f"model_zoo alpha-engine-config-I9018: the live manifest "
+            f"{getattr(cfg, 'META_MANIFEST_KEY', '?')} exists but names no "
+            f"served_version, so the incumbent cannot be identified. Refusing "
+            f"to fall back to that file's own cpcv fields — reading the "
+            f"incumbent's score from the prefix this rotation trains into is "
+            f"the defect this replaced (x >= x, 4/4 rotations "
+            f"2026-08-07 → 2026-08-21)."
+        )
+    try:
+        manifest = _read_registry_manifest(s3, bucket, served_version)
+    except Exception as exc:  # noqa: BLE001 — re-raised as an integrity failure
+        raise PromotionInputIntegrityError(
+            f"model_zoo alpha-engine-config-I9018: the live manifest names "
+            f"served_version={served_version!r} but its registry bundle "
+            f"{_REGISTRY_PREFIX}/{served_version}/manifest.json could not be "
+            f"read ({exc}). The incumbent's CPCV has exactly one honest source "
+            f"and there is no fallback: a promotion decided without it would "
+            f"be decided against a number this run wrote."
+        ) from exc
+    log.info(
+        "model_zoo select: incumbent resolved from its registry bundle — "
+        "served_version=%s, CPCV mean IC %s (immutable, content-addressed; "
+        "NOT re-read from %s)",
+        served_version, _cpcv_mean(manifest),
+        getattr(cfg, "META_MANIFEST_KEY", "?"),
+    )
+    return served_version, manifest
+
+
+class PromotionInputIntegrityError(RuntimeError):
+    """alpha-engine-config-I9018 / -I9024 §6 — a number feeding the promotion
+    decision cannot be trusted as a measurement.
+
+    Raised, never swallowed and never degraded to a warning, when either:
+
+      * the incumbent's CPCV mean IC equals a candidate's to full float
+        precision while the two are different registry versions. Two models
+        trained on different data vintages do not tie to 6 decimal places;
+        that equality is a READ BUG (the incumbent number was sourced from a
+        prefix this run had already overwritten), never a result. Measured in
+        4/4 rotations 2026-08-07 → 2026-08-21.
+      * a manifest reaching the promotion decision declares
+        ``cpcv_is_stale_snapshot: true`` — i.e. it says of itself that its CPCV
+        is not a measurement of this vintage. champion-challenger-policy §7.2:
+        an unmeasurable comparison must never render as a pass.
+    """
+
+
+def _declares_stale_cpcv_snapshot(manifest: dict | None) -> bool:
+    """True when ``manifest`` declares its own CPCV to be a stale snapshot.
+
+    Checked at the top level and inside ``meta_model_oos_ic_cpcv`` (both
+    spellings have been emitted), so a producer setting either one is caught.
+    """
+    if not manifest:
+        return False
+    if manifest.get("cpcv_is_stale_snapshot"):
+        return True
+    cpcv = manifest.get("meta_model_oos_ic_cpcv") or {}
+    return bool(cpcv.get("cpcv_is_stale_snapshot") or cpcv.get("is_stale_snapshot"))
+
+
+def _assert_promotion_inputs_honest(
+    *, incumbent_vid: str | None, incumbent_ic: float | None,
+    incumbent_manifest: dict | None,
+    candidate_ics: dict[str, float | None],
+    candidate_manifests: dict[str, dict | None],
+) -> None:
+    """Fail LOUD before any promotion decision is derived from the inputs.
+
+    See ``PromotionInputIntegrityError`` for the two conditions and why each
+    one is a defect rather than a result. No caller may downgrade these to a
+    log line: a promotion gate that cannot tell the incumbent's score from the
+    candidate's is not a gate.
+    """
+    if _declares_stale_cpcv_snapshot(incumbent_manifest):
+        raise PromotionInputIntegrityError(
+            f"model_zoo alpha-engine-config-I9018: the incumbent manifest "
+            f"({incumbent_vid}) declares cpcv_is_stale_snapshot=true — it is "
+            f"not a measurement of any vintage and must not reach a promotion "
+            f"decision (champion-challenger-policy §7.2)."
+        )
+    for vid, manifest in candidate_manifests.items():
+        if _declares_stale_cpcv_snapshot(manifest):
+            raise PromotionInputIntegrityError(
+                f"model_zoo alpha-engine-config-I9018: candidate {vid}'s "
+                f"manifest declares cpcv_is_stale_snapshot=true — a candidate "
+                f"cannot be promoted on a CPCV it says is stale "
+                f"(champion-challenger-policy §7.2)."
+            )
+    if incumbent_ic is None:
+        return
+    for vid, ic in candidate_ics.items():
+        # A content-addressed bundle that collapses to the incumbent's own id IS
+        # the incumbent — an identical contract, so an identical CPCV is correct.
+        if ic is None or vid == incumbent_vid:
+            continue
+        if float(ic) == float(incumbent_ic):
+            raise PromotionInputIntegrityError(
+                f"model_zoo alpha-engine-config-I9018: the incumbent "
+                f"({incumbent_vid}) and candidate {vid} report an IDENTICAL "
+                f"CPCV mean IC ({incumbent_ic!r}) to full float precision. Two "
+                f"models on different data vintages do not tie — this is a READ "
+                f"bug (the incumbent's score sourced from a prefix this run "
+                f"overwrote), not a result. Refusing to derive a promotion "
+                f"decision from it."
+            )
+
+
+# alpha-engine-config-I9030 — the second opinion carries TWO different kinds of
+# verdict, and they must never share a code path or an authority.
+#
+#   insufficient          the gate could not run at all (no OOS predictions, the
+#                         outcome store unreadable, too few rejoined rows to make
+#                         any verdict). champion-challenger-policy §5.1: reported
+#                         and NON-BLOCKING. "You cannot gate on a statistic you
+#                         did not measure."
+#   join_integrity_failure the gate RAN and reported that the candidate's OOS rows
+#                         do not reconcile with realized outcomes (match rate
+#                         below the floor). This is a DATA-INTEGRITY assertion,
+#                         not a model-quality opinion, so it BLOCKS regardless of
+#                         MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE. The 2026-08-21
+#                         rotation promoted a champion whose own leaderboard row
+#                         said "only 8% of CPCV OOS rows rejoined … a label/join
+#                         integrity problem" because this shared the soak flag
+#                         with the magnitude case below.
+#   magnitude_divergence  the gate ran on a HEALTHY match rate and merely
+#                         disagrees about how good the model is. That is the case
+#                         the observe-first soak was designed for, so it stays
+#                         behind MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE.
+#   corroborates          the gate ran and agreed.
+SECOND_OPINION_UNCOMPUTABLE_STATUSES = (
+    None, "unavailable", "no_oos_predictions", "insufficient_matched_rows",
+)
+
+
+def _second_opinion_verdict_class(second_opinion: dict | None,
+                                  so_verdict: dict | None) -> str:
+    """Classify a second-opinion verdict into one of the four classes above.
+
+    Deliberately derived from the second opinion's OWN reported ``status`` /
+    ``match_rate`` rather than from the divergence reason string: a verdict's
+    authority must not depend on prose that a future edit can reword.
+    """
+    from training.realized_ic_second_opinion import MIN_MATCH_RATE
+
+    second_opinion = second_opinion or {}
+    so_verdict = so_verdict or {}
+    status = second_opinion.get("status")
+    if status in SECOND_OPINION_UNCOMPUTABLE_STATUSES:
+        return "insufficient"
+    if second_opinion.get("second_opinion_ic") is None:
+        return "insufficient"
+    match_rate = second_opinion.get("match_rate")
+    if status == "low_match_rate" or (
+        match_rate is not None and float(match_rate) < MIN_MATCH_RATE
+    ):
+        return "join_integrity_failure"
+    if so_verdict.get("divergence_detected"):
+        return "magnitude_divergence"
+    return "corroborates"
+
+
 def select_winner(
     s3, bucket: str, *, trained: list[dict], margin: float | None = None,
     n_trials_cumulative: int | None = None,
@@ -786,9 +938,11 @@ def select_winner(
     """Rank freshly-trained challengers by leak-free-CPCV mean IC and pick a
     winner that beats the VINTAGE-CONSISTENT baseline by ``margin``. Returns a
     leaderboard dict with three labeled groups (serving_champion / champion_arch /
-    challengers); ``winner_version_id`` is the best eligible CHALLENGER or None;
-    ``champion_arch_refresh_version_id`` keeps the live model fresh when no
-    challenger wins.
+    challengers); ``winner_version_id`` is the best eligible CHALLENGER or None.
+
+    alpha-engine-config-I9024 s1 — ``winner_version_id`` is the ONLY promotion
+    output. There is no second path: the champion-arch refresh (which promoted
+    the fresh retrain whenever no challenger won) has been deleted.
 
     config#671/#673/#1052 + #679(ii) — TRUE FRESH-BEST-WINS promotion.
 
@@ -796,11 +950,12 @@ def select_winner(
     candidate's CPCV — the champion ARCHITECTURE retrained on THIS data vintage — NOT
     the stale serving manifest (a different, older vintage). This is the apples-to-
     apples same-vintage comparison; we fall back to the serving snapshot ONLY when no
-    champion-arch trained this run (logged). The champion-arch row is the baseline, so
-    it is NEVER a "challenger" winner (it can't beat itself) — it carries reason
-    ``champion_arch_baseline``. But it CAN still refresh the live model when no
-    challenger wins (see ``champion_arch_refresh_version_id``), so the deployed 21d
-    model stays current weekly.
+    champion-arch trained this run (logged, and now read from the incumbent's own
+    immutable registry bundle rather than the live manifest — I9018). The
+    champion-arch row is the baseline, so it is NEVER a winner (it can't beat
+    itself) — it carries reason ``champion_arch_baseline`` and, since I9024 s1,
+    it cannot promote itself by any other route either. When no challenger wins,
+    the sitting champion keeps serving however stale it is.
 
     The absolute DSR-0.95 hurdle (``_gate_pass``) is NO LONGER a promotion blocker:
     both estimates are equally data-starved on ~1 independent 21d block, so the
@@ -831,17 +986,26 @@ def select_winner(
     from training.realized_ic_second_opinion import evaluate_second_opinion_gate
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
-    # Its CPCV mean IC is a STALE last-promoted snapshot (a prior vintage), so it
-    # is NOT the apples-to-apples promotion baseline — it's surfaced only so the
-    # operator sees what the system is currently serving + when it was promoted.
-    serving_manifest: dict = {}
-    try:
-        serving_manifest = _read_live_manifest(s3, bucket)
-    except Exception:  # noqa: BLE001 — serving-champion snapshot best-effort
-        log.warning("model_zoo select: could not read live champion manifest", exc_info=True)
+    # alpha-engine-config-I9018 — resolved from the INCUMBENT'S OWN REGISTRY
+    # BUNDLE (``predictor/registry/{champion_version_id}/manifest.json``), never
+    # from ``cfg.META_MANIFEST_KEY``.
+    #
+    # Why: ``predictor/weights/meta/`` is a MUTABLE prefix that every spec in
+    # this rotation trains into (``training/meta_trainer.py``, ``io.weights_prefix``)
+    # BEFORE ``select()`` runs. Reading the incumbent's score from there read the
+    # CANDIDATE'S OWN number back — measured in 4/4 rotations 2026-08-07 →
+    # 2026-08-21, where ``serving_champion.cpcv_mean_ic`` was bit-identical to
+    # ``champion_arch.cpcv_mean_ic`` to 6dp. Registry bundles are immutable and
+    # content-addressed, so this run structurally CANNOT write the number it is
+    # about to be compared against.
+    serving_bundle_vid, serving_manifest = _resolve_incumbent_from_bundle(s3, bucket)
     champ_fwd = int(serving_manifest.get("forward_days") or getattr(cfg, "FORWARD_DAYS", 21))
     serving_ic = _cpcv_mean(serving_manifest)
-    serving_version = serving_manifest.get("served_version") or serving_manifest.get("version")
+    serving_version = (
+        serving_manifest.get("served_version")
+        or serving_manifest.get("version")
+        or serving_bundle_vid
+    )
     serving_date = serving_manifest.get("served_date") or serving_manifest.get("date")
 
     # ── Read every candidate manifest up front (needed to locate champion-arch
@@ -865,6 +1029,18 @@ def select_winner(
         (r for r in trained if r.get("spec_id") == "champion-arch"), None)
     champ_arch_vid = champ_arch_rec.get("version_id") if champ_arch_rec else None
     champ_arch_ic = _cpcv_mean(manifests.get(champ_arch_vid)) if champ_arch_vid else None
+
+    # alpha-engine-config-I9018 / -I9024 §6 — the integrity assertions run BEFORE
+    # any eligibility is derived, so a rotation whose numbers cannot be told apart
+    # fails the run rather than promoting on them.
+    _assert_promotion_inputs_honest(
+        incumbent_vid=serving_bundle_vid,
+        incumbent_ic=serving_ic,
+        incumbent_manifest=serving_manifest,
+        candidate_ics={vid: _cpcv_mean(m) for vid, m in manifests.items()},
+        candidate_manifests=manifests,
+    )
+
     if champ_arch_ic is not None:
         baseline_ic = champ_arch_ic
         baseline_source = "champion_arch_fresh"
@@ -878,8 +1054,34 @@ def select_winner(
         baseline_source = "serving_champion_stale"
         log.warning(
             "model_zoo select: no champion-arch candidate this run — promotion "
-            "baseline FALLS BACK to the stale serving-champion CPCV %s (a "
-            "cross-vintage comparison; #679ii degrades gracefully)", serving_ic,
+            "baseline FALLS BACK to the incumbent's own registry-bundle CPCV %s "
+            "(bundle=%s; a CROSS-VINTAGE comparison, weaker than #679ii's "
+            "same-vintage one, but an immutable number this run cannot write)",
+            serving_ic, serving_bundle_vid,
+        )
+
+    # alpha-engine-config-I9030 — the BASELINE's own join integrity. A challenger
+    # is measured against the champion-arch baseline; if the baseline's OOS rows
+    # do not reconcile with realized outcomes, the comparison is meaningless in
+    # BOTH directions (an inflated baseline refuses good challengers, a deflated
+    # one admits bad ones). So a baseline that fails join integrity refuses the
+    # whole rotation's promotions rather than being silently compared against.
+    _baseline_so = (
+        ((manifests.get(champ_arch_vid) or {}).get("meta_model_oos_ic_cpcv") or {})
+        .get("second_opinion") or {}
+    ) if baseline_source == "champion_arch_fresh" else {}
+    baseline_so_class = _second_opinion_verdict_class(
+        _baseline_so, evaluate_second_opinion_gate(champ_arch_ic, _baseline_so),
+    ) if _baseline_so else "insufficient"
+    baseline_join_integrity_failed = baseline_so_class == "join_integrity_failure"
+    if baseline_join_integrity_failed:
+        log.error(
+            "model_zoo select: alpha-engine-config-I9030 the PROMOTION BASELINE "
+            "(champion-arch %s) fails second-opinion join integrity — every "
+            "comparison against it this rotation is unmeasurable, so no "
+            "candidate is eligible. champion-challenger-policy §7.2: an "
+            "unmeasurable comparison must not render as a pass.",
+            champ_arch_vid,
         )
 
     candidates: list[dict] = []
@@ -902,9 +1104,11 @@ def select_winner(
         # config#671/#673/#1052 + #679(ii) — RELATIVE-BEST CHALLENGER eligibility
         # chain. The baseline is the FRESH champion-arch CPCV (vintage-consistent),
         # NOT the stale serving snapshot. The champion-arch row itself is the
-        # baseline — it is NEVER a "challenger" winner (it can't beat itself); it is
-        # marked ``champion_arch_baseline`` and handled by the separate refresh path
-        # below (so the live model still stays fresh weekly when no challenger wins).
+        # baseline — it is NEVER a winner (it can't beat itself); it is marked
+        # ``champion_arch_baseline`` and, since I9024 s1, has no refresh path to
+        # promote itself by either.
+        #   join-integrity failure → second_opinion_join_integrity (I9030; first,
+        #                            and independent of the enforce flag)
         #   champion-arch row      → champion_arch_baseline (not a challenger)
         #   wrong horizon          → non_canonical_horizon
         #   no usable CPCV mean IC → no_cpcv
@@ -921,16 +1125,38 @@ def select_winner(
         _cpcv = (manifest or {}).get("meta_model_oos_ic_cpcv") or {}
         second_opinion = _cpcv.get("second_opinion") or {}
         so_verdict = evaluate_second_opinion_gate(ic, second_opinion)
-        if so_verdict.get("divergence_detected"):
+        # alpha-engine-config-I9030 — split the verdict's AUTHORITY by class.
+        so_class = _second_opinion_verdict_class(second_opinion, so_verdict)
+        so_blocks_unconditionally = so_class == "join_integrity_failure"
+        if so_blocks_unconditionally:
+            log.error(
+                "model_zoo select: alpha-engine-config-I9030 SECOND-OPINION "
+                "JOIN-INTEGRITY FAILURE for %s (spec=%s): %s — BLOCKING "
+                "regardless of MODEL_ZOO_SECOND_OPINION_GATE_ENFORCE=%s. A "
+                "candidate whose OOS rows do not reconcile with realized "
+                "outcomes is not promotable; this is a data-integrity "
+                "assertion, not a model-quality opinion.",
+                vid, rec.get("spec_id"), so_verdict.get("reason"),
+                enforce_second_opinion,
+            )
+        elif so_verdict.get("divergence_detected"):
             log.warning(
-                "model_zoo select: config#2889 SECOND-OPINION DIVERGENCE for "
-                "%s (spec=%s): %s (enforce=%s)",
+                "model_zoo select: config#2889 SECOND-OPINION MAGNITUDE "
+                "DIVERGENCE for %s (spec=%s): %s (enforce=%s)",
                 vid, rec.get("spec_id"), so_verdict.get("reason"),
                 enforce_second_opinion,
             )
 
         group = "champion_arch" if is_champ_arch else "challenger"
-        if is_champ_arch:
+        if so_blocks_unconditionally:
+            # alpha-engine-config-I9030 — FIRST in the chain, ahead of the group
+            # label, the score comparison and the enforce flag: the candidate's
+            # evidence does not reconcile with realized outcomes, so its CPCV is
+            # not a number to rank on at all. Placed first so the leaderboard
+            # records WHY a row is unusable rather than masking it behind
+            # ``champion_arch_baseline``.
+            eligible, reason = False, "second_opinion_join_integrity"
+        elif is_champ_arch:
             eligible, reason = False, "champion_arch_baseline"
         elif fwd != champ_fwd:
             eligible, reason = False, "non_canonical_horizon"
@@ -938,6 +1164,8 @@ def select_winner(
             eligible, reason = False, "no_cpcv"
         elif ic <= min_ic:
             eligible, reason = False, "below_floor"
+        elif baseline_join_integrity_failed:
+            eligible, reason = False, "baseline_join_integrity"
         elif baseline_ic is not None and ic < baseline_ic + margin:
             eligible, reason = False, "below_champion_arch_plus_margin"
         elif enforce_second_opinion and so_verdict.get("divergence_detected"):
@@ -1026,6 +1254,12 @@ def select_winner(
             "second_opinion_divergence": so_verdict.get("divergence_detected"),
             "second_opinion_reason": so_verdict.get("reason"),
             "second_opinion_gate_enforced": enforce_second_opinion,
+            # alpha-engine-config-I9030 — which AUTHORITY this verdict carries.
+            # ``join_integrity_failure`` blocks unconditionally;
+            # ``magnitude_divergence`` blocks only under the enforce flag;
+            # ``insufficient`` never blocks (policy §5.1).
+            "second_opinion_verdict_class": so_class,
+            "second_opinion_blocks_unconditionally": so_blocks_unconditionally,
             "eligible": eligible, "reason": reason,
         })
 
@@ -1035,37 +1269,28 @@ def select_winner(
     eligibles = [c for c in candidates if c["eligible"]]
     winner = max(eligibles, key=lambda c: c["cpcv_mean_ic"], default=None)
 
-    # #679(ii) — CHAMPION-ARCH REFRESH path. When NO challenger wins, the fresh
-    # champion-arch (same architecture, retrained on this vintage) should still
-    # refresh the LIVE model if it improves on the *serving* champion's CPCV by
-    # margin + clears the positive floor — so the deployed 21d model never goes
-    # stale waiting for a challenger to win. This is NOT a challenger promotion
-    # (no incumbency hurdle is being introduced for challengers); it keeps the
-    # serving model on the current vintage. A challenger win always takes
-    # precedence (it already beat champion-arch, which beat serving).
-    champ_arch_refresh = None
-    if winner is None and champ_arch_vid is not None and champ_arch_ic is not None:
-        arch_cand = next((c for c in candidates if c["version_id"] == champ_arch_vid), None)
-        improves_serving = (
-            champ_arch_ic > min_ic
-            and (serving_ic is None or champ_arch_ic >= serving_ic + margin)
+    # alpha-engine-config-I9024 §1 — the CHAMPION-ARCH REFRESH path is DELETED.
+    #
+    # It was a second, privileged way to become champion: when no challenger won,
+    # the fresh champion-arch retrain took the pointer anyway on the grounds that
+    # the live model should not go stale. Its test was
+    # ``champ_arch_ic >= serving_ic + margin`` with margin 0.0 against a
+    # ``serving_ic`` the same run had overwritten (I9018) — i.e. ``x >= x``,
+    # always true. All four promotions 2026-08-07 → 2026-08-21 took it; no
+    # challenger won any of them.
+    #
+    # STALENESS IS NOT EVIDENCE. A retrain of the champion architecture is just
+    # another arm and is scored as one — it remains the vintage-consistent
+    # promotion BASELINE (#679ii, which is correct and is kept above), it simply
+    # no longer promotes itself. After this there is exactly ONE way to become
+    # champion: ``winner_version_id`` set by a challenger that actually won.
+    if winner is None:
+        log.info(
+            "model_zoo select: no challenger beat the champion-arch baseline "
+            "(%s, CPCV %s) — the live model is UNCHANGED. A stale champion that "
+            "nothing has beaten keeps serving; that is the intended outcome "
+            "(alpha-engine-config-I9024 §1).", champ_arch_vid, champ_arch_ic,
         )
-        right_horizon = arch_cand is not None and arch_cand.get("forward_days") == champ_fwd
-        if improves_serving and right_horizon:
-            champ_arch_refresh = champ_arch_vid
-            log.info(
-                "model_zoo select: no challenger won — FRESH champion-arch %s "
-                "(CPCV %.4f) refreshes the live model (serving CPCV %s + margin "
-                "%s); keeps the deployed 21d model on the current vintage",
-                champ_arch_vid, champ_arch_ic, serving_ic, margin,
-            )
-        else:
-            log.info(
-                "model_zoo select: no challenger won and champion-arch does NOT "
-                "improve on serving (arch CPCV %s vs serving %s + margin %s, "
-                "right_horizon=%s) — live model unchanged",
-                champ_arch_ic, serving_ic, margin, right_horizon,
-            )
 
     selection_pbo = _selection_pbo(candidates, manifests)
     # config #671 — A1: surface the effective-N + the IC-IR each candidate would
@@ -1092,12 +1317,20 @@ def select_winner(
     )
     return {
         # ── #679(ii): THREE clearly-labeled groups (disambiguated presentation) ──
-        # SERVING champion = the live model trading capital NOW. Its CPCV is a
-        # STALE last-promoted snapshot (prior vintage) — observability only, NOT
-        # the promotion baseline. served/promoted date carried so it reads as old.
+        # SERVING champion = the live model trading capital NOW. Its CPCV is read
+        # from the incumbent's OWN immutable registry bundle (I9018) — a prior
+        # vintage, so still not the same-vintage promotion baseline, but a number
+        # this run structurally cannot write. It is observability only.
         "serving_champion": {
             "forward_days": champ_fwd, "cpcv_mean_ic": serving_ic,
-            "cpcv_is_stale_snapshot": True,
+            # I9018: no longer a snapshot re-read from the mutable live prefix.
+            "cpcv_is_stale_snapshot": False,
+            "cpcv_is_prior_vintage": True,
+            "cpcv_source": (
+                f"{_REGISTRY_PREFIX}/{serving_bundle_vid}/manifest.json"
+                if serving_bundle_vid else None
+            ),
+            "incumbent_version_id": serving_bundle_vid,
             "served_version": serving_version, "served_date": serving_date,
         },
         # CHAMPION-ARCH = the champion ARCHITECTURE retrained THIS run on the
@@ -1119,9 +1352,10 @@ def select_winner(
         # The CHALLENGER winner (a rotated spec that beat the champion-arch
         # baseline). champion-arch is excluded from this set by construction.
         "winner_version_id": winner["version_id"] if winner else None,
-        # #679(ii): when no challenger wins, the fresh champion-arch may still
-        # refresh the live model (keeps the deployed 21d model on this vintage).
-        "champion_arch_refresh_version_id": champ_arch_refresh,
+        # alpha-engine-config-I9030 — the baseline's own join-integrity verdict.
+        # True means no comparison against it was measurable this rotation.
+        "baseline_second_opinion_verdict_class": baseline_so_class,
+        "baseline_join_integrity_failed": baseline_join_integrity_failed,
         "selection_pbo": selection_pbo,
         "n_trials_cumulative": n_trials_cumulative,
     }
@@ -1213,7 +1447,6 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
         "promoted": promoted,
         "promoted_kind": leaderboard.get("promoted_kind"),
         "winner_version_id": leaderboard.get("winner_version_id"),
-        "champion_arch_refresh_version_id": leaderboard.get("champion_arch_refresh_version_id"),
         "prior_champion_version_id": prior_champ_vid,
         # The registry version_id that should be SERVING after this rotation:
         # the promoted vid on a cutover, else the (unchanged) prior champion.
@@ -1426,7 +1659,7 @@ def _alert_inert_rotation(bucket, date_str, *, n_active, n_selected, results) ->
 
 def _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc) -> None:
     """config#2870 (no-silent-fails): ``promote_to_champion`` raised — the
-    rotation ran and picked a winner/refresh, but the live champion did NOT
+    rotation ran and picked a winner, but the live champion did NOT
     advance. Distinct from ``_alert_inert_rotation`` (nothing trained at all):
     here the pool produced a promotable candidate and the PROMOTE step itself
     failed. Prior to this alert the only trace was ``leaderboard["promote_error"]``
@@ -1738,14 +1971,11 @@ def _digest_subject(leaderboard: dict, date_str: str | None) -> str:
     # #679(ii): the headline challenger count excludes the champion-arch baseline.
     n_chal = sum(1 for c in cands if c.get("group") != "champion_arch")
     winner = leaderboard.get("winner_version_id")
-    refresh = leaderboard.get("champion_arch_refresh_version_id")
     promoted = leaderboard.get("promoted")
     if promoted:
         promo = f"promoted: {promoted}"
     elif winner:
         promo = f"recommended: {winner} (observe)"
-    elif refresh:
-        promo = f"champion-arch refresh: {refresh} (observe)"
     else:
         promo = "promoted: none"
     return (
@@ -1820,7 +2050,6 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
     # never co-mingled with the challengers (eliminates the duplicative look).
     challengers = [c for c in all_cands if c.get("group") != "champion_arch"]
     winner = leaderboard.get("winner_version_id")
-    refresh = leaderboard.get("champion_arch_refresh_version_id")
     promoted = leaderboard.get("promoted")
     promoted_kind = leaderboard.get("promoted_kind")
     reverted_from = leaderboard.get("reverted_from")
@@ -1845,9 +2074,7 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
 
     # ── PROMOTION line ──
     if promoted:
-        kind_txt = ("a CHALLENGER" if promoted_kind == "challenger"
-                    else "the FRESH champion-arch (no challenger won — keeping the "
-                         "live model on this vintage)")
+        kind_txt = "a CHALLENGER"
         promo_plain = (
             f"PROMOTED {kind_txt}: {reverted_from or '?'} -> {promoted}\n"
             f"  (relative-best vs the {baseline_label} CPCV {_fmt_ic(baseline_ic)} "
@@ -1862,10 +2089,9 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
             f'floor {floor}; revert: <code>python -m model.registry --bucket '
             f'{bucket} --promote {reverted_from or "&lt;prior-id&gt;"}</code></span></p>'
         )
-    elif winner or refresh:
-        rec = winner or refresh
-        kind_txt = ("challenger" if winner else
-                    "fresh champion-arch refresh (no challenger won)")
+    elif winner:
+        rec = winner
+        kind_txt = "challenger"
         promo_plain = (
             f"No promotion executed (mode={mode}). Recommended {kind_txt}: {rec} "
             f"(beats the {baseline_label} baseline; observe — promote manually if "
@@ -1878,13 +2104,16 @@ def send_zoo_digest_email(leaderboard: dict, bucket: str, date_str: str | None,
         )
     else:
         promo_plain = (
-            "No promotion — no challenger beat the champion-arch baseline and the "
-            "champion-arch does not improve on the serving champion this rotation."
+            "No promotion — no challenger beat the champion-arch baseline this "
+            "rotation. The sitting champion keeps serving; a retrain of the "
+            "champion architecture does not displace it (I9024 s1: staleness is "
+            "not evidence)."
         )
         promo_html = (
             '<p style="color:#555;">No promotion — no challenger beat the '
-            'champion-arch baseline and the champion-arch does not improve on the '
-            'serving champion this rotation.</p>'
+            'champion-arch baseline this rotation. The sitting champion keeps '
+            'serving; a retrain of the champion architecture does not displace '
+            'it (I9024 s1: staleness is not evidence).</p>'
         )
 
     # ── CHALLENGER table (champion-arch excluded — it's the baseline, shown above) ──
@@ -2211,13 +2440,13 @@ def select_and_finalize(
         leaderboard["trial_log_status"] = _trial_log_status
 
         winner_vid = leaderboard.get("winner_version_id")
-        # #679(ii): the version that will actually become champion. A CHALLENGER win
-        # takes precedence; otherwise the fresh champion-arch may refresh the live
-        # model (keeps the deployed 21d model on the current vintage). The two are
-        # mutually exclusive by construction (refresh is only set when winner is None).
-        refresh_vid = leaderboard.get("champion_arch_refresh_version_id")
-        promote_vid = winner_vid or refresh_vid
-        promote_kind = "challenger" if winner_vid else ("champion-arch-refresh" if refresh_vid else None)
+        # alpha-engine-config-I9024 §1 — there is exactly ONE way to become
+        # champion: a challenger that won a comparison. The champion-arch refresh
+        # path (an unconditional weekly "keep the vintage fresh" promotion that
+        # took all four cutovers 2026-08-07 → 2026-08-21 on a tautological test)
+        # is deleted. Staleness is not evidence.
+        promote_vid = winner_vid
+        promote_kind = "challenger" if winner_vid else None
 
         # ── ENTRANCE gate (alpha-engine-config-I8195) ────────────────────────────
         # Record, on EVERY rotation, which absolute bar was applied and whether the
@@ -2294,8 +2523,9 @@ def select_and_finalize(
                 _alert_observe_recommendation(bucket, date_str, leaderboard, promote_vid)
             else:
                 log.info(
-                    "model_zoo: no challenger beat the champion-arch baseline and "
-                    "champion-arch does not improve on serving — live model unchanged"
+                    "model_zoo: no challenger beat the champion-arch baseline — "
+                    "live model unchanged (alpha-engine-config-I9024 §1: a "
+                    "champion is displaced only by a won comparison)"
                 )
 
         _write_leaderboard(s3, bucket, date_str, leaderboard)

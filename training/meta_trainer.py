@@ -4073,11 +4073,27 @@ def run_meta_training(
         with tempfile.TemporaryDirectory() as tmp:
             import boto3 as _b3
             s3_up = _b3.client("s3")
-            # Output prefix/keys come from the IO spec — the live prefix for a
-            # production run, the disjoint shadow prefix for an evidence run.
-            prefix = io.weights_prefix  # live: "predictor/weights/meta/"
+            # Output prefix/keys come from the IO spec — the per-run TRAINING
+            # STAGING prefix for a production run, the disjoint shadow prefix
+            # for an evidence run.
+            #
+            # alpha-engine-config-I9018: training NEVER writes
+            # ``predictor/weights/meta/``. ``for_run`` scopes the live spec's
+            # paths to ``meta_staging/{date}/{model_version}/`` so (a) the
+            # served contract is untouched by a retrain, and (b) two specs in
+            # the same weekly Map iteration cannot overwrite each other — the
+            # collision that made the dated archive hold a third model (I9028).
+            io = io.for_run(
+                date_str=date_str,
+                model_version=getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta"),
+            )
+            prefix = io.weights_prefix
             manifest_key = io.manifest_key
             feature_list_key = io.feature_list_key
+            log.info(
+                "Training output prefix (staging, NOT the serving prefix): "
+                "s3://%s/%s", bucket, prefix,
+            )
 
             # Save all models
             # isotonic_calibrator.pkl — binary P(UP) head on meta output.
@@ -4167,40 +4183,39 @@ def run_meta_training(
             # parallel. Existing s3://.../canonical_meta_model.pkl from
             # the observe-only era is left in place; inference's tolerant
             # loader stops reading it (see load_model.py).
-            # Dated archive is always written (records what training produced
-            # regardless of gate decision). Live path is only overwritten when
-            # the promotion gate passes — otherwise live weights stay at the
-            # last-promoted snapshot. Pre-fix, both writes were unconditional,
-            # so a gate-failed run silently swapped in unblessed weights; the
-            # `promoted: false` flag in manifest became informational only.
-            # Caught 2026-05-04 after the 2026-05-02 training (meta_IC=0.090
-            # passed, momentum subsample failed → promoted=False) overwrote
-            # the 2026-04-28 collapse-fix model (val_IC=0.132). Monday daily
-            # inference produced a coarse 4-bucket bearish-collapsed
-            # distribution; the issue was only visible after rolling live
-            # weights back to the 2026-04-28 archive snapshot.
+            # alpha-engine-config-I9018/-I9028 — ONE unconditional write, to
+            # this run's own STAGING prefix. Training has no live-write branch
+            # at all any more, and no dated-archive branch either:
+            #
+            #   * The former `if promoted:` live upload is gone. `promoted` has
+            #     been unconditionally False since config#1052 (challenger-first),
+            #     so it was dead code that nonetheless kept the live prefix
+            #     reachable from training — and the manifest/feature_list writes
+            #     below were NOT gated on it, so the served contract was
+            #     overwritten every Saturday regardless.
+            #   * The former `{prefix}archive/{date}/` copy is gone. It was
+            #     keyed by DATE only, while several specs wrote the same prefix
+            #     in one rotation, so it captured whichever spec finished last
+            #     rather than the model its path named (I9028: the 2026-08-21
+            #     archive held a third model, matching neither the champion it
+            #     displaced nor the one that replaced it). The per-run staging
+            #     prefix now records what each run produced, and the immutable
+            #     content-addressed registry bundle snapshotted from it below is
+            #     the durable store.
+            #
+            # The 2026-05-04 incident this branch was originally written for
+            # (a gate-failed run swapping in unblessed weights) is now
+            # unrepresentable from a stronger direction: training cannot write
+            # the serving prefix at all.
             for name, (model, filename) in models.items():
                 local_path = Path(tmp) / filename
                 model.save(local_path)
-
-                # Dated backup — always written
-                dated_key = f"{prefix}archive/{date_str}/{filename}"
-                s3_up.upload_file(str(local_path), bucket, dated_key)
-
-                # Live promotion — gated on composite promotion gate
-                if promoted:
-                    s3_key = f"{prefix}{filename}"
-                    s3_up.upload_file(str(local_path), bucket, s3_key)
-                    meta_path = Path(str(local_path) + ".meta.json")
-                    if meta_path.exists():
-                        s3_up.upload_file(str(meta_path), bucket, f"{s3_key}.meta.json")
-                    log.info("Uploaded %s → s3://%s/%s (PROMOTED)", name, bucket, s3_key)
-                else:
-                    log.info(
-                        "Skipped live promotion of %s — gate blocked. "
-                        "Archive only at s3://%s/%s",
-                        name, bucket, dated_key,
-                    )
+                s3_key = f"{prefix}{filename}"
+                s3_up.upload_file(str(local_path), bucket, s3_key)
+                meta_path = Path(str(local_path) + ".meta.json")
+                if meta_path.exists():
+                    s3_up.upload_file(str(meta_path), bucket, f"{s3_key}.meta.json")
+                log.info("Uploaded %s → s3://%s/%s (staging)", name, bucket, s3_key)
 
             # Final RSS snapshot — captured AFTER all L1 fits + meta-Ridge
             # but before manifest write, so it reflects the high-water mark
@@ -4226,8 +4241,16 @@ def run_meta_training(
             if promoted:
                 served_version, served_date = _this_version, date_str
             else:
+                # alpha-engine-config-I9018 — read the SERVED identity from the
+                # LIVE manifest, not from this run's staging manifest (which
+                # this run is about to write and which serves nothing). This is
+                # a POINTER read only; no score is taken from that file.
+                _served_identity_key = (
+                    io.manifest_key if io.is_shadow
+                    else getattr(cfg, "META_MANIFEST_KEY")
+                )
                 served_version, served_date = _read_live_served_identity(
-                    s3_up, bucket, manifest_key
+                    s3_up, bucket, _served_identity_key
                 )
             log.info(
                 "Served champion identity for manifest: version=%s date=%s "
@@ -4662,17 +4685,19 @@ def run_meta_training(
             # never fail training (it touches no live weight / gate).
             #
             # L4469 capture-gap fix: register on EVERY run, not only on
-            # promotion. A PROMOTED run snapshots from the live prefix (which now
-            # holds the accepted contract) as the `champion`. A NON-promoted run
-            # snapshots as a `challenger` from the dated ARCHIVE — the archive
-            # always holds THIS run's weights (written unconditionally above) but
-            # lacks manifest.json + feature_list.json (the two
-            # REQUIRED_CONTRACT_FILES), so we complete it by copying the
-            # candidate's just-written manifest + feature_list (the live keys
-            # carry the candidate's values regardless of promotion) into the
-            # archive first. Without this, no challenger ever exists to shadow —
-            # the exact Phase-0 gap that left the registry holding only the
-            # champion (found 2026-06-02).
+            # promotion.
+            #
+            # alpha-engine-config-I9018 — the source is ALWAYS this run's own
+            # staging prefix. Previously a promoted run snapshotted from the
+            # LIVE prefix and a non-promoted run from the dated archive, after
+            # copying the two REQUIRED_CONTRACT_FILES into it. Both sources were
+            # shared mutable directories that several specs in one rotation
+            # wrote, so a bundle could be assembled from a mixture of runs —
+            # exactly how `archive/2026-08-21/` came to hold a model that was
+            # never champion (I9028). The staging prefix is scoped to
+            # `{date}/{model_version}`, already holds the weights, the manifest
+            # and the feature list this run produced, and is written by nothing
+            # else — so the bundle is this run's contract by construction.
             # SHADOW runs do NOT enter the model-zoo registry — registration is
             # what makes a trained model a challenger that `select_winner` can
             # later promote to champion. A CRSP-basis evidence run must never
@@ -4697,43 +4722,24 @@ def run_meta_training(
                     _code_sha = resolve_code_sha()
                     _model_version = manifest.get("version", cfg.MODEL_VERSION_LABEL)
 
-                    if promoted:
-                        _vid = snapshot_to_registry(
-                            s3_up, bucket,
-                            model_version=_model_version,
-                            date=date_str, stage="champion",
-                            code_sha=_code_sha,
-                        )
-                        log.info(
-                            "Phase-0 registry snapshot (champion): predictor/registry/%s/",
-                            _vid,
-                        )
-                    else:
-                        _arch_prefix = f"{prefix}archive/{date_str}/"
-                        # Complete the archived candidate bundle: the archive has the
-                        # weights but not the two REQUIRED_CONTRACT_FILES. Copy the
-                        # candidate's manifest + feature_list (live keys = candidate's
-                        # values on a non-promoted run) so the bundle is reproducible.
-                        for _live_key, _fname in (
-                            (manifest_key, "manifest.json"),
-                            (feature_list_key, "feature_list.json"),
-                        ):
-                            s3_up.copy_object(
-                                Bucket=bucket,
-                                Key=f"{_arch_prefix}{_fname}",
-                                CopySource={"Bucket": bucket, "Key": _live_key},
-                            )
-                        _vid = snapshot_to_registry(
-                            s3_up, bucket,
-                            model_version=_model_version,
-                            date=date_str, stage="challenger",
-                            source_prefix=_arch_prefix,
-                            code_sha=_code_sha,
-                        )
-                        log.info(
-                            "Phase-0 registry snapshot (challenger): predictor/registry/%s/",
-                            _vid,
-                        )
+                    # `promoted` is unconditionally False since config#1052
+                    # (challenger-first): training registers a candidate, and
+                    # `model_zoo.select_winner` -> `promote_to_champion` is the
+                    # only thing that makes one champion. The stage is still
+                    # derived from `promoted` rather than hardcoded so the
+                    # lineage stays true if that ever changes.
+                    _stage = "champion" if promoted else "challenger"
+                    _vid = snapshot_to_registry(
+                        s3_up, bucket,
+                        model_version=_model_version,
+                        date=date_str, stage=_stage,
+                        source_prefix=prefix,
+                        code_sha=_code_sha,
+                    )
+                    log.info(
+                        "Phase-0 registry snapshot (%s) from staging %s: "
+                        "predictor/registry/%s/", _stage, prefix, _vid,
+                    )
                 except Exception as _reg_err:
                     log.warning(
                         "Phase-0 registry snapshot failed (non-blocking): %s", _reg_err,

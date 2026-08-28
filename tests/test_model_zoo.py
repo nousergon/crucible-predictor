@@ -232,13 +232,36 @@ def test_train_weekly_rotation_continues_past_failure():
 # ── L4544: rotation isolation (G1 challenger-first + G2 contract restore) ─────
 
 
+# alpha-engine-config-I9018 — the version_id the fake live manifest names as the
+# SERVING champion, and under which its registry bundle is auto-materialised.
+SERVING_INCUMBENT_VID = "v-serving-incumbent"
+
+
 class _FakeS3:
     """Minimal S3 stub: get_object reads from ``objects``, put_object records to
-    ``puts``. Missing keys raise (mimicking a NoSuchKey the code catches)."""
+    ``puts``. Missing keys raise (mimicking a NoSuchKey the code catches).
+
+    alpha-engine-config-I9018 — the fake models the POST-FIX world, in which the
+    live manifest is a POINTER (``served_version``) and the incumbent's score
+    lives in that version's immutable registry bundle. Whenever a live manifest
+    is supplied without a ``served_version``, one is stamped and the matching
+    ``predictor/registry/{vid}/manifest.json`` is materialised from it, so a
+    fixture written as "the serving champion scores X" still means that. A
+    fixture that supplies either piece explicitly is left alone.
+    """
 
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.puts = {}
+        live_key = getattr(cfg, "META_MANIFEST_KEY", None)
+        live = self.objects.get(live_key)
+        if isinstance(live, dict):
+            vid = live.get("served_version") or SERVING_INCUMBENT_VID
+            live = dict(live)
+            live["served_version"] = vid
+            self.objects[live_key] = live
+            bundle_key = f"predictor/registry/{vid}/manifest.json"
+            self.objects.setdefault(bundle_key, dict(live))
 
     def get_object(self, Bucket, Key):  # noqa: N803 — boto3 kwarg names
         if Key not in self.objects:
@@ -271,7 +294,7 @@ def test_rotation_trains_every_selected_spec():
     # off per train) is GONE — training is unconditionally challenger-first, so a
     # spec can never self-promote and there is nothing to force/restore. The
     # surviving rotation invariant is that every selected spec is trained exactly
-    # once; G2 contract restore is covered by the roundtrip test below.
+    # once.
     trained = []
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
@@ -286,20 +309,11 @@ def test_rotation_trains_every_selected_spec():
     assert all(r.get("status") == "ok" for r in results.values())
 
 
-def test_snapshot_and_restore_live_contract_roundtrip():
-    # G2: the live champion contract is captured then restored byte-for-byte.
-    champ_manifest = {"version": "champ", "forward_days": 21}
-    feat = {"features": ["a", "b"]}
-    s3 = _FakeS3({cfg.META_MANIFEST_KEY: champ_manifest, cfg.META_FEATURE_LIST_KEY: feat})
-    saved = mz._snapshot_live_contract(s3, "bkt")
-    assert set(saved) == {cfg.META_MANIFEST_KEY, cfg.META_FEATURE_LIST_KEY}
-    mz._restore_live_contract(s3, "bkt", saved)
-    assert json.loads(s3.puts[cfg.META_MANIFEST_KEY]) == champ_manifest
-    assert json.loads(s3.puts[cfg.META_FEATURE_LIST_KEY]) == feat
-
-
-# ── L4544: immediate CPCV selection ──────────────────────────────────────────
-
+# alpha-engine-config-I9018 — the G2 snapshot/restore roundtrip test is GONE with
+# the code it covered. Training no longer writes the live contract, so there is
+# nothing to restore, and a restore would itself have been a second writer of
+# ``predictor/weights/meta/``. The replacement guard is
+# tests/test_live_prefix_single_writer.py.
 
 def test_select_winner_horizon_floor_and_margin(monkeypatch):
     # config#671/#673/#1052 RELATIVE-BEST: the DSR/Sortino gate is NO LONGER a

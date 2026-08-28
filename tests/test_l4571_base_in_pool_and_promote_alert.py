@@ -68,6 +68,8 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta", raising=False)
     s3 = _FakeS3({
+        # I9018: the live manifest is a POINTER; _FakeS3 materialises the matching
+        # registry bundle, which is where the incumbent CPCV is actually read from.
         cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),          # serving champion
         cfg.META_FEATURE_LIST_KEY: {"features": ["a"]},
         "predictor/registry/base-today/manifest.json": _mk_manifest(21, base_ic, True),
@@ -100,68 +102,91 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
 
 
 class TestBaseInPool:
-    def test_base_arch_is_baseline_and_refreshes_live_when_no_challenger_wins(self, monkeypatch):
-        # #679(ii): champion-arch (0.30) is the vintage-consistent BASELINE, NOT a
-        # challenger winner — it can't beat itself. The variant (0.15) does NOT clear
-        # baseline+margin, so no CHALLENGER wins (winner_version_id is None). But the
-        # fresh champion-arch beats the stale serving champion (0.10), so it REFRESHES
-        # the live model (keeps the deployed 21d model on the current vintage).
+    def test_base_arch_is_baseline_and_CANNOT_promote_itself(self, monkeypatch):
+        """alpha-engine-config-I9024 s1 — the one-way ratchet.
+
+        #679(ii) still holds: champion-arch (0.30) is the vintage-consistent
+        BASELINE and the variant (0.15) does not clear baseline+margin, so no
+        challenger wins. What changed is what happens next: NOTHING. Pre-fix the
+        fresh champion-arch promoted itself on `champ_arch_ic >= serving_ic + 0`
+        — against a serving_ic the same run had overwritten, i.e. `x >= x` — and
+        that path took all four cutovers 2026-08-07 -> 2026-08-21.
+
+        RED against the pre-fix code, which promoted `base-today` here.
+        """
         board, promotes, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                            base_ic=0.30, variant_ic=0.15)
         ids = {c["spec_id"] for c in board["candidates"]}
         assert "champion-arch" in ids            # base IS in the pool
-        # champion-arch is the BASELINE — never a challenger winner.
+        # champion-arch is the BASELINE — never a winner.
         assert board["winner_version_id"] is None
         assert board["promotion_baseline_source"] == "champion_arch_fresh"
         arch_cand = next(c for c in board["candidates"] if c["spec_id"] == "champion-arch")
         assert arch_cand["reason"] == "champion_arch_baseline"
         assert arch_cand["eligible"] is False
-        # …but it refreshes the live model (no challenger won, beats serving+margin).
-        assert board["champion_arch_refresh_version_id"] == "base-today"
-        assert board["promoted"] == "base-today"
-        assert board["promoted_kind"] == "champion-arch-refresh"
-        assert promotes == ["base-today"]
+        # …and there is no second path by which it becomes champion.
+        assert "champion_arch_refresh_version_id" not in board
+        assert board["promoted"] is None
+        assert board.get("promoted_kind") is None
+        assert promotes == []                    # the live model is UNCHANGED
 
     def test_variant_can_beat_the_base(self, monkeypatch):
         # A challenger (0.25) that clears the champion-arch baseline (0.12) + margin
-        # WINS as a true challenger — takes precedence over any refresh.
+        # WINS as a true challenger — the only remaining way to become champion.
         board, _, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                     base_ic=0.12, variant_ic=0.25)
         assert board["winner_version_id"] == "resid-v"
-        assert board["champion_arch_refresh_version_id"] is None  # challenger won → no refresh
+        assert board["promoted_kind"] == "challenger"
+
+    def test_the_only_promotion_path_requires_a_winner(self, monkeypatch):
+        """No arrangement of the pool promotes without `winner_version_id`.
+
+        Sweeps the champion-arch score across the whole range against a variant
+        that never clears the baseline. Pre-fix, every one of these promoted the
+        champion-arch; post-fix none of them promote anything.
+        """
+        for base_ic in (0.05, 0.15, 0.30, 0.90):
+            board, promotes, _ = _pool_fixture(
+                monkeypatch, auto_promote=True, base_ic=base_ic,
+                variant_ic=base_ic - 0.02,
+            )
+            assert board["winner_version_id"] is None, base_ic
+            assert board["promoted"] is None, base_ic
+            assert promotes == [], base_ic
 
 
 class TestPromotionAlert:
     def test_cutover_fires_alert_with_revert_command(self, monkeypatch):
+        # A CHALLENGER win is now the only cutover, so the alert fixture is one.
         board, promotes, alerts_sent = _pool_fixture(
-            monkeypatch, auto_promote=True, base_ic=0.30, variant_ic=0.15)
-        assert promotes == ["base-today"]
+            monkeypatch, auto_promote=True, base_ic=0.12, variant_ic=0.25)
+        assert promotes == ["resid-v"]
         assert board["reverted_from"] == "old-champ-v"
         assert len(alerts_sent) == 1
         a = alerts_sent[0]
         assert a["severity"] == "warning"
         # The revert command targets the PRIOR champion's version_id, exactly.
         assert "--promote old-champ-v" in a["message"]
-        assert "base-today" in a["message"]      # the new champion
+        assert "resid-v" in a["message"]         # the new champion
         assert a["dedup_key"] == "model_zoo_promote_2026-06-13"
 
     def test_observe_fires_info_alert_no_promote(self, monkeypatch):
         board, promotes, alerts_sent = _pool_fixture(
-            monkeypatch, auto_promote=False, base_ic=0.30, variant_ic=0.15)
+            monkeypatch, auto_promote=False, base_ic=0.12, variant_ic=0.25)
         assert promotes == []                    # observe → never promotes
         assert board["promoted"] is None
         assert len(alerts_sent) == 1
         assert alerts_sent[0]["severity"] == "info"
-        assert "--promote base-today" in alerts_sent[0]["message"]  # manual-promote hint
+        assert "--promote resid-v" in alerts_sent[0]["message"]  # manual-promote hint
 
     def test_no_winner_no_alert(self, monkeypatch):
         # Genuine no-winner case (config#1175). With model_zoo_promote_margin=0.0
         # eligibility is `ic >= baseline` (fresh-best-wins), so a TIE PROMOTES —
         # the former base_ic=variant_ic=0.10 inputs here actually cut over resid-v,
-        # making the "no winner / no alert" assertion stale. Use candidates strictly
-        # BELOW the serving champion (0.10): the fresh champion-arch (0.05) does not
-        # beat serving so it does not refresh, and the variant (0.03) is below the
-        # baseline so no challenger wins → no promotion, no alert.
+        # making the "no winner / no alert" assertion stale. The variant (0.03) is
+        # below the champion-arch baseline (0.05) so no challenger wins, and since
+        # I9024 s1 the champion-arch has no self-promotion path → no promotion,
+        # no alert.
         board, promotes, alerts_sent = _pool_fixture(
             monkeypatch, auto_promote=True, base_ic=0.05, variant_ic=0.03)
         assert board["winner_version_id"] is None

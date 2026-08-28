@@ -12,9 +12,15 @@ pointing inference at an old archive would run that meta-model against the
 This module snapshots the COMPLETE live inference contract (all weights +
 feature_list + manifest) into an immutable, content-addressed bundle under
 ``predictor/registry/{version_id}/``. It is purely additive — a server-side S3
-copy of objects already uploaded by training; it never touches the live weights,
-the promotion gate, or the archive. It doubles as the backfill tool (snapshot
-the current live model now, before the next retrain overwrites it).
+copy of objects already uploaded by training; it never touches the live weights
+or the promotion gate. It doubles as the backfill tool (snapshot a model into a
+bundle from any complete source prefix).
+
+alpha-engine-config-I9018/-I9028: the legacy archive is not merely partial, it
+was WRONG — ``archive/{date}/`` was keyed by date while several specs of one
+rotation wrote the same mutable prefix, so it captured whichever spec finished
+last. Training no longer writes either the archive or the live prefix; it writes
+a per-run staging prefix, and this bundle is the durable store.
 
 ``version_id = {model_version}-{date}-{fingerprint8}`` where the fingerprint is a
 stable hash over the contract files' ETags — so an identical contract collapses
@@ -30,7 +36,21 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_SOURCE_PREFIX = "predictor/weights/meta/"
+# alpha-engine-config-I9018 — the two prefixes are SEPARATE and must stay so.
+#
+# DEFAULT_SOURCE_PREFIX is where a bundle is snapshotted FROM: the training
+# staging root. ``run_meta_training`` always passes an explicit, per-run
+# ``source_prefix`` under it (``meta_staging/{date}/{model_version}/``); this
+# bare root is only the CLI's default and will refuse to snapshot (no flat
+# contract files directly under it) unless ``--source-prefix`` is given, which
+# is the intended fail-loud behaviour.
+#
+# DEFAULT_LIVE_PREFIX is where a bundle is promoted TO: the live serving
+# contract inference reads. ``promote_to_champion`` is its ONLY writer. Until
+# 2026-08-28 these were the same string, so the weekly retrain wrote the served
+# model's manifest and feature contract as a side effect of training.
+DEFAULT_SOURCE_PREFIX = "predictor/weights/meta_staging/"
+DEFAULT_LIVE_PREFIX = "predictor/weights/meta/"
 DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
 
 # The predictor checkout root (``model/registry.py`` → repo root is two
@@ -365,7 +385,7 @@ def promote_to_champion(
     version_id: str,
     *,
     registry_prefix: str = DEFAULT_REGISTRY_PREFIX,
-    live_prefix: str = DEFAULT_SOURCE_PREFIX,
+    live_prefix: str = DEFAULT_LIVE_PREFIX,
 ) -> dict:
     """Promote a registered version to the live champion (L4469, operator step).
 

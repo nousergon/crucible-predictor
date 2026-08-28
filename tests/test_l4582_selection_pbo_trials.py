@@ -216,7 +216,10 @@ def test_selection_pbo_across_aligned_candidates(monkeypatch):
     dominant = [0.06, 0.07, 0.05, 0.08, 0.06, 0.07]
     weak = [0.01, 0.02, 0.00, 0.01, 0.02, 0.01]
     s3 = _FakeS3({
-        cfg.META_MANIFEST_KEY: _manifest(mean_ic=0.10),  # champion: NO ics → excluded
+        # alpha-engine-config-I9018: the incumbent's IC is deliberately distinct
+        # from every candidate's. An exact tie now RAISES — see
+        # tests/test_promotion_gate_honesty.py.
+        cfg.META_MANIFEST_KEY: _manifest(mean_ic=0.11),  # champion: NO ics → excluded
         "predictor/registry/a-v/manifest.json": _manifest(mean_ic=0.20, ics=dominant),
         "predictor/registry/b-v/manifest.json": _manifest(mean_ic=0.05, ics=weak),
         # misaligned CPCV shape → dropped by name, not silently
