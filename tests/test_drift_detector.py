@@ -107,13 +107,16 @@ def test_max_severity_orders_correctly():
 # ── check_prediction_drift ─────────────────────────────────────────────────
 
 
-def _make_preds(directions=None, confidences=None, alphas=None, n=20):
+def _make_preds(directions=None, confidences=None, alphas=None, n=20, champion_version_id=None):
     """Build a predictions JSON payload.
 
     Confidence values are on the LIVE axis — ``|p_up - 0.5| * 2`` ∈ [0, 1], zero
     at coin-flip (PR #143). A healthy daily book sits around 0.10–0.20; fixtures
     in the old ``max(p_up, p_down)`` ∈ [0.5, 1.0] range describe a predictor that
     has not existed since 2026-05-12.
+
+    ``champion_version_id``, when given, is written as the top-level field the
+    real inference artifact carries since 2026-08-21 (alpha-engine-config#9020).
     """
     if directions is None:
         directions = ["UP"] * n
@@ -129,7 +132,10 @@ def _make_preds(directions=None, confidences=None, alphas=None, n=20):
             "prediction_confidence": c,
             "predicted_alpha": a,
         })
-    return {"predictions": preds}
+    payload = {"predictions": preds}
+    if champion_version_id is not None:
+        payload["champion_version_id"] = champion_version_id
+    return payload
 
 
 def test_check_prediction_drift_no_recent_alerts():
@@ -183,12 +189,13 @@ def test_check_prediction_drift_persistent_clustering_alert():
 _MIXED_DIRECTIONS = ["UP", "DOWN"] * 11  # diversified so clustering never fires
 
 
-def _conf_routes(target: str, conf_by_offset, n_days: int = 25):
+def _conf_routes(target: str, conf_by_offset, n_days: int = 25, version_by_offset=None):
     """Routes for ``n_days`` consecutive calendar days back from ``target``.
 
     ``conf_by_offset(offset) -> float`` gives that day's per-ticker confidence.
     Consecutive calendar days (weekends included) keep the fixture readable —
-    the detector only cares that a key exists.
+    the detector only cares that a key exists. ``version_by_offset(offset) ->
+    str | None``, when given, sets that day's ``champion_version_id``.
     """
     routes = {}
     t = date.fromisoformat(target)
@@ -198,6 +205,7 @@ def _conf_routes(target: str, conf_by_offset, n_days: int = 25):
             directions=_MIXED_DIRECTIONS,
             confidences=[conf_by_offset(offset)] * 21,
             n=21,
+            champion_version_id=(version_by_offset(offset) if version_by_offset else None),
         ))
     return routes
 
@@ -257,6 +265,75 @@ def test_confidence_collapse_baseline_excludes_today():
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc and cc[0]["baseline"] == pytest.approx(0.20, abs=0.005)
     assert cc[0]["baseline_days"] == 24
+
+
+# ── level-shift trend classification (alpha-engine-config#9020) ────────────
+# The 2026-08-28 live misfire: a champion promoted 2026-08-21 collapsed
+# confidence to a NEW, settled regime — four straight days (0.092, 0.098,
+# 0.097, 0.110) sitting 3-17% ABOVE the alert bar, after one healthy day
+# (0.281) still on the old champion. The old bar-crossing classifier called
+# this ACUTE ("check today's served model") off a single day crossing a bar
+# the shift itself had already dragged down; it is a five-day-old standing
+# condition caused by a NAMED promotion.
+_NEW_CHAMPION = "v3.0-meta-2026-08-21-7d3d1cce"
+_OLD_CHAMPION = "v2.9-meta-2026-07-10-aaaa1111"
+
+
+def _promoted_collapse_routes(target="2026-08-27", promotion_offset=3, n_days=29):
+    """offset0..promotion_offset (today back through the promotion date) serve
+    ``_NEW_CHAMPION`` at the real live-incident confidences; everything older
+    serves ``_OLD_CHAMPION`` at a stable pre-promotion level."""
+    confs = {0: 0.092, 1: 0.098, 2: 0.097, 3: 0.110, 4: 0.281}
+
+    def conf(o):
+        return confs.get(o, 0.19)
+
+    def version(o):
+        return _NEW_CHAMPION if o <= promotion_offset else _OLD_CHAMPION
+
+    return _conf_routes(target, conf, n_days=n_days, version_by_offset=version)
+
+
+def test_settled_regime_shift_is_not_misclassified_acute():
+    """Regression for alpha-engine-config-I9020. Four collapsed days settled
+    ABOVE the bar (only today, 0.092, crosses it) must classify as chronic —
+    a 6% difference between 0.092 and 0.098 must not decide between 'check
+    today's model' and 'a standing condition'. RED against the pre-fix
+    bar-crossing classifier, which reads exactly this shape as ACUTE."""
+    s3 = _s3_with_routes(_promoted_collapse_routes())
+    alerts = check_prediction_drift(s3, "bucket", "2026-08-27")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc, "expected a confidence_collapse alert"
+    assert cc[0]["trend"] == "chronic"
+    assert cc[0]["severity"] == WARN
+
+
+def test_confidence_collapse_names_the_champion_promotion():
+    """The alert must name the promotion sitting in its lookback window and
+    the date it first served, instead of guessing a same-day cause. RED
+    against the pre-fix code, which never reads ``champion_version_id``."""
+    s3 = _s3_with_routes(_promoted_collapse_routes())
+    alerts = check_prediction_drift(s3, "bucket", "2026-08-27")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc
+    assert _NEW_CHAMPION in cc[0]["cause"]
+    assert "2026-08-24" in cc[0]["cause"]
+    assert _NEW_CHAMPION in cc[0]["line"]
+    assert cc[0]["champion_version_id"] == _NEW_CHAMPION
+    assert cc[0]["champion_version_first_served"] == "2026-08-24"
+
+
+def test_confidence_collapse_no_version_change_keeps_generic_cause():
+    """No champion_version_id in the artifact at all (pre-2026-08-21 shape,
+    or artifacts predating the field) must not fabricate a promotion."""
+    s3 = _s3_with_routes(_conf_routes(
+        "2026-04-15", lambda o: 0.05 if o < 5 else 0.20))
+    alerts = check_prediction_drift(s3, "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc
+    assert cc[0]["champion_version_id"] is None
+    assert cc[0]["champion_version_first_served"] is None
+    assert "champion" not in cc[0]["cause"]
 
 
 def test_confidence_degenerate_is_critical():

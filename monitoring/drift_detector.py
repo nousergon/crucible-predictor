@@ -77,6 +77,17 @@ CONFIDENCE_BASELINE_MIN_DAYS = 10     # trading days of history the baseline nee
 CONFIDENCE_BASELINE_MAX_DAYS = 30     # trading days the baseline is computed over
 CONFIDENCE_BASELINE_LOOKBACK_DAYS = 45  # calendar days scanned to find them
 
+# ── Confidence-collapse trend classification (alpha-engine-config#9020) ───────
+# The acute/chronic split used to count crossings of ``bar`` (the same
+# threshold that raised the alert) — a razor edge sitting exactly at the band a
+# genuine regime shift settles into, since the shift itself drags the trailing
+# median (and so the bar) down toward wherever it lands. A five-day collapse
+# that settled 3-17% ABOVE the bar fired as "today's model regressed" instead
+# of "a standing condition since a promotion four days ago". These two ratios
+# replace the crossing count with a level-shift test that never reads ``bar``:
+CONFIDENCE_TREND_LEVEL_SHIFT_RATIO = 0.80    # recent-window median / TRUE prior-period median (days strictly before the recent window) below this ⇒ the whole window has already shifted, not just today
+CONFIDENCE_ACUTE_PRIOR_BASELINE_RATIO = 0.80  # the days around today must sit at/above this fraction of baseline for the drop to be labeled acute — merely "above the bar" is not "near baseline"
+
 # ── Champion-replacement availability ─────────────────────────────────────────
 # Three of this module's alerts prescribe promoting a challenger or reverting to
 # a known-good champion. All three run through PredictorTraining on the weekly
@@ -239,6 +250,43 @@ def _daily_confidence_means(recent_preds: list[dict]) -> list[tuple[str, float]]
     return out
 
 
+def _champion_version_change(window_preds: list[dict]) -> tuple[str, str] | None:
+    """``(version_id, first_served_date)`` if the champion serving the most
+    recent day in ``window_preds`` (most-recent-first) differs from an earlier
+    day in the window, else ``None``.
+
+    ``predictions/{date}.json`` carries a top-level ``champion_version_id``
+    (since 2026-08-21) that names which model produced that day's batch. The
+    confidence-collapse alert used to ignore it entirely and guess a same-day
+    cause from the confidence numbers alone; a promotion sitting inside the
+    lookback window is a direct, named cause and should say so instead of
+    guessing (alpha-engine-config#9020).
+
+    ``first_served_date`` is the earliest date in the window still serving the
+    CURRENT version, found by walking backward from today until the version
+    differs or the window runs out. A missing value (artifacts predating this
+    field) halts the walk without asserting a change — absence is not
+    evidence of either continuity or a promotion.
+    """
+    if not window_preds:
+        return None
+    current = window_preds[0].get("champion_version_id")
+    if current is None:
+        return None
+    first_served = window_preds[0]["date"]
+    changed = False
+    for day in window_preds[1:]:
+        v = day.get("champion_version_id")
+        if v is None:
+            break
+        if v == current:
+            first_served = day["date"]
+        else:
+            changed = True
+            break
+    return (current, first_served) if changed else None
+
+
 def check_prediction_drift(
     s3, bucket: str, date_str: str, skipped: list[dict] | None = None,
 ) -> list[dict]:
@@ -261,7 +309,11 @@ def check_prediction_drift(
         data = _load_json(s3, bucket, f"predictor/predictions/{d}.json")
         if data and "predictions" in data:
             preds = data["predictions"]
-            window_preds.append({"date": d, "predictions": preds})
+            window_preds.append({
+                "date": d,
+                "predictions": preds,
+                "champion_version_id": data.get("champion_version_id"),
+            })
         if len(window_preds) >= CONFIDENCE_BASELINE_MAX_DAYS:
             break
     recent_preds = window_preds[:5]
@@ -417,11 +469,43 @@ def check_prediction_drift(
                 lo = min((m for _, m in daily), default=mean_conf)
                 hi = max((m for _, m in daily), default=mean_conf)
 
-                # chronic = the recent window has been below the bar for days;
-                # acute = only today dropped while the prior days held up.
-                if n_days >= CONSECUTIVE_DAYS_THRESHOLD and days_below >= CONSECUTIVE_DAYS_THRESHOLD:
+                # Trend is a LEVEL-SHIFT test, never a re-read of ``bar`` (the
+                # bar already decided whether to FIRE; reusing it to decide
+                # acute-vs-chronic put a razor edge exactly at 50% of the
+                # baseline — inside the band a genuine regime shift settles
+                # into, since the shift itself drags the baseline toward the
+                # bar). Two independent, bar-free facts:
+                #   (a) has the recent window's OWN level already moved
+                #       against the TRUE prior period — days strictly before
+                #       the recent window, not the baseline used to fire
+                #       (which includes days 2-5 of the recent window itself
+                #       and so is already dragged down by a settled shift); and
+                #   (b) were the days around today genuinely near baseline —
+                #       not merely above the alert bar, which a settled
+                #       collapse regime usually is.
+                recent_dates = {d for d, _ in daily}
+                prior_period_means = [m for d, m in baseline_daily if d not in recent_dates]
+                recent_median = float(np.median([m for _, m in daily]))
+                prior_period_median = (float(np.median(prior_period_means))
+                                        if prior_period_means else baseline)
+                level_shift = (prior_period_median > 0
+                               and recent_median / prior_period_median
+                               < CONFIDENCE_TREND_LEVEL_SHIFT_RATIO)
+
+                prior_window_means = [m for _, m in daily[1:]]
+                prior_near_baseline = (
+                    bool(prior_window_means) and baseline > 0
+                    and float(np.median(prior_window_means))
+                    >= CONFIDENCE_ACUTE_PRIOR_BASELINE_RATIO * baseline
+                )
+
+                # chronic = the window's own level has already shifted against
+                # the true prior period; acute = it has not, AND the days
+                # around today were genuinely near baseline (not merely above
+                # the bar) — so only a same-day drop reads as acute.
+                if n_days >= CONSECUTIVE_DAYS_THRESHOLD and level_shift:
                     trend, trend_word = "chronic", "CHRONIC"
-                elif n_days >= 2 and days_below == 1 and daily[0][1] < bar:
+                elif n_days >= 2 and not level_shift and prior_near_baseline:
                     trend, trend_word = "acute", "ACUTE"
                 else:
                     trend, trend_word = "indeterminate", "trend-indeterminate"
@@ -430,19 +514,40 @@ def check_prediction_drift(
 
                 trend_detail = (f"below the bar {days_below}/{n_days} recent days "
                                 f"(range {lo:.3f}–{hi:.3f})") if n_days else "no recent history"
+
+                # A champion promotion sitting inside the lookback window is a
+                # named, direct cause — prefer it over guessing from the
+                # confidence numbers alone (alpha-engine-config#9020).
+                version_change = _champion_version_change(window_preds)
+                version_note = None
+                if version_change:
+                    v_id, first_served = version_change
+                    version_note = (f"the served champion changed to {v_id}, first served "
+                                     f"{first_served}, within this lookback window")
+
                 if trend == "chronic":
-                    cause = ("conviction has been sitting well under this book's own recent norm "
-                             "for days — a standing model-quality condition, NOT a same-day "
-                             "regression")
+                    cause = (f"{version_note} — treat that promotion as the likely cause, not a "
+                             f"same-day regression") if version_note else (
+                        "conviction has been sitting well under this book's own recent norm "
+                        "for days — a standing model-quality condition, NOT a same-day "
+                        "regression")
                     action = champion_action
                 elif trend == "acute":
-                    cause = ("a sudden drop from a healthy recent baseline — points at today's "
-                             "served-model version or feature inputs, not a slow decay")
-                    action = ("check today's served model + inference feature inputs for a regression")
+                    cause = (f"{version_note} — check that promotion, not today's feature inputs, "
+                             f"for a regression") if version_note else (
+                        "a sudden drop from a healthy recent baseline — points at today's "
+                        "served-model version or feature inputs, not a slow decay")
+                    action = (f"check the champion served since {version_change[1]} "
+                              f"({version_change[0]}) for a regression") if version_change else (
+                        "check today's served model + inference feature inputs for a regression")
                 else:
-                    cause = "conviction below the trailing baseline; too little recent history to "\
-                            "call chronic vs acute"
-                    action = "watch the next few days to classify; check served-model health"
+                    cause = (f"{version_note} — too little recent history to call chronic vs "
+                             f"acute against it") if version_note else (
+                        "conviction below the trailing baseline; too little recent history to "
+                        "call chronic vs acute")
+                    action = (f"watch the next few days to classify; check the champion served "
+                              f"since {version_change[1]} ({version_change[0]})") if version_change else (
+                        "watch the next few days to classify; check served-model health")
 
                 alerts.append(_alert(
                     code="confidence_collapse",
@@ -461,6 +566,8 @@ def check_prediction_drift(
                     pct_below_threshold=round(deficit, 3),
                     trend=trend,
                     recent_daily_means=[round(m, 3) for _, m in daily],
+                    champion_version_id=version_change[0] if version_change else None,
+                    champion_version_first_served=version_change[1] if version_change else None,
                     date=date_str,
                     **training_ctx,
                 ))
