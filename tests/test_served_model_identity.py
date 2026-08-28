@@ -81,8 +81,20 @@ def _promote_s3_with_live_manifest(*, live_manifest):
     pag.paginate.side_effect = _paginate
     s3.get_paginator.return_value = pag
 
+    # alpha-engine-config-I9028: promote_to_champion now verifies the bundle
+    # against the per-file ETags in its own _lineage.json before copying, so
+    # this fixture must attest to its own contents like a real bundle does.
+    _contract = ("meta_model.pkl", "feature_list.json", "manifest.json")
+    _etags = {f: f"etag-{f}" for f in _contract}
+
+    def _head(Bucket, Key):
+        return {"ETag": '"' + _etags[Key.rsplit("/", 1)[-1]] + '"'}
+
+    s3.head_object.side_effect = _head
+
     bodies = {
-        f"{src}_lineage.json": {"version_id": vid, "stage": "challenger", "date": "2026-06-13"},
+        f"{src}_lineage.json": {"version_id": vid, "stage": "challenger",
+                                "date": "2026-06-13", "file_etags": _etags},
         live_key: live_manifest,
     }
 

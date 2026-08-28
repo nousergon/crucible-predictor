@@ -1020,8 +1020,11 @@ def write_predictions(
             f"executor falls back to prior-day predictions. "
             f"Investigate the model output (manifest's output_distribution_gate "
             f"sub-dict from the most recent training run) before next "
-            f"inference; if the model is genuinely unhealthy, roll back to "
-            f"a known-good archive at predictor/weights/meta/archive/."
+            f"inference; if the model is genuinely unhealthy, roll back with "
+            f"model.registry.promote_to_champion to a version_id under "
+            f"predictor/registry/ — NEVER predictor/weights/meta/archive/, "
+            f"which can hold a model that was never champion "
+            f"(alpha-engine-config-I9028)."
         )
 
     if dry_run:
