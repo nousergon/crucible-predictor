@@ -17,7 +17,7 @@ psutil>=7.2.2
 # started failing 2026-07-14 against the default 79.0.1 bundled by the
 # GH Actions Python 3.11 image). Not a build-backend requirement here — direct
 # pin exists solely to satisfy the security-audit gate.
-setuptools>=83.0.0
+setuptools>=84.0.0
 
 # Shared lib (used by inference + training entrypoints). Public since
 # 2026-05-03 — pip installs from git+https with no auth.
