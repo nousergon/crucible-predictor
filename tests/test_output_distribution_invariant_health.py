@@ -188,3 +188,52 @@ class TestConfidenceSemanticsInvariant:
         )
         assert result.passed is True
         assert result.metrics["n_confidence_checked"] == 0
+
+
+# ── Direction coherence (observe-only) — alpha-engine-config-I9086 ───────────
+# `predicted_direction` is derived from the alpha's sign; `p_up` comes from the
+# calibrator. An isotonic step that does not cross 0.5 at alpha=0 makes the two
+# disagree, and the executor reads one for its veto and the other (via
+# confidence) for its sizing. Measured on the live artifacts: 1-5 rows per
+# session on every session 2026-08-19..28.
+
+def _coherence_row(p_up, direction):
+    return {
+        "ticker": "T",
+        "p_up": p_up,
+        "p_down": round(1.0 - p_up, 4),
+        "predicted_direction": direction,
+        "predicted_alpha": 0.01,
+        "prediction_confidence": round(abs(p_up - 0.5) * 2.0, 4),
+    }
+
+
+def test_direction_coherence_counts_disagreeing_rows():
+    from model.output_distribution_gate import validate_live_batch_invariant_health
+
+    # The measured 2026-08-28 shape: 4 of 30 rows DOWN with p_up > 0.5.
+    rows = [_coherence_row(0.5340, "DOWN") for _ in range(4)]
+    rows += [_coherence_row(0.50 + 0.001 * i, "UP") for i in range(1, 16)]
+    rows += [_coherence_row(0.49 - 0.001 * i, "DOWN") for i in range(1, 12)]
+
+    res = validate_live_batch_invariant_health(rows)
+    assert res.metrics["n_direction_checked"] == 30
+    assert res.metrics["direction_incoherent_count"] == 4
+    assert res.metrics["direction_incoherence_rate"] == round(4 / 30, 4)
+
+
+def test_direction_coherence_is_observe_only():
+    """It must NOT flip the halt verdict. Promoting a chronic condition to a
+    hard stop would halt the book on a standing state rather than a new one —
+    tracked separately (alpha-engine-config-I9088). Recorded, never silenced."""
+    from model.output_distribution_gate import validate_live_batch_invariant_health
+
+    coherent = [_coherence_row(0.50 + 0.004 * i, "UP") for i in range(1, 16)]
+    coherent += [_coherence_row(0.50 - 0.004 * i, "DOWN") for i in range(1, 16)]
+    incoherent = [_coherence_row(0.5340, "DOWN") for _ in range(4)] + coherent[4:]
+
+    a = validate_live_batch_invariant_health(coherent)
+    b = validate_live_batch_invariant_health(incoherent)
+    assert b.metrics["direction_incoherent_count"] == 4
+    assert b.passed == a.passed
+    assert b.failed_check == a.failed_check
