@@ -9,7 +9,10 @@ import inference.stages.write_output as wo
 from inference.stages.write_output import (
     write_predictions, get_veto_threshold,
     _merge_predictions, _read_existing_predictions,
+    _relative_dispersion_check, _n_high_confidence_zero_streak,
+    _load_trailing_batch_history,
 )
+from model.output_distribution_gate import validate_live_batch_invariant_health
 
 
 class TestWritePredictionsDryRun:
@@ -1156,3 +1159,303 @@ class TestSendPredictorEmailConsoleBaseUrl:
                 console_base_url="https://stage.example.com",
             )
         assert captured.get("console_base_url") == "https://stage.example.com"
+
+
+# ── alpha-engine-config-I9019: relative dispersion gate + n_high_confidence ────
+# Fixtures below are the MEASURED numbers from the issue's table
+# (s3://alpha-engine-research/predictor/predictions/{date}.json ->
+# output_distribution_gate.metrics, plus n_high_confidence), 2026-08-19..08-28.
+
+class TestRelativeDispersionCheck:
+    """_relative_dispersion_check — pure function, no S3."""
+
+    PRE_PROMOTION_ALPHA_STDEV = [0.028204, 0.040751, 0.043427]  # 08-19, 08-20, 08-21
+
+    def test_guard_red_without_the_fix(self):
+        """Champion-challenger policy 7.4: prove the PRE-FIX gate (the absolute-
+        floor-only `validate_live_batch_invariant_health`, with no relative check)
+        reports passed=True on the exact 2026-08-24 collapse this PR closes. This
+        is the gap alpha-engine-config-I9019 measured live: 5 consecutive
+        passed=True days while alpha_stdev sat ~6x below its pre-promotion level.
+        """
+        # Alternating +/- 0.010437 over n=30 rows: population stdev (ddof=0)
+        # is exactly 0.010437 — the measured 2026-08-24 alpha_stdev.
+        predicted_alphas = [0.010437 if i % 2 == 0 else -0.010437 for i in range(30)]
+        preds = [{"predicted_alpha": a} for a in predicted_alphas]
+        old_result = validate_live_batch_invariant_health(preds)
+        assert old_result.passed is True  # RED — the absolute floors alone miss this
+        assert old_result.metrics["alpha_stdev"] == pytest.approx(0.010437, abs=1e-6)
+
+    def test_2026_08_21_batch_passes_relative_check(self):
+        # 08-21's alpha_stdev (0.043427) against the two trading days before it
+        # (0.028204, 0.040751): median 0.034478, ratio ~1.26x — comfortably
+        # above the 0.5x compression floor.
+        result = _relative_dispersion_check(
+            [0.028204, 0.040751], 0.043427, statistic="alpha_stdev", min_history_days=2,
+        )
+        assert result["applicable"] is True
+        assert result["passed"] is True
+        assert result["ratio"] > 1.0
+
+    def test_2026_08_24_batch_refused_by_relative_check(self):
+        # 08-24's alpha_stdev (0.010437) against the pre-promotion trailing
+        # history (0.028204, 0.040751, 0.043427): median 0.040751,
+        # ratio ~0.256x — the measured ~6x compression from
+        # alpha-engine-config-I9019, well below the 0.5x floor -> FAILS.
+        result = _relative_dispersion_check(
+            self.PRE_PROMOTION_ALPHA_STDEV, 0.010437,
+            statistic="alpha_stdev", min_history_days=3,
+        )
+        assert result["applicable"] is True
+        assert result["passed"] is False
+        assert result["ratio"] == pytest.approx(0.010437 / 0.040751, rel=1e-3)
+        assert "compression floor" in result["reason"]
+
+    def test_stdev_p_up_observe_only_check_also_refuses_08_24(self):
+        # Same shape, on stdev_p_up (0.191162, 0.216746, 0.152755 -> 0.060170):
+        # this is the OBSERVE-ONLY sibling check — callers decide not to gate on
+        # it (recalibration-invariance, config#1373); the function itself has no
+        # opinion about blocking.
+        result = _relative_dispersion_check(
+            [0.191162, 0.216746, 0.152755], 0.060170,
+            statistic="stdev_p_up", min_history_days=3,
+        )
+        assert result["applicable"] is True
+        assert result["passed"] is False
+
+    def test_insufficient_history_does_not_fire(self):
+        result = _relative_dispersion_check([0.04], 0.01, statistic="alpha_stdev")
+        assert result["applicable"] is False
+        assert result["passed"] is True
+
+    def test_missing_today_value_does_not_fire(self):
+        result = _relative_dispersion_check(
+            [0.04, 0.03, 0.05, 0.04, 0.04], None, statistic="alpha_stdev",
+        )
+        assert result["applicable"] is False
+        assert result["passed"] is True
+
+    def test_zero_median_does_not_fire(self):
+        result = _relative_dispersion_check(
+            [0.0, 0.0, 0.0, 0.0, 0.0], 0.0, statistic="alpha_stdev",
+        )
+        assert result["applicable"] is False
+        assert result["passed"] is True
+
+    def test_exactly_at_floor_passes(self):
+        result = _relative_dispersion_check(
+            [0.10, 0.10, 0.10, 0.10, 0.10], 0.05, statistic="alpha_stdev",
+        )
+        assert result["applicable"] is True
+        assert result["passed"] is True
+        assert result["ratio"] == pytest.approx(0.5)
+
+    def test_just_below_floor_fails(self):
+        result = _relative_dispersion_check(
+            [0.10, 0.10, 0.10, 0.10, 0.10], 0.0499, statistic="alpha_stdev",
+        )
+        assert result["applicable"] is True
+        assert result["passed"] is False
+
+    def test_non_numeric_history_entries_are_dropped(self):
+        result = _relative_dispersion_check(
+            [0.04, None, "bad", 0.05, 0.04, 0.04], 0.02, statistic="alpha_stdev",
+        )
+        assert result["history_n"] == 4
+
+
+class TestNHighConfidenceZeroStreak:
+    """_n_high_confidence_zero_streak — pure function, no S3."""
+
+    def test_measured_five_day_streak(self):
+        # today=2026-08-28 (0); history most-recent-first: 08-27..08-24 (all 0),
+        # then 08-21 (5) breaks the streak — the measured 5-day zero-streak.
+        streak = _n_high_confidence_zero_streak(0, [0, 0, 0, 0, 5, 5, 2])
+        assert streak == 5
+
+    def test_no_streak_when_today_nonzero(self):
+        assert _n_high_confidence_zero_streak(2, [0, 0, 0]) == 0
+
+    def test_streak_stops_at_missing_day(self):
+        # today=0 (streak=1), yesterday=0 (streak=2), day before is missing -> stop.
+        assert _n_high_confidence_zero_streak(0, [0, None, 0]) == 2
+
+    def test_streak_stops_at_nonzero_day(self):
+        assert _n_high_confidence_zero_streak(0, [0, 5, 0]) == 2
+
+    def test_streak_includes_today_alone_when_no_history(self):
+        assert _n_high_confidence_zero_streak(0, []) == 1
+
+
+class TestLoadTrailingBatchHistory:
+    """_load_trailing_batch_history — best-effort S3 read + fast circuit breaker."""
+
+    def test_extracts_metrics_from_prior_batches(self):
+        def make_response(alpha_stdev, stdev_p_up, n_high_confidence):
+            payload = json.dumps({
+                "output_distribution_gate": {
+                    "metrics": {"alpha_stdev": alpha_stdev, "stdev_p_up": stdev_p_up},
+                },
+                "n_high_confidence": n_high_confidence,
+            }).encode()
+            body = MagicMock()
+            body.read.return_value = payload
+            return {"Body": body}
+
+        from botocore.exceptions import ClientError
+
+        def get_object(Bucket, Key):
+            if Key == "predictor/predictions/2026-08-21.json":
+                return make_response(0.043427, 0.191162, 5)
+            if Key == "predictor/predictions/2026-08-20.json":
+                return make_response(0.040751, 0.216746, 5)
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = get_object
+
+        history = _load_trailing_batch_history(
+            mock_s3, "bucket", "2026-08-24", lookback_calendar_days=10, max_days=10,
+        )
+        by_date = {h["date"]: h for h in history}
+        assert by_date["2026-08-21"]["alpha_stdev"] == pytest.approx(0.043427)
+        assert by_date["2026-08-21"]["stdev_p_up"] == pytest.approx(0.191162)
+        assert by_date["2026-08-20"]["n_high_confidence"] == 5
+
+    def test_nosuchkey_does_not_trip_the_circuit_breaker(self):
+        from botocore.exceptions import ClientError
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject",
+        )
+        history = _load_trailing_batch_history(
+            mock_s3, "bucket", "2026-08-24", lookback_calendar_days=10, max_days=10,
+        )
+        assert history == []
+        assert mock_s3.get_object.call_count == 10  # tried every day, never broke early
+
+    def test_circuit_breaker_aborts_fast_on_real_errors(self):
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = RuntimeError("connection refused")
+        history = _load_trailing_batch_history(
+            mock_s3, "bucket", "2026-08-24", lookback_calendar_days=20, max_days=10,
+        )
+        assert history == []
+        assert mock_s3.get_object.call_count == wo._MAX_CONSECUTIVE_S3_FAILURES
+
+    def test_a_success_resets_the_failure_counter(self):
+        from botocore.exceptions import ClientError
+
+        def make_response():
+            payload = json.dumps({
+                "output_distribution_gate": {"metrics": {"alpha_stdev": 0.04, "stdev_p_up": 0.2}},
+                "n_high_confidence": 3,
+            }).encode()
+            body = MagicMock()
+            body.read.return_value = payload
+            return {"Body": body}
+
+        calls = {"n": 0}
+
+        def get_object(Bucket, Key):
+            calls["n"] += 1
+            # alternating fail/succeed: never 2 consecutive failures, so a
+            # 2-failure circuit breaker must never trip.
+            if calls["n"] % 2 == 0:
+                return make_response()
+            raise RuntimeError("transient")
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = get_object
+        history = _load_trailing_batch_history(
+            mock_s3, "bucket", "2026-08-24", lookback_calendar_days=8, max_days=10,
+        )
+        assert len(history) == 4  # calls 2, 4, 6, 8 all succeed; breaker never trips
+
+
+class TestWritePredictionsRelativeDispersionGate:
+    """Integration: write_predictions refuses the write when the relative-
+    dispersion check fires (alpha-engine-config-I9019). Champion-challenger
+    policy 7.4's guard-red-before-fix proof is
+    TestRelativeDispersionCheck.test_guard_red_without_the_fix above.
+    """
+
+    @staticmethod
+    def _history_response(alpha_stdev, stdev_p_up, n_high_confidence=5):
+        payload = json.dumps({
+            "output_distribution_gate": {
+                "metrics": {"alpha_stdev": alpha_stdev, "stdev_p_up": stdev_p_up},
+            },
+            "n_high_confidence": n_high_confidence,
+        }).encode()
+        body = MagicMock()
+        body.read.return_value = payload
+        return {"Body": body}
+
+    def _mock_s3_with_pre_promotion_history(self):
+        from botocore.exceptions import ClientError
+        history = {
+            "2026-08-21": (0.043427, 0.191162),
+            "2026-08-20": (0.040751, 0.216746),
+            "2026-08-19": (0.028204, 0.152755),
+        }
+
+        def get_object(Bucket, Key):
+            for d, (a, p) in history.items():
+                if Key == f"predictor/predictions/{d}.json":
+                    return self._history_response(a, p)
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = get_object
+        return mock_s3
+
+    @staticmethod
+    def _predictions_with_alpha_stdev(target_stdev, n=30):
+        # Alternating +/- target_stdev over n rows: population stdev (ddof=0,
+        # what np.std / the gate use) is exactly target_stdev.
+        return [
+            {"ticker": f"T{i}", "predicted_alpha": target_stdev if i % 2 == 0 else -target_stdev}
+            for i in range(n)
+        ]
+
+    def test_2026_08_24_collapse_is_refused(self, monkeypatch):
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_with_pre_promotion_history()
+        predictions = self._predictions_with_alpha_stdev(0.010437)  # measured 08-24 alpha_stdev
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", True, create=True):
+            with pytest.raises(RuntimeError, match="alpha-engine-config-I9019"):
+                write_predictions(predictions, "2026-08-24", "bucket", {})
+
+    def test_2026_08_21_batch_is_not_refused(self, monkeypatch):
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_with_pre_promotion_history()
+        predictions = self._predictions_with_alpha_stdev(0.043427)  # measured 08-21 alpha_stdev
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", True, create=True), \
+                patch("inference.stages.write_output._s3_put_json"):
+            # date after the mocked history so 08-21/20/19 are all strictly trailing.
+            write_predictions(predictions, "2026-08-22", "bucket", {"model_version": "v1"})
+
+    def test_relative_dispersion_metrics_recorded_even_when_gate_not_blocking(self, monkeypatch, capsys):
+        # blocking=False (the observed default) must still SEE the relative
+        # check in the forensic trail — measurability (principle 7) doesn't
+        # depend on the enforcement flag.
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_with_pre_promotion_history()
+        predictions = self._predictions_with_alpha_stdev(0.010437)
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
+            write_predictions(predictions, "2026-08-24", "bucket", {}, dry_run=True)
+        out = capsys.readouterr().out
+        predictions_json = json.loads(
+            out.split("=== PREDICTIONS (dry-run) ===\n")[1].split("\n=== METRICS")[0]
+        )
+        gate = predictions_json["output_distribution_gate"]
+        assert gate["passed"] is False
+        assert gate["failed_check"] == "alpha_stdev_relative_compression"
+        assert gate["metrics"]["relative_dispersion"]["alpha_stdev"]["passed"] is False

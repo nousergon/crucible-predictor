@@ -37,6 +37,204 @@ def predictor_report_url(date_str: str, console_base_url: str | None = None) -> 
     return build_console_url(PREDICTOR_SLUG, date=date_str or None, base=console_base_url)
 
 
+# ── Relative dispersion gate + n_high_confidence alerting (alpha-engine-config-I9019) ──
+#
+# The 2026-08-21 champion (v3.0-meta-2026-08-21-7d3d1cce) compressed stdev_p_up ~4x
+# and alpha_stdev ~6x against the pre-promotion book, for five consecutive trading
+# days, and `output_distribution_gate` (model/output_distribution_gate.py) kept
+# reporting passed=True the whole time — every one of its checks is an ABSOLUTE
+# floor, and a 4x compression clears them all. This section adds a RELATIVE check:
+# today's dispersion against the book's OWN trailing history median.
+#
+# Per the recalibration-invariance boundary established just below in
+# `write_predictions` (config#1373, the 2026-06-29 GE false-halt): the statistic
+# that DRIVES the halt verdict is `alpha_stdev` — dispersion of `predicted_alpha`,
+# the level-neutralized tradable signal the executor consumes for entry ordering —
+# never `stdev_p_up`, which is an isotonic calibrator's staircase IMAGE of that
+# signal and can legitimately show few unique steps on a thin, healthy,
+# low-dispersion day (the exact false-halt class config#1373 retired). The matching
+# `stdev_p_up` relative check is still computed and recorded — observe-only, same
+# shape as the `legacy_p_up_shape_gate` block below — so the calibration-method
+# soak keeps its forensic trail, but it never gates allocation.
+DISPERSION_HISTORY_LOOKBACK_CALENDAR_DAYS = 21  # calendar days scanned for history
+DISPERSION_HISTORY_MAX_DAYS = 10                # trailing trading days the median uses
+DISPERSION_HISTORY_MIN_DAYS = 5                 # below this the check does not fire
+DISPERSION_COMPRESSION_FLOOR = 0.5              # today < floor * trailing median => FAIL
+_MAX_CONSECUTIVE_S3_FAILURES = 2                # circuit-breaker: abort history load fast
+                                                 # on real (non-NoSuchKey) S3/network errors
+                                                 # so an offline test/drill environment can't
+                                                 # turn this best-effort read into a hang
+
+N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS = 3    # consecutive zero-n_high_confidence days
+
+
+def _load_trailing_batch_history(
+    s3, bucket: str, date_str: str,
+    lookback_calendar_days: int = DISPERSION_HISTORY_LOOKBACK_CALENDAR_DAYS,
+    max_days: int = DISPERSION_HISTORY_MAX_DAYS,
+) -> list[dict]:
+    """Load up to ``max_days`` trading days of PRIOR predictor batches, most-recent-
+    first, strictly before ``date_str`` — the same ``predictor/predictions/{date}.json``
+    lookback pattern ``monitoring/drift_detector.py:261`` uses (read for the pattern
+    only; that module is owned by another agent this session and is not touched here).
+
+    Each entry: ``{"date": d, "alpha_stdev": float|None, "stdev_p_up": float|None,
+    "n_high_confidence": int|None}``, pulled from the prior batch's own
+    ``output_distribution_gate.metrics`` / top-level ``n_high_confidence``.
+
+    Best-effort, with a fast circuit breaker: a missing artifact (weekend/holiday/
+    NoSuchKey) is a normal, expected gap and does not count against the breaker; any
+    other error (network, credentials, throttling) counts, and after
+    ``_MAX_CONSECUTIVE_S3_FAILURES`` in a row the load aborts rather than retrying
+    ``lookback_calendar_days`` more times. This is a forensic/alerting input, not the
+    primary write path — a gap in history must never block or slow today's write.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    try:
+        from botocore.exceptions import ClientError
+    except Exception:  # pragma: no cover — botocore always ships with boto3
+        ClientError = ()  # type: ignore[assignment]
+
+    try:
+        target = _date.fromisoformat(date_str)
+    except ValueError:
+        return []
+
+    out: list[dict] = []
+    consecutive_failures = 0
+    for offset in range(1, lookback_calendar_days + 1):
+        d = (target - _timedelta(days=offset)).isoformat()
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=f"predictor/predictions/{d}.json")
+            data = json.loads(obj["Body"].read())
+            consecutive_failures = 0
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "") if hasattr(exc, "response") else ""
+            if code in ("NoSuchKey", "404"):
+                continue
+            consecutive_failures += 1
+            if consecutive_failures >= _MAX_CONSECUTIVE_S3_FAILURES:
+                log.warning(
+                    "relative-dispersion history load aborting after %d consecutive "
+                    "S3 errors (last: %s) — proceeding with %d day(s) of history",
+                    consecutive_failures, exc, len(out),
+                )
+                break
+            continue
+        except Exception as exc:
+            consecutive_failures += 1
+            if consecutive_failures >= _MAX_CONSECUTIVE_S3_FAILURES:
+                log.warning(
+                    "relative-dispersion history load aborting after %d consecutive "
+                    "errors (last: %s) — proceeding with %d day(s) of history",
+                    consecutive_failures, exc, len(out),
+                )
+                break
+            continue
+        if not isinstance(data, dict):
+            continue
+        gate_metrics = ((data.get("output_distribution_gate") or {}).get("metrics") or {})
+        out.append({
+            "date": d,
+            "alpha_stdev": gate_metrics.get("alpha_stdev"),
+            "stdev_p_up": gate_metrics.get("stdev_p_up"),
+            "n_high_confidence": data.get("n_high_confidence"),
+        })
+        if len(out) >= max_days:
+            break
+    return out
+
+
+def _relative_dispersion_check(
+    history_values: list,
+    today_value,
+    *,
+    statistic: str,
+    min_history_days: int = DISPERSION_HISTORY_MIN_DAYS,
+    compression_floor: float = DISPERSION_COMPRESSION_FLOOR,
+) -> dict:
+    """Today's ``statistic`` against the trailing history's own median.
+
+    Pure function — no S3 — so champion-challenger policy 7.4's guard-red-before-fix
+    tests (alpha-engine-config-I9019) can drive it directly off measured fixture
+    numbers without mocking S3.
+
+    Returns ``{"applicable", "statistic", "today", "history_median", "history_n",
+    "ratio", "passed", "reason"}``. ``applicable=False`` (with ``passed=True``) when
+    there isn't enough trailing history yet, today's value is missing, or the
+    history median is non-positive — an honest non-fire, never a false pass dressed
+    as a checked one (the same pass-on-thin-batch shape
+    ``validate_live_batch_invariant_health`` uses for a thin live batch).
+    """
+    import numpy as np
+
+    finite_history = [float(v) for v in history_values if isinstance(v, (int, float))]
+
+    if today_value is None or not isinstance(today_value, (int, float)):
+        return {
+            "applicable": False, "statistic": statistic, "today": today_value,
+            "history_median": None, "history_n": len(finite_history), "ratio": None,
+            "passed": True,
+            "reason": f"{statistic} missing for today — relative check does not fire",
+        }
+
+    if len(finite_history) < min_history_days:
+        return {
+            "applicable": False, "statistic": statistic, "today": float(today_value),
+            "history_median": None, "history_n": len(finite_history), "ratio": None,
+            "passed": True,
+            "reason": (
+                f"only {len(finite_history)} trailing day(s) of {statistic} history "
+                f"(need >= {min_history_days}) — relative check does not fire"
+            ),
+        }
+
+    median = float(np.median(finite_history))
+    if median <= 0:
+        return {
+            "applicable": False, "statistic": statistic, "today": float(today_value),
+            "history_median": median, "history_n": len(finite_history), "ratio": None,
+            "passed": True,
+            "reason": (
+                f"trailing {statistic} median is {median} (non-positive) — "
+                f"relative check does not fire"
+            ),
+        }
+
+    ratio = float(today_value) / median
+    passed = ratio >= compression_floor
+    reason = (
+        f"today's {statistic} {today_value:.6f} is {ratio:.2f}x the trailing "
+        f"{len(finite_history)}-day median {median:.6f}"
+        + ("" if passed else f" — below the {compression_floor:.0%} compression floor")
+    )
+    return {
+        "applicable": True, "statistic": statistic, "today": float(today_value),
+        "history_median": median, "history_n": len(finite_history), "ratio": ratio,
+        "passed": passed, "reason": reason,
+    }
+
+
+def _n_high_confidence_zero_streak(
+    today_n_high_confidence,
+    history_n_high_confidence: list,
+) -> int:
+    """Consecutive trading days — today plus most-recent-first history — with
+    ``n_high_confidence == 0``. Stops at the first day whose value is nonzero OR
+    missing: a gap in the artifact ends the streak rather than silently extending
+    it (a missing day is not evidence the collapse continued through it).
+    """
+    streak = 0
+    for value in [today_n_high_confidence] + list(history_n_high_confidence):
+        if value is None or not isinstance(value, (int, float)):
+            break
+        if int(value) != 0:
+            break
+        streak += 1
+    return streak
+
+
 # ── S3-delivered predictor params (veto threshold) ────────────────────────────
 
 _predictor_params_cache: dict | None = None
@@ -516,16 +714,73 @@ def write_predictions(
     # Observe-only: the legacy isotonic-p_up shape gate, recorded for forensics
     # (would-it-have-blocked trail) but NOT used as the halt verdict.
     legacy_p_up_gate = validate_live_batch_distribution(predictions)
-    if not inference_gate_result.passed:
+
+    # Relative-dispersion gate (alpha-engine-config-I9019) — see the module-level
+    # comment above `_load_trailing_batch_history` for why `alpha_stdev` drives the
+    # verdict and `stdev_p_up` is observe-only. Best-effort history read: a
+    # circuit-broken/empty history degrades to `applicable=False` (honest non-fire),
+    # never a false pass presented as a checked one.
+    try:
+        import boto3 as _hist_boto3
+        from botocore.config import Config as _BotoConfig
+        # Tight timeouts + a single attempt: this read is best-effort forensic
+        # input, not the primary write path. Bounds worst-case added latency (an
+        # offline drill/test env, a stalled endpoint) to a couple of seconds times
+        # the circuit-breaker's 2-failure limit, instead of botocore's default
+        # 60s connect timeout x lookback_calendar_days retries.
+        _hist_s3 = _hist_boto3.client(
+            "s3", config=_BotoConfig(connect_timeout=1.5, read_timeout=1.5, retries={"max_attempts": 1}),
+        )
+        _batch_history = _load_trailing_batch_history(_hist_s3, s3_bucket, date_str)
+    except Exception as _hist_exc:
+        log.warning(
+            "relative-dispersion history load failed entirely (best-effort — gate "
+            "does not fire without history): %s", _hist_exc,
+        )
+        _batch_history = []
+
+    relative_alpha_check = _relative_dispersion_check(
+        [h["alpha_stdev"] for h in _batch_history],
+        inference_gate_result.metrics.get("alpha_stdev"),
+        statistic="alpha_stdev",
+        min_history_days=DISPERSION_HISTORY_MIN_DAYS,
+        compression_floor=DISPERSION_COMPRESSION_FLOOR,
+    )
+    relative_p_up_check = _relative_dispersion_check(
+        [h["stdev_p_up"] for h in _batch_history],
+        inference_gate_result.metrics.get("stdev_p_up"),
+        statistic="stdev_p_up",
+        min_history_days=DISPERSION_HISTORY_MIN_DAYS,
+        compression_floor=DISPERSION_COMPRESSION_FLOOR,
+    )
+
+    # Combined verdict: the pre-existing absolute-floor invariant-health checks OR
+    # the new relative-dispersion check on `alpha_stdev` — both recalibration-
+    # invariant, both drive the halt. `stdev_p_up`'s relative check is
+    # observe-only, matching the `legacy_p_up_shape_gate` boundary already
+    # established in this file (config#1373).
+    gate_passed = inference_gate_result.passed and relative_alpha_check["passed"]
+    if inference_gate_result.passed and not relative_alpha_check["passed"]:
+        gate_failed_check = "alpha_stdev_relative_compression"
+        gate_reason = (
+            f"relative dispersion gate (alpha-engine-config-I9019): "
+            f"{relative_alpha_check['reason']} — absolute-floor checks passed but "
+            f"dispersion compressed against the book's own trailing median"
+        )
+    else:
+        gate_failed_check = inference_gate_result.failed_check
+        gate_reason = inference_gate_result.reason
+
+    if not gate_passed:
         log.error(
             "Output-distribution gate FAILED at inference-time on %d-row batch: %s "
             "(blocking=%s)",
-            len(predictions), inference_gate_result.reason, inference_gate_blocking,
+            len(predictions), gate_reason, inference_gate_blocking,
         )
     else:
         log.info(
             "Output-distribution gate (inference-time) PASSED — %s",
-            inference_gate_result.reason,
+            gate_reason,
         )
 
     # Observe-only (config#1176): run the SAME gate on the shadow balanced-Platt
@@ -559,6 +814,33 @@ def write_predictions(
                 inference_gate_result.metrics.get("modal_fraction"),
                 inference_gate_result.metrics.get("stdev_p_up"),
             )
+            # alpha-engine-config-I9019: route shadow-Platt gate FAILURES
+            # somewhere a human sees them. This gate has been observe-only
+            # since config#1176 and nothing has ever read a failure off it —
+            # `failed_check: direction_skew` sat unnoticed through 2026-08-28.
+            # Still non-blocking (it never touches `gate_passed`/`gate_block`
+            # above); this only makes a standing failure visible instead of
+            # silent. WARN (not critical) — it is an early forensic signal for
+            # the calibration-method soak, not a live-trading halt condition.
+            if not _pg.passed:
+                try:
+                    from ops_alerts import publish_ops_alert
+                    publish_ops_alert(
+                        message=(
+                            f"output_distribution_gate_shadow_platt FAILED on "
+                            f"{date_str} ({_pg.failed_check}): {_pg.reason}. "
+                            f"Observe-only (config#1176) — does not block "
+                            f"allocation, but nothing has surfaced this before "
+                            f"now (alpha-engine-config-I9019)."
+                        ),
+                        severity="warning",
+                        source="alpha-engine-predictor/inference/stages/write_output.py::write_predictions",
+                        dedup_key=f"predictor_shadow_platt_gate_failed_{date_str}",
+                    )
+                except Exception:  # noqa: BLE001 — alert is best-effort observability, not the primary path
+                    log.warning(
+                        "shadow-platt gate failure alert itself failed", exc_info=True,
+                    )
         except Exception as _e:
             log.debug("shadow-platt gate compute failed (observe-only): %s", _e)
 
@@ -569,19 +851,59 @@ def write_predictions(
         if p.get("prediction_confidence", 0) >= threshold
     )
 
+    # alpha-engine-config-I9019: n_high_confidence has been emitted to
+    # metrics.json with NO consumer anywhere in the fleet (principle 7: a
+    # metric nothing gates on is unobserved, not healthy) — it sat at 0 for
+    # five straight trading days (2026-08-24..28) with no alert. Alert once the
+    # zero-streak reaches N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS; WARN, not
+    # blocking — sizing/conviction is the sizing layer's concern (config#1373
+    # item-2), this only makes the silence visible.
+    n_high_confidence_zero_streak = _n_high_confidence_zero_streak(
+        n_high_confidence, [h["n_high_confidence"] for h in _batch_history],
+    )
+    if n_high_confidence_zero_streak >= N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS:
+        try:
+            from ops_alerts import publish_ops_alert
+            publish_ops_alert(
+                message=(
+                    f"n_high_confidence has been 0 for "
+                    f"{n_high_confidence_zero_streak} consecutive trading days "
+                    f"ending {date_str} (veto_threshold={threshold}) — a metric "
+                    f"emitted to metrics.json with no prior consumer "
+                    f"(alpha-engine-config-I9019)."
+                ),
+                severity="warning",
+                source="alpha-engine-predictor/inference/stages/write_output.py::write_predictions",
+                dedup_key=f"predictor_n_high_confidence_zero_streak_{date_str}",
+            )
+        except Exception:  # noqa: BLE001 — alert is best-effort observability, not the primary path
+            log.warning(
+                "n_high_confidence zero-streak alert itself failed", exc_info=True,
+            )
+
     # Single gate-result block, carried in BOTH metrics.json (forensic trail)
     # AND predictions.json (so the executor's hold-book safeguard can read the
     # gate atomically with the batch it describes — the consumer-cutover for the
     # 2026-06-01 hold-book decision). Additive field; no predictor behavior
     # change here — the executor decides whether to act on it.
     gate_block = {
-        "passed": inference_gate_result.passed,
-        "failed_check": inference_gate_result.failed_check,
-        "reason": inference_gate_result.reason,
-        "metrics": inference_gate_result.metrics,
+        "passed": gate_passed,
+        "failed_check": gate_failed_check,
+        "reason": gate_reason,
+        "metrics": {
+            **inference_gate_result.metrics,
+            # alpha-engine-config-I9019: today's dispersion vs the book's own
+            # trailing median. `alpha_stdev` drives the verdict above;
+            # `stdev_p_up` is observe-only (isotonic staircase artifact, see the
+            # module comment above `_load_trailing_batch_history`).
+            "relative_dispersion": {
+                "alpha_stdev": relative_alpha_check,
+                "stdev_p_up_observe_only": relative_p_up_check,
+            },
+        },
         "blocking": inference_gate_blocking,
-        "would_have_blocked_if_blocking": not inference_gate_result.passed,
-        "verdict_basis": "invariant_output_health",  # config#1373
+        "would_have_blocked_if_blocking": not gate_passed,
+        "verdict_basis": "invariant_output_health+relative_dispersion",  # config#1373 + alpha-engine-config-I9019
         # Observe-only legacy isotonic-p_up shape gate — recorded so the
         # would-it-have-blocked staircase-coarseness trail stays visible, but
         # it does NOT drive the halt verdict (config#1373 / config#1176).
@@ -614,6 +936,11 @@ def write_predictions(
         "model_hit_rate_30d": metrics.get("hit_rate_30d_rolling", None),
         "n_predictions": len(predictions),
         "n_high_confidence": n_high_confidence,
+        # alpha-engine-config-I9019: consecutive trading days (including today)
+        # n_high_confidence has been 0 — the number the zero-streak alert above
+        # fires on, carried alongside so the console/forensic trail shows the
+        # same figure without recomputing it from history.
+        "n_high_confidence_zero_streak": n_high_confidence_zero_streak,
         # Executor reads this for the hold-book safeguard (2026-06-01): a
         # strongly-biased batch (passed=False) must not drive an optimizer
         # rotation — the executor holds the current book instead.
@@ -634,6 +961,7 @@ def write_predictions(
         **metrics,
         "n_predictions_today": len(predictions),
         "n_high_confidence": n_high_confidence,
+        "n_high_confidence_zero_streak": n_high_confidence_zero_streak,
         # config#1075: the tradable-universe coverage denominator + covered count
         # so the report card's inference_coverage grades a real value in [0,1]
         # (covered/universe) instead of a permanent N/A. Computed at the call site
@@ -685,10 +1013,10 @@ def write_predictions(
     # during a release simulation the same way as in production. Per
     # audit §9.5: the alert IS the record; writing stale metrics with
     # status=ok would mislead dashboards.
-    if inference_gate_blocking and not inference_gate_result.passed:
+    if inference_gate_blocking and not gate_passed:
         raise RuntimeError(
             f"Output-distribution gate refused write at inference time: "
-            f"{inference_gate_result.reason}. predictions.json NOT written; "
+            f"{gate_reason}. predictions.json NOT written; "
             f"executor falls back to prior-day predictions. "
             f"Investigate the model output (manifest's output_distribution_gate "
             f"sub-dict from the most recent training run) before next "
