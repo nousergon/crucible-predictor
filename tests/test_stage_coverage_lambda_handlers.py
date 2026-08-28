@@ -88,7 +88,14 @@ def test_weekly_run_day_gate_merges_verdict_when_lib_available(monkeypatch):
     fake_fn.assert_called_once()
     _, kwargs = fake_fn.call_args
     assert fake_fn.call_args[0][0] == "WeeklyRunDayGate"
-    assert kwargs["run_date"] == "2026-07-11"
+    # alpha-engine-config-I8984: the event's date (Sat 2026-07-11) is the
+    # CALENDAR date — WeeklyRunDayGate runs upstream of the SF's
+    # `NormalizeRunDates` by construction, and its own arithmetic needs the
+    # calendar date. Its coverage VERDICT does not: it is keyed on the
+    # cycle's trading day (Fri 2026-07-10) so one cycle writes exactly one
+    # `_stage_coverage/{date}/WeeklyRunDayGate.json`. Asserting the calendar
+    # date here is what this test used to do, and it pinned the defect.
+    assert kwargs["run_date"] == "2026-07-10"
     assert kwargs["window_start"] is not None
 
 
