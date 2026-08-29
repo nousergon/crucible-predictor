@@ -88,53 +88,6 @@ def compute_classification_metrics(
     }
 
 
-# alpha-engine-config-I9255 — a truncated upstream macro series must not be
-# able to annihilate the whole regime panel.
-#
-# ``build_features`` ends with an unconditional ``df.dropna()``. Every extended
-# macro column is computed from a series reindexed onto the SPY index with
-# ffill, so a series that STARTS late leaves NaN on every earlier date — and
-# that one column then drops every one of those rows. On 2026-08-21 the
-# ArcticDB ``macro`` library's ``VIX3M`` symbol held 16 rows (2026-08-07 →
-# 2026-08-28) against SPY's 2515 (2016-08-29 →). ``vix_term_slope`` was NaN
-# everywhere else, ``dropna()`` cut the panel from 799 usable dates to 16, none
-# of which intersected the meta panel's OOS test dates, and every macro feature
-# plus ``regime_intensity_z`` reached the L2 as a constant 0.0 — an exactly-zero
-# coefficient on all seven, and every training row labelled "neutral".
-#
-# The module ALREADY declares the correct behaviour for an unavailable series:
-# ``_load_close`` returns None and each block below falls back to a neutral
-# default. This threshold applies that same declared fallback to a series that
-# is PRESENT but too short to be usable, instead of the silent panel wipeout.
-# Deliberately low: it trips only on catastrophic truncation, never on a
-# legitimately short history (HYOAS is license-gated to 2023+ on FRED and
-# covers ~0.31 of the SPY panel — it must keep working unchanged).
-MACRO_SERIES_MIN_COVERAGE = 0.10
-
-# Panel retention below this after ``dropna()`` is reported as an outage. It
-# does not itself halt the build — ``training/meta_trainer.py`` owns the hard
-# stop, at the point where a dead macro block would otherwise produce a
-# champion. This is the naming surface, so the cause is in the log next to the
-# effect.
-MACRO_PANEL_RETENTION_FLOOR = 0.50
-
-
-def _series_coverage(series: "pd.Series | None", index) -> float:
-    """Fraction of ``index`` at or after the series' first observation.
-
-    ffill can carry a series FORWARD past its last observation, so a stale
-    series still covers the tail of the panel; it cannot carry values
-    BACKWARD, so the first observation is what bounds usable coverage.
-    Returns 0.0 for an absent or empty series.
-    """
-    if series is None or len(series) == 0 or len(index) == 0:
-        return 0.0
-    first = series.dropna().index.min()
-    if pd.isna(first):
-        return 0.0
-    return float((pd.Index(index) >= first).mean())
-
-
 class RegimePredictor:
     """Predict market regime probabilities from macro indicators."""
 
@@ -182,45 +135,6 @@ class RegimePredictor:
         additive columns.
         """
         df = pd.DataFrame(index=spy_series.index)
-
-        # alpha-engine-config-I9255: demote any upstream macro series too short
-        # to be usable to ABSENT *before* it is read, so the neutral-default
-        # branch below handles it — the declared contract — rather than the
-        # trailing ``dropna()`` silently deleting every date outside its span.
-        # Recorded on ``df.attrs`` so the caller can put it in the manifest:
-        # a number that is only in a log is not measurable.
-        macro_series_coverage: dict[str, float] = {}
-        _optional_series = {
-            "VIX": vix_series,
-            "VIX3M": vix3m_series,
-            "TNX": tnx_series,
-            "IRX": irx_series,
-            "TWO": two_series,
-            "HYOAS": hyoas_series,
-            "BAA10Y": baa10y_series,
-        }
-        for _name, _s in _optional_series.items():
-            _cov = _series_coverage(_s, df.index)
-            macro_series_coverage[_name] = round(_cov, 6)
-            if _s is not None and _cov < MACRO_SERIES_MIN_COVERAGE:
-                log.error(
-                    "Macro series %s covers only %.4f of the %d-date panel "
-                    "(first observation %s) — TRUNCATED UPSTREAM. Treating it "
-                    "as ABSENT (neutral default for its columns) rather than "
-                    "letting dropna() delete every earlier date. Fix the "
-                    "producer: ArcticDB library 'macro', symbol %s "
-                    "(alpha-engine-config-I9255).",
-                    _name, _cov, len(df.index),
-                    str(_s.dropna().index.min())[:10], _name,
-                )
-                _optional_series[_name] = None
-        vix_series = _optional_series["VIX"]
-        vix3m_series = _optional_series["VIX3M"]
-        tnx_series = _optional_series["TNX"]
-        irx_series = _optional_series["IRX"]
-        two_series = _optional_series["TWO"]
-        hyoas_series = _optional_series["HYOAS"]
-        baa10y_series = _optional_series["BAA10Y"]
 
         # SPY 20-day return
         df["spy_20d_return"] = (spy_series / spy_series.shift(20)) - 1.0
@@ -358,26 +272,7 @@ class RegimePredictor:
             df["market_breadth"] = 0.5  # neutral default
             df["market_breadth_200d"] = 0.5
 
-        _n_before_dropna = len(df)
-        df_notna_before = df.notna().sum()
         df = df.dropna()
-        _retention = (len(df) / _n_before_dropna) if _n_before_dropna else 0.0
-        if _retention < MACRO_PANEL_RETENTION_FLOOR:
-            log.error(
-                "Regime panel retention %.4f after dropna (%d of %d dates) — "
-                "below the %.2f floor. A macro column is NaN over most of the "
-                "panel; every dropped date reaches the L2 with a constant-0.0 "
-                "macro block. Per-column non-null counts: %s "
-                "(alpha-engine-config-I9255).",
-                _retention, len(df), _n_before_dropna,
-                MACRO_PANEL_RETENTION_FLOOR,
-                {c: int(n) for c, n in df_notna_before.items()},
-            )
-        # Attributes, not columns — additive and invisible to every existing
-        # ``df[...]`` / ``FEATURE_NAMES`` consumer.
-        df.attrs["macro_series_coverage"] = macro_series_coverage
-        df.attrs["macro_panel_retention"] = round(_retention, 6)
-        df.attrs["macro_panel_dates"] = int(len(df))
 
         # Stage D (regime-v3 2026-05-14): AQR-style risk-on/risk-off
         # composite z-score derived from the 6 raw macros above. Single

@@ -4621,15 +4621,10 @@ def run_meta_training(
                 # alpha-engine-config-I9255: is the macro block actually ARRIVING?
                 # `macro_row_coverage` is the fraction of OOS meta rows whose macro
                 # values came from regime_features_df rather than the constant-0.0
-                # fallback; `macro_series_coverage` is the per-upstream-series panel
-                # coverage RegimePredictor.build_features measured. Both are the
-                # numbers whose absence made the 2026-08-21 collapse invisible.
+                # fallback; `macro_panel_dates` is how many dates the regime
+                # feature frame actually held. Both are numbers whose
+                # absence made the 2026-08-21 collapse invisible.
                 "macro_row_coverage": round(float(macro_row_coverage), 6),
-                "macro_series_coverage": dict(
-                    regime_features_df.attrs.get("macro_series_coverage", {})
-                ),
-                "macro_panel_retention": regime_features_df.attrs.get(
-                    "macro_panel_retention"),
                 "macro_panel_dates": int(len(regime_features_df.index)),
                 # config#940: which L2 features (if any) were excluded by the
                 # AUTO_PRUNE_NOISE_FEATURES standalone-IC noise filter. When the
@@ -5057,15 +5052,10 @@ def run_meta_training(
         # alpha-engine-config-I9255: is the macro block actually ARRIVING?
         # `macro_row_coverage` is the fraction of OOS meta rows whose macro
         # values came from regime_features_df rather than the constant-0.0
-        # fallback; `macro_series_coverage` is the per-upstream-series panel
-        # coverage RegimePredictor.build_features measured. Both are the
-        # numbers whose absence made the 2026-08-21 collapse invisible.
+        # fallback; `macro_panel_dates` is how many dates the regime
+        # feature frame actually held. Both are numbers whose
+        # absence made the 2026-08-21 collapse invisible.
         "macro_row_coverage": round(float(macro_row_coverage), 6),
-        "macro_series_coverage": dict(
-            regime_features_df.attrs.get("macro_series_coverage", {})
-        ),
-        "macro_panel_retention": regime_features_df.attrs.get(
-            "macro_panel_retention"),
         "macro_panel_dates": int(len(regime_features_df.index)),
         "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
         "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
