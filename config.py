@@ -758,6 +758,16 @@ ARCTIC_DEGRADED_COVERAGE_RATIO = float(_cfg.get("arctic_degraded_coverage_ratio"
 # without licensing a collapse.
 REGIME_PANEL_COVERAGE_FLOOR = float(_cfg.get("regime_panel_coverage_floor", 0.99))
 
+# alpha-engine-config-I9290 — post-fit arm validity (Brian ruling 2026-08-29:
+# "if any of the arms is not trained properly then the predictor module should
+# fail the task"). Floor on this fit's standardized-coefficient L2 norm as a
+# fraction of the arm's OWN trailing median. Measured across the outage:
+# 0.3142 -> 0.2701 -> 0.1214, so 2026-08-28 sits at ratio 0.386 and 2026-08-21
+# at 0.860. 0.50 refuses the first and passes the second — deliberately, since
+# 08-21 is the case the served-slice behavioral veto already catches and this
+# gate must not be tuned to duplicate it. See training/arm_validity.py.
+ARM_COEF_NORM_MIN_RATIO = float(_cfg.get("arm_coef_norm_min_ratio", 0.50))
+
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the
 # shadow runner re-scores the SAME prices/universe with each registered

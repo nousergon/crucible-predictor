@@ -1055,8 +1055,12 @@ def run_meta_training(
     two_series = _load_close("TWO.parquet")
     hyoas_series = _load_close("HYOAS.parquet")
     baa10y_series = _load_close("BAA10Y.parquet")
-    gld_series = _load_close("GLD.parquet")
-    uso_series = _load_close("USO.parquet")
+    # The GLD and USO loads that used to sit here were read by NOTHING —
+    # verified 2026-08-29: each name had exactly one occurrence in this module,
+    # its own assignment. Deleted rather than left dormant: a dead load reads
+    # as capability while doing nothing, and it put two symbols into the
+    # completeness register that no arm consumes (champion-challenger-policy
+    # §6, alpha-engine-config-I9290).
 
     if spy_series is None:
         raise RuntimeError("SPY.parquet not found in price cache")
@@ -1074,10 +1078,17 @@ def run_meta_training(
             sector_etf_cache[etf_sym] = s
 
     # Load all ticker close prices for regime breadth + feature computation
+    # alpha-engine-config-I9290 — the regime-breadth loop must not fold a MACRO
+    # series into "% of stocks above their 50/200d MA". The literal below named
+    # SPY/VIX/VIX3M/TNX/IRX/GLD/USO and the XL* sector ETFs but NOT HYOAS, TWO,
+    # BAA10Y or the sub-sector ETFs, so a decimal-percent credit spread and a
+    # 26-row ETF were counted as stocks. The macro library's own symbol list is
+    # now the source of truth (arctic_coverage["macro_symbols"]); the literal
+    # stays as the floor for a caller that supplies no coverage dict.
     _SKIP = {
         "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
-    }
+    } | set((arctic_coverage or {}).get("macro_symbols") or ())
     all_close_prices = {}
     all_parquets = sorted(data_path.glob("*.parquet"))
 
@@ -2540,6 +2551,49 @@ def run_meta_training(
         "(val_ic_canonical=%.4f)",
         n_canonical, len(oos_meta_rows), meta_model._val_ic,
     )
+
+    # ── POST-FIT ARM VALIDITY GATE (alpha-engine-config-I9290, Brian ruling
+    #    2026-08-29: "if any of the arms is not trained properly then the
+    #    predictor module should fail the task") ───────────────────────────────
+    #
+    # Layer 1 (the Step 4a input gate above) refuses to START on short, frozen
+    # or absent inputs. This refuses to FINISH on a degenerate FIT — the case
+    # an input gate cannot see, because the inputs arrived and the model still
+    # came out structurally empty. That is precisely what happened on 2026-08-22
+    # and 2026-08-29: SSM Status Success, every spec OK, a full leaderboard, and
+    # every model fitted with seven features hard-zeroed.
+    #
+    # Failing here is SAFE for serving: training writes a per-run staging
+    # prefix (TrainingIOSpec, I9018) and model.registry.promote_to_champion is
+    # the only writer of the live serving prefix (asserted by
+    # tests/test_live_prefix_single_writer.py), so the existing champion keeps
+    # serving preopen inference and the week simply produces no new candidate.
+    from training.arm_validity import (
+        assert_arm_valid, evaluate_arm_validity, load_arm_history,
+    )
+    _arm_label = getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta")
+    _arm_history = load_arm_history(bucket, _arm_label)
+    arm_validity = evaluate_arm_validity(
+        arm=_arm_label,
+        standardized_coef=(meta_model._importance or {}).get("standardized_coef"),
+        meta_X=meta_X,
+        feature_names=TRAIN_META_FEATURES,
+        prior_standardized_coef=_arm_history["prior_standardized_coef"],
+        prior_coef_norms=_arm_history["prior_coef_norms"],
+        min_norm_ratio=float(getattr(cfg, "ARM_COEF_NORM_MIN_RATIO", 0.50)),
+    )
+    arm_validity["history"] = {
+        "status": _arm_history["status"],
+        "n_vintages": _arm_history["n_vintages"],
+        "reason": _arm_history["reason"],
+    }
+    log.info(
+        "Arm validity (I9290): arm=%s status=%s coef_norm=%s history=%s "
+        "(%d vintage(s))",
+        _arm_label, arm_validity["status"], arm_validity["coef_norm"],
+        _arm_history["status"], _arm_history["n_vintages"],
+    )
+    assert_arm_valid(arm_validity)
 
     # ── W1.1a (ROADMAP L4469): leak-free walk-forward OOS meta IC (OBSERVE) ──
     # The val_ic just logged (and the manifest's `meta_model_oos_ic`) are
@@ -4631,6 +4685,10 @@ def run_meta_training(
                 # coverage_ratio counts symbols and reads 1.0 on a 16-row
                 # series.
                 "data_completeness": data_completeness,
+                # I9290 — the post-fit validity verdict for THIS arm. A
+                # `degraded` status means a check was INSUFFICIENT (no history
+                # yet), never that it passed.
+                "arm_validity": arm_validity,
                 "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
@@ -5165,6 +5223,8 @@ def run_meta_training(
         # block above). Carried on the summary too so the training email and
         # the SSOT reader see the honest number, not the symbol-count ratio.
         "data_completeness": data_completeness,
+        # I9290 — see the manifest block above.
+        "arm_validity": arm_validity,
         "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,

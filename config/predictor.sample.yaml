@@ -310,6 +310,11 @@ arctic_degraded_coverage_ratio: 0.98
 # macro row for before training will proceed. Below it the run refuses rather
 # than zero-filling the macro block.
 regime_panel_coverage_floor: 0.99
+# alpha-engine-config-I9290 — post-fit arm validity. Floor on a fit's
+# standardized-coefficient L2 norm as a fraction of that arm's OWN trailing
+# median. Below it the run FAILS (Brian ruling 2026-08-29). Measured across the
+# VIX3M outage: 0.3142 -> 0.2701 -> 0.1214 (ratios 1.00 / 0.860 / 0.386).
+arm_coef_norm_min_ratio: 0.50
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:

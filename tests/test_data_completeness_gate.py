@@ -225,3 +225,74 @@ class TestNoSilentSubstitutionRemains:
         assert "regime_panel_coverage" in src
         assert "REGIME_PANEL_COVERAGE_FLOOR" in src
         assert "assert_trainable(data_completeness)" in src
+
+
+class TestTheSeverityBoundary:
+    """Brian's ruling of 2026-08-29 makes a starved arm fail the task. The
+    `optional` severity is therefore a load-bearing claim: it asserts the input
+    reaches no SERVED model. That claim is guarded here, not left in prose."""
+
+    def test_no_optional_input_feeds_a_served_feature(self):
+        from model.meta_model import (
+            MACRO_FEATURE_META_MAP,
+            REGIME_DERIVED_FEATURE_META_MAP,
+        )
+
+        served = (
+            set(MACRO_FEATURE_META_MAP)
+            | set(MACRO_FEATURE_META_MAP.values())
+            | set(REGIME_DERIVED_FEATURE_META_MAP)
+            | set(REGIME_DERIVED_FEATURE_META_MAP.values())
+        )
+        for spec in INPUT_REGISTER:
+            if spec.severity != "optional":
+                continue
+            overlap = served.intersection(spec.features)
+            assert not overlap, (
+                f"{spec.symbol} is declared `optional` but feeds served "
+                f"feature(s) {sorted(overlap)}. Under the 2026-08-29 ruling an "
+                "input that starves a servable arm must be `required` — move "
+                "the severity in the same PR that wires it."
+            )
+
+    def test_every_required_input_does_feed_the_served_macro_block(self):
+        """The converse, so `required` cannot quietly accumulate inputs whose
+        failure would halt production for nothing."""
+        assert {s.symbol for s in INPUT_REGISTER if s.severity == "required"} == {
+            "SPY", "VIX", "VIX3M", "TNX", "IRX",
+        }
+
+    def test_the_register_holds_no_input_that_nothing_consumes(self):
+        """GLD and USO were loaded by meta_trainer and read by nothing. A dead
+        load reads as capability while doing nothing (policy §6)."""
+        import inspect
+
+        from training import meta_trainer
+
+        src = inspect.getsource(meta_trainer.run_meta_training)
+        assert "gld_series" not in src and "uso_series" not in src
+        assert {"GLD", "USO"}.isdisjoint({s.symbol for s in INPUT_REGISTER})
+
+
+class TestMacroSeriesAreNotCountedAsStocks:
+    def test_the_breadth_skip_reads_the_macro_library_not_a_literal(self):
+        """HYOAS (a decimal-percent credit spread) and the 26-row sub-sector
+        ETFs were absent from the hardcoded `_SKIP`, so they entered
+        `all_close_prices` and were counted in market_breadth as if they were
+        stocks."""
+        import inspect
+
+        from training import meta_trainer
+
+        src = inspect.getsource(meta_trainer.run_meta_training)
+        assert 'get("macro_symbols")' in src
+
+    def test_arctic_reader_reports_the_macro_library_membership(self):
+        import inspect
+
+        import store.arctic_reader as ar
+
+        assert "macro_symbols" in (ar.download_from_arctic.__doc__ or "")
+        assert '"macro_symbols": list(macro_symbols)' in inspect.getsource(
+            ar.download_from_arctic
+        )

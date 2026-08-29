@@ -109,6 +109,9 @@ def download_from_arctic(
                              ``training.data_completeness.evaluate_completeness``,
                              which grades ROWS and DATE SPAN — the two things
                              ``coverage_ratio`` structurally cannot see.
+      ``macro_symbols``   : the macro library's symbol list. The universe
+                             loop downstream must not treat a macro series as
+                             a stock (alpha-engine-config-I9290).
       ``empty_universe``  : universe tickers that read OK holding ZERO rows.
       ``empty_macro``     : macro series that read OK holding ZERO rows.
                              Both were an unrecorded ``continue`` before I9290.
@@ -256,6 +259,13 @@ def download_from_arctic(
         "failed_universe": failed_universe,
         "failed_macro": failed_macro,
         "per_symbol": per_symbol,
+        # I9290 — WHICH symbols are macro. meta_trainer's regime-breadth loop
+        # used a hardcoded _SKIP set that named SPY/VIX/VIX3M/TNX/IRX/GLD/USO
+        # and the XL* sector ETFs but NOT HYOAS, TWO, BAA10Y or the sub-sector
+        # ETFs, so those macro series were folded into market_breadth as if
+        # they were stocks. Reporting the library membership makes the skip
+        # self-maintaining instead of a literal that drifts.
+        "macro_symbols": list(macro_symbols),
         "empty_universe": empty_universe,
         "empty_macro": empty_macro,
     }

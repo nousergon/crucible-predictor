@@ -157,12 +157,37 @@ INPUT_REGISTER: tuple[InputSpec, ...] = (
         consumers=("regime_predictor.build_features",),
         features=("yield_curve_slope",),
     ),
-    # FRED-sourced credit/curve macros. Optional: `build_features` has a
-    # declared neutral fallback for each, so their absence does not delete
-    # the regime frame the way VIX3M's collapse did. Their absence is still
-    # a NAMED degradation — a run that trains without a credit block is not
-    # the same experiment as one that trains with it, and the leaderboard
-    # must say so rather than let the two compare as equals.
+    # ── FRED-sourced credit/curve macros ────────────────────────────────────
+    # `optional` here is a MEASURED verdict, not a convenience, and it is the
+    # one place Brian's 2026-08-29 ruling ("if any of the arms is not trained
+    # properly then the predictor module should fail the task") needs a stated
+    # boundary. Traced 2026-08-29:
+    #
+    #   TWO / HYOAS / BAA10Y
+    #     -> regime_predictor.build_features: yield_curve_10y_2y, hy_oas_level,
+    #        hy_oas_change_21d, baa10y_level, baa10y_change_21d
+    #     -> cfg.MACRO_NORM_FEATURES
+    #     -> meta_trainer's X_vol_aug -> `prod_vol_macro_aug`
+    #
+    # `prod_vol_macro_aug` is a PARALLEL-OBSERVATION variant. Inference does
+    # not read it (Stage 1c wires the parallel observe path; Stage 1d is the
+    # cutover, which has not fired), and the Step 8b subsample IC gate runs
+    # against the PLAIN volatility variant only. None of these five columns
+    # reaches `MACRO_FEATURE_NAMES` — the six market-wide macros that DO enter
+    # the served L2 meta panel. So a frozen HYOAS starves a shadow lane, not a
+    # servable arm, and failing the weekly task on it would halt production on
+    # an input no served model consumes.
+    #
+    # That boundary is guarded, not asserted in prose: see
+    # `tests/test_data_completeness_gate.py::
+    # test_no_optional_input_feeds_a_served_feature`. The day one of these is
+    # wired into a served path, that test goes red and the severity moves to
+    # `required` in the same PR.
+    #
+    # Their absence remains a NAMED degradation on every manifest: a run that
+    # trains without a credit block is not the same experiment as one that
+    # does, and the leaderboard must say so rather than let the two compare as
+    # equals.
     InputSpec(
         symbol="TWO", severity="optional",
         consumers=("regime_predictor.build_features",),
@@ -186,16 +211,6 @@ INPUT_REGISTER: tuple[InputSpec, ...] = (
         symbol="BAA10Y", severity="optional",
         consumers=("regime_predictor.build_features",),
         features=("baa10y_level", "baa10y_change_21d"),
-        max_staleness_days=10,
-    ),
-    InputSpec(
-        symbol="GLD", severity="optional",
-        consumers=("meta_trainer._load_close",), features=(),
-        max_staleness_days=10,
-    ),
-    InputSpec(
-        symbol="USO", severity="optional",
-        consumers=("meta_trainer._load_close",), features=(),
         max_staleness_days=10,
     ),
 )
