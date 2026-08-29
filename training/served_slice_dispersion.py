@@ -104,6 +104,10 @@ LABEL_CLIP = 0.15
 MIN_SLICE_ROWS = 5
 # Fewer measured dates than this is not a distribution — reported uncomputable.
 MIN_DATES = 20
+# The panel's realized forward-return column, in preference order. Used ONLY by
+# the observe-only diagnostics below (alpha-engine-config-I9257); its absence
+# never affects a verdict.
+REALIZED_FWD_COLUMNS: tuple[str, ...] = ("actual_fwd_canonical", "actual_fwd")
 
 
 def _top_n() -> int:
@@ -225,36 +229,176 @@ def score_panel(meta_model, calibrator, panel) -> tuple[object, object]:
     return alpha, _calibrate(calibrator, alpha)
 
 
+def _t_stat(values) -> float | None:
+    """Mean over standard error, or ``None`` when it is not defined."""
+    import numpy as np
+
+    arr = np.asarray([v for v in values if v == v], dtype=float)
+    if arr.size < 2:
+        return None
+    se = float(np.std(arr, ddof=1)) / float(np.sqrt(arr.size))
+    if not se > 0:
+        return None
+    return round(float(np.mean(arr)) / se, 4)
+
+
+def _spearman(a, b) -> float | None:
+    """Rank correlation without a SciPy dependency on this path.
+
+    Pearson on ranks, which is Spearman by definition. Returns ``None`` rather
+    than NaN when either side is constant — a degenerate correlation is not a
+    measurement and must never render as zero.
+    """
+    import numpy as np
+    import pandas as pd
+
+    x = pd.Series(np.asarray(a, dtype=float)).rank().to_numpy()
+    y = pd.Series(np.asarray(b, dtype=float)).rank().to_numpy()
+    if x.size < 3 or np.std(x) == 0 or np.std(y) == 0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 def selected_slice_metrics(alpha, p_up, dates, *, top_n: int,
                            min_confidence: float,
-                           min_dates: int = MIN_DATES) -> dict:
+                           min_dates: int = MIN_DATES,
+                           realized=None) -> dict:
     """Dispersion WITHIN the top-``top_n``-by-alpha slice, per date, median-reduced.
 
     ``n_high_confidence`` counts names whose ``|p_up - 0.5| * 2`` clears
     ``min_confidence`` — the identical definition
     ``inference/stages/write_output.py`` uses on the live batch.
+
+    The verdict-bearing keys are ``alpha_stdev``, ``stdev_p_up`` and
+    ``n_high_confidence`` and nothing here changes them.
+
+    OBSERVE-ONLY (alpha-engine-config-I9257)
+    ----------------------------------------
+    Two nested blocks are added, and neither can ever arm a rule:
+    ``promotion_behavioral_veto._SERVED_METRIC_NAMES`` filters the merge to the
+    four flat rule metrics by name, so a nested key is structurally unreachable
+    from the veto. They exist because the three verdict metrics above are all
+    RAW-MAGNITUDE quantities, and a uniform rescaling of the linear predictor
+    collapses every one of them with no loss of ranking information — which is
+    exactly what happened to the 2026-08-28 vintage, where the champion-
+    ARCHITECTURE control was vetoed alongside every challenger.
+
+    ``scale_invariant.alpha_stdev_standardized``
+        The same top-N slice dispersion, but measured on alpha z-scored
+        CROSS-SECTIONALLY WITHIN EACH DATE before slicing. Invariant to any
+        per-date affine rescaling, so a gap that survives here is a shape
+        change and a gap that vanishes here was only scale.
+
+    ``realized.rank_ic`` / ``realized.top_n_lift``
+        Per-date Spearman of alpha against the panel's realized forward return,
+        and the top-N slice's realized return net of that date's universe mean.
+        Measured over the SAME rows as the dispersion, so a candidate whose
+        magnitude collapsed can be told apart from one whose ranking did.
+
+    Measured on the real artifacts, why both blocks are needed and why NEITHER
+    replaces the raw metric (panel ``oos_rows/2026-08-28.parquet`` and
+    ``oos_rows/2026-08-21.parquet``, 167 dates each, top_n=30):
+
+        08-28 champion-arch vs 08-14 incumbent
+            alpha_stdev ratio            0.347  → VETO
+            standardized ratio           0.943
+            top-30 realized lift        +0.0323 (t +7.25) vs -0.0037 (t -0.70)
+
+        08-21 candidate (the one that promoted and collapsed the live batch)
+            alpha_stdev ratio            0.327  → VETO
+            standardized ratio           0.973  ← a scale-invariant rule PASSES it
+            top-30 realized lift        -0.0353 (t -7.44)
+
+    The standardized quantity alone would have admitted the 2026-08-21 failure.
+    That is precisely why this is a diagnostic and NOT a replacement rule, and
+    why no threshold moves in the change that introduced it.
     """
     import numpy as np
     import pandas as pd
 
-    frame = pd.DataFrame({"date": np.asarray(dates), "alpha": alpha, "p_up": p_up})
+    columns = {"date": np.asarray(dates), "alpha": alpha, "p_up": p_up}
+    has_realized = realized is not None
+    if has_realized:
+        columns["realized"] = np.asarray(realized, dtype=float)
+    frame = pd.DataFrame(columns)
     frame = frame[np.isfinite(frame["alpha"]) & np.isfinite(frame["p_up"])]
     per_date_alpha: list[float] = []
     per_date_p_up: list[float] = []
     per_date_n_hi: list[int] = []
+    per_date_z: list[float] = []
+    per_date_ic: list[float] = []
+    per_date_lift: list[float] = []
     for _, group in frame.groupby("date", sort=True):
         if len(group) < MIN_SLICE_ROWS:
             continue
+        raw = group["alpha"].to_numpy()
         sliced = group.nlargest(min(top_n, len(group)), "alpha")
         per_date_alpha.append(float(np.std(sliced["alpha"].to_numpy())))
         per_date_p_up.append(float(np.std(sliced["p_up"].to_numpy())))
         confidence = np.round(np.abs(sliced["p_up"].to_numpy() - 0.5) * 2.0, 4)
         per_date_n_hi.append(int(np.sum(confidence >= min_confidence)))
+
+        # ── observe-only ────────────────────────────────────────────────────
+        spread = float(np.std(raw))
+        if spread > 0:
+            standardized = (raw - float(np.mean(raw))) / spread
+            order = np.argsort(-raw, kind="stable")[:min(top_n, len(raw))]
+            per_date_z.append(float(np.std(standardized[order])))
+        if has_realized:
+            realized_v = group["realized"].to_numpy()
+            finite = np.isfinite(realized_v)
+            if finite.sum() >= MIN_SLICE_ROWS:
+                ic = _spearman(raw[finite], realized_v[finite])
+                if ic is not None:
+                    per_date_ic.append(ic)
+                sliced_realized = sliced["realized"].to_numpy()
+                sliced_finite = np.isfinite(sliced_realized)
+                if sliced_finite.any():
+                    per_date_lift.append(
+                        float(np.mean(sliced_realized[sliced_finite]))
+                        - float(np.mean(realized_v[finite]))
+                    )
     if len(per_date_alpha) < min_dates:
         raise RuntimeError(
             f"only {len(per_date_alpha)} panel dates yielded a slice of at least "
             f"{MIN_SLICE_ROWS} rows (need {min_dates}) — not a distribution"
         )
+    scale_invariant: dict = {
+        "alpha_stdev_standardized": (
+            round(float(np.median(per_date_z)), 6) if per_date_z else None
+        ),
+        "n_dates": len(per_date_z),
+        "reason": None if per_date_z else (
+            "no panel date had a non-zero cross-sectional alpha spread"
+        ),
+    }
+    if has_realized:
+        realized_block: dict = {
+            "column": None,  # filled by the caller, which knows which one it read
+            "rank_ic": (
+                round(float(np.mean(per_date_ic)), 6) if per_date_ic else None
+            ),
+            "rank_ic_t": _t_stat(per_date_ic),
+            "top_n_lift": (
+                round(float(np.mean(per_date_lift)), 6) if per_date_lift else None
+            ),
+            "top_n_lift_t": _t_stat(per_date_lift),
+            "n_dates": len(per_date_ic),
+            "reason": None if per_date_ic else (
+                "the panel carries a realized column but no date yielded a "
+                "measurable rank correlation"
+            ),
+        }
+    else:
+        realized_block = {
+            "column": None, "rank_ic": None, "rank_ic_t": None,
+            "top_n_lift": None, "top_n_lift_t": None, "n_dates": 0,
+            "reason": (
+                f"panel carries none of the realized forward-return columns "
+                f"{list(REALIZED_FWD_COLUMNS)} — the realized diagnostics are "
+                f"UNMEASURED, not zero (champion-challenger-policy §7.2)"
+            ),
+        }
     return {
         "alpha_stdev": round(float(np.median(per_date_alpha)), 8),
         "stdev_p_up": round(float(np.median(per_date_p_up)), 6),
@@ -262,12 +406,83 @@ def selected_slice_metrics(alpha, p_up, dates, *, top_n: int,
         "n_dates": len(per_date_alpha),
         "top_n": top_n,
         "min_confidence": min_confidence,
+        # Nested, and therefore unreachable from the veto's flat metric merge.
+        "scale_invariant": scale_invariant,
+        "realized": realized_block,
     }
+
+
+def _cross_version_diagnostics(alphas: dict, dates, reference_version_id, *,
+                               top_n: int) -> dict:
+    """Per-version agreement with the REFERENCE version, per date.
+
+    Observe-only (alpha-engine-config-I9257). Two quantities, both invariant to
+    any per-date rescaling of either side:
+
+    ``top_n_overlap_vs_reference``
+        ``|A ∩ B| / max(|A|, |B|)`` over the two top-N selections. Divided by
+        the WIDER set, never the intersection — champion-challenger-policy §4,
+        so a narrow set contained in a wide one scores as the different
+        (narrower) selection it is rather than as a perfect clone.
+
+    ``rank_corr_vs_reference``
+        Mean per-date Spearman between the two alpha vectors on the same rows.
+
+    Together they answer the question the raw dispersion ratio cannot: did the
+    candidate pick DIFFERENT names, or the same names at a different scale?
+    """
+    import numpy as np
+    import pandas as pd
+
+    out: dict = {}
+    if not reference_version_id or reference_version_id not in alphas:
+        return out
+    ref_alpha = alphas[reference_version_id]
+    date_arr = np.asarray(dates)
+    groups = list(pd.Series(range(len(date_arr))).groupby(pd.Series(date_arr)))
+    for vid, cand_alpha in alphas.items():
+        if vid == reference_version_id:
+            continue
+        overlaps: list[float] = []
+        corrs: list[float] = []
+        for _, idx in groups:
+            rows = idx.to_numpy()
+            if rows.size < MIN_SLICE_ROWS:
+                continue
+            c, r = cand_alpha[rows], ref_alpha[rows]
+            finite = np.isfinite(c) & np.isfinite(r)
+            if finite.sum() < MIN_SLICE_ROWS:
+                continue
+            c, r, rows = c[finite], r[finite], rows[finite]
+            k = min(top_n, rows.size)
+            cand_top = set(rows[np.argsort(-c, kind="stable")[:k]].tolist())
+            ref_top = set(rows[np.argsort(-r, kind="stable")[:k]].tolist())
+            overlaps.append(
+                len(cand_top & ref_top) / max(len(cand_top), len(ref_top))
+            )
+            corr = _spearman(c, r)
+            if corr is not None:
+                corrs.append(corr)
+        out[vid] = {
+            "reference_version_id": reference_version_id,
+            "top_n_overlap_vs_reference": (
+                round(float(np.mean(overlaps)), 6) if overlaps else None
+            ),
+            "rank_corr_vs_reference": (
+                round(float(np.mean(corrs)), 6) if corrs else None
+            ),
+            "n_dates": len(overlaps),
+            "reason": None if overlaps else (
+                "no panel date had enough finite rows under both versions"
+            ),
+        }
+    return out
 
 
 def served_slice_metrics(s3, bucket: str, version_ids, *,
                          date_str: str | None = None,
-                         panel=None, panel_key: str | None = None) -> dict:
+                         panel=None, panel_key: str | None = None,
+                         reference_version_id: str | None = None) -> dict:
     """Served-slice metrics for every version in ``version_ids``, on ONE panel.
 
     Returns::
@@ -313,12 +528,36 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
         return out
     out["n_panel_rows"] = int(len(panel))
     dates = panel["date"].to_numpy()
+    # alpha-engine-config-I9257 — the realized forward-return column feeding the
+    # OBSERVE-ONLY diagnostics. Absent is a named reason on every version's
+    # block, never a silent None and never a verdict change.
+    realized_column = next(
+        (c for c in REALIZED_FWD_COLUMNS if c in getattr(panel, "columns", [])),
+        None,
+    )
+    out["realized_column"] = realized_column
+    if realized_column is None:
+        log.warning(
+            "served-slice dispersion: panel %s carries none of %s, so the "
+            "observe-only realized diagnostics (alpha-engine-config-I9257) are "
+            "UNMEASURED for this rotation. The VERDICT metrics are unaffected.",
+            panel_key, list(REALIZED_FWD_COLUMNS),
+        )
+    realized = (
+        panel[realized_column].to_numpy(dtype=float)
+        if realized_column is not None else None
+    )
+    alphas: dict = {}
     for vid in version_ids:
         try:
             meta_model, calibrator = load_scoring_head(s3, bucket, vid)
             alpha, p_up = score_panel(meta_model, calibrator, panel)
-            out["metrics"][vid] = selected_slice_metrics(
-                alpha, p_up, dates, top_n=top_n, min_confidence=min_conf)
+            metrics = selected_slice_metrics(
+                alpha, p_up, dates, top_n=top_n, min_confidence=min_conf,
+                realized=realized)
+            metrics["realized"]["column"] = realized_column
+            out["metrics"][vid] = metrics
+            alphas[vid] = alpha
         except Exception as exc:  # noqa: BLE001 — per-version, named, non-blocking
             out["errors"][vid] = str(exc)
             log.warning(
@@ -326,6 +565,24 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
                 "recorded on the leaderboard as an error, NOT as a pass.",
                 vid, exc, exc_info=True,
             )
+    # Observe-only cross-version agreement against the SERVING version.
+    for vid, block in _cross_version_diagnostics(
+            alphas, dates, reference_version_id, top_n=top_n).items():
+        if vid in out["metrics"]:
+            out["metrics"][vid]["scale_invariant"].update(block)
+    # The standardized dispersion RATIO against the reference, so a reader does
+    # not have to divide two medians by hand to tell scale from shape.
+    ref_metrics = out["metrics"].get(reference_version_id or "") or {}
+    ref_std = (ref_metrics.get("scale_invariant") or {}).get("alpha_stdev_standardized")
+    for vid, metrics in out["metrics"].items():
+        if vid == reference_version_id:
+            continue
+        cand_std = (metrics.get("scale_invariant") or {}).get("alpha_stdev_standardized")
+        metrics["scale_invariant"]["alpha_stdev_standardized_ratio"] = (
+            round(cand_std / ref_std, 6)
+            if cand_std is not None and ref_std not in (None, 0) else None
+        )
+    out["reference_version_id"] = reference_version_id
     if out["metrics"]:
         out["status"] = "measured"
         log.info(

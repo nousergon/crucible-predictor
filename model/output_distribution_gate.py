@@ -596,6 +596,7 @@ def validate_stratified_per_regime(
     regimes: list[str],
     *,
     min_per_regime_size: int = 25,
+    min_regimes_evaluated: int = 2,
     min_unique_p_up: int = 8,
     max_modal_fraction: float = 0.5,
     max_saturation_rate: float = 0.25,
@@ -632,10 +633,16 @@ def validate_stratified_per_regime(
         note in the metrics — too few rows to make a meaningful
         per-regime call. This matches the audit's "don't confuse
         low-sample noise with signal" framing.
-      - If every regime is below ``min_per_regime_size``, the gate
-        returns ``passed=True`` with a metrics dict indicating
-        "insufficient stratified sample" — operator decides whether
-        the training corpus is too narrow.
+      - Fewer than ``min_regimes_evaluated`` regimes clearing
+        ``min_per_regime_size`` is a FAILURE, not a pass
+        (alpha-engine-config-I9258). A gate whose whole purpose is to
+        compare regimes against each other has measured nothing when it
+        sees one bucket, and "measured nothing" is never green. This
+        fired for real: the 2026-08-21 and 2026-08-28 vintages both
+        promoted with ``n_regimes_evaluated == 1`` and the gate
+        reporting "all 1 evaluated regimes passed", because a truncated
+        VIX3M series (I9256) collapsed every training row's regime label
+        to "neutral".
 
     Fail semantics:
       - Returns ``passed=False`` with ``failed_check`` formatted as
@@ -657,6 +664,11 @@ def validate_stratified_per_regime(
         min_per_regime_size: minimum rows required for a regime to
             participate. Default 25 — fewer rows than that and the
             within-regime stdev / uniqueness checks are too noisy.
+        min_regimes_evaluated: minimum number of regimes that must clear
+            ``min_per_regime_size`` for the gate to have measured
+            anything. Default 2 — with one bucket there is no
+            cross-regime comparison to make. Below it the gate returns
+            ``passed=False`` / ``failed_check="insufficient_regime_coverage"``.
         Other args: same thresholds as the other gate variants.
     """
     import numpy as np
@@ -724,17 +736,31 @@ def validate_stratified_per_regime(
     aggregate_metrics = {
         "n_regimes_evaluated": n_regimes_evaluated,
         "min_per_regime_size": min_per_regime_size,
+        "min_regimes_evaluated": min_regimes_evaluated,
         "per_regime": per_regime_results,
     }
 
-    if n_regimes_evaluated == 0:
+    if n_regimes_evaluated < min_regimes_evaluated:
+        # I9258: this used to return passed=True whenever at least one
+        # regime cleared the floor (and passed=True even at zero). A
+        # stratified gate that saw one bucket did not pass — it did not
+        # run. Report that, loudly, instead of laundering absent
+        # measurement into a green verdict.
+        counts = ", ".join(
+            f"{r}={per_regime_results[r]['n']}"
+            for r in ("bull", "neutral", "bear")
+        )
+        reason = (
+            f"only {n_regimes_evaluated} of 3 regimes met "
+            f"min_per_regime_size={min_per_regime_size} "
+            f"(need >= {min_regimes_evaluated}); per-regime rows: {counts} "
+            f"— the stratified gate measured nothing, which is not a pass"
+        )
+        log.error("Stratified per-regime gate UNMEASURED — %s", reason)
         return OutputDistributionGateResult(
-            passed=True,
-            failed_check=None,
-            reason=(
-                f"no regime met min_per_regime_size={min_per_regime_size} "
-                f"— stratified gate does not fire"
-            ),
+            passed=False,
+            failed_check="insufficient_regime_coverage",
+            reason=reason,
             metrics=aggregate_metrics,
         )
 

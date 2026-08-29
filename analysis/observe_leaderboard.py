@@ -89,6 +89,19 @@ MIN_REALIZED_OUTCOMES = 20
 # Minimum matured pairs to compute a meaningful realized rank-IC at all.
 _MIN_PAIRS_FOR_IC = 10
 
+# ── alpha-engine-config-I9336: measurability vs. merely-thin ───────────────
+# Mirrors crucible-research/scoring/leaderboard_scoring.py::measurability_for
+# (landing in crucible-research-PR767) — same vocabulary, reimplemented
+# locally (the predictor and research Lambdas are separate deployables with
+# no shared runtime import boundary). Second adoption of this shape;
+# consider lifting both into nousergon-lib (shared-code-policy.md).
+MEASURABILITY_MEASURED = "measured"
+MEASURABILITY_UNMEASURABLE = "unmeasurable"
+# An arm that wrote none of the most recent N cohort dates has stopped
+# producing comparable output — mirrors crucible-research's
+# COHORT_LAG_UNMEASURABLE_DATES.
+MEASURABILITY_LAG_CYCLES = 3
+
 
 def _list_shadow_versions(bucket: str, s3_client=None) -> list[str]:
     """The version_ids under ``predictor/predictions_shadow/`` (one dir per
@@ -112,6 +125,97 @@ def _list_shadow_versions(bucket: str, s3_client=None) -> list[str]:
         log.warning("observe_leaderboard: failed to list shadow versions", exc_info=True)
         return []
     return sorted(versions)
+
+
+def _list_registered_challenger_ids(bucket: str, s3_client=None) -> list[str]:
+    """version_ids currently registered ``stage=challenger`` — the CENSUS of
+    arms that must be measured every cycle (alpha-engine-config-I9336
+    deliverable 2). Best-effort: [] on read failure, matching this module's
+    existing degrade shape — an unreadable census adds no explicit
+    unmeasurable rows rather than blocking the leaderboard build.
+    """
+    import boto3
+
+    from model.registry import list_versions
+
+    s3 = s3_client or boto3.client("s3")
+    try:
+        return [
+            v["version_id"] for v in list_versions(s3, bucket, stage="challenger")
+            if v.get("version_id")
+        ]
+    except Exception:  # noqa: BLE001 — best-effort census, never fatal
+        log.warning("observe_leaderboard: failed to list registered challengers", exc_info=True)
+        return []
+
+
+def _list_shadow_dates_for_version(bucket: str, version_id: str, s3_client=None) -> list[str]:
+    """Every date this version has EVER written a shadow prediction for — the
+    FULL history (not windowed to ``n_days``), so a genuinely-stale arm (last
+    write outside the scoring window) is distinguishable from one that never
+    wrote anything at all. Best-effort: [] on read failure."""
+    import boto3
+
+    s3 = s3_client or boto3.client("s3")
+    dates: list[str] = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=bucket, Prefix=f"{_SHADOW_PREFIX}/{version_id}/",
+        ):
+            for obj in page.get("Contents", []):
+                name = obj["Key"].rsplit("/", 1)[-1]
+                if name.endswith(".json"):
+                    dates.append(name[: -len(".json")])
+    except Exception:  # noqa: BLE001 — best-effort; treated as "no dates known"
+        log.warning(
+            "observe_leaderboard: failed to list shadow dates for %s",
+            version_id, exc_info=True,
+        )
+        return []
+    return sorted(dates)
+
+
+def measurability_for_shadow_arm(
+    dates_scored: list[str],
+    cohort_dates: list[str],
+    *,
+    lag: int = MEASURABILITY_LAG_CYCLES,
+) -> tuple[str, str | None]:
+    """``(measurability, reason)`` for one arm's shadow-write coverage.
+
+    ``cohort_dates`` is the union of shadow-write dates across every OTHER
+    currently-registered challenger this cycle — the population this arm is
+    judged against. An arm that wrote zero shadows ever, or wrote none of the
+    ``lag`` most-recent cohort dates, is UNMEASURABLE and must never render as
+    a merely-thin/insufficient-data row (champion-challenger-policy §7.2,
+    §3) — that was exactly the I9307-class defect this mirrors: an arm
+    starved of comparable output rendering identically to one that merely has
+    little.
+    """
+    cohort = sorted(cohort_dates)
+    if not cohort:
+        # No cohort at all — every arm is equally silent, a leaderboard-level
+        # condition (already surfaced elsewhere), not this arm's fault.
+        return MEASURABILITY_MEASURED, None
+    scored = sorted(dates_scored)
+    if not scored:
+        return (
+            MEASURABILITY_UNMEASURABLE,
+            f"wrote 0 of {len(cohort)} cohort shadow date(s) — produced no "
+            "comparable shadow output at all, which is an absence, not thin "
+            "evidence",
+        )
+    recent = cohort[-lag:]
+    if not (set(scored) & set(recent)):
+        return (
+            MEASURABILITY_UNMEASURABLE,
+            f"last shadow write {scored[-1]}, but wrote none of the "
+            f"{len(recent)} most recent cohort cycle(s) ({', '.join(recent)}) "
+            "— has stopped producing comparable shadow output; its remaining "
+            "dates are residue, not a thin-but-live record",
+        )
+    return MEASURABILITY_MEASURED, None
 
 
 def _load_shadow_pairs(bucket: str, version_id: str, n_days: int, s3_client=None) -> list[dict]:
@@ -622,6 +726,8 @@ def build_observe_leaderboard(
     prices_by_ticker: dict | None = None,
     sector_map: dict | None = None,
     date_str: str | None = None,
+    registered_challenger_ids: list[str] | None = None,
+    shadow_dates_by_version: dict[str, list[str]] | None = None,
 ) -> dict:
     """Score every shadow-run version against realized 21d alpha + emit the
     leaderboard with a per-version ``ready_for_full_promotion`` verdict.
@@ -632,7 +738,16 @@ def build_observe_leaderboard(
     Measurement only — it NEVER promotes or allocates.
 
     Test-injectable: ``shadow_pairs_by_version`` / ``live_pairs`` /
-    ``prices_by_ticker`` / ``sector_map`` bypass S3 when provided.
+    ``prices_by_ticker`` / ``sector_map`` / ``registered_challenger_ids`` /
+    ``shadow_dates_by_version`` bypass S3 when provided.
+
+    alpha-engine-config-I9336: every currently-registered ``stage=challenger``
+    arm gets an explicit row, even one that has written NO shadow prediction
+    at all (previously entirely ABSENT from the leaderboard rather than
+    reported). Each arm's ``measurability`` is ``measured`` or
+    ``unmeasurable`` (see ``measurability_for_shadow_arm``) — an unmeasurable
+    arm overrides the usual insufficient-data verdict and triggers one
+    ops_alert per build naming every starved arm.
     """
     bucket = bucket or cfg.S3_BUCKET
     horizon_days = horizon_days or int(getattr(cfg, "FORWARD_DAYS", 21))
@@ -681,8 +796,35 @@ def build_observe_leaderboard(
     )
     champ_ic, champ_n, champ_weeks = _realized_rank_ic(live_pairs)
 
+    # alpha-engine-config-I9336: the CENSUS of arms that must be measured this
+    # cycle — every currently-registered stage=challenger version, whether or
+    # not it has ever written a shadow prediction. Without this a version
+    # that never wrote a shadow simply never appears in
+    # ``shadow_pairs_by_version`` (keyed off an S3 directory listing) and is
+    # silently absent from the leaderboard rather than reported.
+    if registered_challenger_ids is None:
+        registered_challenger_ids = _list_registered_challenger_ids(bucket, s3_client=s3_client)
+    registered_challenger_ids = list(dict.fromkeys(registered_challenger_ids))  # de-dup, order-stable
+
+    all_vids = list(dict.fromkeys(list(shadow_pairs_by_version.keys()) + registered_challenger_ids))
+    if shadow_dates_by_version is None:
+        shadow_dates_by_version = {
+            vid: _list_shadow_dates_for_version(bucket, vid, s3_client=s3_client)
+            for vid in all_vids
+        }
+    # The cohort is the population a registered arm is judged against: every
+    # OTHER currently-registered challenger's shadow-write dates. Falls back
+    # to every known version's dates if the registered census is empty
+    # (read failure) — degrade gracefully rather than suppress the check.
+    cohort_source_vids = registered_challenger_ids or all_vids
+    cohort_dates = sorted({
+        d for vid in cohort_source_vids for d in shadow_dates_by_version.get(vid, [])
+    })
+
     entries: list[dict] = []
-    for vid, vpairs in shadow_pairs_by_version.items():
+    starved: list[str] = []
+    for vid in all_vids:
+        vpairs = shadow_pairs_by_version.get(vid, [])
         compute_realized_alpha_for_pairs(
             vpairs, horizon_days=horizon_days,
             prices_by_ticker=prices_by_ticker, sector_map=sector_map,
@@ -693,6 +835,9 @@ def build_observe_leaderboard(
         )
         enough_data = (v_weeks >= MIN_SOAK_WEEKS and v_n >= MIN_REALIZED_OUTCOMES)
         ready = bool(enough_data and beats)
+        measurability, measurability_reason = measurability_for_shadow_arm(
+            shadow_dates_by_version.get(vid, []), cohort_dates,
+        )
         if v_ic is None:
             verdict_reason = (
                 f"insufficient matured outcomes: {v_n} (need >= {_MIN_PAIRS_FOR_IC} "
@@ -714,6 +859,14 @@ def build_observe_leaderboard(
                 f"{v_weeks} weeks / {v_n} matured outcomes. Operator may promote: "
                 f"python -m model.registry --bucket {bucket} --promote {vid}"
             )
+        if measurability == MEASURABILITY_UNMEASURABLE:
+            # Overrides the insufficient/soak-too-young framing above: this is
+            # not "not enough evidence yet", it is "produced no comparable
+            # output" — a defect that resolves by fixing the shadow write
+            # path, never by waiting (champion-challenger-policy §7.2).
+            ready = False
+            verdict_reason = f"UNMEASURABLE: {measurability_reason}"
+            starved.append(vid)
         entries.append({
             "version_id": vid,
             "realized_rank_ic": v_ic,
@@ -722,7 +875,63 @@ def build_observe_leaderboard(
             "beats_champion_realized": beats,
             "ready_for_full_promotion": ready,
             "verdict_reason": verdict_reason,
+            "measurability": measurability,
+            "measurability_reason": measurability_reason,
         })
+
+    if starved:
+        try:
+            from ops_alerts import publish_ops_alert
+            publish_ops_alert(
+                message=(
+                    f"observe_leaderboard: {len(starved)} registered "
+                    f"challenger(s) UNMEASURABLE this cycle "
+                    f"({', '.join(starved)}) — produced no comparable shadow "
+                    f"output within the last {MEASURABILITY_LAG_CYCLES} cohort "
+                    f"cycle(s) (alpha-engine-config-I9336). Never renders as a "
+                    f"merely-thin row."
+                ),
+                # DELIBERATELY "warning", not "error"/"critical" — kept as a
+                # LITERAL keyword argument (not a variable) because
+                # nousergon-data's alert_class_pr_guard.py resolves a call
+                # site's registry severity by a static regex over the
+                # quoted-string form of this exact keyword argument; a
+                # non-literal argument resolves to `dynamic` and would force
+                # the alert_classes row below to declare `severities:
+                # [dynamic]` instead of the true, single, deliberate value.
+                # (Do not write that regex's own pattern in a comment near
+                # this call — the guard scans raw source text including
+                # comments, and an example match here is indistinguishable
+                # from a second call site to it.)
+                #
+                # A starved shadow arm is a MEASUREMENT-COVERAGE signal
+                # (fixed by repairing the shadow write path, or by waiting for
+                # `_select_challengers_for_cycle`'s rotation to reach it) —
+                # never a trading-halt condition, so it must never land as an
+                # immediate page in the one operator chat. That conflation
+                # (severity gating the buzz while every severity landed in
+                # the same destination) is the exact 2026-08-28 alert-
+                # destination-arc lesson (fleet memory
+                # project_alert_destination_arc_260829): severity does not
+                # by itself pick a destination tier, so this row must pair a
+                # non-paging severity with the batched routing response, not
+                # merely "not critical".
+                #
+                # Registered as `class: predictor_shadow_leaderboard_
+                # unmeasurable_arm` in nousergon-data's
+                # infrastructure/overseer/playbooks.yaml::alert_classes with
+                # `severities: [warning]`, `intake: bus`, `response:
+                # drain-queue` — the batched alert-drain queue, NOT
+                # `response: operator` (declared human-only/paging). Companion
+                # PR required per that file's CI guard
+                # (.github/workflows/alert-class-pr-guard.yml); see
+                # alpha-engine-config-I9336.
+                severity="warning",
+                source="alpha-engine-predictor/analysis/observe_leaderboard.py::build_observe_leaderboard",
+                dedup_key=f"predictor_shadow_unmeasurable_{trading_day}",
+            )
+        except Exception:  # noqa: BLE001 — alert is best-effort observability
+            log.warning("observe_leaderboard: unmeasurable-arm alert itself failed", exc_info=True)
 
     # Rank promotion-ready first, then by realized IC desc (None last).
     entries.sort(

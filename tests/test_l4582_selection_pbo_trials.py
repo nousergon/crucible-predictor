@@ -254,7 +254,7 @@ def test_selection_pbo_insufficient_with_one_candidate(monkeypatch):
 
 def test_rotation_leaderboard_carries_trial_log_and_pbo(monkeypatch):
     import model.registry as reg
-    from tests.test_model_zoo import _SPECS
+    from tests.test_model_zoo import _H60_SPECS as _SPECS
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     ics = [0.05, 0.06, 0.04, 0.07, 0.05, 0.06]
     s3 = _FakeS3({
@@ -275,10 +275,21 @@ def test_rotation_leaderboard_carries_trial_log_and_pbo(monkeypatch):
         date_str="2026-06-13",
     )
     assert board["trial_log_status"] == "ok"
-    assert board["n_trials_cumulative"] == 2      # both candidates ledgered
     assert mz._TRIAL_LOG_KEY in s3.puts
-    # the horizon variant still competes in the PBO matrix (selection
-    # diagnostics ≠ promotion eligibility — it stays non_canonical_horizon)
-    assert board["selection_pbo"]["status"] == "ok"
+    # alpha-engine-config-I9313 — h60 is INAPPLICABLE to the 21d M slot, so the
+    # rotation never spends a training run on it and it never reaches the
+    # candidate pool. Before the register it was trained and scored every week
+    # and then refused at selection, which is the cost this closes.
+    assert [c["spec_id"] for c in board["candidates"]] == ["resid"]
+    assert board["n_trials_cumulative"] == 1
+    # The exclusion is a RECORDED property of the slot register, carried on the
+    # leaderboard with its reason — not a bare string the artifact never
+    # explains.
+    _h60 = next(a for a in board["slot_register"]["arms"] if a["spec_id"] == "h60")
+    assert _h60["applicability"] == "inapplicable"
+    assert _h60["trainable"] is False
+    assert "60-day forward horizon" in _h60["reason"]
+    assert board["slot_register"]["horizon_policy"] == "refuse_non_canonical"
+    assert board["slot_register"]["n_inapplicable"] == 1
     written = json.loads(s3.puts[f"{mz._LEADERBOARD_PREFIX}/2026-06-13.json"])
-    assert written["selection_pbo"]["pbo"] is not None
+    assert written["slot_register"]["canonical_horizon_days"] == 21

@@ -11,6 +11,8 @@ from inference.stages.write_output import (
     _merge_predictions, _read_existing_predictions,
     _relative_dispersion_check, _n_high_confidence_zero_streak,
     _load_trailing_batch_history,
+    _absolute_dispersion_floor_check, _dispersion_gate_verdict,
+    DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV,
 )
 from model.output_distribution_gate import validate_live_batch_invariant_health
 
@@ -1263,6 +1265,167 @@ class TestRelativeDispersionCheck:
         )
         assert result["history_n"] == 4
 
+    def test_effective_floor_and_history_dates_provenance(self):
+        # alpha-engine-config-I9267 deliverable 2: the floor's own value and
+        # the window it came from must ride along in the result, not just the
+        # ratio's raw inputs.
+        result = _relative_dispersion_check(
+            [0.10, 0.10, 0.10, 0.10, 0.10], 0.04, statistic="alpha_stdev",
+            history_dates=["2026-08-21", "2026-08-20", "2026-08-19", "2026-08-18", "2026-08-17"],
+        )
+        assert result["effective_floor"] == pytest.approx(0.05)
+        assert result["history_dates"] == [
+            "2026-08-21", "2026-08-20", "2026-08-19", "2026-08-18", "2026-08-17",
+        ]
+
+    def test_history_dates_defaults_to_none(self):
+        result = _relative_dispersion_check([0.04] * 5, 0.03, statistic="alpha_stdev")
+        assert result["history_dates"] is None
+
+
+class TestAbsoluteDispersionFloorCheck:
+    """_absolute_dispersion_floor_check — pure function, no S3
+    (alpha-engine-config-I9267 deliverable 1b: a hard stop independent of any
+    trailing window, derived from the measured healthy population).
+    """
+
+    def test_measured_healthy_sessions_all_pass(self):
+        # 2026-08-10..08-21 alpha_stdev from the issue table: range 0.0200-0.0434.
+        for v in (
+            0.02865469, 0.02955441, 0.02641287, 0.01999851, 0.02319664,
+            0.02335963, 0.02610537, 0.02820351, 0.04075134, 0.04342717,
+        ):
+            result = _absolute_dispersion_floor_check(v)
+            assert result["passed"] is True, v
+
+    def test_measured_collapsed_sessions_all_fail(self):
+        # 2026-08-24..08-28 alpha_stdev from the issue table: range 0.00591-0.01044.
+        for v in (0.01043722, 0.00877974, 0.00822851, 0.00722553, 0.00709906):
+            result = _absolute_dispersion_floor_check(v)
+            assert result["passed"] is False, v
+
+    def test_08_28_champion_arch_retrain_scaled_projection_fails(self):
+        # The issue's own replay projection: a promoted 08-28 champion-arch
+        # retrain scaled to a live ~0.011 — the exact figure the relative
+        # check alone would pass on 2026-08-31 (ratio ~0.67 against the
+        # decayed floor).
+        result = _absolute_dispersion_floor_check(0.011)
+        assert result["passed"] is False
+
+    def test_missing_today_does_not_fire(self):
+        result = _absolute_dispersion_floor_check(None)
+        assert result["applicable"] is False
+        assert result["passed"] is True
+
+    def test_reason_names_the_floor(self):
+        result = _absolute_dispersion_floor_check(0.011)
+        assert "0.015" in result["reason"]
+
+
+class TestDispersionGateVerdict:
+    """_dispersion_gate_verdict — combined relative(cross-champion)+absolute
+    floor verdict (alpha-engine-config-I9267). Fixture values are the MEASURED
+    ``predictor/predictions/{date}.json`` alpha_stdev series from the issue
+    table, 2026-08-10..08-28, with champion attribution.
+    """
+
+    _PRE_PROMOTION_CHAMPION = "champ-pre-promotion"
+    _COLLAPSED_CHAMPION = "v3.0-meta-2026-08-21-7d3d1cce"
+
+    _MEASURED_SERIES = [
+        ("2026-08-10", 0.02865469, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-11", 0.02955441, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-12", 0.02641287, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-13", 0.01999851, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-14", 0.02319664, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-17", 0.02335963, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-18", 0.02610537, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-19", 0.02820351, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-20", 0.04075134, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-21", 0.04342717, _PRE_PROMOTION_CHAMPION),
+        ("2026-08-24", 0.01043722, _COLLAPSED_CHAMPION),
+        ("2026-08-25", 0.00877974, _COLLAPSED_CHAMPION),
+        ("2026-08-26", 0.00822851, _COLLAPSED_CHAMPION),
+        ("2026-08-27", 0.00722553, _COLLAPSED_CHAMPION),
+        ("2026-08-28", 0.00709906, _COLLAPSED_CHAMPION),
+    ]
+
+    @classmethod
+    def _history(cls, dates_values_champions):
+        return [
+            {"date": d, "alpha_stdev": v, "champion_version_id": c}
+            for d, v, c in dates_values_champions
+        ]
+
+    # ── Deliverable 3: replay the real series, prove 2026-08-31 is blocked ──
+
+    def test_2026_08_31_trailing10_window_passes_the_old_uncontaminated_check(self):
+        """Guard-red-before-fix (champion-challenger policy 7.4): the plain
+        trailing-10-day median (08-17..08-28, NOT filtered by champion — the
+        pre-fix behavior) has decayed enough that a 0.011 batch on 2026-08-31
+        PASSES. This is the measured ~0.67 ratio against a floor that decayed
+        38% — the exact gap alpha-engine-config-I9267 reports. Proves the
+        bug is real and the fix below is necessary."""
+        trailing_10 = [v for _, v, _ in self._MEASURED_SERIES[-10:]]  # 08-17..08-28
+        old_check = _relative_dispersion_check(trailing_10, 0.011, statistic="alpha_stdev")
+        assert old_check["applicable"] is True
+        assert old_check["passed"] is True  # RED — uncaught by the relative check alone
+
+    def test_2026_08_31_batch_is_blocked_by_the_absolute_floor(self):
+        """The regression test the issue requires (deliverable 3). A NEW
+        champion (succeeding the collapsed one) differs from every champion in
+        the trailing-10 window, so the same-champion exclusion (1a) excludes
+        nothing here — this is the cross-champion handoff case the issue
+        names as (a)'s thin-history limit. The absolute floor (1b) is what
+        actually blocks it: MUST fail against the pre-fix implementation
+        (there is no absolute floor pre-fix) and pass after."""
+        history = self._history(self._MEASURED_SERIES[-10:])  # 08-17..08-28
+        verdict = _dispersion_gate_verdict(
+            history, 0.011, "v3.0-meta-2026-08-28-01cf7e1a", min_history_days=3,
+        )
+        assert verdict["relative"]["passed"] is True  # (a) alone insufficient here
+        assert verdict["absolute_floor"]["passed"] is False  # (b) is what catches it
+        assert verdict["passed"] is False
+        assert verdict["excluded_same_champion_sessions"] == 0
+
+    def test_same_champion_cannot_set_its_own_bar(self):
+        """Deliverable 1(a) itself: the currently-serving collapsed champion's
+        OWN trailing sessions (08-24..08-27) are excluded from ITS OWN
+        reference on 08-28 — the median falls back to the last time a
+        DIFFERENT champion served (the healthy pre-promotion population), so
+        the relative check alone catches the collapse without needing the
+        absolute floor."""
+        history = self._history(self._MEASURED_SERIES[:-1])  # up to 08-27
+        verdict = _dispersion_gate_verdict(
+            history, 0.00709906, self._COLLAPSED_CHAMPION, min_history_days=3,
+        )
+        assert verdict["excluded_same_champion_sessions"] == 4  # 08-24..08-27
+        assert verdict["relative"]["history_n"] == 10  # only pre-promotion remains
+        assert verdict["relative"]["passed"] is False
+        assert verdict["passed"] is False
+
+    def test_no_champion_metadata_falls_back_to_absolute_floor_only(self):
+        # An older artifact (or a registry read failure that day) with no
+        # champion_version_id: exclusion cannot fire (nothing to compare
+        # against), so the absolute floor is the sole backstop.
+        history = [
+            {"date": d, "alpha_stdev": v, "champion_version_id": None}
+            for d, v, _ in self._MEASURED_SERIES[-10:]
+        ]
+        verdict = _dispersion_gate_verdict(history, 0.011, None, min_history_days=3)
+        assert verdict["excluded_same_champion_sessions"] == 0
+        assert verdict["absolute_floor"]["passed"] is False
+        assert verdict["passed"] is False
+
+    def test_healthy_batch_passes_both_checks(self):
+        history = self._history(self._MEASURED_SERIES[-10:])
+        verdict = _dispersion_gate_verdict(
+            history, 0.043427, "v3.0-meta-2026-08-28-01cf7e1a", min_history_days=3,
+        )
+        assert verdict["relative"]["passed"] is True
+        assert verdict["absolute_floor"]["passed"] is True
+        assert verdict["passed"] is True
+
 
 class TestNHighConfidenceZeroStreak:
     """_n_high_confidence_zero_streak — pure function, no S3."""
@@ -1459,3 +1622,109 @@ class TestWritePredictionsRelativeDispersionGate:
         assert gate["passed"] is False
         assert gate["failed_check"] == "alpha_stdev_relative_compression"
         assert gate["metrics"]["relative_dispersion"]["alpha_stdev"]["passed"] is False
+
+
+class TestWritePredictionsAbsoluteFloorAndChampionExclusion:
+    """Integration: alpha-engine-config-I9267's fixes wired into
+    write_predictions — the absolute floor backstop, and same-champion
+    history exclusion.
+    """
+
+    @staticmethod
+    def _history_response(alpha_stdev, champion_version_id):
+        payload = json.dumps({
+            "output_distribution_gate": {
+                "metrics": {"alpha_stdev": alpha_stdev, "stdev_p_up": 0.1},
+            },
+            "n_high_confidence": 0,
+            "champion_version_id": champion_version_id,
+        }).encode()
+        body = MagicMock()
+        body.read.return_value = payload
+        return {"Body": body}
+
+    def _mock_s3_collapsed_history(self):
+        from botocore.exceptions import ClientError
+        history = {
+            "2026-08-28": (0.00709906, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-27": (0.00722553, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-26": (0.00822851, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-25": (0.00877974, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-24": (0.01043722, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-21": (0.04342717, "champ-pre-promotion"),
+            "2026-08-20": (0.04075134, "champ-pre-promotion"),
+            "2026-08-19": (0.02820351, "champ-pre-promotion"),
+        }
+
+        def get_object(Bucket, Key):
+            for d, (a, c) in history.items():
+                if Key == f"predictor/predictions/{d}.json":
+                    return self._history_response(a, c)
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = get_object
+        return mock_s3
+
+    @staticmethod
+    def _predictions_with_alpha_stdev(target_stdev, n=30):
+        return [
+            {"ticker": f"T{i}", "predicted_alpha": target_stdev if i % 2 == 0 else -target_stdev}
+            for i in range(n)
+        ]
+
+    def test_new_champion_batch_blocked_by_absolute_floor(self, monkeypatch):
+        """The issue's own 2026-08-31 scenario: a NEW champion succeeding the
+        collapsed one differs from every champion in the trailing window, so
+        exclusion (1a) removes nothing — the absolute floor (1b) is what
+        blocks the ~0.011 projected live figure."""
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_collapsed_history()
+        predictions = self._predictions_with_alpha_stdev(0.011)
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo, "_resolve_champion_version_id",
+                             return_value="v3.0-meta-2026-08-28-01cf7e1a"), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", True, create=True):
+            with pytest.raises(RuntimeError):
+                write_predictions(predictions, "2026-08-31", "bucket", {})
+
+    def test_gate_artifact_carries_floor_provenance(self, monkeypatch, capsys):
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_collapsed_history()
+        predictions = self._predictions_with_alpha_stdev(0.011)
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo, "_resolve_champion_version_id",
+                             return_value="v3.0-meta-2026-08-28-01cf7e1a"), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
+            write_predictions(predictions, "2026-08-31", "bucket", {}, dry_run=True)
+        out = capsys.readouterr().out
+        predictions_json = json.loads(
+            out.split("=== PREDICTIONS (dry-run) ===\n")[1].split("\n=== METRICS")[0]
+        )
+        rel = predictions_json["output_distribution_gate"]["metrics"]["relative_dispersion"]
+        assert rel["absolute_floor_alpha_stdev"]["passed"] is False
+        assert rel["excluded_same_champion_sessions"] == 0
+        assert rel["today_champion_version_id"] == "v3.0-meta-2026-08-28-01cf7e1a"
+        assert rel["alpha_stdev"]["history_dates"] == [
+            "2026-08-28", "2026-08-27", "2026-08-26", "2026-08-25", "2026-08-24",
+            "2026-08-21", "2026-08-20", "2026-08-19",
+        ]
+
+    def test_same_champion_history_excluded_end_to_end(self, monkeypatch):
+        """The still-serving collapsed champion cannot set its own bar: with
+        today's champion equal to the last 5 mocked history days, those days
+        are excluded and the reference falls back to the healthy
+        pre-promotion sessions, blocking today's collapsed value even without
+        the absolute floor."""
+        monkeypatch.setattr(wo, "DISPERSION_HISTORY_MIN_DAYS", 3)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3_collapsed_history()
+        predictions = self._predictions_with_alpha_stdev(0.00709906)
+        with patch.dict("sys.modules", {"boto3": mock_boto3}), \
+                patch.object(wo, "_resolve_champion_version_id",
+                             return_value="v3.0-meta-2026-08-21-7d3d1cce"), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", True, create=True):
+            with pytest.raises(RuntimeError):
+                write_predictions(predictions, "2026-08-29", "bucket", {})

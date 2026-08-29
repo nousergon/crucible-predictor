@@ -139,24 +139,55 @@ class TestInsufficientSample:
         assert result.metrics["per_regime"]["bull"]["evaluated"] is True
         assert result.metrics["per_regime"]["bear"]["evaluated"] is True
 
-    def test_no_regime_meets_min_size_passes_with_note(self):
-        # All regimes too small.
+    def test_no_regime_meets_min_size_is_a_failure(self):
+        # alpha-engine-config-I9258: this asserted passed=True. A gate that
+        # evaluated zero regimes measured nothing, and no data is never green.
         preds = _diverse_predictions(15)
         regimes = ["bull"] * 5 + ["neutral"] * 5 + ["bear"] * 5
         result = validate_stratified_per_regime(preds, regimes)
-        assert result.passed is True
-        assert "stratified gate does not fire" in result.reason
+        assert result.passed is False
+        assert result.failed_check == "insufficient_regime_coverage"
         assert result.metrics["n_regimes_evaluated"] == 0
 
-    def test_skipped_regime_does_not_block_pass(self):
-        # Bull is the only regime with enough rows; it's healthy. Even
-        # though bear and neutral are too small to evaluate, the gate
-        # passes because the only evaluated regime is clean.
+    def test_one_evaluated_regime_is_a_failure(self):
+        # alpha-engine-config-I9258: this asserted passed=True, and it is
+        # EXACTLY the live shape that let the 2026-08-21 and 2026-08-28
+        # vintages promote — bull n=0, bear n=0, neutral n=6006/10465, the
+        # gate reporting "all 1 evaluated regimes passed". A stratified gate
+        # with one bucket has no cross-regime comparison to make.
         preds = _diverse_predictions(30) + _diverse_predictions(5) + _diverse_predictions(5)
         regimes = ["bull"] * 30 + ["neutral"] * 5 + ["bear"] * 5
         result = validate_stratified_per_regime(preds, regimes)
-        assert result.passed is True
+        assert result.passed is False
+        assert result.failed_check == "insufficient_regime_coverage"
         assert result.metrics["n_regimes_evaluated"] == 1
+        # The reason must name the per-regime counts so an operator can see
+        # WHICH regimes went missing without opening the manifest.
+        assert "bull=30" in result.reason
+        assert "bear=5" in result.reason
+
+    def test_the_live_08_21_shape_fails(self):
+        # Reproduces v3.0-meta-2026-08-21-7d3d1cce exactly: every row
+        # labelled neutral, bull and bear empty. Healthy neutral slice —
+        # the failure is the absent stratification, not a degenerate batch.
+        preds = _diverse_predictions(100)
+        result = validate_stratified_per_regime(preds, ["neutral"] * 100)
+        assert result.passed is False
+        assert result.failed_check == "insufficient_regime_coverage"
+        assert result.metrics["per_regime"]["bull"]["n"] == 0
+        assert result.metrics["per_regime"]["bear"]["n"] == 0
+
+    def test_min_regimes_evaluated_is_tunable(self):
+        # Two healthy regimes clear the default floor of 2 ...
+        preds = _diverse_predictions(60)
+        regimes = ["bull"] * 30 + ["bear"] * 30
+        assert validate_stratified_per_regime(preds, regimes).passed is True
+        # ... and a caller demanding all three can say so.
+        strict = validate_stratified_per_regime(
+            preds, regimes, min_regimes_evaluated=3,
+        )
+        assert strict.passed is False
+        assert strict.failed_check == "insufficient_regime_coverage"
 
 
 # ── Other / unknown regime labels ────────────────────────────────────────
@@ -173,7 +204,7 @@ class TestUnknownRegimeLabels:
         )
         regimes = ["unknown"] * 30 + ["bull"] * 30 + ["bear"] * 30
         result = validate_stratified_per_regime(preds, regimes)
-        assert result.passed is True
+        assert result.passed is True  # bull + bear both clear the floor
         # Only bull + bear evaluated.
         assert result.metrics["n_regimes_evaluated"] == 2
 
@@ -202,4 +233,6 @@ class TestCustomThresholds:
         result_default = validate_stratified_per_regime(preds, regimes)
         result_relaxed = validate_stratified_per_regime(preds, regimes, min_per_regime_size=10)
         assert result_default.metrics["n_regimes_evaluated"] == 0
+        assert result_default.passed is False  # I9258 — zero evaluated is not a pass
         assert result_relaxed.metrics["n_regimes_evaluated"] == 3
+        assert result_relaxed.passed is True

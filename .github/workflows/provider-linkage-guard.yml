@@ -1,0 +1,27 @@
+name: Provider direct-linkage guard
+
+# Thin caller — all scan behavior lives in the reusable workflow. Edit it
+# there, not here: nousergon/nousergon-lib/.github/workflows/provider-linkage-guard.yml
+#
+# alpha-engine-config-I9295 (spine I9294 — Brian's 2026-08-29 ruling: the
+# entire nous ergon system runs through the krepis router, no parallel
+# setups). Replaces openrouter-guard.yml, which this superset now covers.
+# Baseline of pre-existing matches, if any: .provider-linkage-allowlist.yaml.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: caller-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    uses: nousergon/nousergon-lib/.github/workflows/provider-linkage-guard.yml@27a6a7b31880355c566bedab3093c8a4c168677c  # nousergon-lib PR371, merged 2026-08-29

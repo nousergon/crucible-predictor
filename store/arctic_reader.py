@@ -26,6 +26,22 @@ promotion. Failures are now logged at WARN (ticker/series id + exception)
 and the return value is a coverage dict — ``n_written`` (back-compat count),
 ``n_expected`` (symbols listed), ``n_failed``, and ``coverage_ratio`` — so
 callers can gate on PARTIAL loss, not just total loss.
+
+alpha-engine-config-I9290 — ``coverage_ratio`` counts SYMBOLS, never ROWS
+PER SYMBOL, and that blindness is what let ``macro/VIX3M`` run at 16 rows
+against SPY's ~2514 for two full weekly rotations while every manifest
+recorded ``coverage_ratio: 1.0``. This function now also returns
+``per_symbol`` — ``{symbol: {rows, first_date, last_date}}`` — which
+``training/data_completeness.py`` grades against the reference series and
+the scored window. ``coverage_ratio`` is retained for back-compat and is
+explicitly NOT the completeness number: read
+``data_completeness.input_completeness_ratio`` for that.
+
+Empty-DataFrame reads are no longer an unrecorded ``continue`` either: a
+symbol that exists with zero rows is named in ``empty_universe`` /
+``empty_macro`` and appears in ``per_symbol`` with ``rows: 0``, so "the
+symbol is there but holds nothing" and "the symbol was written" stop
+rendering identically.
 """
 
 from __future__ import annotations
@@ -87,6 +103,18 @@ def download_from_arctic(
                              nothing was missed).
       ``failed_universe`` : list of universe tickers whose read raised.
       ``failed_macro``    : list of macro series whose read raised.
+      ``per_symbol``      : ``{symbol: {"rows", "first_date", "last_date"}}``
+                             for every symbol READ, including empty ones
+                             (alpha-engine-config-I9290). This is the input to
+                             ``training.data_completeness.evaluate_completeness``,
+                             which grades ROWS and DATE SPAN — the two things
+                             ``coverage_ratio`` structurally cannot see.
+      ``macro_symbols``   : the macro library's symbol list. The universe
+                             loop downstream must not treat a macro series as
+                             a stock (alpha-engine-config-I9290).
+      ``empty_universe``  : universe tickers that read OK holding ZERO rows.
+      ``empty_macro``     : macro series that read OK holding ZERO rows.
+                             Both were an unrecorded ``continue`` before I9290.
     """
     t0 = time.time()
     local_dir = str(local_dir)
@@ -113,6 +141,12 @@ def download_from_arctic(
     n_written = 0
     failed_universe: list[str] = []
     failed_macro: list[str] = []
+    # alpha-engine-config-I9290 — rows + date span per symbol. The map the
+    # symbol-count coverage_ratio cannot express.
+    per_symbol: dict[str, dict] = {}
+    empty_universe: list[str] = []
+    empty_macro: list[str] = []
+    from training.data_completeness import measure_symbol_coverage
 
     # Write stock tickers from universe library
     symbols = universe.list_symbols()
@@ -124,7 +158,17 @@ def download_from_arctic(
     for i, ticker in enumerate(symbols):
         try:
             df = universe.read(ticker).data
+            per_symbol[ticker] = measure_symbol_coverage(df)
             if df.empty:
+                # I9290 — NOT a silent skip. An empty symbol is a distinct
+                # finding from a failed read and from a written file; it is
+                # named here and carries rows=0 into per_symbol so the
+                # completeness gate can see it.
+                empty_universe.append(ticker)
+                log.warning(
+                    "ArcticDB universe symbol %s read OK but holds ZERO rows "
+                    "— recorded as empty, not skipped silently.", ticker,
+                )
                 continue
             out_path = os.path.join(local_dir, f"{ticker}.parquet")
             df.to_parquet(out_path, engine="pyarrow", compression="snappy")
@@ -145,7 +189,14 @@ def download_from_arctic(
     for key in macro_symbols:
         try:
             df = macro_lib.read(key).data
+            per_symbol[key] = measure_symbol_coverage(df)
             if df.empty:
+                # I9290 — see the universe branch above.
+                empty_macro.append(key)
+                log.warning(
+                    "ArcticDB macro series %s read OK but holds ZERO rows — "
+                    "recorded as empty, not skipped silently.", key,
+                )
                 continue
             out_path = os.path.join(local_dir, f"{key}.parquet")
             df.to_parquet(out_path, engine="pyarrow", compression="snappy")
@@ -189,11 +240,32 @@ def download_from_arctic(
             n_failed, n_expected, coverage_ratio,
             len(failed_universe), len(failed_macro),
         )
+    if empty_universe or empty_macro:
+        log.warning(
+            "[data_source=arcticdb] alpha-engine-config-I9290: %d symbol(s) "
+            "read OK but held ZERO rows (universe=%d, macro=%d) — these are "
+            "NOT counted as failures and NOT counted as written, so "
+            "coverage_ratio cannot see them. universe=%s macro=%s",
+            len(empty_universe) + len(empty_macro), len(empty_universe),
+            len(empty_macro), empty_universe[:20], empty_macro[:20],
+        )
     return {
         "n_written": n_written,
         "n_expected": n_expected,
         "n_failed": n_failed,
+        # I9290 — SYMBOL-count ratio. Retained for back-compat; it is not
+        # the completeness measure. See per_symbol + data_completeness.
         "coverage_ratio": coverage_ratio,
         "failed_universe": failed_universe,
         "failed_macro": failed_macro,
+        "per_symbol": per_symbol,
+        # I9290 — WHICH symbols are macro. meta_trainer's regime-breadth loop
+        # used a hardcoded _SKIP set that named SPY/VIX/VIX3M/TNX/IRX/GLD/USO
+        # and the XL* sector ETFs but NOT HYOAS, TWO, BAA10Y or the sub-sector
+        # ETFs, so those macro series were folded into market_breadth as if
+        # they were stocks. Reporting the library membership makes the skip
+        # self-maintaining instead of a literal that drifts.
+        "macro_symbols": list(macro_symbols),
+        "empty_universe": empty_universe,
+        "empty_macro": empty_macro,
     }

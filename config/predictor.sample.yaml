@@ -261,9 +261,18 @@ shadow_versions:
 #     status: active                 # active | retired
 #     priority: 10                   # train first at cold start (only promote-eligible spec)
 #     overrides: {RESIDUAL_MOMENTUM_ENABLED: true, MOMENTUM_L1_IN_META: false}
+#   # alpha-engine-config-I9313 — a non-canonical-horizon arm is INAPPLICABLE
+#   # to the M slot and the arm register (training/model_zoo_registry.py)
+#   # refuses to schedule it, whatever `status` says: the slot's champion is
+#   # what the executor consumes on a 21-day hold, so a 60d arm cannot win the
+#   # slot on any statistic. Declaring it `retired` is the operator half
+#   # (champion-challenger-policy §6) and makes the intent explicit; the
+#   # horizon question is measured offline by analysis/horizon_battery.py.
 #   - id: horizon-60d
 #     model_version_label: spec-60d
-#     status: active
+#     status: retired
+#     retired_date: "2026-08-29"
+#     retired_reason: "non-canonical horizon; the M slot is 21d (I9313)"
 #     overrides: {FORWARD_DAYS: 60}
 #   - id: sota-directional-combine     # L4565: COIN fix — vol out of directional, z-score+winsor, residual-mom swap
 #     model_version_label: spec-sota-combine
@@ -302,6 +311,19 @@ model_zoo_promote_min_ic: 0.0
 # ModelZoo promotion on incomplete data is visible before/after promotion.
 arctic_min_coverage_ratio: 0.5
 arctic_degraded_coverage_ratio: 0.98
+# alpha-engine-config-I9290 — the two ratios above count SYMBOLS, not rows per
+# symbol, so both read 1.0 for a macro series holding 16 rows against SPY's
+# ~2514 (the live 2026-08-15 VIX3M collapse). The row/date-span gate lives in
+# training/data_completeness.py and raises on a REQUIRED input; this floor is
+# the fraction of training-panel dates the regime feature frame must carry a
+# macro row for before training will proceed. Below it the run refuses rather
+# than zero-filling the macro block.
+regime_panel_coverage_floor: 0.99
+# alpha-engine-config-I9290 — post-fit arm validity. Floor on a fit's
+# standardized-coefficient L2 norm as a fraction of that arm's OWN trailing
+# median. Below it the run FAILS (Brian ruling 2026-08-29). Measured across the
+# VIX3M outage: 0.3142 -> 0.2701 -> 0.1214 (ratios 1.00 / 0.860 / 0.386).
+arm_coef_norm_min_ratio: 0.50
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:

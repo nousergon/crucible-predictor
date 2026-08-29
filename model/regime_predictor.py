@@ -30,6 +30,14 @@ REGIME_MAP = {"bear": 0, "neutral": 1, "bull": 2}
 BEAR_THRESHOLD = -0.03   # SPY down >3% over next 20d → bear
 BULL_THRESHOLD = 0.03    # SPY up >3% over next 20d → bull
 
+# alpha-engine-config-I9258 — the ONLY columns whose NaNs justify deleting a
+# date from the regime feature frame. Both are SPY-derived and NaN only in the
+# 20-day warm-up window at the front of history. Every other column is built
+# from an OPTIONAL macro series that already declares a neutral fallback for
+# the absent case; a present-but-short series takes the same neutral and is
+# recorded in ``build_features``'s ``macro_coverage``, never dropped.
+CORE_DROPNA_COLUMNS = ("spy_20d_return", "spy_20d_vol")
+
 
 def compute_classification_metrics(
     y_true: np.ndarray,
@@ -136,6 +144,50 @@ class RegimePredictor:
         """
         df = pd.DataFrame(index=spy_series.index)
 
+        # alpha-engine-config-I9258 / I9256 — a PRESENT-BUT-SHORT optional
+        # macro series used to be indistinguishable from a fully-covered one.
+        # ``VIX3M`` truncated to 16 rows (2026-08-07 onward) NaN'd
+        # ``vix_term_slope`` for every earlier date, and the terminal
+        # ``dropna()`` below then truncated the WHOLE regime frame from ~2514
+        # dates to 16. Downstream that zero-filled every macro feature and
+        # labelled every training row "neutral" for two consecutive vintages.
+        #
+        # Each optional series already has a DECLARED neutral for the case
+        # where it is absent entirely (``vix_level = 1.0``,
+        # ``vix_term_slope = 0.0``, ...). Present-but-short now gets the SAME
+        # declared neutral on the dates it does not cover, and the shortfall
+        # is RECORDED and logged loudly rather than silently deleting history.
+        macro_coverage: dict[str, dict] = {}
+
+        def _record_coverage(aligned: pd.Series, name: str) -> pd.Series:
+            """Record how much of the frame index an optional series covers.
+
+            Returns ``aligned`` unchanged — this is an observability
+            chokepoint, not a transform. Callers apply the column's own
+            declared neutral via ``fillna`` after the derived arithmetic.
+            """
+            n_total = int(len(df.index))
+            n_covered = int(aligned.notna().sum())
+            first_valid = aligned.first_valid_index()
+            macro_coverage[name] = {
+                "n_covered": n_covered,
+                "n_total": n_total,
+                "coverage_ratio": (n_covered / n_total) if n_total else 1.0,
+                "first_covered_date": str(first_valid) if first_valid is not None else None,
+            }
+            if n_covered < n_total:
+                log.warning(
+                    "Regime macro series %r covers only %d/%d frame dates "
+                    "(%.2f%%, first covered %s) — uncovered dates take the "
+                    "declared neutral for their derived columns. A series "
+                    "shorter than its siblings is an upstream producer defect "
+                    "(see alpha-engine-config-I9256), not a modelling choice.",
+                    name, n_covered, n_total,
+                    100.0 * (n_covered / n_total) if n_total else 0.0,
+                    first_valid,
+                )
+            return aligned
+
         # SPY 20-day return
         df["spy_20d_return"] = (spy_series / spy_series.shift(20)) - 1.0
 
@@ -145,16 +197,24 @@ class RegimePredictor:
 
         # VIX level (normalized by baseline ~20)
         if vix_series is not None:
-            vix_aligned = vix_series.reindex(df.index, method="ffill")
-            df["vix_level"] = vix_aligned / 20.0
+            vix_aligned = _record_coverage(
+                vix_series.reindex(df.index, method="ffill"), "VIX",
+            )
+            # 1.0 is the same neutral the absent branch below declares.
+            df["vix_level"] = (vix_aligned / 20.0).fillna(1.0)
         else:
             df["vix_level"] = 1.0
 
         # VIX term structure slope
         if vix_series is not None and vix3m_series is not None:
             vix_aligned = vix_series.reindex(df.index, method="ffill")
-            vix3m_aligned = vix3m_series.reindex(df.index, method="ffill")
-            df["vix_term_slope"] = (vix_aligned - vix3m_aligned) / 20.0
+            vix3m_aligned = _record_coverage(
+                vix3m_series.reindex(df.index, method="ffill"), "VIX3M",
+            )
+            # 0.0 / 1.0 are the neutrals the absent branch below declares.
+            df["vix_term_slope"] = (
+                (vix_aligned - vix3m_aligned) / 20.0
+            ).fillna(0.0)
             # vix_vix3m_ratio: institutional-canonical normalization of the
             # VIX term structure (Stage 2c-partial). Ratio > 1.0 = backwardation
             # (front-month vol > 3M vol = stress regime); ratio < 1.0 = contango
@@ -170,9 +230,15 @@ class RegimePredictor:
 
         # Yield curve slope (10Y - 3M, normalized)
         if tnx_series is not None and irx_series is not None:
-            tnx_aligned = tnx_series.reindex(df.index, method="ffill")
-            irx_aligned = irx_series.reindex(df.index, method="ffill")
-            df["yield_curve_slope"] = (tnx_aligned - irx_aligned) / 10.0
+            tnx_aligned = _record_coverage(
+                tnx_series.reindex(df.index, method="ffill"), "TNX",
+            )
+            irx_aligned = _record_coverage(
+                irx_series.reindex(df.index, method="ffill"), "IRX",
+            )
+            df["yield_curve_slope"] = (
+                (tnx_aligned - irx_aligned) / 10.0
+            ).fillna(0.0)
         else:
             df["yield_curve_slope"] = 0.0
 
@@ -187,8 +253,12 @@ class RegimePredictor:
         # values) historically precedes recessions by 6-18 months.
         if tnx_series is not None and two_series is not None:
             tnx_for_2y = tnx_series.reindex(df.index, method="ffill")
-            two_aligned = two_series.reindex(df.index, method="ffill")
-            df["yield_curve_10y_2y"] = (tnx_for_2y - two_aligned) / 10.0
+            two_aligned = _record_coverage(
+                two_series.reindex(df.index, method="ffill"), "TWO",
+            )
+            df["yield_curve_10y_2y"] = (
+                (tnx_for_2y - two_aligned) / 10.0
+            ).fillna(0.0)
         else:
             df["yield_curve_10y_2y"] = 0.0
 
@@ -197,11 +267,15 @@ class RegimePredictor:
         # the level captures HY-specific stress regimes that BAA10Y
         # (BBB-rated) misses.
         if hyoas_series is not None:
-            hyoas_aligned = hyoas_series.reindex(df.index, method="ffill")
-            df["hy_oas_level"] = hyoas_aligned
+            hyoas_aligned = _record_coverage(
+                hyoas_series.reindex(df.index, method="ffill"), "HYOAS",
+            )
+            df["hy_oas_level"] = hyoas_aligned.fillna(0.0)
             # 21d change captures regime shifts (credit widening) that
             # the level alone smooths. Used by institutional credit dashboards.
-            df["hy_oas_change_21d"] = hyoas_aligned - hyoas_aligned.shift(21)
+            df["hy_oas_change_21d"] = (
+                hyoas_aligned - hyoas_aligned.shift(21)
+            ).fillna(0.0)
         else:
             df["hy_oas_level"] = 0.0
             df["hy_oas_change_21d"] = 0.0
@@ -212,9 +286,13 @@ class RegimePredictor:
         # spread vs HY's below-BBB; both belong in the institutional
         # credit feature set.
         if baa10y_series is not None:
-            baa_aligned = baa10y_series.reindex(df.index, method="ffill")
-            df["baa10y_level"] = baa_aligned
-            df["baa10y_change_21d"] = baa_aligned - baa_aligned.shift(21)
+            baa_aligned = _record_coverage(
+                baa10y_series.reindex(df.index, method="ffill"), "BAA10Y",
+            )
+            df["baa10y_level"] = baa_aligned.fillna(0.0)
+            df["baa10y_change_21d"] = (
+                baa_aligned - baa_aligned.shift(21)
+            ).fillna(0.0)
         else:
             df["baa10y_level"] = 0.0
             df["baa10y_change_21d"] = 0.0
@@ -272,7 +350,15 @@ class RegimePredictor:
             df["market_breadth"] = 0.5  # neutral default
             df["market_breadth_200d"] = 0.5
 
-        df = df.dropna()
+        # I9258 — dropna ONLY on the core SPY-derived columns, whose NaNs are
+        # the legitimate 20-day warm-up window. Before this, a NaN anywhere in
+        # any OPTIONAL macro column deleted the row, so one short optional
+        # series (VIX3M at 16 rows) silently destroyed 2498 dates of regime
+        # history. Optional columns now carry their declared neutral instead,
+        # with the shortfall recorded in ``macro_coverage``.
+        n_before_dropna = int(len(df))
+        df = df.dropna(subset=list(CORE_DROPNA_COLUMNS))
+        n_after_dropna = int(len(df))
 
         # Stage D (regime-v3 2026-05-14): AQR-style risk-on/risk-off
         # composite z-score derived from the 6 raw macros above. Single
@@ -281,15 +367,49 @@ class RegimePredictor:
         # (same algorithm as the substrate Lambda) so training +
         # inference see consistent values without an S3 substrate
         # dependency at this stage.
+        # alpha-engine-config-I9290 — the 0.0 fallback below is a
+        # SUBSTITUTION, so it is recorded rather than only logged. A WARN line
+        # on a spot box that nobody reads is not a record: the status travels
+        # on df.attrs and lands on the training manifest under
+        # data_completeness.degradations, where the model zoo can see that an
+        # arm trained with a dead regime_intensity_z.
+        intensity_z_status = {"status": "ok", "reason": None}
         try:
             from regime.composite import compute_intensity_z_series
             df["intensity_z"] = compute_intensity_z_series(df)
         except Exception as e:
-            log.warning(
-                "regime intensity_z computation failed (%s); defaulting column to 0.0",
-                type(e).__name__,
+            intensity_z_status = {
+                "status": "substituted_constant",
+                "reason": (
+                    f"compute_intensity_z_series raised {type(e).__name__}: {e} "
+                    "— intensity_z is a CONSTANT 0.0 for every date on this "
+                    "frame, so the meta feature regime_intensity_z carries no "
+                    "information for any arm trained on it."
+                ),
+            }
+            log.error(
+                "regime intensity_z computation failed (%s) — column is a "
+                "CONSTANT 0.0 and the run is recorded as degraded "
+                "(alpha-engine-config-I9290), not silently defaulted.",
+                type(e).__name__, exc_info=True,
             )
             df["intensity_z"] = 0.0
+
+        # Carry the coverage record on the frame so callers (and the training
+        # manifest) can see a degraded macro substrate instead of inferring it
+        # from a suspiciously short index.
+        df.attrs["macro_coverage"] = macro_coverage
+        df.attrs["intensity_z_status"] = intensity_z_status
+        degraded = sorted(
+            name for name, c in macro_coverage.items()
+            if c["coverage_ratio"] < 1.0
+        )
+        log.info(
+            "Regime feature frame: %d dates (core dropna removed %d of %d "
+            "warm-up rows); optional macro series with partial coverage: %s",
+            len(df), n_before_dropna - n_after_dropna, n_before_dropna,
+            ", ".join(degraded) if degraded else "none",
+        )
 
         return df
 

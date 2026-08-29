@@ -84,7 +84,14 @@ def test_weekly_run_day_gate_merges_verdict_when_lib_available(monkeypatch):
     result = h.handler({"action": "check_weekly_run_day", "date": "2026-07-11"}, None)
 
     assert result["is_weekly_run_day"] is True
-    assert result["stage_coverage"] == {"verdict": "COVERED_NO_OUTPUT", "stage": "WeeklyRunDayGate"}
+    assert result["stage_coverage"] == {
+        **{"verdict": "COVERED_NO_OUTPUT", "stage": "WeeklyRunDayGate"},
+        # alpha-engine-config-I8155: every verdict now says which run and
+        # which kind of caller produced it. Both are None here because the
+        # fake event carries neither.
+        "execution_arn": None,
+        "invocation_kind": None,
+    }
     fake_fn.assert_called_once()
     _, kwargs = fake_fn.call_args
     assert fake_fn.call_args[0][0] == "WeeklyRunDayGate"
@@ -183,7 +190,14 @@ def test_lib_pin_drift_check_merges_verdict_when_lib_available(monkeypatch):
     result = h.handler({"action": "check_lib_pin_drift", "date": "2026-08-13"}, None)
 
     assert result["has_drift"] is False
-    assert result["stage_coverage"] == {"verdict": "COVERED_NO_OUTPUT", "stage": "LibPinDriftCheck"}
+    assert result["stage_coverage"] == {
+        **{"verdict": "COVERED_NO_OUTPUT", "stage": "LibPinDriftCheck"},
+        # alpha-engine-config-I8155: every verdict now says which run and
+        # which kind of caller produced it. Both are None here because the
+        # fake event carries neither.
+        "execution_arn": None,
+        "invocation_kind": None,
+    }
     fake_fn.assert_called_once()
     assert fake_fn.call_args[0][0] == "LibPinDriftCheck"
     assert fake_fn.call_args[1]["run_date"] == "2026-08-13"
@@ -256,7 +270,14 @@ def test_pipeline_contract_check_merges_verdict_when_lib_available(monkeypatch):
     result = h.handler({"action": "check_pipeline_contract", "date": "2026-08-13"}, None)
 
     assert result["has_violation"] is False
-    assert result["stage_coverage"] == {"verdict": "COVERED_NO_OUTPUT", "stage": "PipelineContractCheck"}
+    assert result["stage_coverage"] == {
+        **{"verdict": "COVERED_NO_OUTPUT", "stage": "PipelineContractCheck"},
+        # alpha-engine-config-I8155: every verdict now says which run and
+        # which kind of caller produced it. Both are None here because the
+        # fake event carries neither.
+        "execution_arn": None,
+        "invocation_kind": None,
+    }
     assert fake_fn.call_args[0][0] == "PipelineContractCheck"
     assert fake_fn.call_args[1]["run_date"] == "2026-08-13"
 
@@ -341,7 +362,14 @@ def test_regime_substrate_produce_merges_verdict_when_lib_available(monkeypatch)
     result = rh.lambda_handler({"action": "produce", "run_date": "2026-08-13"}, None)
 
     assert result["statusCode"] == 200
-    assert result["stage_coverage"] == {"verdict": "COVERED", "stage": "RegimeSubstrate"}
+    assert result["stage_coverage"] == {
+        **{"verdict": "COVERED", "stage": "RegimeSubstrate"},
+        # alpha-engine-config-I8155: every verdict now says which run and
+        # which kind of caller produced it. Both are None here because the
+        # fake event carries neither.
+        "execution_arn": None,
+        "invocation_kind": None,
+    }
     assert fake_fn.call_args[0][0] == "RegimeSubstrate"
     assert fake_fn.call_args[1]["run_date"] == "2026-08-13"
 
@@ -464,7 +492,14 @@ def test_retrospective_eval_produce_merges_verdict_when_lib_available(monkeypatc
     result = reh.lambda_handler({"action": "produce", "run_date": "2026-08-13"}, None)
 
     assert result["statusCode"] == 200
-    assert result["stage_coverage"] == {"verdict": "COVERED", "stage": "RegimeRetrospectiveEval"}
+    assert result["stage_coverage"] == {
+        **{"verdict": "COVERED", "stage": "RegimeRetrospectiveEval"},
+        # alpha-engine-config-I8155: every verdict now says which run and
+        # which kind of caller produced it. Both are None here because the
+        # fake event carries neither.
+        "execution_arn": None,
+        "invocation_kind": None,
+    }
     assert fake_fn.call_args[0][0] == "RegimeRetrospectiveEval"
     assert fake_fn.call_args[1]["run_date"] == "2026-08-13"
 
