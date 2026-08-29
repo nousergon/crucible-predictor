@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import date as _date
 
 import config as cfg
 from inference.pipeline import PipelineContext
@@ -60,6 +61,47 @@ def _clone_for_shadow(ctx: PipelineContext, *, weights_prefix: str) -> PipelineC
         )
     shadow.weights_prefix_override = weights_prefix
     return shadow
+
+
+def _select_challengers_for_cycle(
+    challengers: list[dict], max_n: int, date_str: str,
+) -> list[dict]:
+    """Rotate which up-to-``max_n`` challengers get shadowed today
+    (alpha-engine-config-I9336).
+
+    ``challengers`` comes in ``list_versions``' newest-first order (by
+    ``(date, created_utc)``). A plain ``challengers[:max_n]`` on that order is
+    STRUCTURALLY unfair: training re-registers the zoo specs in the same fixed
+    order every week, so the sort was effectively constant and the same
+    trailing arms (``sota-directional-combine``, the champion-arch candidate)
+    were cut every single cycle — 16 days of zero shadow coverage for one of
+    them, with no way to ever recover.
+
+    Fix: sort by ``version_id`` (a stable key independent of registration
+    order) and rotate the start of the ``max_n`` window by a day-derived
+    offset. Over ``ceil(n / max_n)`` consecutive trading days every registered
+    arm is shadowed at least once — deliverable 1's "rotation across cycles."
+    The offset is derived from ``date_str`` (not wall-clock or randomness) so
+    a retried Lambda invocation on the same date selects the identical slice
+    — the shadow contract already treats ``{version_id}/{date}.json`` as
+    idempotent per date, and this must not break that.
+
+    Kept at a fixed ``max_n`` per cycle rather than lifting the cap
+    (explicitly INVALID per the issue — shadowing every arm unconditionally
+    every cycle re-introduces the cost/latency problem the cap exists for:
+    each shadowed challenger repeats load_model + run_inference against the
+    Lambda's soft-timeout budget).
+    """
+    if max_n <= 0 or len(challengers) <= max_n:
+        return challengers
+    ordered = sorted(challengers, key=lambda v: v.get("version_id") or "")
+    n = len(ordered)
+    try:
+        offset = _date.fromisoformat(date_str).toordinal() % n
+    except (ValueError, TypeError):
+        offset = 0
+    rotated = ordered[offset:] + ordered[:offset]
+    return rotated[:max_n]
 
 
 def _write_shadow(ctx: PipelineContext, version_id: str) -> None:
@@ -122,7 +164,8 @@ def run(ctx: PipelineContext) -> None:
         return
 
     max_n = int(getattr(cfg, "SHADOW_VERSIONS_MAX_N", 3))
-    challengers = challengers[:max_n]
+    # alpha-engine-config-I9336: rotate, don't always cut the same tail.
+    challengers = _select_challengers_for_cycle(challengers, max_n, ctx.date_str)
     if not challengers:
         log.info("Shadow runner: no registered challengers — no-op.")
         return
