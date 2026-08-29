@@ -86,7 +86,11 @@ class TestTheWeekThatShouldHaveFailed:
     def test_the_coefficient_norm_collapse_of_2026_08_28_is_refused(self):
         v = evaluate_arm_validity(
             arm="v3.0-meta",
-            standardized_coef={"a": 0.1214},          # norm 0.1214
+            # A cross-sectionally VARYING feature: since I9271 the collapse
+            # check reads the norm restricted to those, because the market-wide
+            # block contributes zero within-date dispersion however large its
+            # coefficient.
+            standardized_coef={"research_calibrator_prob": 0.1214},
             meta_X=_panel(macro_dead=False),
             feature_names=_ALL,
             prior_standardized_coef=_coefs(macro_dead=False),
@@ -102,7 +106,7 @@ class TestTheWeekThatShouldHaveFailed:
         this gate must not be tuned to duplicate a guard that already works."""
         v = evaluate_arm_validity(
             arm="v3.0-meta",
-            standardized_coef={"a": 0.2701},
+            standardized_coef={"research_calibrator_prob": 0.2701},
             meta_X=_panel(macro_dead=False),
             feature_names=_ALL,
             prior_standardized_coef=_coefs(macro_dead=False),

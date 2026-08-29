@@ -37,13 +37,23 @@ happened**.
     same arm is a producer failure.
 
 ``coef_norm_collapse``
-    The L2 norm of the arm's standardized coefficient vector, against the
-    arm's own trailing history. Measured across the outage:
+    The L2 norm of the arm's standardized coefficients **restricted to the
+    cross-sectionally varying features** (``XSEC_FEATURES``), against the arm's
+    own trailing history. Measured across the outage:
     ``0.3142 -> 0.2701 -> 0.1214``. The macro death cost 14%; the following
     week cost 55% more. A floor at ``ARM_COEF_NORM_MIN_RATIO`` (0.50) of the
     trailing reference refuses 2026-08-28 (ratio 0.386) and passes 2026-08-21
     (0.860) — deliberately, because 08-21 is the case the BEHAVIORAL VETO
     already catches and this gate must not be tuned to duplicate it.
+
+    **Corrected 2026-08-29 (alpha-engine-config-I9271).** Those three numbers
+    are the cross-sectional norm; the check as first written took the norm over
+    the WHOLE coefficient vector, which measured ``0.9676 -> 0.2701 -> 0.1214``
+    and would have refused 2026-08-21 at a ratio of ``0.279`` — the opposite of
+    the verdict its own justification claims, because the market-wide macro
+    block dying moves the full-vector norm hard while costing the served
+    within-date spread nothing. The gated quantity is now the one the floor was
+    sited on.
 
 ## Two rules this module obeys
 
@@ -78,7 +88,9 @@ log = logging.getLogger(__name__)
 __all__ = [
     "ArmValidityError",
     "FEATURE_BLOCKS",
+    "XSEC_FEATURES",
     "coef_norm",
+    "xsec_coef_norm",
     "constant_input_columns",
     "evaluate_arm_validity",
     "assert_arm_valid",
@@ -120,6 +132,53 @@ def coef_norm(standardized_coef: "dict | None") -> "float | None":
     vals = [
         float(v) for v in standardized_coef.values()
         if isinstance(v, (int, float)) and math.isfinite(float(v))
+    ]
+    if not vals:
+        return None
+    return float(math.sqrt(sum(v * v for v in vals)))
+
+
+# The meta-features that vary WITHIN a date. Everything else the L2 consumes
+# is market-wide — one value broadcast to every ticker on the date — and by
+# construction contributes exactly zero within-date prediction dispersion,
+# however large its coefficient. A norm taken over the whole vector therefore
+# measures something the served alpha's spread does not depend on
+# (alpha-engine-config-I9271).
+XSEC_FEATURES: tuple[str, ...] = (
+    "research_calibrator_prob",
+    "momentum_score",
+    "expected_move",
+    "research_composite_score",
+    "research_conviction",
+    "sector_macro_modifier",
+)
+
+
+def xsec_coef_norm(standardized_coef: "dict | None") -> "float | None":
+    """L2 norm restricted to the cross-sectionally VARYING features.
+
+    This is the quantity that governs a linear L2's within-date prediction
+    spread: a feature contributes ``coef_k * std(x_k) = standardized_coef_k *
+    std(y)``, and a market-wide feature has ``std(x_k) == 0`` within a date.
+
+    Measured across the 2026-08 collapse: ``0.3142 -> 0.2701 -> 0.1214``,
+    step ratios ``0.860`` then ``0.449``, against a served-slice ``alpha_stdev``
+    ratio of ``0.347`` — the restricted norm tracks the served dispersion and
+    the full-vector norm does not (the full norm read ``0.9676 -> 0.2701 ->
+    0.1214``, a first step of ``0.279`` driven entirely by the market-wide
+    macro block dying, which cost the served spread nothing).
+
+    ``None`` when no declared cross-sectional feature carries a finite
+    coefficient — reported, never defaulted to a number.
+    """
+    if not isinstance(standardized_coef, dict) or not standardized_coef:
+        return None
+    vals = [
+        float(standardized_coef[k]) for k in XSEC_FEATURES
+        if k in standardized_coef
+        and isinstance(standardized_coef[k], (int, float))
+        and not isinstance(standardized_coef[k], bool)
+        and math.isfinite(float(standardized_coef[k]))
     ]
     if not vals:
         return None
@@ -194,12 +253,18 @@ def evaluate_arm_validity(
         first vintage, or when the registry read failed — the block check is
         then ``insufficient``, never a pass.
     prior_coef_norms : list[float], optional
-        Trailing coefficient norms for THIS arm. The reference is their median,
+        Trailing CROSS-SECTIONAL coefficient norms for THIS arm, recomputed
+        from each prior manifest's own ``standardized_coef``. The reference is
+        their median,
         so one bad week does not move the bar it will be judged against next
         week.
     """
     checks: list[_Check] = []
-    norm = coef_norm(standardized_coef)
+    # Both are recorded; only the cross-sectional one gates. The full-vector
+    # norm is retained on the block because it is the series eight prior
+    # vintages carry, and dropping it would silently reset the history.
+    full_norm = coef_norm(standardized_coef)
+    norm = xsec_coef_norm(standardized_coef)
 
     # ── 1. constant input columns — history-free, always gating ─────────────
     if meta_X is None or not feature_names:
@@ -272,15 +337,17 @@ def evaluate_arm_validity(
     if norm is None:
         checks.append(_Check(
             "coef_norm_collapse", "insufficient",
-            f"{arm}: this fit carries no finite standardized coefficients, so "
-            "its norm is unmeasurable. Reported insufficient, NOT a pass.",
+            f"{arm}: this fit carries no finite standardized coefficient on "
+            f"any of the {len(XSEC_FEATURES)} declared cross-sectional "
+            "features, so its cross-sectional norm is unmeasurable. Reported "
+            "insufficient, NOT a pass.",
         ))
     elif not ref_norms:
         checks.append(_Check(
             "coef_norm_collapse", "insufficient",
-            f"{arm}: no trailing coefficient-norm history for this arm "
-            f"(current norm {norm:.6f}), so a collapse cannot be measured. "
-            "Reported insufficient, NOT a pass.",
+            f"{arm}: no trailing cross-sectional coefficient-norm history for "
+            f"this arm (current xsec norm {norm:.6f}), so a collapse cannot be "
+            "measured. Reported insufficient, NOT a pass.",
         ))
     else:
         ordered = sorted(ref_norms)
@@ -289,8 +356,8 @@ def evaluate_arm_validity(
         if ratio is not None and ratio < min_norm_ratio:
             checks.append(_Check(
                 "coef_norm_collapse", "fail",
-                f"{arm}: coef_norm_collapse — standardized coefficient norm "
-                f"{norm:.6f} against this arm's trailing median "
+                f"{arm}: coef_norm_collapse — CROSS-SECTIONAL standardized "
+                f"coefficient norm {norm:.6f} against this arm's trailing median "
                 f"{reference:.6f} over {len(ref_norms)} vintage(s); measured "
                 f"ratio {ratio:.4f}, required >= {min_norm_ratio}. The model "
                 "shrank toward the intercept, which is what a starved or dead "
@@ -304,7 +371,12 @@ def evaluate_arm_validity(
     return {
         "arm": arm,
         "status": "invalid" if failures else ("degraded" if insufficient else "valid"),
+        # The gating quantity. Kept under the historical key so eight
+        # vintages of `prior_coef_norms` stay comparable with what is written
+        # from here on, and named explicitly beside it.
         "coef_norm": round(norm, 6) if norm is not None else None,
+        "xsec_coef_norm": round(norm, 6) if norm is not None else None,
+        "full_coef_norm": round(full_norm, 6) if full_norm is not None else None,
         "checks": [c.as_dict() for c in checks],
         "failures": [c.as_dict() for c in failures],
         "insufficient": [c.as_dict() for c in insufficient],
@@ -341,7 +413,8 @@ def assert_arm_valid(block: dict) -> None:
 
 
 def load_arm_history(bucket: str, arm: str, *, s3=None, max_vintages: int = 8) -> dict:
-    """The arm's OWN prior vintages: last standardized coefs + trailing norms.
+    """The arm's OWN prior vintages: last standardized coefs + trailing
+    CROSS-SECTIONAL norms.
 
     Reads the immutable registry bundles for ``model_version == arm``, newest
     first. Best-effort by DESIGN and honest about it: a read failure returns
@@ -401,7 +474,11 @@ def load_arm_history(bucket: str, arm: str, *, s3=None, max_vintages: int = 8) -
             ((manifest.get("models") or {}).get("meta_model") or {})
             .get("importance", {}) or {}
         ).get("standardized_coef")
-        n = coef_norm(coef)
+        # Recomputed from each prior manifest's own `standardized_coef`, so
+        # switching the gated quantity to the cross-sectional norm
+        # (alpha-engine-config-I9271) applies retroactively to the whole
+        # history rather than resetting it.
+        n = xsec_coef_norm(coef)
         if n is not None:
             norms.append(n)
         if latest_coef is None and isinstance(coef, dict) and coef:
