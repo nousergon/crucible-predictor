@@ -302,6 +302,14 @@ model_zoo_promote_min_ic: 0.0
 # ModelZoo promotion on incomplete data is visible before/after promotion.
 arctic_min_coverage_ratio: 0.5
 arctic_degraded_coverage_ratio: 0.98
+# alpha-engine-config-I9290 — the two ratios above count SYMBOLS, not rows per
+# symbol, so both read 1.0 for a macro series holding 16 rows against SPY's
+# ~2514 (the live 2026-08-15 VIX3M collapse). The row/date-span gate lives in
+# training/data_completeness.py and raises on a REQUIRED input; this floor is
+# the fraction of training-panel dates the regime feature frame must carry a
+# macro row for before training will proceed. Below it the run refuses rather
+# than zero-filling the macro block.
+regime_panel_coverage_floor: 0.99
 
 # ── Feature engineering parameters ────────────────────────────────────────────
 features:

@@ -561,6 +561,9 @@ from model import momentum_scorer
 from model import residual_momentum_scorer
 from model.residual_momentum_scorer import RESIDUAL_MOMENTUM_FEATURES
 from data.residual_momentum_features import compute_residual_momentum_features
+# alpha-engine-config-I9290 — the fail-loud input-completeness gate. Imported
+# at module scope so the fold-loop raise below cannot depend on a lazy import.
+from training.data_completeness import DataCompletenessError
 
 
 def build_train_meta_features(
@@ -1567,6 +1570,114 @@ def run_meta_training(
     log.info("Regime data: %d dates with features+labels", len(common_dates))
     peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 4 regime-feature build"))
 
+    # ── Step 4a: INPUT COMPLETENESS GATE (alpha-engine-config-I9290) ─────────
+    # Measured in ROWS PER SYMBOL and DATE SPAN, not symbol presence. This is
+    # the guard that would have refused the 2026-08-15 run: macro/VIX3M held
+    # 16 rows against SPY's ~2514, coverage_ratio read 1.0, and the resulting
+    # regime frame collapsed to 16 dates while every artifact recorded full
+    # coverage. Required inputs RAISE here; optional ones are recorded as
+    # NAMED degradations on the manifest so two arms that trained on
+    # different input sets never compare as equals.
+    from training.data_completeness import (
+        assert_trainable, evaluate_completeness, summarize_universe_rows,
+    )
+    _panel_dates = pd.to_datetime(pd.Series(all_dates)).dt.date
+    _oos_window = (
+        (str(_panel_dates.min()), str(_panel_dates.max()))
+        if len(_panel_dates) else None
+    )
+    data_completeness = evaluate_completeness(
+        (arctic_coverage or {}).get("per_symbol") or {},
+        oos_window=_oos_window,
+    )
+    data_completeness["universe_rows"] = summarize_universe_rows(
+        (arctic_coverage or {}).get("per_symbol") or {}
+    )
+    log.info(
+        "Input completeness (I9290): status=%s ratio=%s failures=%d "
+        "degradations=%d window=%s",
+        data_completeness["status"],
+        data_completeness["input_completeness_ratio"],
+        len(data_completeness["failures"]), len(data_completeness["degradations"]),
+        _oos_window,
+    )
+    # Fail loud. A required input that is absent, short, frozen or spanning
+    # less than the scored window stops the run — it never becomes a constant.
+    assert_trainable(data_completeness)
+
+    # ── Step 4a(ii): the regime frame must COVER the panel it is joined to ──
+    # Independent of the input gate above: an input can clear its own bar and
+    # the regime frame still fail to cover the training dates (a dropna on a
+    # derived column, a calendar mismatch). Measured directly, because the
+    # 2026-08-15 defect surfaced HERE — regime_features_df went 799 -> 16
+    # dates and the fold loop silently wrote 0.0 for every macro feature on
+    # every uncovered date.
+    _regime_covered = set(pd.to_datetime(pd.Series(regime_features_df.index)).dt.date)
+    _panel_unique = sorted(set(_panel_dates))
+    _uncovered = [d for d in _panel_unique if d not in _regime_covered]
+    _regime_cov_ratio = (
+        1.0 - (len(_uncovered) / len(_panel_unique)) if _panel_unique else 1.0
+    )
+    _regime_cov_floor = float(getattr(cfg, "REGIME_PANEL_COVERAGE_FLOOR", 0.99))
+    data_completeness["regime_panel_coverage"] = {
+        "n_panel_dates": len(_panel_unique),
+        "n_uncovered": len(_uncovered),
+        "coverage_ratio": round(_regime_cov_ratio, 6),
+        "floor": _regime_cov_floor,
+        "uncovered_sample": [str(d) for d in _uncovered[:10]],
+    }
+    # I9290 — the derived regime columns must EXIST on the frame. Previously
+    # a missing one was substituted per-row with a constant 0.0 inside the
+    # fold loop, which is invisible: the feature is present, finite, and
+    # carries nothing. Checked once, here, where it can still stop the run.
+    from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP as _RDMAP
+    _missing_derived = [
+        c for c in _RDMAP if c not in regime_features_df.columns
+    ]
+    data_completeness["regime_derived_columns"] = {
+        "expected": sorted(_RDMAP),
+        "missing": _missing_derived,
+    }
+    # The producer's own record of whether it SUBSTITUTED a constant for
+    # intensity_z (regime_predictor sets this on df.attrs). A present column
+    # holding a constant is the harder case to see, so it is carried through
+    # as a named degradation rather than inferred.
+    _iz = dict(regime_features_df.attrs.get("intensity_z_status") or {})
+    data_completeness["intensity_z"] = _iz or {"status": "unrecorded"}
+    if _iz.get("status") not in (None, "ok"):
+        data_completeness.setdefault("degradations", []).append({
+            "input": "regime.intensity_z",
+            "status": _iz.get("status"),
+            "severity": "optional",
+            "reason": _iz.get("reason"),
+            "features_affected": list(_RDMAP.values()),
+        })
+        if data_completeness["status"] == "ok":
+            data_completeness["status"] = "degraded"
+        log.warning(
+            "data_completeness: regime_intensity_z is a SUBSTITUTED CONSTANT "
+            "on this run — %s", _iz.get("reason"),
+        )
+    if _missing_derived:
+        raise DataCompletenessError(
+            "Refusing to train: the regime feature frame is missing derived "
+            f"column(s) {_missing_derived}, which feed the meta features "
+            f"{[_RDMAP[c] for c in _missing_derived]}. Refusing to substitute "
+            "a constant 0.0 for them (alpha-engine-config-I9290)."
+        )
+
+    if _regime_cov_ratio < _regime_cov_floor:
+        raise DataCompletenessError(
+            "Refusing to train: the regime feature frame covers "
+            f"{_regime_cov_ratio:.4f} of the {len(_panel_unique)} panel dates "
+            f"(floor {_regime_cov_floor}); {len(_uncovered)} dates have no "
+            f"macro row, first missing {_uncovered[:5]}. Every uncovered date "
+            "would otherwise have had its six macro_* meta features and "
+            "regime_intensity_z written as a constant 0.0 — the "
+            "alpha-engine-config-I9290 defect. Check the macro library row "
+            "counts (see the input-completeness block above) before retrying."
+        )
+
     # ── Step 4b: Build macro feature array for Stage 1b parallel observation ─
     # Stage 1b of the regime-conditioning rebuild (plan doc:
     # alpha-engine-docs/private/regime-conditioning-260510.md). Builds a
@@ -1899,37 +2010,57 @@ def run_meta_training(
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
                     macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
                 # Stage D: regime-derived features (currently just
-                # intensity_z). Same date-indexed lookup pattern; missing
-                # columns default to 0.0 so older code paths that
-                # haven't repopulated regime_features_df via
-                # RegimePredictor.build_features (which now adds
-                # intensity_z) degrade gracefully.
+                # intensity_z). Same date-indexed lookup pattern. A missing
+                # column USED to default to 0.0 here; since
+                # alpha-engine-config-I9290 the presence check is hoisted to
+                # the Step 4a(ii) gate and a missing column stops the run
+                # instead of degrading every OOS row into a constant.
                 from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
                 for src_name, meta_name in REGIME_DERIVED_FEATURE_META_MAP.items():
-                    if src_name in regime_features_df.columns:
-                        macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
-                    else:
-                        macro_row[meta_name] = 0.0
+                    # I9290 — no per-row constant substitution. The Step 4a(ii)
+                    # gate above already refused the run if a derived column is
+                    # missing, so this is an assertion, not a fallback.
+                    macro_row[meta_name] = float(
+                        regime_features_df.at[test_date, src_name]
+                    )
             else:
-                # alpha-engine-config-I9255: this branch is a SILENT DEGRADE on
-                # a producer. It fills every macro feature and
-                # regime_intensity_z with 0.0 — not even their declared neutral
-                # (vix_level's is 1.0) — so a date missing from
-                # regime_features_df is indistinguishable downstream from a
-                # genuine reading of zero. When it fired for EVERY date (the
-                # 2026-08-21 vintage, VIX3M truncated upstream), all seven
-                # columns became constant, the L2 gave each an exactly-zero
-                # coefficient, the surviving coefficients shrank ~2.9x, and the
-                # champion served five live sessions with zero high-confidence
-                # names. Count it here; the run is failed after the loop by the
-                # coverage gate below, which is where the count is complete.
+                # alpha-engine-config-I9255 + -I9290, resolved in favour of the
+                # STRICTER form. I9255 counted this branch and failed the run
+                # AFTER the fold loop when coverage fell below a 0.50 floor;
+                # I9290 refuses BEFORE the loop (the Step 4a input gate and the
+                # Step 4a(ii) regime-panel coverage floor of 0.99) and makes
+                # this branch itself raise. A 0.50 floor permits half the panel
+                # to be zero-filled and still produce a champion, which Brian's
+                # 2026-08-29 ruling forbids: "if any of the arms is not trained
+                # properly then the predictor module should fail the task."
+                #
+                # What this branch used to do: write a constant 0.0 for all six
+                # macro_* features plus regime_intensity_z — not even their
+                # declared neutrals (vix_level's is 1.0) — so a date missing
+                # from regime_features_df was indistinguishable downstream from
+                # a genuine reading of zero. It fired for EVERY date in the
+                # 2026-08-12, -08-21 and -08-28 vintages (VIX3M truncated
+                # upstream), all seven columns went constant, the L2 gave each
+                # an exactly-zero coefficient, and the coefficient norm fell
+                # 0.9676 -> 0.1214.
+                #
+                # The counters below are kept so I9255's post-loop coverage gate
+                # and its diagnostics stay coherent; they are now unreachable in
+                # practice, which is the point.
                 n_macro_rows_defaulted += len(date_indices)
                 macro_dates_defaulted.add(str(test_date))
-                for meta_name in MACRO_FEATURE_META_MAP.values():
-                    macro_row[meta_name] = 0.0
-                from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
-                for meta_name in REGIME_DERIVED_FEATURE_META_MAP.values():
-                    macro_row[meta_name] = 0.0
+                raise DataCompletenessError(
+                    f"No regime/macro row for OOS test_date {test_date!r} "
+                    "inside the fold loop. Refusing to substitute a constant "
+                    "0.0 for the macro block (alpha-engine-config-I9290). The "
+                    "Step 4a(ii) regime-panel coverage gate should have "
+                    "refused this run before training started — reaching here "
+                    "means the gate and the join disagree about coverage. "
+                    f"{n_macro_rows_defaulted} row(s) across "
+                    f"{len(macro_dates_defaulted)} test date(s) had no macro "
+                    f"row; regime_features_df carries "
+                    f"{len(regime_features_df.index)} dates."
+                )
 
             # Lookup the most-recent-prior weekly signals snapshot for this
             # test_date (built once before the fold loop in Step 5c).
@@ -4495,6 +4626,11 @@ def run_meta_training(
                 # measurably-incomplete dataset is visible in the promoted
                 # artifact, not silently absent from it.
                 "arctic_coverage": arctic_coverage,
+                # I9290 — rows-per-symbol + date-span completeness. The
+                # honest number is input_completeness_ratio; arctic_coverage's
+                # coverage_ratio counts symbols and reads 1.0 on a 16-row
+                # series.
+                "data_completeness": data_completeness,
                 "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
@@ -5025,6 +5161,10 @@ def run_meta_training(
         # so the training_summary SSOT and email formatter also carry the
         # data-coverage signal, not only the registry manifest.
         "arctic_coverage": arctic_coverage,
+        # I9290 — rows-per-symbol + date-span completeness (see the manifest
+        # block above). Carried on the summary too so the training email and
+        # the SSOT reader see the honest number, not the symbol-count ratio.
+        "data_completeness": data_completeness,
         "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,

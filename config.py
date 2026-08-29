@@ -747,6 +747,17 @@ ARCTIC_MIN_COVERAGE_RATIO = float(_cfg.get("arctic_min_coverage_ratio", 0.5))
 # no trace of the data loss at all.
 ARCTIC_DEGRADED_COVERAGE_RATIO = float(_cfg.get("arctic_degraded_coverage_ratio", 0.98))
 
+# alpha-engine-config-I9290 — BOTH ratios above count SYMBOLS. They read 1.0
+# when a macro series is present with 16 rows against SPY's 2514, which is
+# what let the 2026-08-15 VIX3M collapse train and score two rotations of the
+# model zoo on a constant-zero macro block. The row/date gate lives in
+# training/data_completeness.py; this is the floor on the fraction of PANEL
+# dates the regime feature frame must actually carry a macro row for. Below
+# it, training refuses — it never writes a constant in place of a macro
+# reading. 0.99 rather than 1.0 leaves room for a single calendar edge date
+# without licensing a collapse.
+REGIME_PANEL_COVERAGE_FLOOR = float(_cfg.get("regime_panel_coverage_floor", 0.99))
+
 # ── Champion/challenger Phase 1 shadow runner (L4469) ───────────────────────
 # After the live (champion) inference writes predictions/{date}.json, the
 # shadow runner re-scores the SAME prices/universe with each registered
