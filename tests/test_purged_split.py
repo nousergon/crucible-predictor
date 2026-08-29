@@ -28,6 +28,7 @@ import pytest
 from training.purged_split import (
     MAX_VAL_DATE_WEIGHT,
     MAX_VAL_ROW_FRACTION,
+    MIN_TEST_DATES,
     MIN_TRAIN_DATE_MULTIPLE,
     MIN_VAL_DATES,
     MIN_VAL_DATES_RESEARCH_GBM,
@@ -388,6 +389,12 @@ def test_research_gbm_floor_is_derived_from_the_champion_measurement_not_hardcod
     assert MIN_VAL_DATES_RESEARCH_GBM > MIN_VAL_DATES
 
 
+def test_min_test_dates_is_aliased_to_min_val_dates_not_duplicated():
+    """I9377 reuses the same date-count floor for the reporting test block —
+    an alias, so the two can never silently drift apart."""
+    assert MIN_TEST_DATES == MIN_VAL_DATES
+
+
 # ── Composition with the I9271 fit-validity gate ─────────────────────────────
 
 def test_refusal_reason_reaches_the_gate_finding():
@@ -437,3 +444,26 @@ def test_meta_trainer_no_longer_cuts_an_l1_split_on_row_indices():
     assert "X_vol[n_train:val_end]" not in code
     assert "build_purged_split" in code
     assert "assert_design_matrix_supports_fit" in code
+
+
+def test_meta_trainer_flips_test_gap_once_the_panel_is_long_enough():
+    """I9377 — the volatility L1s' production split must not hardcode
+    `test_gap=False`; it decides from a measured two-sided trial against
+    `MIN_TEST_DATES`, and records the leak's size when the flip can't land
+    yet. A source guard for the same reason as the row-index pin above: the
+    defect is a silent optimistic bias, not a crash, so nothing forces a
+    behavioural test to exercise the ~167-date live panel here."""
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "training" / "meta_trainer.py"
+    text = src.read_text()
+    code = "\n".join(
+        ln for ln in text.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert 'test_gap=False,\n    )\n    prod_split_block' not in text, (
+        "test_gap=False must not be the unconditional production split again"
+    )
+    assert "MIN_TEST_DATES" in code
+    assert "use_test_gap" in code
+    assert "test_gap_leak" in code
+    assert "purged_test_row_start" in code

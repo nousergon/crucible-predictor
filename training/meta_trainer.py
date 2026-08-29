@@ -4135,48 +4135,87 @@ def run_meta_training(
     # a cross-section) with a purge of `cfg.FORWARD_DAYS` dates and an
     # overlapping-label embargo of the same before the early-stop block.
     #
-    # SOTA deviation, recorded rather than hidden (`principles.md` §2.4): the
-    # trailing gap between the early-stop block and the reporting test block is
-    # NOT cut. At 167 dates a trailing purge+embargo of 42 dates consumes the
-    # entire ~25-date test block, which would delete `test_ic`, the subsample
-    # IC gate and the momentum baseline's reported IC rather than harden them.
-    # The leading gap — the one that decides `best_iteration`, which is what
-    # I9333 is about — is applied. The trailing gap is gated on panel length
-    # and tracked separately; `embargo_edges` on the manifest records which
-    # edges were actually cut, so no reader can mistake this for a full
-    # two-sided split.
-    from training.purged_split import build_purged_split as _build_purged_split
+    # alpha-engine-config-I9377 — whether the trailing gap CAN be cut is a
+    # measured property of the panel, not a hardcoded posture: at 167 dates a
+    # trailing purge+embargo of 42 dates consumes the entire ~25-date test
+    # block, which would delete `test_ic`, the subsample IC gate and the
+    # momentum baseline's reported IC rather than harden them. Once the panel
+    # is long enough that the full two-sided split still leaves a test block
+    # of >= MIN_TEST_DATES dates, the leak this issue is about closes itself
+    # — no code change needed, only re-measurement each week. Until then the
+    # leak's SIZE is recorded (test_ic on the purged sub-block, alongside the
+    # full one) rather than only its existence.
+    from training.purged_split import MIN_TEST_DATES, build_purged_split as _build_purged_split
 
-    prod_split = _build_purged_split(
-        all_dates,
-        label_horizon_days=int(cfg.FORWARD_DAYS),
-        train_frac=float(cfg.TRAIN_FRAC),
-        val_frac=float(cfg.VAL_FRAC),
-        test_gap=False,
-    )
-    prod_split_block = prod_split.as_manifest_block()
-    if not prod_split.ok:
+    def _fit_prod_split(*, test_gap: bool):
+        return _build_purged_split(
+            all_dates,
+            label_horizon_days=int(cfg.FORWARD_DAYS),
+            train_frac=float(cfg.TRAIN_FRAC),
+            val_frac=float(cfg.VAL_FRAC),
+            test_gap=test_gap,
+        )
+
+    # The train/val floors (min_val_dates, max_val_row_fraction,
+    # max_val_date_weight, min_train_date_multiple, min_train_rows) never
+    # depend on `test_gap` — only where the test block starts does — so
+    # `.ok` is identical between the two calls and it is safe to decide the
+    # gap from the two-sided trial alone.
+    _two_sided_trial = _fit_prod_split(test_gap=True)
+    if not _two_sided_trial.ok:
         raise RuntimeError(
             "Refusing to fit the production L1 GBMs on an unmeasurable "
-            f"early-stop split — {prod_split.reason} "
+            f"early-stop split — {_two_sided_trial.reason} "
             "(alpha-engine-config-I9333). The live champion is untouched: "
             "training writes a staging prefix and "
             "model.registry.promote_to_champion is the only writer of the "
             "serving prefix."
         )
+    use_test_gap = _two_sided_trial.n_test_dates >= MIN_TEST_DATES
+    if use_test_gap:
+        prod_split = _two_sided_trial
+        purged_test_row_start: "int | None" = None
+    else:
+        prod_split = _fit_prod_split(test_gap=False)
+        # The two-sided trial's own test block IS the purged sub-block: its
+        # `test_start` already skipped the full purge+embargo gap after
+        # `val_end`. Reused rather than re-derived (shared-code-policy.md).
+        purged_test_row_start = (
+            int(_two_sided_trial.test_idx[0])
+            if len(_two_sided_trial.test_idx) else None
+        )
+        log.warning(
+            "Production L1 split (I9377): the panel's %d dates cannot carry a "
+            "full trailing purge+embargo AND leave a test block of >= %d "
+            "dates (a two-sided cut leaves only %d) — reporting test_ic on "
+            "the LEAKED block (embargo_edges=['leading']) with the "
+            "purged-sub-block delta recorded alongside, not only a caveat.",
+            _two_sided_trial.n_train_dates + _two_sided_trial.n_val_dates
+            + _two_sided_trial.n_purged_dates + _two_sided_trial.n_embargoed_dates
+            + _two_sided_trial.n_test_dates,
+            MIN_TEST_DATES, _two_sided_trial.n_test_dates,
+        )
+    prod_split_block = prod_split.as_manifest_block()
+    prod_split_block["test_gap_leak"] = {
+        "test_gap_applied": use_test_gap,
+        "min_test_dates": MIN_TEST_DATES,
+        "purged_test_block_n_dates": _two_sided_trial.n_test_dates,
+        "purged_test_block_n_rows": _two_sided_trial.n_test_rows,
+    }
     n_train = int(prod_split.n_train_rows)
     val_start = int(prod_split.val_idx[0])
     val_end = int(prod_split.val_idx[-1]) + 1
     test_start = int(prod_split.test_idx[0]) if len(prod_split.test_idx) else N
     log.info(
-        "Production L1 split (I9333): train rows [0:%d] over %d dates | purge "
-        "%d + embargo %d dates dropped %d rows | early-stop rows [%d:%d] over "
-        "%d dates | test rows [%d:%d] over %d dates",
+        "Production L1 split (I9333/I9377): train rows [0:%d] over %d dates | "
+        "purge %d + embargo %d dates dropped %d rows | early-stop rows "
+        "[%d:%d] over %d dates | test rows [%d:%d] over %d dates | "
+        "embargo_edges=%s",
         n_train, prod_split.n_train_dates, prod_split.label_horizon_days,
         prod_split.embargo_days,
         prod_split.n_purged_rows + prod_split.n_embargoed_rows,
         val_start, val_end, prod_split.n_val_dates, test_start, N,
-        prod_split.n_test_dates,
+        prod_split.n_test_dates, list(prod_split.embargo_edges),
     )
 
     # Momentum L1 component is the deterministic weighted-blend baseline.
@@ -4189,6 +4228,23 @@ def run_meta_training(
     mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[test_start:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
     log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
+    # alpha-engine-config-I9377 — when the trailing gap could NOT be cut
+    # (`purged_test_row_start` set), record what `mom_test_ic`/`vol_test_ic`
+    # would read on the purged sub-block too, so the leak is a number on the
+    # manifest and not only a caveat in a PR body. `None` when the block was
+    # cut clean (nothing to compare) or the purge consumed the whole test
+    # block (no purged rows survive).
+    def _purged_sub_ic(preds_full, y_full) -> "float | None":
+        if purged_test_row_start is None or purged_test_row_start >= N:
+            return None
+        sub_preds = preds_full[purged_test_row_start - test_start:]
+        sub_y = y_full[purged_test_row_start:]
+        if len(sub_preds) != len(sub_y) or len(sub_preds) < 2:
+            return None
+        return float(np.corrcoef(sub_preds, sub_y)[0, 1])
+
+    mom_test_ic_purged = _purged_sub_ic(mom_test_preds, y_fwd[test_start:])
+
     # Volatility production model
     peak_rss_mb = max(peak_rss_mb, _log_rss("before prod_vol (plain) fit"))
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
@@ -4199,6 +4255,36 @@ def run_meta_training(
     vol_test_preds = prod_vol.predict(X_vol[test_start:])
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[test_start:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
+    vol_test_ic_purged = _purged_sub_ic(vol_test_preds, np.abs(y_fwd[test_start:]))
+    if purged_test_row_start is not None:
+        n_purged_test_rows = max(0, N - purged_test_row_start)
+        prod_split_block["test_gap_leak"].update({
+            "purged_test_row_start": purged_test_row_start,
+            "n_purged_test_rows_available": n_purged_test_rows,
+            "momentum_test_ic_full": round(mom_test_ic, 6),
+            "momentum_test_ic_purged": (
+                round(mom_test_ic_purged, 6) if mom_test_ic_purged is not None else None
+            ),
+            "volatility_test_ic_full": round(vol_test_ic, 6),
+            "volatility_test_ic_purged": (
+                round(vol_test_ic_purged, 6) if vol_test_ic_purged is not None else None
+            ),
+            "volatility_test_ic_leak_delta": (
+                round(vol_test_ic - vol_test_ic_purged, 6)
+                if vol_test_ic_purged is not None else None
+            ),
+        })
+        log.warning(
+            "I9377 test_ic leak, sized: volatility test_IC full=%.4f purged=%s "
+            "(delta=%s) over %d purged-sub-block rows | momentum test_IC "
+            "full=%.4f purged=%s",
+            vol_test_ic,
+            f"{vol_test_ic_purged:.4f}" if vol_test_ic_purged is not None else "n/a (purge consumed the whole test block)",
+            f"{vol_test_ic - vol_test_ic_purged:.4f}" if vol_test_ic_purged is not None else "n/a",
+            n_purged_test_rows,
+            mom_test_ic,
+            f"{mom_test_ic_purged:.4f}" if mom_test_ic_purged is not None else "n/a",
+        )
     # I9271: `volatility` shipped `test_ic` and nothing else for its whole
     # life — no `best_iteration`, no `val_ic` on any manifest — so the plain
     # volatility GBM could early-stop into a constant and no artifact would
