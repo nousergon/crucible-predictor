@@ -28,8 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as cfg
 from training import model_zoo as mz
 
+# alpha-engine-config-I9313 — `demean` is the canonical-horizon second arm.
+# `h60` stays in the fixture because the point of the scheduling assertions
+# below is now that the M-slot arm register REFUSES it before training.
 _SPECS = [
     {"id": "resid", "status": "active", "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
+    {"id": "demean", "status": "active", "model_version_label": "spec-demean",
+     "overrides": {"XSEC_DEMEAN_ALPHA_ENABLED": True}},
     {"id": "h60", "status": "active", "model_version_label": "spec-60d",
      "overrides": {"FORWARD_DAYS": 60}},
     {"id": "old", "status": "retired", "overrides": {"FORWARD_DAYS": 90}},
@@ -124,14 +129,19 @@ def test_train_one_spec_raises_on_unknown_spec():
 
 
 def test_list_rotation_spec_ids_budget_stalest():
-    # No registry → both active maximally stale; id tiebreak; budget caps the list.
+    # No registry → all APPLICABLE arms maximally stale; id tiebreak; budget
+    # caps the list.
     assert mz.list_rotation_spec_ids("bkt", budget=1, specs=_SPECS,
-                                     registered_versions=[]) == ["h60"]
+                                     registered_versions=[]) == ["demean"]
     assert mz.list_rotation_spec_ids("bkt", budget=5, specs=_SPECS,
-                                     registered_versions=[]) == ["h60", "resid"]
-    # Retired spec never appears.
-    assert "old" not in mz.list_rotation_spec_ids("bkt", budget=5, specs=_SPECS,
-                                                  registered_versions=[])
+                                     registered_versions=[]) == ["demean", "resid"]
+    _all = mz.list_rotation_spec_ids("bkt", budget=5, specs=_SPECS,
+                                     registered_versions=[])
+    # Retired spec never appears…
+    assert "old" not in _all
+    # …and neither does a non-canonical-horizon arm: I9313 refuses it BEFORE
+    # the rotation spends a training run on it, rather than after scoring it.
+    assert "h60" not in _all
 
 
 def test_list_rotation_spec_ids_empty_when_no_active(monkeypatch):

@@ -21,11 +21,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as cfg
 from training import model_zoo as mz
 
+# alpha-engine-config-I9313 — the scheduling fixture's second arm is at the
+# CANONICAL horizon. It used to be the 60d arm, which the M-slot register now
+# refuses before training (a 60d arm cannot win the 21d slot, so spending a
+# training run on it is the cost the register exists to stop). The 60d arm
+# keeps its own fixture below, where its horizon is the point of the test.
 _SPECS = [
     {"id": "resid", "status": "active", "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
+    {"id": "demean", "status": "active", "model_version_label": "spec-demean",
+     "overrides": {"XSEC_DEMEAN_ALPHA_ENABLED": True}},
+    {"id": "old", "status": "retired", "overrides": {"FORWARD_DAYS": 90}},
+]
+
+# The non-canonical-horizon arms, kept separate: they are INAPPLICABLE to the
+# M slot and the register refuses to schedule them (see
+# tests/test_model_zoo_arm_register.py for the guards that assert it).
+_H60_SPECS = _SPECS + [
     {"id": "h60", "status": "active", "model_version_label": "spec-60d",
      "overrides": {"FORWARD_DAYS": 60}},
-    {"id": "old", "status": "retired", "overrides": {"FORWARD_DAYS": 90}},
 ]
 
 
@@ -89,7 +102,7 @@ def test_train_spec_applies_overrides_and_defaults_label():
     import contextlib
     base_fd = getattr(cfg, "FORWARD_DAYS", 21)
     with contextlib.ExitStack():
-        out = mz.train_spec("h60", "bkt", specs=_SPECS, train_fn=_fake_train)
+        out = mz.train_spec("h60", "bkt", specs=_H60_SPECS, train_fn=_fake_train)
     assert seen["forward_days"] == 60
     assert seen["label"] == "spec-60d"        # spec's declared label
     assert out["status"] == "ok"
@@ -112,16 +125,18 @@ def test_train_all_active_skips_retired_and_continues_on_failure():
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
         calls.append(cfg.MODEL_VERSION_LABEL)
-        if cfg.FORWARD_DAYS == 60:
-            raise RuntimeError("h60 boom")
+        if cfg.MODEL_VERSION_LABEL == "spec-demean":
+            raise RuntimeError("demean boom")
         return {"status": "ok"}
 
-    results = mz.train_all_active("bkt", specs=_SPECS, train_fn=_fake_train)
-    # Only the 2 active specs run; the retired one is skipped.
-    assert set(results) == {"resid", "h60"}
+    results = mz.train_all_active("bkt", specs=_H60_SPECS, train_fn=_fake_train)
+    # Only the 2 APPLICABLE specs run: the retired one is skipped, and I9313
+    # refuses h60 (60d) before training rather than after scoring it.
+    assert set(results) == {"resid", "demean"}
     assert results["resid"]["status"] == "ok"
-    assert results["h60"]["status"] == "error"  # failure captured, didn't abort
+    assert results["demean"]["status"] == "error"  # failure captured, didn't abort
     assert "old" not in results
+    assert "h60" not in results
 
 
 # ── L4488g: weekly rotation ──────────────────────────────────────────────────
@@ -141,44 +156,44 @@ def test_resolve_label_overrides_then_declared_then_default():
 def test_select_rotation_never_trained_first_then_id_tiebreak():
     # No registry history → both active specs are maximally stale; id tiebreak.
     sel = mz.select_rotation_specs(_SPECS, [], budget=1)
-    assert sel == ["h60"]                       # "h60" < "resid"
-    assert mz.select_rotation_specs(_SPECS, [], budget=5) == ["h60", "resid"]
+    assert sel == ["demean"]                    # "demean" < "resid"
+    assert mz.select_rotation_specs(_SPECS, [], budget=5) == ["demean", "resid"]
     # Retired spec never selected.
     assert "old" not in mz.select_rotation_specs(_SPECS, [], budget=5)
 
 
 def test_select_rotation_prefers_never_trained_over_trained():
-    # resid trained recently, h60 never → h60 (never-trained) is stalest.
+    # resid trained recently, demean never → demean (never-trained) is stalest.
     reg = [{"model_version": "spec-resid", "date": "2026-06-01"}]
-    assert mz.select_rotation_specs(_SPECS, reg, budget=1) == ["h60"]
+    assert mz.select_rotation_specs(_SPECS, reg, budget=1) == ["demean"]
 
 
 def test_select_rotation_oldest_version_first_using_newest_per_spec():
-    # Both trained; resid's NEWEST version is older than h60's → resid first.
+    # Both trained; resid's NEWEST version is older than demean's → resid first.
     reg = [
         {"model_version": "spec-resid", "date": "2026-05-01"},
         {"model_version": "spec-resid", "date": "2026-05-20"},  # newest for resid
-        {"model_version": "spec-60d", "date": "2026-06-01"},
+        {"model_version": "spec-demean", "date": "2026-06-01"},
     ]
     assert mz.select_rotation_specs(_SPECS, reg, budget=1) == ["resid"]
-    assert mz.select_rotation_specs(_SPECS, reg, budget=2) == ["resid", "h60"]
+    assert mz.select_rotation_specs(_SPECS, reg, budget=2) == ["resid", "demean"]
 
 
 def test_select_rotation_priority_steers_cold_start():
     # All never-registered (equal staleness) → priority breaks the tie ahead of
-    # the id alphabetical fallback. resid would lose the id tiebreak ("h60" <
+    # the id alphabetical fallback. resid would lose the id tiebreak ("aaa" <
     # "resid") but priority 10 pulls it first — the cold-start steer toward the
     # one promote-eligible variant.
     specs = [
         {"id": "resid", "status": "active", "priority": 10,
          "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
-        {"id": "h60", "status": "active", "overrides": {"FORWARD_DAYS": 60}},
-        {"id": "h90", "status": "active", "overrides": {"FORWARD_DAYS": 90}},
+        {"id": "aaa", "status": "active", "overrides": {"MOMENTUM_L1_IN_META": False}},
+        {"id": "bbb", "status": "active", "overrides": {"XSEC_DEMEAN_ALPHA_ENABLED": True}},
     ]
     assert mz.select_rotation_specs(specs, [], budget=1) == ["resid"]
     # Full cold-start order: resid (priority), then the two zero-priority
-    # horizons by id.
-    assert mz.select_rotation_specs(specs, [], budget=3) == ["resid", "h60", "h90"]
+    # canonical-horizon arms by id.
+    assert mz.select_rotation_specs(specs, [], budget=3) == ["resid", "aaa", "bbb"]
 
 
 def test_select_rotation_priority_never_overrides_staleness():
@@ -188,16 +203,16 @@ def test_select_rotation_priority_never_overrides_staleness():
     specs = [
         {"id": "resid", "status": "active", "priority": 10,
          "overrides": {"RESIDUAL_MOMENTUM_ENABLED": True}},
-        {"id": "h60", "status": "active", "overrides": {"FORWARD_DAYS": 60}},
+        {"id": "aaa", "status": "active", "overrides": {"MOMENTUM_L1_IN_META": False}},
     ]
     reg = [{"model_version": "spec-resid", "date": "2026-06-13"}]
-    assert mz.select_rotation_specs(specs, reg, budget=1) == ["h60"]
+    assert mz.select_rotation_specs(specs, reg, budget=1) == ["aaa"]
 
 
 def test_select_rotation_default_priority_preserves_id_tiebreak():
     # No priority field anywhere → behavior is byte-identical to the pre-priority
     # id tiebreak (back-compat).
-    assert mz.select_rotation_specs(_SPECS, [], budget=2) == ["h60", "resid"]
+    assert mz.select_rotation_specs(_SPECS, [], budget=2) == ["demean", "resid"]
 
 
 def test_train_weekly_rotation_trains_only_budget_stalest():
@@ -207,7 +222,7 @@ def test_train_weekly_rotation_trains_only_budget_stalest():
         trained.append(cfg.MODEL_VERSION_LABEL)
         return {"status": "ok"}
 
-    reg = [{"model_version": "spec-60d", "date": "2026-06-01"}]  # h60 fresh, resid never
+    reg = [{"model_version": "spec-demean", "date": "2026-06-01"}]  # demean fresh, resid never
     results = mz.train_weekly_rotation(
         "bkt", budget=1, specs=_SPECS, train_fn=_fake_train, registered_versions=reg,
     )
@@ -218,14 +233,14 @@ def test_train_weekly_rotation_trains_only_budget_stalest():
 
 def test_train_weekly_rotation_continues_past_failure():
     def _fake_train(bucket, *, date_str=None, dry_run=False):
-        if cfg.FORWARD_DAYS == 60:
-            raise RuntimeError("h60 boom")
+        if cfg.MODEL_VERSION_LABEL == "spec-demean":
+            raise RuntimeError("demean boom")
         return {"status": "ok"}
 
     results = mz.train_weekly_rotation(
         "bkt", budget=5, specs=_SPECS, train_fn=_fake_train, registered_versions=[],
     )
-    assert results["h60"]["status"] == "error"
+    assert results["demean"]["status"] == "error"
     assert results["resid"]["status"] == "ok"
 
 
@@ -336,11 +351,28 @@ def test_select_winner_horizon_floor_and_margin(monkeypatch):
         {"spec_id": "h60", "version_id": "h60-v", "model_version": "spec-60d"},
         {"spec_id": "low", "version_id": "low-v", "model_version": "spec-low"},
     ]
-    board = mz.select_winner(s3, "bkt", trained=trained, margin=0.01)
+    # I9313 — the register is INJECTED, so `h60` resolves as an inapplicable
+    # registered arm rather than an unregistered one. A spec trained outside
+    # the scheduler (a manual `--spec` run) still cannot win the slot.
+    _reg_specs = [
+        {"id": "dsrfail", "status": "active", "model_version_label": "spec-dsrfail"},
+        {"id": "h60", "status": "active", "model_version_label": "spec-60d",
+         "overrides": {"FORWARD_DAYS": 60}},
+        {"id": "low", "status": "active", "model_version_label": "spec-low"},
+    ]
+    board = mz.select_winner(
+        s3, "bkt", trained=trained, margin=0.01, specs=_reg_specs,
+    )
     # the DSR-gate-failing challenger PROMOTES on relative-best (beats champ+margin)
     assert board["winner_version_id"] == "dsrfail-v"
     reasons = {c["spec_id"]: c["reason"] for c in board["candidates"]}
     assert reasons["h60"] == "non_canonical_horizon"        # wrong horizon, never eligible
+    # I9313 — and the exclusion is now a RECORDED property carrying its reason,
+    # not a bare string the artifact never explains.
+    h60_row = next(c for c in board["candidates"] if c["spec_id"] == "h60")
+    assert h60_row["arm_applicability"] == "inapplicable"
+    assert "60-day forward horizon" in h60_row["arm_applicability_reason"]
+    assert board["slot_register"]["horizon_policy"] == "refuse_non_canonical"
     # #679(ii): no champion-arch in this pool → the baseline falls back to the
     # stale serving snapshot; the below-baseline reason is the vintage-consistent
     # name. The fall-back is logged + reflected in promotion_baseline_source.
@@ -521,7 +553,7 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
     )
 
     assert inert_calls.get("called") is True
-    assert inert_calls["n_active"] == 2          # resid + h60 are active in _SPECS
+    assert inert_calls["n_active"] == 2          # resid + demean are applicable in _SPECS
     assert inert_calls["n_selected"] == 0        # budget=0 → trained nothing
     assert cw_calls == [0]                        # CW metric emitted with value 0
     # SNS alert fired (severity warning, dedup keyed on the date).

@@ -168,3 +168,89 @@ def test_time_guard_stops_run(monkeypatch):
     monkeypatch.setattr(ctx, "near_timeout", lambda: True)  # already over budget
     sv.run(ctx)
     assert fake.puts == []  # nothing shadowed — guard fired before the first
+
+
+# ── alpha-engine-config-I9336: rotation fixes the fixed-tail starvation ────
+# The measured live signature: training emits the zoo specs in a fixed order
+# every week, so `list_versions`' newest-first sort was effectively constant
+# and a plain `[:MAX_N]` truncation always cut the SAME trailing two arms
+# (sota-directional-combine, the champion-arch candidate) — 16 days of zero
+# shadow coverage for one of them, structurally unrecoverable under the old
+# code.
+
+_LIVE_EMISSION_ORDER = [
+    {"version_id": "spec-horizon-60d"},
+    {"version_id": "spec-horizon-90d"},
+    {"version_id": "spec-residual-momentum"},
+    {"version_id": "spec-sota-combine"},
+    {"version_id": "spec-champion-arch"},
+]
+
+
+class TestSelectChallengersForCycle:
+    """_select_challengers_for_cycle — pure function, no S3."""
+
+    def test_guard_red_without_the_fix_same_two_arms_starved_every_day(self):
+        """Champion-challenger policy 7.4 guard-red-before-fix: the OLD plain
+        positional truncation starves the SAME two arms on every consecutive
+        date — this is the measured live defect (16 days of zero coverage)."""
+        max_n = 3
+        for date_str in (
+            "2026-08-24", "2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28",
+        ):
+            old_selection = {v["version_id"] for v in _LIVE_EMISSION_ORDER[:max_n]}
+            assert old_selection == {
+                "spec-horizon-60d", "spec-horizon-90d", "spec-residual-momentum",
+            }
+            assert "spec-sota-combine" not in old_selection  # RED, every single day
+            assert "spec-champion-arch" not in old_selection  # RED, every single day
+
+    def test_every_registered_arm_shadowed_within_one_rotation_cycle(self):
+        """Deliverable 3's regression test: with the specs in their live
+        emission order, every registered challenger receives a shadow slot
+        within one full rotation cycle (``ceil(n / max_n)`` consecutive
+        trading days — 2, here). MUST fail against the pre-fix
+        `challengers[:max_n]` (proven starved above)."""
+        max_n = 3
+        seen: set[str] = set()
+        for date_str in ("2026-08-07", "2026-08-10"):  # ceil(5/3) = 2 trading days (Fri->Mon)
+            for v in sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, max_n, date_str):
+                seen.add(v["version_id"])
+        assert seen == {v["version_id"] for v in _LIVE_EMISSION_ORDER}
+
+    def test_deterministic_per_date(self):
+        a = sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, 3, "2026-08-31")
+        b = sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, 3, "2026-08-31")
+        assert a == b
+
+    def test_under_the_cap_returns_everything_unchanged(self):
+        challengers = [{"version_id": "V1"}, {"version_id": "V2"}]
+        assert sv._select_challengers_for_cycle(challengers, 3, "2026-08-31") == challengers
+
+    def test_no_challengers_returns_empty(self):
+        assert sv._select_challengers_for_cycle([], 3, "2026-08-31") == []
+
+    def test_bad_date_string_falls_back_to_offset_zero(self):
+        result = sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, 3, "not-a-date")
+        ordered = sorted(_LIVE_EMISSION_ORDER, key=lambda v: v["version_id"])
+        assert result == ordered[:3]
+
+
+def test_run_rotates_across_two_dates_end_to_end(monkeypatch):
+    """Integration: sv.run(), called on two consecutive dates with the same 5
+    registered challengers, shadows every one of them across the two runs —
+    not just the same 3."""
+    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_MAX_N", 3, raising=False)
+    monkeypatch.setattr(
+        "model.registry.list_versions", lambda *a, **k: _LIVE_EMISSION_ORDER,
+    )
+    _patch_stages(monkeypatch)
+
+    fake = _FakeS3()
+    monkeypatch.setattr("boto3.client", lambda *a, **k: fake)
+    sv.run(_base_ctx(date_str="2026-08-07"))
+    sv.run(_base_ctx(date_str="2026-08-10"))
+
+    shadowed_versions = {p["Key"].split("/")[2] for p in fake.puts}
+    assert shadowed_versions == {v["version_id"] for v in _LIVE_EMISSION_ORDER}

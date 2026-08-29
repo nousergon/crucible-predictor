@@ -76,6 +76,15 @@ setup_logging(
 )
 
 import config as cfg
+# alpha-engine-config-I9313 — the ONE arm register. Every membership question
+# (schedule / train / score / drop) resolves through it; nothing in this
+# module re-derives slot membership from `status` or a horizon comparison.
+from training.model_zoo_registry import (
+    applicable_spec_ids,
+    arm_applicability,
+    as_leaderboard_block,
+    resolve_arms,
+)
 
 log = logging.getLogger(__name__)
 
@@ -260,8 +269,19 @@ def train_all_active(
     """Train every active spec sequentially; one spec's failure never aborts the
     rest (each is captured to the registry before the next runs)."""
     specs = specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
-    active = [s["id"] for s in specs if s.get("status", "active") == "active" and s.get("id")]
-    log.info("model_zoo: %d active spec(s) to train: %s", len(active), active)
+    # alpha-engine-config-I9313 — membership is resolved from the ONE arm
+    # register, not re-derived from `status` here. An arm that cannot win the
+    # slot (non-canonical horizon) is refused BEFORE training rather than
+    # after scoring (champion-challenger-policy §4).
+    _arms = resolve_arms(specs)
+    active = [a.spec_id for a in _arms if a.trainable]
+    for a in _arms:
+        if not a.trainable:
+            log.info(
+                "model_zoo: spec %s is %s and will NOT be trained — %s",
+                a.spec_id, a.applicability, a.reason,
+            )
+    log.info("model_zoo: %d applicable spec(s) to train: %s", len(active), active)
     results: dict = {}
     for sid in active:
         try:
@@ -309,8 +329,12 @@ def select_rotation_specs(
     spec id for deterministic, reproducible selection. Pure (registry list
     injected) so the policy is unit-testable without S3.
     """
-    active = [s for s in specs
-              if s.get("status", "active") == "active" and s.get("id")]
+    # alpha-engine-config-I9313 — the schedulable set comes from the arm
+    # register. Before this, `horizon-60d` and `horizon-90d` occupied 2 of the
+    # 4 weekly budget slots and were then refused at selection for a reason no
+    # artifact carried.
+    _schedulable = set(applicable_spec_ids(specs))
+    active = [s for s in specs if s.get("id") in _schedulable]
     newest: dict[str, str] = {}
     for v in registered_versions:
         mv, d = v.get("model_version"), v.get("date")
@@ -408,10 +432,19 @@ def train_weekly_rotation(
     if registered_versions is None:
         registered_versions = _list_registry_versions(bucket)
     selected = select_rotation_specs(specs, registered_versions, budget)
-    n_active = sum(1 for s in specs
-                   if s.get("status", "active") == "active" and s.get("id"))
+    # I9313 — count the APPLICABLE arms, not the merely-active ones, so the
+    # log's denominator matches the set that can actually be scheduled.
+    _arms = resolve_arms(specs)
+    n_active = sum(1 for a in _arms if a.trainable)
+    _refused = [(a.spec_id, a.applicability) for a in _arms if not a.trainable]
+    if _refused:
+        log.info(
+            "model_zoo rotation: %d arm(s) refused before training by the arm "
+            "register (I9313): %s — see the leaderboard `slot_register` block "
+            "for the recorded reason.", len(_refused), _refused,
+        )
     log.info(
-        "model_zoo rotation: budget=%d → training %d/%d active spec(s): %s",
+        "model_zoo rotation: budget=%d → training %d/%d applicable spec(s): %s",
         budget, len(selected), n_active, selected,
     )
 
@@ -711,6 +744,20 @@ def _selection_pbo(candidates: list[dict], manifests: dict) -> dict:
     modal = max(shapes, key=shapes.get)
     aligned = [(sid, ics) for sid, shape, ics in rows if shape == modal]
     dropped = [sid for sid, shape, _ in rows if shape != modal]
+    # I9313 — a spec dropped here is dropped for a CPCV-SHAPE mismatch, which
+    # is a different finding from being inapplicable to the slot. Both used to
+    # render as the same bare id list. The register says which is which, so a
+    # reader can tell "its folds did not align" from "it was never in the
+    # race". With the register refusing inapplicable arms before training,
+    # `dropped_for_shape` should be empty on a healthy rotation — a non-empty
+    # one is a real fold-alignment finding, not the horizon exclusion in
+    # disguise.
+    if dropped:
+        out_drop_detail = {
+            sid: arm_applicability(sid) for sid in dropped
+        }
+    else:
+        out_drop_detail = {}
     from training.deflated_sharpe import cscv_pbo
     out = cscv_pbo(
         list(map(list, zip(*[ics for _, ics in aligned]))),
@@ -724,6 +771,7 @@ def _selection_pbo(candidates: list[dict], manifests: dict) -> dict:
     )
     if dropped:
         out["dropped_misaligned_specs"] = dropped
+        out["dropped_spec_applicability"] = out_drop_detail
     return out
 
 
@@ -798,7 +846,8 @@ def _resolve_rescored_serving_ic(manifests: dict, champ_arch_vid: str | None,
     }
 
 
-def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
+def _resolve_incumbent_from_bundle(
+        s3, bucket: str) -> tuple[str | None, dict, dict]:
     """Resolve the SERVING champion's identity and CPCV from its own immutable
     registry bundle. alpha-engine-config-I9018.
 
@@ -822,7 +871,13 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
 
     The one non-raising case is a bucket with no live manifest at all — a
     bootstrap rotation with nothing yet serving (champion-challenger-policy
-    §9.1). That returns ``(None, {})`` and is logged loudly.
+    §9.1). That returns ``(None, {}, {})`` and is logged loudly.
+
+    Returns ``(served_version, bundle_manifest, live_manifest)``. The LIVE
+    manifest is returned so callers can report what is serving from the pointer
+    itself. A bundle manifest's own ``served_version`` / ``served_date`` fields
+    are a PREDECESSOR STAMP — who was serving when THAT bundle trained — and
+    reading them as the current answer is alpha-engine-config-I9260.
     """
     try:
         live_manifest = _read_live_manifest(s3, bucket)
@@ -834,7 +889,7 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
             "manifest (alpha-engine-config-I9018).",
             getattr(cfg, "META_MANIFEST_KEY", "?"), exc,
         )
-        return None, {}
+        return None, {}, {}
 
     served_version = live_manifest.get("served_version")
     if not served_version:
@@ -865,7 +920,7 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
         served_version, _cpcv_mean(manifest),
         getattr(cfg, "META_MANIFEST_KEY", "?"),
     )
-    return served_version, manifest
+    return served_version, manifest, live_manifest
 
 
 class PromotionInputIntegrityError(RuntimeError):
@@ -1005,7 +1060,11 @@ def _second_opinion_verdict_class(second_opinion: dict | None,
 def select_winner(
     s3, bucket: str, *, trained: list[dict], margin: float | None = None,
     n_trials_cumulative: int | None = None, date_str: str | None = None,
+    specs: list | None = None,
 ) -> dict:
+    # ``specs`` (alpha-engine-config-I9313) is the arm register this selection
+    # resolves membership from; ``None`` reads ``cfg.MODEL_SPECS``, and it is
+    # injectable so the register can be exercised without a live config.
     """Rank freshly-trained challengers by leak-free-CPCV mean IC and pick a
     winner that beats the VINTAGE-CONSISTENT baseline by ``margin``. Returns a
     leaderboard dict with three labeled groups (serving_champion / champion_arch /
@@ -1079,15 +1138,34 @@ def select_winner(
     # ``champion_arch.cpcv_mean_ic`` to 6dp. Registry bundles are immutable and
     # content-addressed, so this run structurally CANNOT write the number it is
     # about to be compared against.
-    serving_bundle_vid, serving_manifest = _resolve_incumbent_from_bundle(s3, bucket)
+    serving_bundle_vid, serving_manifest, serving_live_manifest = (
+        _resolve_incumbent_from_bundle(s3, bucket))
     champ_fwd = int(serving_manifest.get("forward_days") or getattr(cfg, "FORWARD_DAYS", 21))
     serving_ic = _cpcv_mean(serving_manifest)
-    serving_version = (
-        serving_manifest.get("served_version")
-        or serving_manifest.get("version")
-        or serving_bundle_vid
+    # alpha-engine-config-I9260 — a registry bundle manifest's OWN
+    # ``served_version`` / ``served_date`` is a PREDECESSOR STAMP: it records
+    # who was serving at the moment THAT bundle was trained, not who is serving
+    # now. Reading it here chained one hop backwards and made the leaderboard
+    # report v3.0-meta-2026-08-12-7d0d9328 as the serving version while
+    # ``incumbent_version_id`` correctly said v3.0-meta-2026-08-14-119e069b.
+    # The identity of the serving model has exactly one honest source and it is
+    # the same live pointer ``_resolve_incumbent_from_bundle`` already read.
+    serving_version = serving_bundle_vid
+    serving_date = (
+        serving_live_manifest.get("served_date")
+        or serving_live_manifest.get("date")
     )
-    serving_date = serving_manifest.get("served_date") or serving_manifest.get("date")
+    # The leaderboard must never carry two fields that disagree about which
+    # model is serving (champion-challenger-policy §7.5 — provenance true by
+    # construction). This is an equality by construction today; the assertion
+    # is what keeps it one if either source is re-pointed.
+    if serving_version != serving_bundle_vid:
+        raise PromotionInputIntegrityError(
+            f"model_zoo alpha-engine-config-I9260: serving_version "
+            f"{serving_version!r} disagrees with incumbent_version_id "
+            f"{serving_bundle_vid!r}. The leaderboard would assert two "
+            f"different serving models in one block; refusing to write it."
+        )
 
     # ── Read every candidate manifest up front (needed to locate champion-arch
     # BEFORE the eligibility loop, since the fresh champion-arch CPCV is now the
@@ -1258,10 +1336,19 @@ def select_winner(
     # Non-blocking on failure, per champion-challenger-policy §5.1: an
     # unmeasurable statistic is reported ``uncomputable`` and named on the
     # leaderboard. It is never a pass, and it never fails the rotation.
+    # ``reference_version_id`` drives the OBSERVE-ONLY scale-invariant block
+    # (alpha-engine-config-I9257): standardized dispersion ratio, top-N overlap
+    # and rank correlation, each against the SERVING version. Those exist
+    # because every verdict metric above is a raw-magnitude quantity, so a
+    # uniform rescaling of the linear predictor collapses all of them with no
+    # loss of ranking information — the 2026-08-28 rotation, where the
+    # champion-ARCHITECTURE control was vetoed alongside every challenger.
+    # They are nested and cannot arm a rule; no threshold moves.
     served_slice = served_slice_metrics(
         s3, bucket,
         list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
         date_str=date_str,
+        reference_version_id=serving_bundle_vid,
     )
     served_by_vid = served_slice.get("metrics") or {}
     incumbent_served = served_by_vid.get(serving_bundle_vid)
@@ -1374,6 +1461,40 @@ def select_winner(
                 vid, rec.get("spec_id"), behavioral.get("uncomputable"),
             )
 
+        # I9313 — resolved ONCE from the arm register, so the training
+        # scheduler, the PBO drop and this eligibility chain can never
+        # disagree about whether an arm is in the slot.
+        arm_verdict = arm_applicability(rec.get("spec_id"), specs)
+        if is_champ_arch:
+            # champion-arch is the baseline retrain, not a registered spec; it
+            # is canonical by construction.
+            arm_verdict = {
+                "applicability": "applicable", "reason": None,
+                "horizon_days": fwd,
+            }
+        # `unregistered` is RECORDED but deliberately does NOT gate. The
+        # register is read from cfg.MODEL_SPECS, which has been observed EMPTY
+        # at runtime on a child spot (the config#1051 probe exists for exactly
+        # that) — and an empty register is indistinguishable from a genuinely
+        # unregistered arm. Gating on it would turn one config-load failure
+        # into a rotation that can promote nothing, silently. So it is logged
+        # loudly and carried on the row, and the operator sees it.
+        if arm_verdict["applicability"] == "unregistered":
+            log.error(
+                "model_zoo select: candidate %s (spec=%s) is NOT in the arm "
+                "register — %s. Recorded on its leaderboard row as "
+                "arm_applicability=unregistered; NOT gated, because an empty "
+                "MODEL_SPECS at runtime reads identically and would block "
+                "every promotion.",
+                vid, rec.get("spec_id"), arm_verdict["reason"],
+            )
+        elif arm_verdict["applicability"] != "applicable":
+            log.warning(
+                "model_zoo select: candidate %s (spec=%s) is %s to the M slot "
+                "— %s", vid, rec.get("spec_id"),
+                arm_verdict["applicability"], arm_verdict["reason"],
+            )
+
         group = "champion_arch" if is_champ_arch else "challenger"
         if so_blocks_unconditionally:
             # alpha-engine-config-I9030 — FIRST in the chain, ahead of the group
@@ -1391,8 +1512,21 @@ def select_winner(
             eligible, reason = False, "behavioral_veto"
         elif is_champ_arch:
             eligible, reason = False, "champion_arch_baseline"
-        elif fwd != champ_fwd:
-            eligible, reason = False, "non_canonical_horizon"
+        elif arm_verdict["applicability"] in ("inapplicable", "retired"):
+            # alpha-engine-config-I9313 — the exclusion is now a RECORDED
+            # PROPERTY resolved from the arm register, carrying the reason,
+            # not a bare `fwd != champ_fwd` comparison invented here. The
+            # reason travels onto this candidate row as
+            # `arm_applicability_reason`, and the slot's horizon ruling
+            # travels on the leaderboard's `slot_register` block. With the
+            # register refusing inapplicable arms before training, reaching
+            # this branch means a spec was trained outside the scheduler (a
+            # manual `--spec` run) — legitimate, and still unable to win.
+            eligible, reason = False, (
+                "non_canonical_horizon"
+                if arm_verdict["applicability"] == "inapplicable"
+                else "arm_retired"
+            )
         elif ic is None:
             eligible, reason = False, "no_cpcv"
         elif ic <= min_ic:
@@ -1455,6 +1589,28 @@ def select_winner(
         candidates.append({
             "spec_id": rec.get("spec_id"), "version_id": vid,
             "model_version": rec.get("model_version"),
+            # I9313 — the recorded applicability property. `non_canonical_horizon`
+            # used to be a bare reason string with no explanation anywhere in
+            # the artifact; the reason now travels with the verdict.
+            "arm_applicability": arm_verdict["applicability"],
+            "arm_applicability_reason": arm_verdict["reason"],
+            # alpha-engine-config-I9290 — what this candidate actually trained
+            # on, measured in ROWS PER SYMBOL. `arctic_coverage_ratio` below
+            # counts symbols and reads 1.0 on a 16-row macro series. Two arms
+            # with a different `input_completeness_ratio` did not run the same
+            # experiment and must not be read as a fair comparison.
+            "data_completeness_status": (
+                ((manifest or {}).get("data_completeness") or {}).get("status")
+            ),
+            "input_completeness_ratio": (
+                ((manifest or {}).get("data_completeness") or {})
+                .get("input_completeness_ratio")
+            ),
+            "data_completeness_degradations": [
+                d.get("input")
+                for d in (((manifest or {}).get("data_completeness") or {})
+                          .get("degradations") or [])
+            ],
             # #679(ii): the disambiguation group — "champion_arch" (fresh retrain,
             # the baseline) vs "challenger" (a rotated spec competing against it).
             "group": group,
@@ -1622,6 +1778,21 @@ def select_winner(
         )
 
     selection_pbo = _selection_pbo(candidates, manifests)
+    # alpha-engine-config-I9313 — the AUDIT surface. States the slot's
+    # comparison contract, the horizon ruling AND its reason, and every
+    # registered arm with the applicability that decided whether it ran at
+    # all. A reader of this artifact alone can now tell an arm that LOST from
+    # an arm that was never in the race — the 2026-08-28 leaderboard could
+    # not.
+    slot_register = as_leaderboard_block(specs, canonical_horizon=champ_fwd)
+    log.info(
+        "model_zoo slot register (I9313): canonical_horizon=%dd policy=%s — "
+        "%d applicable / %d inapplicable / %d retired arm(s): %s",
+        slot_register["canonical_horizon_days"],
+        slot_register["horizon_policy"], slot_register["n_applicable"],
+        slot_register["n_inapplicable"], slot_register["n_retired"],
+        [(a["spec_id"], a["applicability"]) for a in slot_register["arms"]],
+    )
     # config #671 — A1: surface the effective-N + the IC-IR each candidate would
     # need to clear the full DSR bar, so a data-starved 'too young' verdict is
     # explicit rather than a silent gate fail (the full bar is passable only once
@@ -1645,6 +1816,10 @@ def select_winner(
         n_trials_cumulative,
     )
     return {
+        # I9313 — the slot's declared comparison contract + every registered
+        # arm's applicability. First field so a reader hits the race's rules
+        # before its results.
+        "slot_register": slot_register,
         # ── #679(ii): THREE clearly-labeled groups (disambiguated presentation) ──
         # SERVING champion = the live model trading capital NOW. Its CPCV is read
         # from the incumbent's OWN immutable registry bundle (I9018) — a prior
@@ -2743,8 +2918,10 @@ def run_rotation_and_select(
     # all-errored cases the guard above can't (e.g. every selected spec crashed).
     # Skipped on a dry run (no real training happened — nothing to alert on).
     if not dry_run:
-        _n_active = sum(1 for s in _resolved_specs
-                        if s.get("status", "active") == "active" and s.get("id"))
+        # I9313 — the inert-rotation alert counts APPLICABLE arms. An
+        # inapplicable arm is not expected to train, so counting it here would
+        # make "N active but 0 trained" fire on a healthy rotation.
+        _n_active = sum(1 for a in resolve_arms(_resolved_specs) if a.trainable)
         _n_trained = _count_challengers_trained(results)
         _emit_challengers_trained_metric(_n_trained)
         if _n_active >= 1 and _n_trained == 0:
@@ -2765,6 +2942,10 @@ def run_rotation_and_select(
     return select_and_finalize(
         s3, bucket, date_str=date_str, mode=mode,
         auto_promote_winner=auto_promote_winner, trained=trained, dry_run=dry_run,
+        # I9313 — the rotation's OWN register travels into selection, so the
+        # scheduler and the selection cannot resolve slot membership from two
+        # different lists.
+        specs=specs,
     )
 
 
@@ -2859,6 +3040,10 @@ def select_and_finalize(
         leaderboard = select_winner(
             s3, bucket, trained=trained, n_trials_cumulative=_n_trials_cum,
             date_str=date_str,
+            # I9313 — the SAME register the rotation scheduled from. Passing it
+            # explicitly is what makes the scheduler and the selection provably
+            # unable to disagree about slot membership.
+            specs=specs,
         )
         leaderboard["date"] = date_str
         leaderboard["mode"] = mode
@@ -3161,8 +3346,13 @@ def run_select_only(
     # (the first run already emitted the real metric/alerts for this date).
     if not dry_run and s3 is not None and not leaderboard.get("idempotent_noop"):
         _cands = leaderboard.get("candidates", []) or []
-        _n_specs = sum(1 for s in (specs if specs is not None else getattr(cfg, "MODEL_SPECS", []))
-                       if s.get("status", "active") == "active" and s.get("id"))
+        # I9313 — count APPLICABLE arms. An inapplicable arm never trains, so
+        # counting it would make the inert-rotation alert fire on a healthy run.
+        _n_specs = sum(
+            1 for a in resolve_arms(
+                specs if specs is not None else getattr(cfg, "MODEL_SPECS", [])
+            ) if a.trainable
+        )
         _n_challengers = sum(1 for c in _cands if c.get("spec_id") != "champion-arch")
         _emit_challengers_trained_metric(_n_challengers)
         if _n_specs >= 1 and len(_cands) == 0:

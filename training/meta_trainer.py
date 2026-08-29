@@ -225,7 +225,13 @@ def _classify_regime(macro_features: dict) -> str:
 
     - ``bull``    if ``macro_spy_20d_return > +0.03`` (3% over 20 trading days)
     - ``bear``    if ``macro_spy_20d_return < -0.03``
-    - ``neutral`` otherwise
+    - ``neutral`` if the value is present and finite but between them
+    - ``unknown`` if the value is absent, ``None``, NaN or non-numeric
+
+    ``unknown`` (alpha-engine-config-I9258): this used to return ``neutral``
+    for an undefined input, making "the market was flat" and "we could not
+    tell" the same label. Callers MUST treat ``unknown`` as absent
+    measurement, never as a regime.
 
     This is a single-feature heuristic chosen for transparency. The retired
     Tier-0 regime classifier (`model/regime_predictor.py`) used a richer
@@ -241,11 +247,11 @@ def _classify_regime(macro_features: dict) -> str:
     own promotion gate. Per audit §6.2 + §6.3.
     """
     spy_20d = macro_features.get("macro_spy_20d_return")
-    if spy_20d is None or not isinstance(spy_20d, (int, float)):
-        return "neutral"
+    if spy_20d is None or isinstance(spy_20d, bool) or not isinstance(spy_20d, (int, float)):
+        return "unknown"
     import math
-    if math.isnan(float(spy_20d)):
-        return "neutral"
+    if not math.isfinite(float(spy_20d)):
+        return "unknown"
     if spy_20d > 0.03:
         return "bull"
     if spy_20d < -0.03:
@@ -437,6 +443,16 @@ def _compute_overfit_signal(
     return ratio, warn
 
 
+# I9333 — the forward window of `research_gbm`'s label (`actual_fwd_10d`), in
+# trading days. It is the PURGE width for that arm's early-stop split, and it
+# is deliberately NOT `cfg.FORWARD_DAYS` (21, the volatility/L2 horizon): a
+# purge narrower than the arm's own label horizon leaves train and validation
+# rows sharing forward window, which is the leak that let 2026-08-21 run all
+# 500 boosting rounds without early stopping firing once.
+_RESEARCH_GBM_LABEL_FIELD = "actual_fwd_10d"
+_RESEARCH_GBM_LABEL_HORIZON_DAYS = 10
+
+
 def _emit_research_gbm_overfit_metrics(
     *,
     train_ic: float | None,
@@ -555,6 +571,9 @@ from model import momentum_scorer
 from model import residual_momentum_scorer
 from model.residual_momentum_scorer import RESIDUAL_MOMENTUM_FEATURES
 from data.residual_momentum_features import compute_residual_momentum_features
+# alpha-engine-config-I9290 — the fail-loud input-completeness gate. Imported
+# at module scope so the fold-loop raise below cannot depend on a lazy import.
+from training.data_completeness import DataCompletenessError
 
 
 def build_train_meta_features(
@@ -1046,8 +1065,12 @@ def run_meta_training(
     two_series = _load_close("TWO.parquet")
     hyoas_series = _load_close("HYOAS.parquet")
     baa10y_series = _load_close("BAA10Y.parquet")
-    gld_series = _load_close("GLD.parquet")
-    uso_series = _load_close("USO.parquet")
+    # The GLD and USO loads that used to sit here were read by NOTHING —
+    # verified 2026-08-29: each name had exactly one occurrence in this module,
+    # its own assignment. Deleted rather than left dormant: a dead load reads
+    # as capability while doing nothing, and it put two symbols into the
+    # completeness register that no arm consumes (champion-challenger-policy
+    # §6, alpha-engine-config-I9290).
 
     if spy_series is None:
         raise RuntimeError("SPY.parquet not found in price cache")
@@ -1065,10 +1088,17 @@ def run_meta_training(
             sector_etf_cache[etf_sym] = s
 
     # Load all ticker close prices for regime breadth + feature computation
+    # alpha-engine-config-I9290 — the regime-breadth loop must not fold a MACRO
+    # series into "% of stocks above their 50/200d MA". The literal below named
+    # SPY/VIX/VIX3M/TNX/IRX/GLD/USO and the XL* sector ETFs but NOT HYOAS, TWO,
+    # BAA10Y or the sub-sector ETFs, so a decimal-percent credit spread and a
+    # 26-row ETF were counted as stocks. The macro library's own symbol list is
+    # now the source of truth (arctic_coverage["macro_symbols"]); the literal
+    # stays as the floor for a caller that supplies no coverage dict.
     _SKIP = {
         "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
         "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
-    }
+    } | set((arctic_coverage or {}).get("macro_symbols") or ())
     all_close_prices = {}
     all_parquets = sorted(data_path.glob("*.parquet"))
 
@@ -1561,6 +1591,114 @@ def run_meta_training(
     log.info("Regime data: %d dates with features+labels", len(common_dates))
     peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 4 regime-feature build"))
 
+    # ── Step 4a: INPUT COMPLETENESS GATE (alpha-engine-config-I9290) ─────────
+    # Measured in ROWS PER SYMBOL and DATE SPAN, not symbol presence. This is
+    # the guard that would have refused the 2026-08-15 run: macro/VIX3M held
+    # 16 rows against SPY's ~2514, coverage_ratio read 1.0, and the resulting
+    # regime frame collapsed to 16 dates while every artifact recorded full
+    # coverage. Required inputs RAISE here; optional ones are recorded as
+    # NAMED degradations on the manifest so two arms that trained on
+    # different input sets never compare as equals.
+    from training.data_completeness import (
+        assert_trainable, evaluate_completeness, summarize_universe_rows,
+    )
+    _panel_dates = pd.to_datetime(pd.Series(all_dates)).dt.date
+    _oos_window = (
+        (str(_panel_dates.min()), str(_panel_dates.max()))
+        if len(_panel_dates) else None
+    )
+    data_completeness = evaluate_completeness(
+        (arctic_coverage or {}).get("per_symbol") or {},
+        oos_window=_oos_window,
+    )
+    data_completeness["universe_rows"] = summarize_universe_rows(
+        (arctic_coverage or {}).get("per_symbol") or {}
+    )
+    log.info(
+        "Input completeness (I9290): status=%s ratio=%s failures=%d "
+        "degradations=%d window=%s",
+        data_completeness["status"],
+        data_completeness["input_completeness_ratio"],
+        len(data_completeness["failures"]), len(data_completeness["degradations"]),
+        _oos_window,
+    )
+    # Fail loud. A required input that is absent, short, frozen or spanning
+    # less than the scored window stops the run — it never becomes a constant.
+    assert_trainable(data_completeness)
+
+    # ── Step 4a(ii): the regime frame must COVER the panel it is joined to ──
+    # Independent of the input gate above: an input can clear its own bar and
+    # the regime frame still fail to cover the training dates (a dropna on a
+    # derived column, a calendar mismatch). Measured directly, because the
+    # 2026-08-15 defect surfaced HERE — regime_features_df went 799 -> 16
+    # dates and the fold loop silently wrote 0.0 for every macro feature on
+    # every uncovered date.
+    _regime_covered = set(pd.to_datetime(pd.Series(regime_features_df.index)).dt.date)
+    _panel_unique = sorted(set(_panel_dates))
+    _uncovered = [d for d in _panel_unique if d not in _regime_covered]
+    _regime_cov_ratio = (
+        1.0 - (len(_uncovered) / len(_panel_unique)) if _panel_unique else 1.0
+    )
+    _regime_cov_floor = float(getattr(cfg, "REGIME_PANEL_COVERAGE_FLOOR", 0.99))
+    data_completeness["regime_panel_coverage"] = {
+        "n_panel_dates": len(_panel_unique),
+        "n_uncovered": len(_uncovered),
+        "coverage_ratio": round(_regime_cov_ratio, 6),
+        "floor": _regime_cov_floor,
+        "uncovered_sample": [str(d) for d in _uncovered[:10]],
+    }
+    # I9290 — the derived regime columns must EXIST on the frame. Previously
+    # a missing one was substituted per-row with a constant 0.0 inside the
+    # fold loop, which is invisible: the feature is present, finite, and
+    # carries nothing. Checked once, here, where it can still stop the run.
+    from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP as _RDMAP
+    _missing_derived = [
+        c for c in _RDMAP if c not in regime_features_df.columns
+    ]
+    data_completeness["regime_derived_columns"] = {
+        "expected": sorted(_RDMAP),
+        "missing": _missing_derived,
+    }
+    # The producer's own record of whether it SUBSTITUTED a constant for
+    # intensity_z (regime_predictor sets this on df.attrs). A present column
+    # holding a constant is the harder case to see, so it is carried through
+    # as a named degradation rather than inferred.
+    _iz = dict(regime_features_df.attrs.get("intensity_z_status") or {})
+    data_completeness["intensity_z"] = _iz or {"status": "unrecorded"}
+    if _iz.get("status") not in (None, "ok"):
+        data_completeness.setdefault("degradations", []).append({
+            "input": "regime.intensity_z",
+            "status": _iz.get("status"),
+            "severity": "optional",
+            "reason": _iz.get("reason"),
+            "features_affected": list(_RDMAP.values()),
+        })
+        if data_completeness["status"] == "ok":
+            data_completeness["status"] = "degraded"
+        log.warning(
+            "data_completeness: regime_intensity_z is a SUBSTITUTED CONSTANT "
+            "on this run — %s", _iz.get("reason"),
+        )
+    if _missing_derived:
+        raise DataCompletenessError(
+            "Refusing to train: the regime feature frame is missing derived "
+            f"column(s) {_missing_derived}, which feed the meta features "
+            f"{[_RDMAP[c] for c in _missing_derived]}. Refusing to substitute "
+            "a constant 0.0 for them (alpha-engine-config-I9290)."
+        )
+
+    if _regime_cov_ratio < _regime_cov_floor:
+        raise DataCompletenessError(
+            "Refusing to train: the regime feature frame covers "
+            f"{_regime_cov_ratio:.4f} of the {len(_panel_unique)} panel dates "
+            f"(floor {_regime_cov_floor}); {len(_uncovered)} dates have no "
+            f"macro row, first missing {_uncovered[:5]}. Every uncovered date "
+            "would otherwise have had its six macro_* meta features and "
+            "regime_intensity_z written as a constant 0.0 — the "
+            "alpha-engine-config-I9290 defect. Check the macro library row "
+            "counts (see the input-completeness block above) before retrying."
+        )
+
     # ── Step 4b: Build macro feature array for Stage 1b parallel observation ─
     # Stage 1b of the regime-conditioning rebuild (plan doc:
     # alpha-engine-docs/private/regime-conditioning-260510.md). Builds a
@@ -1783,6 +1921,13 @@ def run_meta_training(
     n_rows_dropped_no_signals_snapshot = 0  # test_date predates first signals
     n_rows_dropped_ticker_missing = 0       # ticker absent from snapshot's universe
     n_rows_with_real_signals = 0            # rows actually retained for L2 training
+    # alpha-engine-config-I9255: macro-block coverage over the OOS meta panel.
+    # A test_date absent from regime_features_df gets a constant-0.0 macro row;
+    # when that is EVERY date the whole macro block reaches the L2 as dead
+    # columns with exactly-zero coefficients. Counted here, gated after the loop.
+    n_macro_rows_covered = 0
+    n_macro_rows_defaulted = 0
+    macro_dates_defaulted: set[str] = set()
     vol_fold_ics = []
     resid_mom_fold_ics = []  # W2: per-fold raw IC of the residual-momentum L1
 
@@ -1882,26 +2027,61 @@ def run_meta_training(
 
             macro_row: dict[str, float] = {}
             if test_date in regime_features_df.index:
+                n_macro_rows_covered += len(date_indices)
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
                     macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
                 # Stage D: regime-derived features (currently just
-                # intensity_z). Same date-indexed lookup pattern; missing
-                # columns default to 0.0 so older code paths that
-                # haven't repopulated regime_features_df via
-                # RegimePredictor.build_features (which now adds
-                # intensity_z) degrade gracefully.
+                # intensity_z). Same date-indexed lookup pattern. A missing
+                # column USED to default to 0.0 here; since
+                # alpha-engine-config-I9290 the presence check is hoisted to
+                # the Step 4a(ii) gate and a missing column stops the run
+                # instead of degrading every OOS row into a constant.
                 from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
                 for src_name, meta_name in REGIME_DERIVED_FEATURE_META_MAP.items():
-                    if src_name in regime_features_df.columns:
-                        macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
-                    else:
-                        macro_row[meta_name] = 0.0
+                    # I9290 — no per-row constant substitution. The Step 4a(ii)
+                    # gate above already refused the run if a derived column is
+                    # missing, so this is an assertion, not a fallback.
+                    macro_row[meta_name] = float(
+                        regime_features_df.at[test_date, src_name]
+                    )
             else:
-                for meta_name in MACRO_FEATURE_META_MAP.values():
-                    macro_row[meta_name] = 0.0
-                from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
-                for meta_name in REGIME_DERIVED_FEATURE_META_MAP.values():
-                    macro_row[meta_name] = 0.0
+                # alpha-engine-config-I9255 + -I9290, resolved in favour of the
+                # STRICTER form. I9255 counted this branch and failed the run
+                # AFTER the fold loop when coverage fell below a 0.50 floor;
+                # I9290 refuses BEFORE the loop (the Step 4a input gate and the
+                # Step 4a(ii) regime-panel coverage floor of 0.99) and makes
+                # this branch itself raise. A 0.50 floor permits half the panel
+                # to be zero-filled and still produce a champion, which Brian's
+                # 2026-08-29 ruling forbids: "if any of the arms is not trained
+                # properly then the predictor module should fail the task."
+                #
+                # What this branch used to do: write a constant 0.0 for all six
+                # macro_* features plus regime_intensity_z — not even their
+                # declared neutrals (vix_level's is 1.0) — so a date missing
+                # from regime_features_df was indistinguishable downstream from
+                # a genuine reading of zero. It fired for EVERY date in the
+                # 2026-08-12, -08-21 and -08-28 vintages (VIX3M truncated
+                # upstream), all seven columns went constant, the L2 gave each
+                # an exactly-zero coefficient, and the coefficient norm fell
+                # 0.9676 -> 0.1214.
+                #
+                # The counters below are kept so I9255's post-loop coverage gate
+                # and its diagnostics stay coherent; they are now unreachable in
+                # practice, which is the point.
+                n_macro_rows_defaulted += len(date_indices)
+                macro_dates_defaulted.add(str(test_date))
+                raise DataCompletenessError(
+                    f"No regime/macro row for OOS test_date {test_date!r} "
+                    "inside the fold loop. Refusing to substitute a constant "
+                    "0.0 for the macro block (alpha-engine-config-I9290). The "
+                    "Step 4a(ii) regime-panel coverage gate should have "
+                    "refused this run before training started — reaching here "
+                    "means the gate and the join disagree about coverage. "
+                    f"{n_macro_rows_defaulted} row(s) across "
+                    f"{len(macro_dates_defaulted)} test date(s) had no macro "
+                    f"row; regime_features_df carries "
+                    f"{len(regime_features_df.index)} dates."
+                )
 
             # Lookup the most-recent-prior weekly signals snapshot for this
             # test_date (built once before the fold loop in Step 5c).
@@ -2043,6 +2223,46 @@ def run_meta_training(
         dropped_no_snapshot=n_rows_dropped_no_signals_snapshot,
         dropped_ticker_missing=n_rows_dropped_ticker_missing,
     )
+    # ── Macro-block coverage gate (alpha-engine-config-I9255) ────────────────
+    # The macro / regime_intensity_z columns are market-wide: one value per
+    # date. When regime_features_df does not carry a fold's test_date they are
+    # filled with a constant 0.0 and NOTHING said so — the 2026-08-21 vintage
+    # trained its entire panel that way (VIX3M truncated upstream to 16 rows →
+    # RegimePredictor.build_features' dropna() cut the panel 799 → 16 dates),
+    # zeroed all seven coefficients, shrank the survivors ~2.9x, promoted, and
+    # served five live sessions with n_high_confidence = 0.
+    #
+    # A producer does not silently degrade: below the floor this RAISES. The
+    # floor is deliberately loose (half the panel) — a few uncovered dates at
+    # the edge of history is a warning, a dead block is a failed run.
+    _macro_rows_total = n_macro_rows_covered + n_macro_rows_defaulted
+    macro_row_coverage = (
+        n_macro_rows_covered / _macro_rows_total if _macro_rows_total else 0.0
+    )
+    if _macro_rows_total and macro_row_coverage < cfg.META_MACRO_MIN_ROW_COVERAGE:
+        raise RuntimeError(
+            f"Meta-trainer: macro-block coverage {macro_row_coverage:.4f} over "
+            f"the OOS meta panel ({n_macro_rows_covered} of {_macro_rows_total} "
+            f"rows carry real macro values) is below the "
+            f"{cfg.META_MACRO_MIN_ROW_COVERAGE:.2f} floor — "
+            f"{len(macro_dates_defaulted)} test dates are absent from "
+            f"regime_features_df, which has {len(regime_features_df.index)} "
+            f"dates. Every uncovered row reaches the L2 with a constant-0.0 "
+            f"macro block, so all six macro_* features and regime_intensity_z "
+            f"get an exactly-zero coefficient and the surviving coefficients "
+            f"shrink. Check the ArcticDB 'macro' library for a truncated series "
+            f"(regime_predictor.build_features logs the per-series coverage) "
+            f"before retraining. Do NOT promote a vintage trained this way "
+            f"(alpha-engine-config-I9255)."
+        )
+    if macro_row_coverage < 1.0:
+        log.warning(
+            "Macro-block coverage %.4f over the OOS meta panel — %d of %d rows "
+            "(%d distinct test dates) got the constant-0.0 macro fallback.",
+            macro_row_coverage, n_macro_rows_defaulted, _macro_rows_total,
+            len(macro_dates_defaulted),
+        )
+
     if _research_features_in_meta and n_rows_with_real_signals == 0:
         raise RuntimeError(
             "Meta-trainer: 0 rows survived the research-signal join. "
@@ -2075,12 +2295,28 @@ def run_meta_training(
     # emits both train_ic and val_ic so the gap can be monitored. Per-fold
     # WF tightening tracked for ~30-week milestone (2026-06-20-ish).
     from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
+    from training.purged_split import (
+        MIN_VAL_DATES_RESEARCH_GBM,
+        DegenerateDesignMatrixError,
+        assert_design_matrix_supports_fit,
+        build_purged_split,
+        val_ic_precision,
+    )
 
     prod_research_gbm: ResearchGBMScorer | None = None
+    research_gbm_split_block: dict | None = None
+    research_gbm_matrix_block: dict | None = None
+    research_gbm_val_precision: dict | None = None
     research_gbm_metrics: dict | None = None
     research_gbm_train_ic: float | None = None
     research_gbm_train_val_ic_ratio: float | None = None
     research_gbm_overfit_warn: bool = False
+    # alpha-engine-config-I9271: every L1 fit registers what it actually
+    # produced here, and `training/l1_fit_validity` grades the whole register.
+    # An arm missing from this dict is treated as ABSENT, which for a declared
+    # non-optional arm is itself a failure — the bucket-lookup fallback below
+    # is exactly the silent substitution the gate exists to refuse.
+    l1_fits: dict[str, dict] = {}
     try:
         finite_mask = np.array([
             np.isfinite(r.get("actual_fwd_10d", float("nan")))
@@ -2096,21 +2332,86 @@ def run_meta_training(
                 1.0 if r.get("actual_fwd_10d", 0.0) > 0 else 0.0
                 for r, m in zip(oos_meta_rows, finite_mask) if m
             ], dtype=np.float32)
-            split_idx = int(n_finite * 0.8)
+            # I9333: the row-ordered dates behind the SAME finite mask, so the
+            # split is cut on the date axis and can never land inside a
+            # cross-section. `oos_meta_rows` is built fold-by-fold from a
+            # date-sorted panel; `build_purged_split` asserts the ordering
+            # rather than assuming it.
+            research_dates = [
+                str(r.get("date"))
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ]
+
+            # I9333 deliverable 3 — refuse a degenerate design matrix BEFORE a
+            # booster exists. Since 2026-07-18 this arm has fitted 9 declared
+            # features of which ONE varies (`research_composite_score`);
+            # `conviction` and `sector_modifiers` are constants and the six
+            # macro columns were zero-filled. Upstream cause: -I9307.
+            research_gbm_matrix_block = assert_design_matrix_supports_fit(
+                "research_gbm", X_research, RESEARCH_GBM_FEATURES,
+            )
+
+            # I9333 deliverable 1 — purged, embargoed, multi-date early-stop
+            # split replacing `split_idx = int(n_finite * 0.8)`. The label is
+            # `actual_fwd_10d`, so the purge width is 10 trading dates and the
+            # embargo defaults to the same (the overlapping-label embargo, the
+            # repo's L4488a convention). No test block: this panel's only
+            # holdout is the early-stopping block.
+            #
+            # alpha-engine-config-I9376 — MIN_VAL_DATES=10 (the generic floor)
+            # bounds any single cross-section's leverage on val_ic at 10%; it
+            # does not bound val_ic's STANDARD ERROR against the
+            # min_abs_val_ic gate it is read against. research_gbm's own
+            # derived floor (min_val_dates_for_target_se, sited on the
+            # champion-architecture per-date IC std) targets SE(val_ic) <=
+            # half of that gate.
+            research_split = build_purged_split(
+                research_dates,
+                label_horizon_days=_RESEARCH_GBM_LABEL_HORIZON_DAYS,
+                train_frac=0.80,
+                val_frac=None,
+                min_val_dates=MIN_VAL_DATES_RESEARCH_GBM,
+            )
+            research_gbm_split_block = research_split.as_manifest_block()
+            if not research_split.ok:
+                raise RuntimeError(
+                    "research_gbm: refusing to fit on an unmeasurable split — "
+                    f"{research_split.reason} A split whose own properties do "
+                    "not meet their floors cannot be gated on, and fitting on "
+                    "a one-date holdout to avoid reporting that is exactly the "
+                    "coin flip this refuses (alpha-engine-config-I9333; "
+                    "champion-challenger-policy §5.1)."
+                )
+            tr_idx, va_idx = research_split.train_idx, research_split.val_idx
             prod_research_gbm = ResearchGBMScorer(
                 n_estimators=500, early_stopping_rounds=30,
             )
             prod_research_gbm.fit(
-                X_research[:split_idx], y_research[:split_idx],
-                X_research[split_idx:], y_research[split_idx:],
+                X_research[tr_idx], y_research[tr_idx],
+                X_research[va_idx], y_research[va_idx],
             )
             research_gbm_metrics = prod_research_gbm.metrics()
+
+            # I9333 — how precise `val_ic` actually is. Recorded, not gated:
+            # it is the number that says whether l1_fit_validity's
+            # `min_abs_val_ic` floor is being read against a statistic or
+            # against noise.
+            research_gbm_val_precision = val_ic_precision(
+                prod_research_gbm.predict(X_research[va_idx]),
+                y_research[va_idx],
+                [research_dates[i] for i in va_idx],
+                label_horizon_days=_RESEARCH_GBM_LABEL_HORIZON_DAYS,
+            )
+            log.info(
+                "research_gbm val_ic precision (I9333): %s",
+                research_gbm_val_precision,
+            )
 
             # Train_ic — Pearson IC on the same training split the GBM saw.
             # train_ic >> val_ic (e.g. >2×) signals overfitting; emit both
             # in the manifest so monitoring can flag a degenerating gap.
-            train_preds = prod_research_gbm.predict(X_research[:split_idx])
-            train_y = y_research[:split_idx]
+            train_preds = prod_research_gbm.predict(X_research[tr_idx])
+            train_y = y_research[tr_idx]
             if np.std(train_preds) > 1e-10 and np.std(train_y) > 1e-10:
                 research_gbm_train_ic = float(np.corrcoef(train_preds, train_y)[0, 1])
             log.info(
@@ -2159,6 +2460,30 @@ def run_meta_training(
                 warn=research_gbm_overfit_warn,
             )
 
+            # I9271: the served spread of this arm's own output, RAW. A
+            # two-round booster produced std 0.003731 over the 903-name
+            # universe against the prior vintage's 0.107021 — a 28.7x collapse
+            # in the meta-Ridge's largest cross-sectional feature. Recorded on
+            # the arm's own scale; a standardized form would divide exactly
+            # this collapse away (champion-challenger-policy §5.3).
+            from training.l1_fit_validity import measure_output_dispersion
+            l1_fits["research_gbm"] = {
+                "fitted": True,
+                "best_iteration": int(prod_research_gbm._best_iteration),
+                "val_ic": float(prod_research_gbm._val_ic),
+                "train_ic": research_gbm_train_ic,
+                "n_estimators": int(prod_research_gbm.n_estimators),
+                "n_samples": int(research_split.n_train_rows),
+                "output_dispersion": measure_output_dispersion(
+                    prod_research_gbm.predict(X_research)
+                ),
+                # I9333 — the split and the design matrix travel with the fit
+                # so a finding names the geometry it was produced under.
+                "split": research_gbm_split_block,
+                "design_matrix": research_gbm_matrix_block,
+                "val_ic_precision": research_gbm_val_precision,
+            }
+
             # Recompute research_calibrator_prob in oos_meta_rows using the
             # GBM's predictions (in-sample for the rows the GBM trained on,
             # OOS for any non-finite-label rows that weren't part of the fit
@@ -2175,24 +2500,48 @@ def run_meta_training(
                 n_recomputed += 1
             log.info(
                 "research_calibrator_prob recomputed via GBM for %d oos_meta_rows "
-                "(in-sample for ~80%%, OOS-fitted for ~20%% per the GBM's "
-                "temporal early-stop split)",
+                "(in-sample for the purged training block, OOS for the "
+                "embargoed early-stop block and the purged gap — I9333)",
                 n_recomputed,
             )
         else:
-            log.info(
+            l1_fits["research_gbm"] = {
+                "fitted": False,
+                "reason": (
+                    f"only {n_finite} finite-label rows in the panel; measured "
+                    f"{n_finite}, required >= 100 to fit at all."
+                ),
+            }
+            log.warning(
                 "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
-                "skipped this cycle. Bucket-lookup ResearchCalibrator-sourced "
-                "research_calibrator_prob remains in oos_meta_rows.",
+                "NOT fitted this cycle. Bucket-lookup ResearchCalibrator-sourced "
+                "research_calibrator_prob remains in oos_meta_rows, and the L1 "
+                "fit-validity gate (Step 8a-iii, I9271) will fail the run on the "
+                "absent canonical arm rather than ship the substitution.",
                 n_finite,
             )
     except Exception as e:
-        # Non-blocking: failure here logs a warning but doesn't fail the
-        # whole training run. The bucket-lookup-sourced research_calibrator_prob
-        # already populated by the WF loop survives.
-        log.warning(
-            "ResearchGBMScorer fit failed (non-blocking, falling back to "
-            "bucket-lookup-sourced research_calibrator_prob): %s", e,
+        # I9271: this used to be documented as "non-blocking", and it is no
+        # longer. The bucket-lookup fallback still populates
+        # research_calibrator_prob so the rest of Step 6c can run, but
+        # `research_gbm` is then ABSENT from `l1_fits`, and the Step 8a-iii
+        # fit-validity gate fails the run on that absence. A silent
+        # substitution for the canonical producer of the meta-Ridge's largest
+        # cross-sectional feature is the defect, not the recovery.
+        # I9333: the reason travels with the arm. `DegenerateDesignMatrixError`
+        # and an `insufficient` split both land here, and a gate finding that
+        # says only "absent" would lose the one sentence naming which constant
+        # columns or which split floor stopped the fit.
+        l1_fits.setdefault("research_gbm", {
+            "fitted": False,
+            "reason": f"{type(e).__name__}: {e}",
+            "split": research_gbm_split_block,
+            "design_matrix": research_gbm_matrix_block,
+        })
+        log.error(
+            "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
+            "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
+            "will fail this run on the arm: %s", e,
         )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
@@ -2341,6 +2690,49 @@ def run_meta_training(
         "(val_ic_canonical=%.4f)",
         n_canonical, len(oos_meta_rows), meta_model._val_ic,
     )
+
+    # ── POST-FIT ARM VALIDITY GATE (alpha-engine-config-I9290, Brian ruling
+    #    2026-08-29: "if any of the arms is not trained properly then the
+    #    predictor module should fail the task") ───────────────────────────────
+    #
+    # Layer 1 (the Step 4a input gate above) refuses to START on short, frozen
+    # or absent inputs. This refuses to FINISH on a degenerate FIT — the case
+    # an input gate cannot see, because the inputs arrived and the model still
+    # came out structurally empty. That is precisely what happened on 2026-08-22
+    # and 2026-08-29: SSM Status Success, every spec OK, a full leaderboard, and
+    # every model fitted with seven features hard-zeroed.
+    #
+    # Failing here is SAFE for serving: training writes a per-run staging
+    # prefix (TrainingIOSpec, I9018) and model.registry.promote_to_champion is
+    # the only writer of the live serving prefix (asserted by
+    # tests/test_live_prefix_single_writer.py), so the existing champion keeps
+    # serving preopen inference and the week simply produces no new candidate.
+    from training.arm_validity import (
+        assert_arm_valid, evaluate_arm_validity, load_arm_history,
+    )
+    _arm_label = getattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta")
+    _arm_history = load_arm_history(bucket, _arm_label)
+    arm_validity = evaluate_arm_validity(
+        arm=_arm_label,
+        standardized_coef=(meta_model._importance or {}).get("standardized_coef"),
+        meta_X=meta_X,
+        feature_names=TRAIN_META_FEATURES,
+        prior_standardized_coef=_arm_history["prior_standardized_coef"],
+        prior_coef_norms=_arm_history["prior_coef_norms"],
+        min_norm_ratio=float(getattr(cfg, "ARM_COEF_NORM_MIN_RATIO", 0.50)),
+    )
+    arm_validity["history"] = {
+        "status": _arm_history["status"],
+        "n_vintages": _arm_history["n_vintages"],
+        "reason": _arm_history["reason"],
+    }
+    log.info(
+        "Arm validity (I9290): arm=%s status=%s coef_norm=%s history=%s "
+        "(%d vintage(s))",
+        _arm_label, arm_validity["status"], arm_validity["coef_norm"],
+        _arm_history["status"], _arm_history["n_vintages"],
+    )
+    assert_arm_valid(arm_validity)
 
     # ── W1.1a (ROADMAP L4469): leak-free walk-forward OOS meta IC (OBSERVE) ──
     # The val_ic just logged (and the manifest's `meta_model_oos_ic`) are
@@ -2747,10 +3139,13 @@ def run_meta_training(
     # Self-contained (own dates + fit_predict) so a failure in the W1/W3 blocks
     # above can't take it down. The canonical 21d target is unchanged.
     meta_l1_standalone_alpha_ic: dict = {"status": "not_run"}
+    # alpha-engine-config-I9255: features the standalone read classified DEAD.
+    meta_l1_dead_standalone_features: list[str] = []
     meta_oos_ic_leakfree_no_expected_move: dict = {"status": "not_run"}
     meta_oos_ic_leakfree_post2020: dict = {"status": "not_run"}
     try:
         from training.leakfree_meta_ic import (
+            dead_standalone_features as _d_dead,
             leakfree_meta_oos_ic as _d_lf,
             per_feature_standalone_ic as _d_pfsi,
         )
@@ -2795,6 +3190,24 @@ def run_meta_training(
                 fit_predict_fn=_d_fit_predict,
                 forward_days=cfg.FORWARD_DAYS,
                 embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+
+        # alpha-engine-config-I9255: a feature classified DEAD by the
+        # standalone read (no variance ANYWHERE in the panel) is a PRODUCER
+        # defect — a linear L2 with a fitted intercept hands it an exactly-zero
+        # coefficient, which is indistinguishable in `meta_coefficients` from a
+        # legitimate prune. The 2026-08-21 vintage lost the entire macro block
+        # plus `regime_intensity_z` this way and nothing said so. Say it LOUDLY,
+        # and carry it into the manifest as its own field so the console and the
+        # dead-L1 sweep can read it without parsing per-feature entries.
+        meta_l1_dead_standalone_features = _d_dead(meta_l1_standalone_alpha_ic)
+        if meta_l1_dead_standalone_features:
+            log.error(
+                "DEAD meta features (no variance anywhere in the %d-row panel): "
+                "%s — each gets an exactly-zero L2 coefficient. This is an INPUT "
+                "OUTAGE, not a prune; check the producer before trusting this "
+                "vintage's coefficients (alpha-engine-config-I9255).",
+                int(meta_X.shape[0]), meta_l1_dead_standalone_features,
             )
 
         _em = meta_l1_standalone_alpha_ic.get("expected_move", {}) if isinstance(
@@ -3383,12 +3796,59 @@ def run_meta_training(
         "bull": row_regimes.count("bull"),
         "neutral": row_regimes.count("neutral"),
         "bear": row_regimes.count("bear"),
+        "unknown": row_regimes.count("unknown"),
     }
     log.info(
-        "Per-row regime distribution: bull=%d  neutral=%d  bear=%d  total=%d",
+        "Per-row regime distribution: bull=%d  neutral=%d  bear=%d  "
+        "unknown=%d  total=%d",
         regime_counts["bull"], regime_counts["neutral"], regime_counts["bear"],
-        len(row_regimes),
+        regime_counts["unknown"], len(row_regimes),
     )
+
+    # alpha-engine-config-I9258 — the regime labeller is a PRODUCER; a
+    # degenerate output is a defect to announce, not a market read to accept.
+    # 2026-08-21 and 2026-08-28 both labelled 100% of rows "neutral" (a
+    # truncated VIX3M series, I9256, zero-filled every macro feature) and
+    # nothing said so: the per-regime gate reported "all 1 evaluated regimes
+    # passed" and two models promoted on an unmeasured stratification.
+    #
+    # ``n_oos_rows_without_macro_coverage`` is the direct measurement of the
+    # cause — OOS rows whose date is absent from the regime feature frame and
+    # therefore took the 0.0 macro fill.
+    n_rows_without_macro_coverage = sum(
+        1 for r in oos_meta_rows if r.get("date") not in regime_features_df.index
+    )
+    regime_coverage = {
+        "n_regime_feature_dates": int(len(regime_features_df.index)),
+        "n_oos_rows": len(row_regimes),
+        "n_oos_rows_without_macro_coverage": int(n_rows_without_macro_coverage),
+        "n_unknown_regime_rows": regime_counts["unknown"],
+        "n_distinct_regimes": sum(
+            1 for k in ("bull", "neutral", "bear") if regime_counts[k] > 0
+        ),
+        "macro_series_coverage": dict(
+            getattr(regime_features_df, "attrs", {}).get("macro_coverage", {})
+        ),
+    }
+    if row_regimes and (
+        regime_coverage["n_distinct_regimes"] < 2
+        or regime_counts["unknown"] > 0
+        or n_rows_without_macro_coverage > 0
+    ):
+        log.error(
+            "REGIME LABELLING DEGENERATE — %d distinct regimes over %d OOS "
+            "rows (bull=%d neutral=%d bear=%d unknown=%d); %d rows have no "
+            "macro coverage and took the 0.0 fill; the regime feature frame "
+            "holds %d dates. Every per-regime diagnostic and the stratified "
+            "per-regime gate below are UNMEASURED this cycle. Root cause is "
+            "almost always a truncated macro series upstream — see "
+            "alpha-engine-config-I9256 / I9258.",
+            regime_coverage["n_distinct_regimes"], len(row_regimes),
+            regime_counts["bull"], regime_counts["neutral"],
+            regime_counts["bear"], regime_counts["unknown"],
+            n_rows_without_macro_coverage,
+            regime_coverage["n_regime_feature_dates"],
+        )
     for h in _DIAGNOSTIC_HORIZONS:
         y_h = np.array([r[f"actual_fwd_{h}d"] for r in oos_meta_rows])
         mask = np.isfinite(y_h)
@@ -3659,18 +4119,74 @@ def run_meta_training(
 
     # ── Step 8: Train production models on full data ─────────────────────────
     log.info("Training production models on full dataset...")
-    n_train = int(N * cfg.TRAIN_FRAC)
-    n_val_raw = int(N * cfg.VAL_FRAC)
-    val_end = min(n_train + n_val_raw, N)
+    # I9333 — the three production L1 GBMs (`volatility`,
+    # `volatility_macro_aug`, `volatility_risk_aug`) early-stop on this split,
+    # and until now it was the same defect `research_gbm` carried: a bare row
+    # index cut, `[:n_train]` for train and `[n_train:val_end]` for the
+    # early-stop block, with NO purge and NO embargo against the
+    # `cfg.FORWARD_DAYS` forward label. Adjacent train and validation rows
+    # shared their whole forward window, so the "held-out" early-stop signal
+    # was ~the training signal. The date-count defect that made
+    # `research_gbm`'s val_ic a one-date accident is NOT present here — this
+    # panel is ~167 trading dates at ~898 rows each, so a 15% block is ~25
+    # dates — but the leak is, and it is the same leak.
+    #
+    # The blocks are now cut on the DATE axis (a cut can no longer land inside
+    # a cross-section) with a purge of `cfg.FORWARD_DAYS` dates and an
+    # overlapping-label embargo of the same before the early-stop block.
+    #
+    # SOTA deviation, recorded rather than hidden (`principles.md` §2.4): the
+    # trailing gap between the early-stop block and the reporting test block is
+    # NOT cut. At 167 dates a trailing purge+embargo of 42 dates consumes the
+    # entire ~25-date test block, which would delete `test_ic`, the subsample
+    # IC gate and the momentum baseline's reported IC rather than harden them.
+    # The leading gap — the one that decides `best_iteration`, which is what
+    # I9333 is about — is applied. The trailing gap is gated on panel length
+    # and tracked separately; `embargo_edges` on the manifest records which
+    # edges were actually cut, so no reader can mistake this for a full
+    # two-sided split.
+    from training.purged_split import build_purged_split as _build_purged_split
+
+    prod_split = _build_purged_split(
+        all_dates,
+        label_horizon_days=int(cfg.FORWARD_DAYS),
+        train_frac=float(cfg.TRAIN_FRAC),
+        val_frac=float(cfg.VAL_FRAC),
+        test_gap=False,
+    )
+    prod_split_block = prod_split.as_manifest_block()
+    if not prod_split.ok:
+        raise RuntimeError(
+            "Refusing to fit the production L1 GBMs on an unmeasurable "
+            f"early-stop split — {prod_split.reason} "
+            "(alpha-engine-config-I9333). The live champion is untouched: "
+            "training writes a staging prefix and "
+            "model.registry.promote_to_champion is the only writer of the "
+            "serving prefix."
+        )
+    n_train = int(prod_split.n_train_rows)
+    val_start = int(prod_split.val_idx[0])
+    val_end = int(prod_split.val_idx[-1]) + 1
+    test_start = int(prod_split.test_idx[0]) if len(prod_split.test_idx) else N
+    log.info(
+        "Production L1 split (I9333): train rows [0:%d] over %d dates | purge "
+        "%d + embargo %d dates dropped %d rows | early-stop rows [%d:%d] over "
+        "%d dates | test rows [%d:%d] over %d dates",
+        n_train, prod_split.n_train_dates, prod_split.label_horizon_days,
+        prod_split.embargo_days,
+        prod_split.n_purged_rows + prod_split.n_embargoed_rows,
+        val_start, val_end, prod_split.n_val_dates, test_start, N,
+        prod_split.n_test_dates,
+    )
 
     # Momentum L1 component is the deterministic weighted-blend baseline.
     # No fit step — the formula is fixed (see model/momentum_scorer.py).
     # test_IC is computed against the held-out slice for manifest reporting
     # and parity with the volatility component below.
     mom_test_preds = momentum_scorer.predict_array(
-        X_mom_raw[val_end:], cfg.MOMENTUM_FEATURES,
+        X_mom_raw[test_start:], cfg.MOMENTUM_FEATURES,
     )
-    mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[val_end:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
+    mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[test_start:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
     log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
     # Volatility production model
@@ -3678,11 +4194,27 @@ def run_meta_training(
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
                          early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS)
     prod_vol.fit(X_vol[:n_train], np.abs(y_fwd[:n_train]),
-                 X_vol[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+                 X_vol[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
                  feature_names=cfg.VOLATILITY_FEATURES)
-    vol_test_preds = prod_vol.predict(X_vol[val_end:])
-    vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
+    vol_test_preds = prod_vol.predict(X_vol[test_start:])
+    vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[test_start:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
+    # I9271: `volatility` shipped `test_ic` and nothing else for its whole
+    # life — no `best_iteration`, no `val_ic` on any manifest — so the plain
+    # volatility GBM could early-stop into a constant and no artifact would
+    # record it. It is registered and graded like every other L1 now.
+    l1_fits["volatility"] = {
+        "fitted": True,
+        "best_iteration": int(prod_vol._best_iteration),
+        "val_ic": float(prod_vol._val_ic),
+        "train_ic": None,
+        "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+        "n_samples": int(n_train),
+        "output_dispersion": None,
+        # I9333 — the purged, embargoed early-stop split this arm was fitted
+        # under, recorded on the arm's own row.
+        "split": prod_split_block,
+    }
     peak_rss_mb = max(peak_rss_mb, _log_rss("after prod_vol (plain) fit"))
 
     # ── Step 8a: Parallel macro-augmented volatility GBM (Stage 1b observe-only) ──
@@ -3718,12 +4250,12 @@ def run_meta_training(
         )
         prod_vol_macro_aug.fit(
             X_vol_aug[:n_train], np.abs(y_fwd[:n_train]),
-            X_vol_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            X_vol_aug[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
             feature_names=VOL_AUG_FEATURES,
         )
-        vol_aug_test_preds = prod_vol_macro_aug.predict(X_vol_aug[val_end:])
+        vol_aug_test_preds = prod_vol_macro_aug.predict(X_vol_aug[test_start:])
         vol_macro_aug_test_ic = (
-            float(np.corrcoef(vol_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            float(np.corrcoef(vol_aug_test_preds, np.abs(y_fwd[test_start:]))[0, 1])
             if len(vol_aug_test_preds) > 1 else 0.0
         )
         lift = vol_macro_aug_test_ic - vol_test_ic
@@ -3739,6 +4271,19 @@ def run_meta_training(
             prod_vol_macro_aug._best_iteration,
             prod_vol_macro_aug._booster.num_feature(),
         )
+        # I9271: registered for the L1 fit-validity gate. Observe-only, but a
+        # registered arm all the same — an arm that early-stopped into a
+        # constant must not sit on the manifest as a cutover candidate.
+        l1_fits["volatility_macro_aug"] = {
+            "fitted": True,
+            "best_iteration": int(prod_vol_macro_aug._best_iteration),
+            "val_ic": float(prod_vol_macro_aug._val_ic),
+            "train_ic": None,
+            "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+            "n_samples": int(n_train),
+            "output_dispersion": None,
+            "split": prod_split_block,
+        }
     except Exception as e:
         log.warning(
             "Volatility-with-macros parallel fit failed (non-blocking, "
@@ -3783,12 +4328,12 @@ def run_meta_training(
         )
         prod_vol_risk_aug.fit(
             X_vol_risk_aug[:n_train], np.abs(y_fwd[:n_train]),
-            X_vol_risk_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            X_vol_risk_aug[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
             feature_names=VOL_RISK_AUG_FEATURES,
         )
-        vol_risk_aug_test_preds = prod_vol_risk_aug.predict(X_vol_risk_aug[val_end:])
+        vol_risk_aug_test_preds = prod_vol_risk_aug.predict(X_vol_risk_aug[test_start:])
         vol_risk_aug_test_ic = (
-            float(np.corrcoef(vol_risk_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            float(np.corrcoef(vol_risk_aug_test_preds, np.abs(y_fwd[test_start:]))[0, 1])
             if len(vol_risk_aug_test_preds) > 1 else 0.0
         )
         lift = vol_risk_aug_test_ic - vol_test_ic
@@ -3804,6 +4349,19 @@ def run_meta_training(
             prod_vol_risk_aug._best_iteration,
             prod_vol_risk_aug._booster.num_feature(),
         )
+        # I9271: registered for the L1 fit-validity gate. Observe-only, but a
+        # registered arm all the same — an arm that early-stopped into a
+        # constant must not sit on the manifest as a cutover candidate.
+        l1_fits["volatility_risk_aug"] = {
+            "fitted": True,
+            "best_iteration": int(prod_vol_risk_aug._best_iteration),
+            "val_ic": float(prod_vol_risk_aug._val_ic),
+            "train_ic": None,
+            "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+            "n_samples": int(n_train),
+            "output_dispersion": None,
+            "split": prod_split_block,
+        }
     except Exception as e:
         log.warning(
             "Volatility-with-risk parallel fit failed (non-blocking, "
@@ -3817,6 +4375,35 @@ def run_meta_training(
     del X_vol_risk_aug
     gc.collect()
     peak_rss_mb = max(peak_rss_mb, _log_rss("after X_vol_risk_aug del + gc"))
+
+    # ── Step 8a-iii: L1 fit-validity gate (alpha-engine-config-I9271) ────────
+    # Layer 3 of Brian's ruling of 2026-08-29 ("if any of the arms is not
+    # trained properly then the predictor module should fail the task").
+    # `data_completeness` refuses to START on a bad input; `arm_validity`
+    # refuses to FINISH on a degenerate L2; this refuses to finish on a
+    # degenerate L1 — the case where every input arrived, the L2 fitted
+    # cleanly, and `research_gbm` early-stopped at iteration 2 into a
+    # near-constant prediction that the L2 then correctly down-weighted to
+    # nothing. The 2026-08-28 manifest carried `overfit_warn: true` and
+    # `train_val_ic_ratio: 8.987169` beside `best_iteration: 2`; NOTHING in
+    # the repository read either field, and that vintage promoted.
+    #
+    # Placed after the last L1 fit and before the manifest is assembled, so a
+    # failure costs no upload. Failing here is SAFE for serving for the same
+    # reason arm_validity's raise is: training writes a per-run staging prefix
+    # and promote_to_champion is the only writer of the live serving prefix.
+    from training.l1_fit_validity import evaluate_l1_fits, assert_l1_fits_valid
+
+    l1_fit_validity = evaluate_l1_fits(l1_fits)
+    log.info(
+        "L1 fit validity (I9271): status=%s  %s",
+        l1_fit_validity["status"],
+        {
+            k: (v.get("status"), v.get("best_iteration"), v.get("val_ic"))
+            for k, v in l1_fit_validity["arms"].items()
+        },
+    )
+    assert_l1_fits_valid(l1_fit_validity)
 
     # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
     # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
@@ -3833,15 +4420,15 @@ def run_meta_training(
     from model.subsample_validator import (
         volatility_baseline_predict, validate_component,
     )
-    vol_subsample_mask_test = vol_nan_mask[val_end:]
+    vol_subsample_mask_test = vol_nan_mask[test_start:]
     vol_baseline_preds = volatility_baseline_predict(
-        X_vol_raw[val_end:], cfg.VOLATILITY_FEATURES,
+        X_vol_raw[test_start:], cfg.VOLATILITY_FEATURES,
     )
     vol_subsample_result = validate_component(
         component_name="volatility",
         component_preds=vol_test_preds,
         baseline_preds=vol_baseline_preds,
-        y_true=np.abs(y_fwd[val_end:]),
+        y_true=np.abs(y_fwd[test_start:]),
         subsample_mask=vol_subsample_mask_test,
     )
     vol_subsample_result.log()
@@ -4324,6 +4911,10 @@ def run_meta_training(
                 # is the prerequisite for any future regime-aware-
                 # threshold redesign.
                 "labels_up_rate_by_regime": labels_up_rate_by_regime,
+                # I9258 — the coverage behind the slice above. Without it a
+                # bull n=0 / bear n=0 manifest is indistinguishable from an
+                # honest all-neutral market.
+                "regime_coverage": regime_coverage,
                 # Horizon-of-record + label-domain top-level metadata (added
                 # 2026-05-09 post Track A PR 5/6 cutover) so downstream
                 # consumers — dashboard, backtester analytics, evaluator —
@@ -4355,6 +4946,20 @@ def run_meta_training(
                 # measurably-incomplete dataset is visible in the promoted
                 # artifact, not silently absent from it.
                 "arctic_coverage": arctic_coverage,
+                # I9290 — rows-per-symbol + date-span completeness. The
+                # honest number is input_completeness_ratio; arctic_coverage's
+                # coverage_ratio counts symbols and reads 1.0 on a 16-row
+                # series.
+                "data_completeness": data_completeness,
+                # I9290 — the post-fit validity verdict for THIS arm. A
+                # `degraded` status means a check was INSUFFICIENT (no history
+                # yet), never that it passed.
+                "arm_validity": arm_validity,
+                # I9271 — the per-L1 fit verdict. `overfit_warn` and
+                # `train_val_ic_ratio` were computed here for months and read
+                # by nothing; the floors that make them load-bearing are
+                # recorded per arm under `arms.<name>.floors`.
+                "l1_fit_validity": l1_fit_validity,
                 "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
@@ -4427,6 +5032,12 @@ def run_meta_training(
                                 else None
                             ),
                             "overfit_warn": research_gbm_overfit_warn,
+                            # I9333 — the split's own properties, so a reader
+                            # can tell a val_ic that is a statistic from one
+                            # that is a single cross-section's accident.
+                            "split": research_gbm_split_block,
+                            "design_matrix": research_gbm_matrix_block,
+                            "val_ic_precision": research_gbm_val_precision,
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}
@@ -4534,6 +5145,15 @@ def run_meta_training(
                 # W4 watch + L4469 P2 (OBSERVE): is the meta IC real alpha +
                 # pre-2020 drag. NOT gated.
                 "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+                "meta_l1_dead_standalone_features": meta_l1_dead_standalone_features,
+                # alpha-engine-config-I9255: is the macro block actually ARRIVING?
+                # `macro_row_coverage` is the fraction of OOS meta rows whose macro
+                # values came from regime_features_df rather than the constant-0.0
+                # fallback; `macro_panel_dates` is how many dates the regime
+                # feature frame actually held. Both are numbers whose
+                # absence made the 2026-08-21 collapse invisible.
+                "macro_row_coverage": round(float(macro_row_coverage), 6),
+                "macro_panel_dates": int(len(regime_features_df.index)),
                 # config#940: which L2 features (if any) were excluded by the
                 # AUTO_PRUNE_NOISE_FEATURES standalone-IC noise filter. When the
                 # flag is OFF this records {"enabled": False} and l2_features is
@@ -4876,11 +5496,20 @@ def run_meta_training(
         # so the training_summary SSOT and email formatter also carry the
         # data-coverage signal, not only the registry manifest.
         "arctic_coverage": arctic_coverage,
+        # I9290 — rows-per-symbol + date-span completeness (see the manifest
+        # block above). Carried on the summary too so the training email and
+        # the SSOT reader see the honest number, not the symbol-count ratio.
+        "data_completeness": data_completeness,
+        # I9290 — see the manifest block above.
+        "arm_validity": arm_validity,
+        "l1_fit_validity": l1_fit_validity,
         "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,
-        "n_val": val_end - n_train,
-        "n_test": N - val_end,
+        "n_val": val_end - val_start,
+        "n_test": N - test_start,
+        # I9333 — the production L1 early-stop split's own properties.
+        "l1_early_stop_split": prod_split_block,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
         # config#1815: components at/below cfg.L1_COMPONENT_IC_ALERT_FLOOR —
@@ -4956,6 +5585,15 @@ def run_meta_training(
         # standalone alpha-IC; (A2) leak-free meta IC w/o expected_move; (B)
         # leak-free meta IC on post-2020-03-31 rows. Additive per S3 contract.
         "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+        "meta_l1_dead_standalone_features": meta_l1_dead_standalone_features,
+        # alpha-engine-config-I9255: is the macro block actually ARRIVING?
+        # `macro_row_coverage` is the fraction of OOS meta rows whose macro
+        # values came from regime_features_df rather than the constant-0.0
+        # fallback; `macro_panel_dates` is how many dates the regime
+        # feature frame actually held. Both are numbers whose
+        # absence made the 2026-08-21 collapse invisible.
+        "macro_row_coverage": round(float(macro_row_coverage), 6),
+        "macro_panel_dates": int(len(regime_features_df.index)),
         "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
         "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
         # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC — vs the linear

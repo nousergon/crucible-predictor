@@ -128,8 +128,19 @@ def compute_horizon_battery(
         "bull": regimes.count("bull"),
         "neutral": regimes.count("neutral"),
         "bear": regimes.count("bear"),
+        # I9258 — rows whose macro_spy_20d_return was absent/NaN/non-numeric.
+        # Previously folded into "neutral", which made an undefined regime
+        # indistinguishable from a flat market.
+        "unknown": regimes.count("unknown"),
     }
     log.info("Regime distribution: %s", regime_dist)
+    if regime_dist["unknown"]:
+        log.error(
+            "Horizon battery: %d/%d rows have an UNDEFINED regime — every "
+            "per-regime IC below is computed on a partial slice "
+            "(alpha-engine-config-I9258).",
+            regime_dist["unknown"], len(regimes),
+        )
 
     dates = df["date"].tolist()
 

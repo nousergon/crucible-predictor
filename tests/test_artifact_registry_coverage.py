@@ -49,6 +49,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "monitoring/drift_detector.py": 1,
     "monitoring/feature_drift.py": 1,  # feature_drift_reference.json — weekly training-time KS reference, diagnostic-supporting (absence → report card N/A, not a trading failure), no freshness SLA (config#859)
     "regime/retrospective_eval_handler.py": 2,
+    # alpha-engine-config-I8155: NOT a new producer. `_AttributingS3Client`
+    # is a pass-through proxy around the caller's own S3 client — one
+    # `put_object` override and the one line inside it that forwards to the
+    # wrapped client (the scanner counts both `put_object(` sites) — so the
+    # bytes it writes are `krepis.stage_coverage.record_verdict`'s, under the
+    # ALREADY-REGISTERED `_stage_coverage/{run_date}/{stage}.json` key. It
+    # adds `execution_arn` / `invocation_kind` to that record and creates no
+    # new artifact and no new prefix.
+    "stage_coverage_safety.py": 2,
     "regime/substrate.py": 2,
     # alpha-engine-config-I9018: 7 -> 6. The dated-archive write
     # (predictor/weights/meta/archive/{date}/) is GONE — training writes a

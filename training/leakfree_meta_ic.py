@@ -477,9 +477,47 @@ def leakfree_horizon_ic_curve(
     return curve
 
 
+# A per-date standard deviation at or below this is treated as "no cross-
+# sectional dispersion on that date" — the same threshold ``cross_sectional_
+# ic_series`` uses to skip a date. Named so the standalone-IC classifier and
+# the IC series cannot drift apart.
+_XSEC_DEGENERATE_STD = 1e-12
+
+
+def _time_series_ic(col, y, dates) -> tuple[float | None, int]:
+    """Spearman of a DATE-CONSTANT feature's per-date value against that
+    date's mean realized label — the only honest standalone read for a
+    market-wide feature.
+
+    A macro / regime column carries ONE value per date and is identical for
+    every name on that date, so its cross-sectional rank IC is undefined by
+    construction (``cross_sectional_ic_series`` skips every such date). Its
+    skill, if any, is time-series: does a high VIX date earn a lower average
+    forward alpha than a low VIX date? Returns ``(ic, n_dates)``; ``(None, n)``
+    when fewer than 3 dates are usable or either side is degenerate.
+    """
+    per_date_x: list[float] = []
+    per_date_y: list[float] = []
+    for d in np.unique(dates):
+        m = (dates == d) & np.isfinite(col) & np.isfinite(y)
+        if not m.any():
+            continue
+        per_date_x.append(float(np.mean(col[m])))
+        per_date_y.append(float(np.mean(y[m])))
+    n = len(per_date_x)
+    if n < 3:
+        return None, n
+    ax = np.asarray(per_date_x)
+    ay = np.asarray(per_date_y)
+    if np.std(ax) < _XSEC_DEGENERATE_STD or np.std(ay) < _XSEC_DEGENERATE_STD:
+        return None, n
+    ic = spearmanr(ax, ay).correlation
+    return (round(float(ic), 6) if np.isfinite(ic) else None), n
+
+
 def per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names) -> dict:
-    """Standalone cross-sectional rank IC of EACH meta-feature column vs the
-    (canonical) realized label — the honest per-input alpha-IC.
+    """Standalone per-input alpha-IC of EACH meta-feature column, with an
+    explicit ``status`` naming WHY a number is absent when one is.
 
     No refit: each column is already an OOS L1 prediction (momentum_score,
     expected_move, research_calibrator_prob, …) or a raw context feature, so its
@@ -487,18 +525,111 @@ def per_feature_standalone_ic(meta_X, meta_y, row_dates, feature_names) -> dict:
     Surfaces the W4 watch-item (L4469): whether ``expected_move`` — the meta's
     dominant coefficient, a VOLATILITY L1 — actually predicts cross-sectional
     ALPHA, or is merely in-sample dominance with ~0 standalone alpha-IC.
-    OBSERVE-only; gates nothing. Returns ``{feature: {xsec_ic, n_dates}}``.
+
+    Why the ``status`` field exists (alpha-engine-config-I9255)
+    ----------------------------------------------------------
+    The previous implementation returned ``{"xsec_ic": None, "n_dates": 0}``
+    and nothing else. Every ``macro_*`` column and ``regime_intensity_z`` are
+    MARKET-WIDE — one value per date, identical for every name — so
+    ``cross_sectional_ic_series`` skipped every date for them and this
+    diagnostic reported ``n_dates: 0`` in EVERY vintage ever produced,
+    including the vintages where those columns carried the largest
+    standardized coefficients in the model. A column that had gone entirely
+    DEAD (constant 0.0 across the whole panel, as the macro block did in the
+    2026-08-21 vintage when the ArcticDB ``VIX3M`` series truncated) produced
+    a BYTE-IDENTICAL diagnostic to a healthy market-wide column. The failure
+    was therefore unobservable on this surface by construction.
+
+    Every feature now returns a ``status``, one of:
+
+    ``ok``
+        Cross-sectional IC computed. ``xsec_ic`` / ``n_dates`` as before.
+    ``constant_within_date``
+        Market-wide by construction (macro / regime). ``xsec_ic`` is null
+        BECAUSE it is undefined, not because data was missing — and
+        ``ts_ic`` / ``ts_n_dates`` carry the honest time-series read instead.
+        This is the EXPECTED status for a healthy ``macro_*`` column.
+    ``constant_all_rows``
+        The column has no variance ANYWHERE in the panel — a DEAD input,
+        which a linear L2 with a fitted intercept gives an exactly-zero
+        coefficient. This is a DEFECT in the producer, never a property of
+        the feature.
+    ``no_finite_rows``
+        Every row is NaN/inf for this column.
+    ``insufficient_dates``
+        Finite and varying within a date, but no date had ≥2 usable,
+        non-degenerate name pairs.
+
+    OBSERVE-only; gates nothing. Returns
+    ``{feature: {status, xsec_ic, n_dates, ts_ic, ts_n_dates, panel_std}}``.
     """
     X = np.asarray(meta_X, dtype=float)
     y = np.asarray(meta_y, dtype=float)
+    dates = np.asarray(row_dates)
     out: dict = {}
     for j, name in enumerate(feature_names):
-        series = cross_sectional_ic_series(X[:, j], y, row_dates)
-        out[name] = {
-            "xsec_ic": round(float(np.mean(series)), 6) if series else None,
-            "n_dates": len(series),
+        col = X[:, j]
+        finite = np.isfinite(col) & np.isfinite(y)
+        entry: dict = {
+            "status": None,
+            "xsec_ic": None,
+            "n_dates": 0,
+            "ts_ic": None,
+            "ts_n_dates": 0,
+            "panel_std": None,
         }
+        if not finite.any():
+            entry["status"] = "no_finite_rows"
+            out[name] = entry
+            continue
+
+        panel_std = float(np.std(col[finite]))
+        entry["panel_std"] = round(panel_std, 12)
+
+        series = cross_sectional_ic_series(col, y, dates)
+        if series:
+            entry["status"] = "ok"
+            entry["xsec_ic"] = round(float(np.mean(series)), 6)
+            entry["n_dates"] = len(series)
+            out[name] = entry
+            continue
+
+        # No cross-sectional read was possible. Say WHY — the whole point of
+        # this branch. A dead column and a market-wide column are different
+        # findings and must never render identically.
+        if panel_std < _XSEC_DEGENERATE_STD:
+            entry["status"] = "constant_all_rows"
+            out[name] = entry
+            continue
+
+        # Varies across the panel but not within any date → market-wide.
+        # Measure it the way it CAN be measured.
+        ts_ic, ts_n = _time_series_ic(col, y, dates)
+        entry["ts_ic"] = ts_ic
+        entry["ts_n_dates"] = ts_n
+        entry["status"] = (
+            "constant_within_date" if ts_n >= 3 else "insufficient_dates"
+        )
+        out[name] = entry
+
     return out
+
+
+def dead_standalone_features(standalone: dict) -> list[str]:
+    """The features ``per_feature_standalone_ic`` classified as DEAD —
+    ``constant_all_rows`` or ``no_finite_rows``.
+
+    A producer defect, never a property of the input (see
+    alpha-engine-config-I9255). Callers log this LOUDLY and record it in the
+    manifest; it is the signal that a whole feature block stopped arriving.
+    """
+    if not isinstance(standalone, dict):
+        return []
+    return sorted(
+        name for name, e in standalone.items()
+        if isinstance(e, dict)
+        and e.get("status") in ("constant_all_rows", "no_finite_rows")
+    )
 
 
 def decile_spread_monotonicity(

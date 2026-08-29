@@ -12,23 +12,34 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 import sys
 
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from inference.stages.write_output import DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV
+
+# alpha-engine-config-I9267: derive the spread from the dispersion gate's own
+# absolute-floor constant — see the identical comment in
+# test_write_predictions_inference_gate.py, the same fixture shape rotted
+# there too.
+_ALPHA_SPREAD_TARGET = DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV * 1.5
+
 
 def _predictions(n: int = 27):
+    p_ups = [0.10 + (i / (n - 1)) * 0.75 for i in range(n)]
+    raw_stdev = statistics.pstdev(p - 0.5 for p in p_ups)
+    scale = _ALPHA_SPREAD_TARGET / raw_stdev
     preds = []
-    for i in range(n):
-        p_up = 0.10 + (i / (n - 1)) * 0.75
+    for i, p_up in enumerate(p_ups):
         preds.append({
             "ticker": f"T{i:02d}",
             "p_up": round(p_up, 4),
             "p_down": round(1 - p_up, 4),
             "p_flat": 0.0,
-            "predicted_alpha": (p_up - 0.5) * 0.05,
+            "predicted_alpha": (p_up - 0.5) * scale,
             "predicted_direction": "UP" if p_up >= 0.5 else "DOWN",
             "prediction_confidence": round(abs(p_up - 0.5) * 2.0, 4),
         })
