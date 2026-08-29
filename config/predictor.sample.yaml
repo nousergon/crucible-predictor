@@ -261,9 +261,18 @@ shadow_versions:
 #     status: active                 # active | retired
 #     priority: 10                   # train first at cold start (only promote-eligible spec)
 #     overrides: {RESIDUAL_MOMENTUM_ENABLED: true, MOMENTUM_L1_IN_META: false}
+#   # alpha-engine-config-I9313 — a non-canonical-horizon arm is INAPPLICABLE
+#   # to the M slot and the arm register (training/model_zoo_registry.py)
+#   # refuses to schedule it, whatever `status` says: the slot's champion is
+#   # what the executor consumes on a 21-day hold, so a 60d arm cannot win the
+#   # slot on any statistic. Declaring it `retired` is the operator half
+#   # (champion-challenger-policy §6) and makes the intent explicit; the
+#   # horizon question is measured offline by analysis/horizon_battery.py.
 #   - id: horizon-60d
 #     model_version_label: spec-60d
-#     status: active
+#     status: retired
+#     retired_date: "2026-08-29"
+#     retired_reason: "non-canonical horizon; the M slot is 21d (I9313)"
 #     overrides: {FORWARD_DAYS: 60}
 #   - id: sota-directional-combine     # L4565: COIN fix — vol out of directional, z-score+winsor, residual-mom swap
 #     model_version_label: spec-sota-combine
