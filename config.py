@@ -777,10 +777,14 @@ ARM_COEF_NORM_MIN_RATIO = float(_cfg.get("arm_coef_norm_min_ratio", 0.50))
 # and time-guarded (skips remaining challengers near the Lambda soft-timeout),
 # so it can never delay or break the live path. No-op until challengers exist
 # in the registry (they register from the next retrain via the L4469 capture
-# fix), so default-on is safe. ``max_n`` bounds the per-run challenger count.
+# fix), so default-on is safe. ``max_n`` bounds the per-run challenger count
+# and defaults to the fleet arena cap (champion-challenger-policy.md §6.1:
+# default ``cap`` = 5) so every registered zoo arm is shadowed in one cycle
+# when the pool is at or under the cap. Rotation (shadow_versions.py) only
+# applies when the registry temporarily exceeds the cap during grace.
 _shadow_cfg = _cfg.get("shadow_versions", {})
 SHADOW_VERSIONS_ENABLED = _shadow_cfg.get("enabled", True)
-SHADOW_VERSIONS_MAX_N = int(_shadow_cfg.get("max_n", 3))
+SHADOW_VERSIONS_MAX_N = int(_shadow_cfg.get("max_n", 5))
 RESID_MOM_BETA_WINDOW = _resid_mom_cfg.get("beta_window", 60)
 RESID_MOM_WINDOW = _resid_mom_cfg.get("window", 252)
 RESID_MOM_SKIP_DAYS = _resid_mom_cfg.get("skip_days", 21)

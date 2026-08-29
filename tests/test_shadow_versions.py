@@ -206,17 +206,25 @@ class TestSelectChallengersForCycle:
             assert "spec-champion-arch" not in old_selection  # RED, every single day
 
     def test_every_registered_arm_shadowed_within_one_rotation_cycle(self):
-        """Deliverable 3's regression test: with the specs in their live
-        emission order, every registered challenger receives a shadow slot
-        within one full rotation cycle (``ceil(n / max_n)`` consecutive
-        trading days — 2, here). MUST fail against the pre-fix
-        `challengers[:max_n]` (proven starved above)."""
+        """When n exceeds max_n, rotation covers every arm within
+        ``ceil(n / max_n)`` trading days (grace-period overflow)."""
         max_n = 3
         seen: set[str] = set()
         for date_str in ("2026-08-07", "2026-08-10"):  # ceil(5/3) = 2 trading days (Fri->Mon)
             for v in sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, max_n, date_str):
                 seen.add(v["version_id"])
         assert seen == {v["version_id"] for v in _LIVE_EMISSION_ORDER}
+
+    def test_arena_cap_shadows_all_five_zoo_arms_in_one_cycle(self):
+        """At the fleet arena cap (max_n=5), every live zoo arm is selected on
+        a single date — no rotation needed and no arm starved."""
+        max_n = 5
+        selected = sv._select_challengers_for_cycle(
+            _LIVE_EMISSION_ORDER, max_n, "2026-08-28",
+        )
+        assert {v["version_id"] for v in selected} == {
+            v["version_id"] for v in _LIVE_EMISSION_ORDER
+        }
 
     def test_deterministic_per_date(self):
         a = sv._select_challengers_for_cycle(_LIVE_EMISSION_ORDER, 3, "2026-08-31")
@@ -236,14 +244,32 @@ class TestSelectChallengersForCycle:
         assert result == ordered[:3]
 
 
-def test_run_rotates_across_two_dates_end_to_end(monkeypatch):
-    """Integration: sv.run(), called on two consecutive dates with the same 5
-    registered challengers, shadows every one of them across the two runs —
-    not just the same 3."""
+def test_run_shadows_all_zoo_arms_in_one_run_at_arena_cap(monkeypatch):
+    """Integration: with max_n=5 (arena cap), sv.run() shadows every registered
+    zoo arm on a single inference date — the measured live pool."""
     monkeypatch.setattr(cfg, "SHADOW_VERSIONS_ENABLED", True, raising=False)
-    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_MAX_N", 3, raising=False)
+    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_MAX_N", 5, raising=False)
     monkeypatch.setattr(
         "model.registry.list_versions", lambda *a, **k: _LIVE_EMISSION_ORDER,
+    )
+    _patch_stages(monkeypatch)
+
+    fake = _FakeS3()
+    monkeypatch.setattr("boto3.client", lambda *a, **k: fake)
+    sv.run(_base_ctx(date_str="2026-08-28"))
+
+    shadowed_versions = {p["Key"].split("/")[2] for p in fake.puts}
+    assert shadowed_versions == {v["version_id"] for v in _LIVE_EMISSION_ORDER}
+
+
+def test_run_rotates_when_pool_exceeds_arena_cap(monkeypatch):
+    """When grace pushes the pool above max_n=5, rotation still covers all arms
+    across consecutive runs."""
+    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_ENABLED", True, raising=False)
+    monkeypatch.setattr(cfg, "SHADOW_VERSIONS_MAX_N", 5, raising=False)
+    six_arms = _LIVE_EMISSION_ORDER + [{"version_id": "spec-extra-grace"}]
+    monkeypatch.setattr(
+        "model.registry.list_versions", lambda *a, **k: six_arms,
     )
     _patch_stages(monkeypatch)
 
@@ -253,4 +279,4 @@ def test_run_rotates_across_two_dates_end_to_end(monkeypatch):
     sv.run(_base_ctx(date_str="2026-08-10"))
 
     shadowed_versions = {p["Key"].split("/")[2] for p in fake.puts}
-    assert shadowed_versions == {v["version_id"] for v in _LIVE_EMISSION_ORDER}
+    assert shadowed_versions == {v["version_id"] for v in six_arms}

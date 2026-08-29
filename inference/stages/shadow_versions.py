@@ -86,11 +86,12 @@ def _select_challengers_for_cycle(
     — the shadow contract already treats ``{version_id}/{date}.json`` as
     idempotent per date, and this must not break that.
 
-    Kept at a fixed ``max_n`` per cycle rather than lifting the cap
-    (explicitly INVALID per the issue — shadowing every arm unconditionally
-    every cycle re-introduces the cost/latency problem the cap exists for:
-    each shadowed challenger repeats load_model + run_inference against the
-    Lambda's soft-timeout budget).
+    ``max_n`` defaults to the fleet arena cap (5 — champion-challenger-policy
+    §6.1) so the live five-spec zoo is fully shadowed every cycle without
+    rotation. When the registry temporarily exceeds the cap during grace,
+    rotation ensures every arm is shadowed within ``ceil(n / max_n)`` days
+    rather than structurally starving the same tail. Unconditionally shadowing
+    an unbounded pool every cycle is explicitly INVALID (Lambda soft-timeout).
     """
     if max_n <= 0 or len(challengers) <= max_n:
         return challengers
@@ -163,7 +164,7 @@ def run(ctx: PipelineContext) -> None:
         log.warning("Shadow runner: failed to list shadow-stage versions — skip.", exc_info=True)
         return
 
-    max_n = int(getattr(cfg, "SHADOW_VERSIONS_MAX_N", 3))
+    max_n = int(getattr(cfg, "SHADOW_VERSIONS_MAX_N", 5))
     # alpha-engine-config-I9336: rotate, don't always cut the same tail.
     challengers = _select_challengers_for_cycle(challengers, max_n, ctx.date_str)
     if not challengers:
