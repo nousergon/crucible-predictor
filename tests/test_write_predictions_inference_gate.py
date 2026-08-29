@@ -77,10 +77,16 @@ class TestGateObserveOnly:
         assert mock_put.call_count == 3
 
     def test_degenerate_batch_observe_only_still_writes(self):
-        # Default mode: gate runs, logs failure, but does NOT block.
+        # Observe-only mode: gate runs, logs failure, but does NOT block.
+        # The flag is PINNED, not inherited. It used to rely on the ambient
+        # config's default of False; predictor.yaml has since set
+        # output_distribution_gate_inference_blocking: true, which turned
+        # this test red everywhere the live config is readable while saying
+        # nothing about the behaviour under test.
         from inference.stages.write_output import write_predictions
-        with patch("inference.stages.write_output._s3_put_json") as mock_put:
-            # Don't patch the cfg flag; default is False (observe-only).
+        from inference.stages import write_output as wo_module
+        with patch("inference.stages.write_output._s3_put_json") as mock_put, \
+             patch.object(wo_module.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
             write_predictions(
                 _degenerate_predictions(),
                 "2026-05-07",
@@ -98,7 +104,8 @@ class TestGateObserveOnly:
             if "metrics" in key:
                 captured_metrics_body.append(body)
 
-        with patch.object(write_output, "_s3_put_json", side_effect=fake_put):
+        with patch.object(write_output, "_s3_put_json", side_effect=fake_put), \
+             patch.object(write_output.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
             write_output.write_predictions(
                 _degenerate_predictions(),
                 "2026-05-07",
