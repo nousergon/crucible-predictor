@@ -19,6 +19,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.horizon_battery import (
+    OOS_ROWS_PREFIX,
     PREDICTION_PANELS_PREFIX,
     _fit_horizon_members,
     _fmt,
@@ -28,6 +29,7 @@ from analysis.horizon_battery import (
     compute_horizon_blend,
     format_blend_report,
     format_report,
+    load_oos_rows,
     persist_horizon_prediction_panels,
 )
 from training.meta_trainer import _DIAGNOSTIC_HORIZONS, _ENSEMBLE_HORIZONS
@@ -370,6 +372,101 @@ class TestPersistHorizonPredictionPanels:
         assert len(nested[21][any_date]) <= 10  # <= tickers_per_date
 
 
+# ── load_oos_rows key scoping + freshness (alpha-engine-config-I9378) ──
+
+class _FakeS3Get:
+    class exceptions:
+        class NoSuchKey(Exception):
+            pass
+
+    def __init__(self, key_to_body: dict):
+        self._key_to_body = key_to_body
+
+    def get_object(self, Bucket, Key):
+        if Key not in self._key_to_body:
+            raise self.exceptions.NoSuchKey(Key)
+        return {"Body": io.BytesIO(self._key_to_body[Key])}
+
+
+def _parquet_bytes(df) -> bytes:
+    buf = io.BytesIO()
+    df.to_parquet(buf, index=False)
+    return buf.getvalue()
+
+
+class TestLoadOosRowsKeyScoping:
+    def test_reads_the_model_version_scoped_key(self, monkeypatch):
+        df = _synthetic_oos_rows(n_dates=5, tickers_per_date=3)
+        key = f"{OOS_ROWS_PREFIX}v3.0-meta-2026-08-28-01cf7e1a/latest.parquet"
+        fake = _FakeS3Get({key: _parquet_bytes(df)})
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        out = load_oos_rows("test-bucket", model_version="v3.0-meta-2026-08-28-01cf7e1a")
+        assert out is not None
+        assert len(out) == len(df)
+
+    def test_unscoped_read_falls_back_to_the_legacy_prefix(self, monkeypatch):
+        """`model_version=None` reads the pre-I9378 unscoped key — historical
+        panels, never a fresh write."""
+        df = _synthetic_oos_rows(n_dates=5, tickers_per_date=3)
+        key = f"{OOS_ROWS_PREFIX}latest.parquet"
+        fake = _FakeS3Get({key: _parquet_bytes(df)})
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        out = load_oos_rows("test-bucket")
+        assert out is not None
+
+    def test_scoped_and_unscoped_reads_are_disjoint_keys(self, monkeypatch):
+        """The exact collision this issue closes: a champion-arch read and a
+        specialist read at the same date must not resolve to the same key."""
+        df = _synthetic_oos_rows(n_dates=5, tickers_per_date=3)
+        df["date"] = pd.date_range("2026-08-20", periods=len(df), freq="h").strftime("%Y-%m-%d")
+        champ_key = f"{OOS_ROWS_PREFIX}v3.0-meta-2026-08-28-01cf7e1a/2026-08-28.parquet"
+        spec_key = f"{OOS_ROWS_PREFIX}m-spec-60d-2026-08-28-50bb8bdf/2026-08-28.parquet"
+        assert champ_key != spec_key
+        fake = _FakeS3Get({
+            champ_key: _parquet_bytes(df),
+            spec_key: _parquet_bytes(df.assign(some_other_col=1)),
+        })
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        champ_df = load_oos_rows(
+            "test-bucket", date="2026-08-28",
+            model_version="v3.0-meta-2026-08-28-01cf7e1a",
+        )
+        spec_df = load_oos_rows(
+            "test-bucket", date="2026-08-28",
+            model_version="m-spec-60d-2026-08-28-50bb8bdf",
+        )
+        assert "some_other_col" not in champ_df.columns
+        assert "some_other_col" in spec_df.columns
+
+
+class TestLoadOosRowsFreshnessGuard:
+    def test_a_panel_far_older_than_the_requested_date_raises(self, monkeypatch):
+        """The measured incident: a 150000x34 panel spanning
+        2025-07-10..2026-03-09 read against a 2026-08-28 training run — 172
+        days stale. Must raise rather than silently answer."""
+        df = _synthetic_oos_rows(n_dates=5, tickers_per_date=3)
+        df["date"] = pd.date_range("2026-03-01", periods=len(df), freq="h").strftime("%Y-%m-%d")
+        key = f"{OOS_ROWS_PREFIX}v3.0-meta/2026-08-28.parquet"
+        fake = _FakeS3Get({key: _parquet_bytes(df)})
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        with pytest.raises(RuntimeError, match="STALE"):
+            load_oos_rows("test-bucket", date="2026-08-28", model_version="v3.0-meta")
+
+    def test_a_fresh_panel_does_not_raise(self, monkeypatch):
+        df = _synthetic_oos_rows(n_dates=5, tickers_per_date=3)
+        df["date"] = pd.date_range("2026-08-20", periods=len(df), freq="h").strftime("%Y-%m-%d")
+        key = f"{OOS_ROWS_PREFIX}v3.0-meta/2026-08-28.parquet"
+        fake = _FakeS3Get({key: _parquet_bytes(df)})
+        import boto3
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: fake)
+        out = load_oos_rows("test-bucket", date="2026-08-28", model_version="v3.0-meta")
+        assert out is not None
+
+
 # ── main() CLI guard (§119 rule 1) ────────────────────────────────────
 
 class TestMainCLIGuard:
@@ -388,7 +485,7 @@ class TestMainCLIGuard:
         monkeypatch.setattr("sys.argv", ["horizon_battery"])
         monkeypatch.setattr(
             "analysis.horizon_battery.load_oos_rows",
-            lambda bucket=None, date=None: df,
+            lambda bucket=None, date=None, model_version=None: df,
         )
         main()  # must not raise
 
@@ -400,7 +497,7 @@ class TestMainCLIGuard:
         monkeypatch.setattr("sys.argv", ["horizon_battery"])
         monkeypatch.setattr(
             "analysis.horizon_battery.load_oos_rows",
-            lambda bucket=None, date=None: None,
+            lambda bucket=None, date=None, model_version=None: None,
         )
         with pytest.raises(SystemExit) as exc:
             main()
@@ -414,7 +511,7 @@ class TestMainCLIGuard:
         monkeypatch.setattr("sys.argv", ["horizon_battery"])
         monkeypatch.setattr(
             "analysis.horizon_battery.load_oos_rows",
-            lambda bucket=None, date=None: pd.DataFrame(),
+            lambda bucket=None, date=None, model_version=None: pd.DataFrame(),
         )
         with pytest.raises(SystemExit) as exc:
             main()

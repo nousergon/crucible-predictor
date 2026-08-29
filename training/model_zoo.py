@@ -1348,6 +1348,9 @@ def select_winner(
         s3, bucket,
         list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
         date_str=date_str,
+        # alpha-engine-config-I9378 — the oos_rows panel this rotation is
+        # scoped by the champion-arch spec that wrote it, never a bare date.
+        model_version=champ_arch_vid,
         reference_version_id=serving_bundle_vid,
     )
     served_by_vid = served_slice.get("metrics") or {}

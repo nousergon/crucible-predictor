@@ -5521,23 +5521,85 @@ def run_meta_training(
                 _buf = _io.BytesIO()
                 _df_rows.to_parquet(_buf, index=False)
                 _buf.seek(0)
-                _oos_key = io.oos_rows_key(date_str)
+                _payload = _buf.getvalue()
+
+                # alpha-engine-config-I9378 — the key is scoped by the arm
+                # that wrote it. Recomputed fresh here (not the `_model_version`
+                # local above, which is only in scope on the register_in_zoo
+                # path) so this write can never silently fall through to an
+                # unscoped default: that default IS the collision this closes.
+                _oos_model_version = manifest.get("version") or getattr(
+                    cfg, "MODEL_VERSION_LABEL", None,
+                )
+                if not _oos_model_version:
+                    raise RuntimeError(
+                        "no model_version available to scope the OOS-diagnostic "
+                        "key by — refusing to write an unscoped oos_rows key "
+                        "(alpha-engine-config-I9378); manifest['version'] and "
+                        "cfg.MODEL_VERSION_LABEL were both empty."
+                    )
+                _oos_key = io.oos_rows_key(date_str, _oos_model_version)
+                _oos_latest_key = io.oos_rows_latest_key(_oos_model_version)
+
+                # I9378 deliverable 2 — the shape this write CLAIMS, computed
+                # from the exact bytes about to go over the wire, carried as
+                # S3 object metadata (never trust a bucket listing to answer
+                # "which run produced this" — the metadata answers it without
+                # a re-read) plus asserted against the local frame before the
+                # log line that a downstream reader trusts is emitted.
+                _oos_n_rows, _oos_n_cols = len(_df_rows), len(_df_rows.columns)
+                _oos_date_min = _oos_date_max = None
+                if "date" in _df_rows.columns and _oos_n_rows:
+                    _oos_date_min = str(_df_rows["date"].min())
+                    _oos_date_max = str(_df_rows["date"].max())
+                _oos_metadata = {
+                    "model_version": str(_oos_model_version),
+                    "training_run_date": str(date_str),
+                    "n_rows": str(_oos_n_rows),
+                    "n_cols": str(_oos_n_cols),
+                    "date_min": _oos_date_min or "",
+                    "date_max": _oos_date_max or "",
+                }
+                assert len(_df_rows) == _oos_n_rows and len(_df_rows.columns) == _oos_n_cols, (
+                    "OOS-row shape changed between measurement and write — "
+                    "refusing to persist a claim the object cannot back."
+                )
+
                 s3_up.put_object(
                     Bucket=bucket, Key=_oos_key,
-                    Body=_buf.getvalue(),
+                    Body=_payload,
                     ContentType="application/octet-stream",
+                    Metadata=_oos_metadata,
                 )
+                # I9378 — verify the write landed intact (byte-for-byte, via
+                # ContentLength) before trusting the "persisted" log line.
+                # This is the ONLY sense in which this diagnostic write is
+                # verified; it does not (and cannot, S3 has no CAS) prevent a
+                # concurrent writer at the SAME key — that protection is the
+                # model_version-scoped key itself, not this check.
+                _head = s3_up.head_object(Bucket=bucket, Key=_oos_key)
+                if int(_head.get("ContentLength", -1)) != len(_payload):
+                    raise RuntimeError(
+                        f"OOS-row write verification failed at s3://{bucket}/"
+                        f"{_oos_key}: wrote {len(_payload)} bytes, HEAD reports "
+                        f"{_head.get('ContentLength')}."
+                    )
+
                 # Also write a 'latest' alias so the analysis module can
-                # default-read the most recent run without knowing the date.
-                _buf.seek(0)
+                # default-read the most recent run without knowing the date —
+                # scoped by the SAME model_version, so 'latest' still names an
+                # arm rather than "whichever live-basis spec wrote last".
                 s3_up.put_object(
-                    Bucket=bucket, Key=io.oos_rows_latest_key,
-                    Body=_buf.getvalue(),
+                    Bucket=bucket, Key=_oos_latest_key,
+                    Body=_payload,
                     ContentType="application/octet-stream",
+                    Metadata=_oos_metadata,
                 )
                 log.info(
-                    "OOS rows persisted to s3://%s/%s (%d rows × %d cols)",
-                    bucket, _oos_key, len(_df_rows), len(_df_rows.columns),
+                    "OOS rows persisted to s3://%s/%s (%d rows × %d cols, "
+                    "model_version=%s, dates %s..%s)",
+                    bucket, _oos_key, _oos_n_rows, _oos_n_cols,
+                    _oos_model_version, _oos_date_min, _oos_date_max,
                 )
             except Exception as e:
                 # Non-blocking — analysis can fall back to re-running training

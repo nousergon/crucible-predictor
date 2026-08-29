@@ -2,8 +2,10 @@
 analysis/horizon_battery.py — offline horizon-IC measurement battery.
 
 Reads the OOS rows persisted by meta_trainer at
-``s3://{bucket}/predictor/diagnostics/oos_rows/{latest|YYYY-MM-DD}.parquet``
-and computes the same overlap / non-overlap / per-regime / bootstrap-CI
+``s3://{bucket}/predictor/diagnostics/oos_rows/{model_version}/{latest|YYYY-MM-DD}.parquet``
+(alpha-engine-config-I9378 — scoped by the arm that wrote it since a bare
+date-keyed prefix let one live-basis spec's write overwrite another's) and
+computes the same overlap / non-overlap / per-regime / bootstrap-CI
 breakdown that the training pipeline emits. Lets operators iterate on
 horizon decisions without waiting for the next Saturday training cycle:
 vary regime thresholds, horizon sets, bootstrap iteration counts, etc.
@@ -43,24 +45,49 @@ from training.meta_trainer import (
 OOS_ROWS_PREFIX = "predictor/diagnostics/oos_rows/"
 
 
-def load_oos_rows(bucket: str, date: str | None = None):
+def load_oos_rows(bucket: str, date: str | None = None, model_version: str | None = None):
     """Download the OOS rows parquet from S3 and return a DataFrame.
 
     ``date`` of ``None`` reads ``latest.parquet``. Otherwise reads
     ``{date}.parquet``. Returns ``None`` if the object doesn't exist —
     caller decides whether that's a hard fail or a "training hasn't run
     yet" warning.
+
+    ``model_version`` (alpha-engine-config-I9378) scopes the read to the arm
+    that wrote it — pass the champion-arch spec's registered version_id (see
+    ``predictor/registry/{version_id}/manifest.json``). ``None`` falls back
+    to the pre-fix unscoped prefix, for reading panels written before this
+    fix landed; a fresh read should always name the version.
     """
     import boto3
     import io
     import pandas as pd
 
-    key = f"{OOS_ROWS_PREFIX}{'latest' if date is None else date}.parquet"
+    prefix = f"{OOS_ROWS_PREFIX}{model_version}/" if model_version else OOS_ROWS_PREFIX
+    key = f"{prefix}{'latest' if date is None else date}.parquet"
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)
         df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
         log.info("Loaded %d OOS rows from s3://%s/%s", len(df), bucket, key)
+        # I9378 deliverable 3 — a consumer never silently answers from a
+        # panel whose date range disagrees with what it was asked for.
+        if date and "date" in df.columns and not df.empty:
+            panel_max = pd.to_datetime(df["date"], errors="coerce").dropna().max()
+            expected = pd.to_datetime(date, errors="coerce")
+            if pd.notna(panel_max) and pd.notna(expected):
+                # Trading-day arithmetic, not calendar days — the fleet-wide
+                # freshness convention (tests/test_freshness_uses_trading_days.py).
+                from krepis.dates import trading_days_stale
+
+                lag_sessions = trading_days_stale(panel_max.date(), expected.date())
+                if lag_sessions > 30:
+                    raise RuntimeError(
+                        f"OOS panel {key} is STALE: last date {panel_max.date()} "
+                        f"is {lag_sessions} NYSE sessions before the requested "
+                        f"{date} — refusing to analyze the wrong panel "
+                        "(alpha-engine-config-I9378)."
+                    )
         return df
     except s3.exceptions.NoSuchKey:
         log.error("No OOS rows at s3://%s/%s — has training run since the persistence PR landed?", bucket, key)
@@ -735,6 +762,13 @@ def main():
         help="OOS rows date (YYYY-MM-DD). Default: latest.",
     )
     parser.add_argument(
+        "--model-version", default=None,
+        help="OOS rows are keyed by the arm that wrote them since "
+             "alpha-engine-config-I9378 (predictor/registry/{version_id}/ "
+             "identifies it). Required to read a rotation persisted after "
+             "that fix; omitted only to read a pre-fix unscoped panel.",
+    )
+    parser.add_argument(
         "--bucket", default=cfg.S3_BUCKET,
         help=f"S3 bucket. Default: {cfg.S3_BUCKET}",
     )
@@ -785,7 +819,7 @@ def main():
     if args.horizons:
         horizons = [int(h.strip()) for h in args.horizons.split(",") if h.strip()]
 
-    df = load_oos_rows(args.bucket, date=args.date)
+    df = load_oos_rows(args.bucket, date=args.date, model_version=args.model_version)
     if df is None or len(df) == 0:
         log.error("No OOS rows available — exiting with nonzero status.")
         sys.exit(1)
