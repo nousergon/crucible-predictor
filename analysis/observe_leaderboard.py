@@ -891,6 +891,41 @@ def build_observe_leaderboard(
                     f"cycle(s) (alpha-engine-config-I9336). Never renders as a "
                     f"merely-thin row."
                 ),
+                # DELIBERATELY "warning", not "error"/"critical" — kept as a
+                # LITERAL keyword argument (not a variable) because
+                # nousergon-data's alert_class_pr_guard.py resolves a call
+                # site's registry severity by a static regex over the
+                # quoted-string form of this exact keyword argument; a
+                # non-literal argument resolves to `dynamic` and would force
+                # the alert_classes row below to declare `severities:
+                # [dynamic]` instead of the true, single, deliberate value.
+                # (Do not write that regex's own pattern in a comment near
+                # this call — the guard scans raw source text including
+                # comments, and an example match here is indistinguishable
+                # from a second call site to it.)
+                #
+                # A starved shadow arm is a MEASUREMENT-COVERAGE signal
+                # (fixed by repairing the shadow write path, or by waiting for
+                # `_select_challengers_for_cycle`'s rotation to reach it) —
+                # never a trading-halt condition, so it must never land as an
+                # immediate page in the one operator chat. That conflation
+                # (severity gating the buzz while every severity landed in
+                # the same destination) is the exact 2026-08-28 alert-
+                # destination-arc lesson (fleet memory
+                # project_alert_destination_arc_260829): severity does not
+                # by itself pick a destination tier, so this row must pair a
+                # non-paging severity with the batched routing response, not
+                # merely "not critical".
+                #
+                # Registered as `class: predictor_shadow_leaderboard_
+                # unmeasurable_arm` in nousergon-data's
+                # infrastructure/overseer/playbooks.yaml::alert_classes with
+                # `severities: [warning]`, `intake: bus`, `response:
+                # drain-queue` — the batched alert-drain queue, NOT
+                # `response: operator` (declared human-only/paging). Companion
+                # PR required per that file's CI guard
+                # (.github/workflows/alert-class-pr-guard.yml); see
+                # alpha-engine-config-I9336.
                 severity="warning",
                 source="alpha-engine-predictor/analysis/observe_leaderboard.py::build_observe_leaderboard",
                 dedup_key=f"predictor_shadow_unmeasurable_{trading_day}",
