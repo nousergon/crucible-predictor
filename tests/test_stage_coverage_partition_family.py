@@ -82,7 +82,7 @@ def test_the_verdict_is_asserted_against_the_trading_day_partition(monkeypatch) 
     TRADING day, so exactly one `WeeklyRunDayGate.json` is written per cycle."""
     seen: dict[str, object] = {}
 
-    def _fake_assert(stage, *, run_date, window_start):
+    def _fake_assert(stage, *, run_date, window_start, **_):
         seen["stage"] = stage
         seen["run_date"] = run_date
         return {"stage": stage, "status": "COVERED_NO_OUTPUT", "run_date": run_date}
