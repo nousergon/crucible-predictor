@@ -120,6 +120,7 @@ __all__ = [
     "MIN_TRAIN_DATE_MULTIPLE",
     "MIN_TRAIN_ROWS",
     "MIN_VARYING_FEATURES",
+    "MIN_TEST_DATES",
     "MIN_VAL_DATES_RESEARCH_GBM",
     "TARGET_VAL_IC_SE",
     "min_val_dates_for_target_se",
@@ -135,6 +136,14 @@ MAX_VAL_ROW_FRACTION = 0.40
 MIN_TRAIN_DATE_MULTIPLE = 3
 MIN_TRAIN_ROWS = 500
 MIN_VARYING_FEATURES = 2
+
+# alpha-engine-config-I9377 — the volatility arms' reporting TEST block needs
+# the same date-count floor `MIN_VAL_DATES` applies to the early-stop block:
+# fewer dates and `test_ic` is one cross-section's accident, not a leak-free
+# statistic (I9333's own reasoning, reused rather than re-derived per
+# shared-code-policy.md). Aliased, not duplicated, so the two floors cannot
+# silently drift apart.
+MIN_TEST_DATES = MIN_VAL_DATES
 
 
 def min_val_dates_for_target_se(
