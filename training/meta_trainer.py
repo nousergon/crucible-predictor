@@ -2291,6 +2291,12 @@ def run_meta_training(
     research_gbm_train_ic: float | None = None
     research_gbm_train_val_ic_ratio: float | None = None
     research_gbm_overfit_warn: bool = False
+    # alpha-engine-config-I9271: every L1 fit registers what it actually
+    # produced here, and `training/l1_fit_validity` grades the whole register.
+    # An arm missing from this dict is treated as ABSENT, which for a declared
+    # non-optional arm is itself a failure — the bucket-lookup fallback below
+    # is exactly the silent substitution the gate exists to refuse.
+    l1_fits: dict[str, dict] = {}
     try:
         finite_mask = np.array([
             np.isfinite(r.get("actual_fwd_10d", float("nan")))
@@ -2369,6 +2375,25 @@ def run_meta_training(
                 warn=research_gbm_overfit_warn,
             )
 
+            # I9271: the served spread of this arm's own output, RAW. A
+            # two-round booster produced std 0.003731 over the 903-name
+            # universe against the prior vintage's 0.107021 — a 28.7x collapse
+            # in the meta-Ridge's largest cross-sectional feature. Recorded on
+            # the arm's own scale; a standardized form would divide exactly
+            # this collapse away (champion-challenger-policy §5.3).
+            from training.l1_fit_validity import measure_output_dispersion
+            l1_fits["research_gbm"] = {
+                "fitted": True,
+                "best_iteration": int(prod_research_gbm._best_iteration),
+                "val_ic": float(prod_research_gbm._val_ic),
+                "train_ic": research_gbm_train_ic,
+                "n_estimators": int(prod_research_gbm.n_estimators),
+                "n_samples": int(n_finite),
+                "output_dispersion": measure_output_dispersion(
+                    prod_research_gbm.predict(X_research)
+                ),
+            }
+
             # Recompute research_calibrator_prob in oos_meta_rows using the
             # GBM's predictions (in-sample for the rows the GBM trained on,
             # OOS for any non-finite-label rows that weren't part of the fit
@@ -2390,19 +2415,26 @@ def run_meta_training(
                 n_recomputed,
             )
         else:
-            log.info(
+            log.warning(
                 "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
-                "skipped this cycle. Bucket-lookup ResearchCalibrator-sourced "
-                "research_calibrator_prob remains in oos_meta_rows.",
+                "NOT fitted this cycle. Bucket-lookup ResearchCalibrator-sourced "
+                "research_calibrator_prob remains in oos_meta_rows, and the L1 "
+                "fit-validity gate (Step 8a-iii, I9271) will fail the run on the "
+                "absent canonical arm rather than ship the substitution.",
                 n_finite,
             )
     except Exception as e:
-        # Non-blocking: failure here logs a warning but doesn't fail the
-        # whole training run. The bucket-lookup-sourced research_calibrator_prob
-        # already populated by the WF loop survives.
+        # I9271: this used to be documented as "non-blocking", and it is no
+        # longer. The bucket-lookup fallback still populates
+        # research_calibrator_prob so the rest of Step 6c can run, but
+        # `research_gbm` is then ABSENT from `l1_fits`, and the Step 8a-iii
+        # fit-validity gate fails the run on that absence. A silent
+        # substitution for the canonical producer of the meta-Ridge's largest
+        # cross-sectional feature is the defect, not the recovery.
         log.warning(
-            "ResearchGBMScorer fit failed (non-blocking, falling back to "
-            "bucket-lookup-sourced research_calibrator_prob): %s", e,
+            "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
+            "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
+            "will fail this run on the absent arm: %s", e,
         )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
@@ -4004,6 +4036,19 @@ def run_meta_training(
     vol_test_preds = prod_vol.predict(X_vol[val_end:])
     vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
+    # I9271: `volatility` shipped `test_ic` and nothing else for its whole
+    # life — no `best_iteration`, no `val_ic` on any manifest — so the plain
+    # volatility GBM could early-stop into a constant and no artifact would
+    # record it. It is registered and graded like every other L1 now.
+    l1_fits["volatility"] = {
+        "fitted": True,
+        "best_iteration": int(prod_vol._best_iteration),
+        "val_ic": float(prod_vol._val_ic),
+        "train_ic": None,
+        "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+        "n_samples": int(n_train),
+        "output_dispersion": None,
+    }
     peak_rss_mb = max(peak_rss_mb, _log_rss("after prod_vol (plain) fit"))
 
     # ── Step 8a: Parallel macro-augmented volatility GBM (Stage 1b observe-only) ──
@@ -4060,6 +4105,18 @@ def run_meta_training(
             prod_vol_macro_aug._best_iteration,
             prod_vol_macro_aug._booster.num_feature(),
         )
+        # I9271: registered for the L1 fit-validity gate. Observe-only, but a
+        # registered arm all the same — an arm that early-stopped into a
+        # constant must not sit on the manifest as a cutover candidate.
+        l1_fits["volatility_macro_aug"] = {
+            "fitted": True,
+            "best_iteration": int(prod_vol_macro_aug._best_iteration),
+            "val_ic": float(prod_vol_macro_aug._val_ic),
+            "train_ic": None,
+            "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+            "n_samples": int(n_train),
+            "output_dispersion": None,
+        }
     except Exception as e:
         log.warning(
             "Volatility-with-macros parallel fit failed (non-blocking, "
@@ -4125,6 +4182,18 @@ def run_meta_training(
             prod_vol_risk_aug._best_iteration,
             prod_vol_risk_aug._booster.num_feature(),
         )
+        # I9271: registered for the L1 fit-validity gate. Observe-only, but a
+        # registered arm all the same — an arm that early-stopped into a
+        # constant must not sit on the manifest as a cutover candidate.
+        l1_fits["volatility_risk_aug"] = {
+            "fitted": True,
+            "best_iteration": int(prod_vol_risk_aug._best_iteration),
+            "val_ic": float(prod_vol_risk_aug._val_ic),
+            "train_ic": None,
+            "n_estimators": int(cfg.GBM_N_ESTIMATORS),
+            "n_samples": int(n_train),
+            "output_dispersion": None,
+        }
     except Exception as e:
         log.warning(
             "Volatility-with-risk parallel fit failed (non-blocking, "
@@ -4138,6 +4207,35 @@ def run_meta_training(
     del X_vol_risk_aug
     gc.collect()
     peak_rss_mb = max(peak_rss_mb, _log_rss("after X_vol_risk_aug del + gc"))
+
+    # ── Step 8a-iii: L1 fit-validity gate (alpha-engine-config-I9271) ────────
+    # Layer 3 of Brian's ruling of 2026-08-29 ("if any of the arms is not
+    # trained properly then the predictor module should fail the task").
+    # `data_completeness` refuses to START on a bad input; `arm_validity`
+    # refuses to FINISH on a degenerate L2; this refuses to finish on a
+    # degenerate L1 — the case where every input arrived, the L2 fitted
+    # cleanly, and `research_gbm` early-stopped at iteration 2 into a
+    # near-constant prediction that the L2 then correctly down-weighted to
+    # nothing. The 2026-08-28 manifest carried `overfit_warn: true` and
+    # `train_val_ic_ratio: 8.987169` beside `best_iteration: 2`; NOTHING in
+    # the repository read either field, and that vintage promoted.
+    #
+    # Placed after the last L1 fit and before the manifest is assembled, so a
+    # failure costs no upload. Failing here is SAFE for serving for the same
+    # reason arm_validity's raise is: training writes a per-run staging prefix
+    # and promote_to_champion is the only writer of the live serving prefix.
+    from training.l1_fit_validity import evaluate_l1_fits, assert_l1_fits_valid
+
+    l1_fit_validity = evaluate_l1_fits(l1_fits)
+    log.info(
+        "L1 fit validity (I9271): status=%s  %s",
+        l1_fit_validity["status"],
+        {
+            k: (v.get("status"), v.get("best_iteration"), v.get("val_ic"))
+            for k, v in l1_fit_validity["arms"].items()
+        },
+    )
+    assert_l1_fits_valid(l1_fit_validity)
 
     # ── Step 8b: Short-history subsample IC gate ─────────────────────────────
     # Per ROADMAP P1 "NaN-feature handling audit + short-history subsample
@@ -4689,6 +4787,11 @@ def run_meta_training(
                 # `degraded` status means a check was INSUFFICIENT (no history
                 # yet), never that it passed.
                 "arm_validity": arm_validity,
+                # I9271 — the per-L1 fit verdict. `overfit_warn` and
+                # `train_val_ic_ratio` were computed here for months and read
+                # by nothing; the floors that make them load-bearing are
+                # recorded per arm under `arms.<name>.floors`.
+                "l1_fit_validity": l1_fit_validity,
                 "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
                 # L4540 part 2: the SERVED champion's identity (the model
                 # actually in the live weights prefix), distinct from this run's
@@ -5225,6 +5328,7 @@ def run_meta_training(
         "data_completeness": data_completeness,
         # I9290 — see the manifest block above.
         "arm_validity": arm_validity,
+        "l1_fit_validity": l1_fit_validity,
         "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,
