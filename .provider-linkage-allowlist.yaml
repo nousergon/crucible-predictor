@@ -1,0 +1,15 @@
+# .provider-linkage-allowlist.yaml — pre-cleared provider-linkage matches
+# (alpha-engine-config-I9295, spine I9294 — Brian's 2026-08-29 ruling: the
+# entire nous ergon system runs through the krepis router). Schema:
+# nousergon-lib scripts/provider_linkage_guard.py::load_allowlist. Replaces
+# the retired .openrouter-allowlist.yaml (there was none in this repo).
+schema_version: 1
+entries:
+  - path: tests/test_no_secret_environ_reads.py
+    pattern: "anthropic:env_key"
+    reason: >-
+      `_PINNED_SECRETS` asserts ANTHROPIC_API_KEY is NEVER read via
+      os.environ.get/getenv anywhere in the tree -- a regression test for
+      the literal's ABSENCE, same shape as nousergon-data's identical entry.
+    expires: "2026-11-27"
+    tracking: alpha-engine-config-I9295
