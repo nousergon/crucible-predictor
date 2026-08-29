@@ -313,9 +313,15 @@ def evaluate_l1_fits(fits: "dict | None",
                 "measured: no fit record; required: a fitted arm."
             )))
         elif not fit.get("fitted"):
+            # I9333: the caller's reason is carried verbatim. A finding that
+            # says only "fitted=False" loses the sentence naming WHICH floor
+            # stopped the fit — the constant columns, or the split property
+            # that could not be met — which is the whole diagnostic value.
+            why = (fit.get("reason") or "").strip()
             issues.append(("not_fitted", (
                 f"{spec.name} recorded fitted=False; measured: no booster, "
                 "required: a fitted arm."
+                + (f" Reason: {why}" if why else "")
             )))
         else:
             if best_it is None:
@@ -409,6 +415,13 @@ def evaluate_l1_fits(fits: "dict | None",
                 round(dispersion, 8) if dispersion is not None else None
             ),
             "n_samples": (fit or {}).get("n_samples"),
+            # I9333 — the split geometry and the design-matrix census the fit
+            # was produced under, recorded on the arm's verdict whether it
+            # passed or failed. A floor read against an unrecorded split is
+            # not a measurement (champion-challenger §7.2).
+            "split": (fit or {}).get("split"),
+            "design_matrix": (fit or {}).get("design_matrix"),
+            "val_ic_precision": (fit or {}).get("val_ic_precision"),
             "floors": {
                 "min_best_iteration": spec.min_best_iteration,
                 "min_abs_val_ic": spec.min_abs_val_ic,
