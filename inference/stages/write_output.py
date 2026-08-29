@@ -65,6 +65,31 @@ _MAX_CONSECUTIVE_S3_FAILURES = 2                # circuit-breaker: abort history
                                                  # so an offline test/drill environment can't
                                                  # turn this best-effort read into a hang
 
+# alpha-engine-config-I9267: the relative check above draws its reference from
+# the trailing window of the SAME series it polices, so a collapsed model that
+# keeps serving drags the median toward its own level and the gate stops
+# firing on a repeat of itself — measured live, the 2026-08-31 floor decayed
+# 38% (0.013653 -> 0.008449) purely because the 2026-08-21 collapse
+# (v3.0-meta-2026-08-21-7d3d1cce) was allowed to serve five sessions. Two
+# independent fixes, per the issue's recommended (a)+(b):
+#
+#   (a) DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY: the trailing median is built
+#       only from sessions served by a DIFFERENT champion_version_id than
+#       today's — a model can never set its own bar. `champion_version_id` has
+#       been stamped on every predictions artifact since alpha-engine-config-I8175.
+#   (b) DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV: a hard floor derived from the
+#       measured healthy population (2026-08-10..08-21 `alpha_stdev` ranged
+#       0.0200-0.0434 — see the issue table), independent of any trailing
+#       window, so the ratchet has a hard stop even when (a)'s cross-champion
+#       history is thin or entirely absent (e.g. a champion that has served
+#       for the whole lookback window). Set at 0.015: below every measured
+#       healthy session and above every measured collapsed one (0.00591-0.01044),
+#       so it rejects both the 2026-08-21 collapse AND the 2026-08-28
+#       champion-arch retrain scaled to a live ~0.011 (the issue's own
+#       replay projection).
+DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY = True
+DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV = 0.015
+
 N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS = 3    # consecutive zero-n_high_confidence days
 
 
@@ -140,6 +165,10 @@ def _load_trailing_batch_history(
             "alpha_stdev": gate_metrics.get("alpha_stdev"),
             "stdev_p_up": gate_metrics.get("stdev_p_up"),
             "n_high_confidence": data.get("n_high_confidence"),
+            # alpha-engine-config-I9267: which champion served this session, so
+            # the caller can exclude same-champion sessions from the trailing
+            # reference (see DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY above).
+            "champion_version_id": data.get("champion_version_id"),
         })
         if len(out) >= max_days:
             break
@@ -153,6 +182,7 @@ def _relative_dispersion_check(
     statistic: str,
     min_history_days: int = DISPERSION_HISTORY_MIN_DAYS,
     compression_floor: float = DISPERSION_COMPRESSION_FLOOR,
+    history_dates: list | None = None,
 ) -> dict:
     """Today's ``statistic`` against the trailing history's own median.
 
@@ -160,11 +190,18 @@ def _relative_dispersion_check(
     tests (alpha-engine-config-I9019) can drive it directly off measured fixture
     numbers without mocking S3.
 
+    ``history_dates``, when given, is the same-length list of dates the caller
+    already excluded same-champion sessions from (alpha-engine-config-I9267) —
+    carried through into the result purely for artifact provenance so the
+    window a floor came from is never invisible from the artifact alone. It
+    plays no role in the arithmetic.
+
     Returns ``{"applicable", "statistic", "today", "history_median", "history_n",
-    "ratio", "passed", "reason"}``. ``applicable=False`` (with ``passed=True``) when
-    there isn't enough trailing history yet, today's value is missing, or the
-    history median is non-positive — an honest non-fire, never a false pass dressed
-    as a checked one (the same pass-on-thin-batch shape
+    "history_dates", "ratio", "effective_floor", "passed", "reason"}``.
+    ``applicable=False`` (with ``passed=True``) when there isn't enough trailing
+    history yet, today's value is missing, or the history median is
+    non-positive — an honest non-fire, never a false pass dressed as a checked
+    one (the same pass-on-thin-batch shape
     ``validate_live_batch_invariant_health`` uses for a thin live batch).
     """
     import numpy as np
@@ -174,7 +211,8 @@ def _relative_dispersion_check(
     if today_value is None or not isinstance(today_value, (int, float)):
         return {
             "applicable": False, "statistic": statistic, "today": today_value,
-            "history_median": None, "history_n": len(finite_history), "ratio": None,
+            "history_median": None, "history_n": len(finite_history),
+            "history_dates": history_dates, "ratio": None, "effective_floor": None,
             "passed": True,
             "reason": f"{statistic} missing for today — relative check does not fire",
         }
@@ -182,7 +220,8 @@ def _relative_dispersion_check(
     if len(finite_history) < min_history_days:
         return {
             "applicable": False, "statistic": statistic, "today": float(today_value),
-            "history_median": None, "history_n": len(finite_history), "ratio": None,
+            "history_median": None, "history_n": len(finite_history),
+            "history_dates": history_dates, "ratio": None, "effective_floor": None,
             "passed": True,
             "reason": (
                 f"only {len(finite_history)} trailing day(s) of {statistic} history "
@@ -194,7 +233,8 @@ def _relative_dispersion_check(
     if median <= 0:
         return {
             "applicable": False, "statistic": statistic, "today": float(today_value),
-            "history_median": median, "history_n": len(finite_history), "ratio": None,
+            "history_median": median, "history_n": len(finite_history),
+            "history_dates": history_dates, "ratio": None, "effective_floor": None,
             "passed": True,
             "reason": (
                 f"trailing {statistic} median is {median} (non-positive) — "
@@ -202,17 +242,122 @@ def _relative_dispersion_check(
             ),
         }
 
+    effective_floor = compression_floor * median
     ratio = float(today_value) / median
     passed = ratio >= compression_floor
     reason = (
         f"today's {statistic} {today_value:.6f} is {ratio:.2f}x the trailing "
         f"{len(finite_history)}-day median {median:.6f}"
-        + ("" if passed else f" — below the {compression_floor:.0%} compression floor")
+        + ("" if passed else f" — below the {compression_floor:.0%} compression floor "
+                              f"({effective_floor:.6f})")
     )
     return {
         "applicable": True, "statistic": statistic, "today": float(today_value),
-        "history_median": median, "history_n": len(finite_history), "ratio": ratio,
+        "history_median": median, "history_n": len(finite_history),
+        "history_dates": history_dates, "ratio": ratio,
+        "effective_floor": effective_floor,
         "passed": passed, "reason": reason,
+    }
+
+
+def _absolute_dispersion_floor_check(
+    today_value,
+    *,
+    statistic: str = "alpha_stdev",
+    floor: float = DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV,
+) -> dict:
+    """Hard floor on ``statistic``, independent of any trailing window.
+
+    alpha-engine-config-I9267 deliverable 1(b): bounds the ratchet the relative
+    check alone cannot — a same-champion-excluded history can be thin or empty
+    (a champion serving through the whole lookback window), and the relative
+    check honestly does not fire in that case (``applicable=False``). This
+    check always fires when today's value is present, regardless of history.
+
+    Returns ``{"applicable", "statistic", "today", "floor", "passed", "reason"}``.
+    """
+    if today_value is None or not isinstance(today_value, (int, float)):
+        return {
+            "applicable": False, "statistic": statistic, "today": today_value,
+            "floor": floor, "passed": True,
+            "reason": f"{statistic} missing for today — absolute floor check does not fire",
+        }
+
+    passed = float(today_value) >= floor
+    reason = (
+        f"today's {statistic} {today_value:.6f} is "
+        + ("at or above" if passed else "BELOW")
+        + f" the absolute floor {floor:.6f} (derived from the measured healthy "
+          f"population, alpha-engine-config-I9267)"
+    )
+    return {
+        "applicable": True, "statistic": statistic, "today": float(today_value),
+        "floor": floor, "passed": passed, "reason": reason,
+    }
+
+
+def _dispersion_gate_verdict(
+    history: list[dict],
+    today_value,
+    today_champion_version_id,
+    *,
+    statistic: str = "alpha_stdev",
+    min_history_days: int = DISPERSION_HISTORY_MIN_DAYS,
+    compression_floor: float = DISPERSION_COMPRESSION_FLOOR,
+    absolute_floor: float = DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV,
+    exclude_same_champion: bool = DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY,
+) -> dict:
+    """Combined relative + absolute dispersion verdict (alpha-engine-config-I9267).
+
+    ``history`` is the list of dicts ``_load_trailing_batch_history`` returns
+    (each carrying ``date``, the statistic, and ``champion_version_id``). When
+    ``exclude_same_champion`` is True (the default — deliverable 1a), sessions
+    served by ``today_champion_version_id`` are dropped from the reference
+    BEFORE the median is taken, so a model can never set its own bar: the
+    2026-08-24..28 collapse contaminating the 2026-08-31 floor (measured 38%
+    decay in the issue) is structurally impossible once the collapsed
+    champion's own sessions are excluded from its own successor's reference.
+
+    A session with ``champion_version_id`` missing (an older artifact, or the
+    registry read failed that day) is treated as NOT matching today's
+    champion — excluding it would silently starve the reference on old data;
+    including a truly-unknown-origin session is the conservative choice since
+    the absolute floor (1b) still bounds the damage if that choice is wrong.
+
+    ``passed`` is the AND of both checks — either one refusing blocks the
+    session (verdict_basis: mirrors the module's existing OR-of-checks
+    convention: `overall = A OR B` for stages meaning "either invariant check
+    can independently block"; here it is `overall = relative AND absolute`
+    because a session must clear BOTH bounds, not just one).
+    """
+    same_champion_n = 0
+    filtered_values: list = []
+    filtered_dates: list = []
+    for h in history:
+        v = h.get(statistic)
+        if v is None:
+            continue
+        if exclude_same_champion and today_champion_version_id is not None \
+                and h.get("champion_version_id") == today_champion_version_id:
+            same_champion_n += 1
+            continue
+        filtered_values.append(v)
+        filtered_dates.append(h.get("date"))
+
+    relative = _relative_dispersion_check(
+        filtered_values, today_value, statistic=statistic,
+        min_history_days=min_history_days, compression_floor=compression_floor,
+        history_dates=filtered_dates,
+    )
+    absolute = _absolute_dispersion_floor_check(
+        today_value, statistic=statistic, floor=absolute_floor,
+    )
+    return {
+        "passed": relative["passed"] and absolute["passed"],
+        "relative": relative,
+        "absolute_floor": absolute,
+        "excluded_same_champion_sessions": same_champion_n,
+        "today_champion_version_id": today_champion_version_id,
     }
 
 
@@ -224,6 +369,20 @@ def _n_high_confidence_zero_streak(
     ``n_high_confidence == 0``. Stops at the first day whose value is nonzero OR
     missing: a gap in the artifact ends the streak rather than silently extending
     it (a missing day is not evidence the collapse continued through it).
+
+    alpha-engine-config-I9267 deliverable 4 — re-checked for the same
+    self-referential contamination shape as the relative dispersion gate
+    above. It does NOT have it: this is a plain forward count over the raw
+    series with no threshold or reference drawn from the population it
+    reports on (unlike the dispersion median, nothing here could decay toward
+    a persisting collapse). Each day's WARN alert also carries a
+    ``date_str``-keyed ``dedup_key`` (see the call site), so the alert fires
+    every day the streak persists rather than being suppressed after the
+    first breach — the five-day 2026-08-24..28 streak in the issue passed
+    WITHOUT BLOCKING because this detector was always designed non-blocking
+    (config#1373 item-2: sizing/conviction is the sizing layer's concern),
+    not because of a decaying reference. No change made here; this docstring
+    records the re-check.
     """
     streak = 0
     for value in [today_n_high_confidence] + list(history_n_high_confidence):
@@ -740,13 +899,22 @@ def write_predictions(
         )
         _batch_history = []
 
-    relative_alpha_check = _relative_dispersion_check(
-        [h["alpha_stdev"] for h in _batch_history],
+    # alpha-engine-config-I9267: resolved once, up front, so both today's
+    # champion-attribution field (below) and the dispersion gate's
+    # same-champion exclusion use the identical value.
+    _today_champion_version_id = _resolve_champion_version_id(s3_bucket)
+
+    dispersion_verdict = _dispersion_gate_verdict(
+        _batch_history,
         inference_gate_result.metrics.get("alpha_stdev"),
+        _today_champion_version_id,
         statistic="alpha_stdev",
         min_history_days=DISPERSION_HISTORY_MIN_DAYS,
         compression_floor=DISPERSION_COMPRESSION_FLOOR,
+        absolute_floor=DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV,
     )
+    relative_alpha_check = dispersion_verdict["relative"]
+    absolute_alpha_check = dispersion_verdict["absolute_floor"]
     relative_p_up_check = _relative_dispersion_check(
         [h["stdev_p_up"] for h in _batch_history],
         inference_gate_result.metrics.get("stdev_p_up"),
@@ -756,17 +924,23 @@ def write_predictions(
     )
 
     # Combined verdict: the pre-existing absolute-floor invariant-health checks OR
-    # the new relative-dispersion check on `alpha_stdev` — both recalibration-
-    # invariant, both drive the halt. `stdev_p_up`'s relative check is
-    # observe-only, matching the `legacy_p_up_shape_gate` boundary already
-    # established in this file (config#1373).
-    gate_passed = inference_gate_result.passed and relative_alpha_check["passed"]
-    if inference_gate_result.passed and not relative_alpha_check["passed"]:
-        gate_failed_check = "alpha_stdev_relative_compression"
+    # the new dispersion verdict on `alpha_stdev` (itself relative-AND-absolute,
+    # alpha-engine-config-I9267) — both recalibration-invariant, both drive the
+    # halt. `stdev_p_up`'s relative check is observe-only, matching the
+    # `legacy_p_up_shape_gate` boundary already established in this file
+    # (config#1373).
+    gate_passed = inference_gate_result.passed and dispersion_verdict["passed"]
+    if inference_gate_result.passed and not dispersion_verdict["passed"]:
+        gate_failed_check = (
+            "alpha_stdev_relative_compression" if not relative_alpha_check["passed"]
+            else "alpha_stdev_absolute_floor"
+        )
         gate_reason = (
-            f"relative dispersion gate (alpha-engine-config-I9019): "
-            f"{relative_alpha_check['reason']} — absolute-floor checks passed but "
-            f"dispersion compressed against the book's own trailing median"
+            f"dispersion gate (alpha-engine-config-I9019/I9267): "
+            f"relative={relative_alpha_check['reason']} | "
+            f"absolute_floor={absolute_alpha_check['reason']} | "
+            f"excluded_same_champion_sessions={dispersion_verdict['excluded_same_champion_sessions']} — "
+            f"absolute-floor invariant-health checks passed but dispersion gate did not"
         )
     else:
         gate_failed_check = inference_gate_result.failed_check
@@ -897,8 +1071,19 @@ def write_predictions(
             # trailing median. `alpha_stdev` drives the verdict above;
             # `stdev_p_up` is observe-only (isotonic staircase artifact, see the
             # module comment above `_load_trailing_batch_history`).
+            #
+            # alpha-engine-config-I9267: `alpha_stdev` now carries `history_dates`
+            # (the same-champion-excluded window the median was drawn from) and
+            # `effective_floor` (compression_floor * median, in the statistic's
+            # own units) so the floor's provenance is never invisible from the
+            # artifact alone — this is the exact gap the issue named. A sibling
+            # `absolute_floor_alpha_stdev` block carries the hard floor (1b) that
+            # bounds the ratchet independent of any trailing window.
             "relative_dispersion": {
                 "alpha_stdev": relative_alpha_check,
+                "absolute_floor_alpha_stdev": absolute_alpha_check,
+                "excluded_same_champion_sessions": dispersion_verdict["excluded_same_champion_sessions"],
+                "today_champion_version_id": _today_champion_version_id,
                 "stdev_p_up_observe_only": relative_p_up_check,
             },
         },
@@ -933,7 +1118,9 @@ def write_predictions(
         # champion SLOT, and the model_zoo auto-demote gate (L4539) would act on a
         # number belonging to a predecessor. None when the registry is unreadable —
         # honest absence, never a stale literal.
-        "champion_version_id": _resolve_champion_version_id(s3_bucket),
+        # alpha-engine-config-I9267: reuse the single resolution made above the
+        # dispersion gate rather than re-querying the registry a second time.
+        "champion_version_id": _today_champion_version_id,
         "model_hit_rate_30d": metrics.get("hit_rate_30d_rolling", None),
         "n_predictions": len(predictions),
         "n_high_confidence": n_high_confidence,
