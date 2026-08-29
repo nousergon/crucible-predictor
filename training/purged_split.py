@@ -120,6 +120,9 @@ __all__ = [
     "MIN_TRAIN_DATE_MULTIPLE",
     "MIN_TRAIN_ROWS",
     "MIN_VARYING_FEATURES",
+    "MIN_VAL_DATES_RESEARCH_GBM",
+    "TARGET_VAL_IC_SE",
+    "min_val_dates_for_target_se",
     "build_purged_split",
     "describe_design_matrix",
     "assert_design_matrix_supports_fit",
@@ -132,6 +135,57 @@ MAX_VAL_ROW_FRACTION = 0.40
 MIN_TRAIN_DATE_MULTIPLE = 3
 MIN_TRAIN_ROWS = 500
 MIN_VARYING_FEATURES = 2
+
+
+def min_val_dates_for_target_se(
+    per_date_ic_std: float, target_se: float, label_horizon_days: int,
+) -> int:
+    """Derive the date-count floor that makes ``SE(val_ic) <= target_se``.
+
+    alpha-engine-config-I9376. ``val_ic`` is a per-date cross-sectional IC
+    averaged over ``D`` dates; overlapping ``label_horizon_days``-forward
+    labels make it worth ``n_eff = D / label_horizon_days`` independent
+    observations rather than ``D`` (measured lag-1 autocorrelation of the
+    fleet's own per-date IC series: 0.90-0.94 over 167 dates). So
+    ``SE(val_ic) = per_date_ic_std / sqrt(n_eff)``, and solving for the
+    date count that bounds it at ``target_se``::
+
+        n_eff_required = ceil((per_date_ic_std / target_se) ** 2)
+        D_required = n_eff_required * label_horizon_days
+
+    This is the derivation, not a fixed constant: call it fresh against the
+    THEN-measured ``per_date_ic_std`` rather than carrying a prior
+    measurement forward (the issue's explicit instruction — the panel's
+    measured IC std moves as the research-feature panel composition
+    changes, most recently 0.0581 -> 0.0528 between the incumbent and
+    champion architectures).
+    """
+    import math
+
+    if per_date_ic_std <= 0 or target_se <= 0 or label_horizon_days <= 0:
+        raise ValueError(
+            "min_val_dates_for_target_se requires strictly positive "
+            f"per_date_ic_std ({per_date_ic_std}), target_se ({target_se}) "
+            f"and label_horizon_days ({label_horizon_days})."
+        )
+    n_eff_required = math.ceil((per_date_ic_std / target_se) ** 2)
+    return int(n_eff_required * label_horizon_days)
+
+
+# alpha-engine-config-I9376 — `research_gbm`'s own floor, derived (not
+# hardcoded as a bare literal) from the champion-architecture measurement in
+# `purged_split`'s own module docstring: per-date cross-sectional IC std
+# 0.0528 (167 dates, 2025-07-10..2026-03-09, champion arch), a target SE of
+# half of `l1_fit_validity.L1FitSpec.min_abs_val_ic` (0.05) so a `val_ic` at
+# the floor sits >= 2 SE from zero, and the arm's own 10-trading-day label
+# horizon. Re-derive this against a freshly measured `per_date_ic_std` when
+# the research-feature panel composition next changes materially (I9307) —
+# do not carry 0.0528 forward without re-measuring it.
+_RESEARCH_GBM_MEASURED_PER_DATE_IC_STD = 0.0528
+TARGET_VAL_IC_SE = 0.025
+MIN_VAL_DATES_RESEARCH_GBM = min_val_dates_for_target_se(
+    _RESEARCH_GBM_MEASURED_PER_DATE_IC_STD, TARGET_VAL_IC_SE, 10,
+)
 
 
 class DegenerateDesignMatrixError(RuntimeError):
