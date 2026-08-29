@@ -367,13 +367,31 @@ class RegimePredictor:
         # (same algorithm as the substrate Lambda) so training +
         # inference see consistent values without an S3 substrate
         # dependency at this stage.
+        # alpha-engine-config-I9290 — the 0.0 fallback below is a
+        # SUBSTITUTION, so it is recorded rather than only logged. A WARN line
+        # on a spot box that nobody reads is not a record: the status travels
+        # on df.attrs and lands on the training manifest under
+        # data_completeness.degradations, where the model zoo can see that an
+        # arm trained with a dead regime_intensity_z.
+        intensity_z_status = {"status": "ok", "reason": None}
         try:
             from regime.composite import compute_intensity_z_series
             df["intensity_z"] = compute_intensity_z_series(df)
         except Exception as e:
-            log.warning(
-                "regime intensity_z computation failed (%s); defaulting column to 0.0",
-                type(e).__name__,
+            intensity_z_status = {
+                "status": "substituted_constant",
+                "reason": (
+                    f"compute_intensity_z_series raised {type(e).__name__}: {e} "
+                    "— intensity_z is a CONSTANT 0.0 for every date on this "
+                    "frame, so the meta feature regime_intensity_z carries no "
+                    "information for any arm trained on it."
+                ),
+            }
+            log.error(
+                "regime intensity_z computation failed (%s) — column is a "
+                "CONSTANT 0.0 and the run is recorded as degraded "
+                "(alpha-engine-config-I9290), not silently defaulted.",
+                type(e).__name__, exc_info=True,
             )
             df["intensity_z"] = 0.0
 
@@ -381,6 +399,7 @@ class RegimePredictor:
         # manifest) can see a degraded macro substrate instead of inferring it
         # from a suspiciously short index.
         df.attrs["macro_coverage"] = macro_coverage
+        df.attrs["intensity_z_status"] = intensity_z_status
         degraded = sorted(
             name for name, c in macro_coverage.items()
             if c["coverage_ratio"] < 1.0
