@@ -2296,6 +2296,7 @@ def run_meta_training(
     # WF tightening tracked for ~30-week milestone (2026-06-20-ish).
     from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
     from training.purged_split import (
+        MIN_VAL_DATES_RESEARCH_GBM,
         DegenerateDesignMatrixError,
         assert_design_matrix_supports_fit,
         build_purged_split,
@@ -2356,11 +2357,20 @@ def run_meta_training(
             # embargo defaults to the same (the overlapping-label embargo, the
             # repo's L4488a convention). No test block: this panel's only
             # holdout is the early-stopping block.
+            #
+            # alpha-engine-config-I9376 — MIN_VAL_DATES=10 (the generic floor)
+            # bounds any single cross-section's leverage on val_ic at 10%; it
+            # does not bound val_ic's STANDARD ERROR against the
+            # min_abs_val_ic gate it is read against. research_gbm's own
+            # derived floor (min_val_dates_for_target_se, sited on the
+            # champion-architecture per-date IC std) targets SE(val_ic) <=
+            # half of that gate.
             research_split = build_purged_split(
                 research_dates,
                 label_horizon_days=_RESEARCH_GBM_LABEL_HORIZON_DAYS,
                 train_frac=0.80,
                 val_frac=None,
+                min_val_dates=MIN_VAL_DATES_RESEARCH_GBM,
             )
             research_gbm_split_block = research_split.as_manifest_block()
             if not research_split.ok:

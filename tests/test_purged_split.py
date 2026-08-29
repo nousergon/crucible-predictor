@@ -30,11 +30,14 @@ from training.purged_split import (
     MAX_VAL_ROW_FRACTION,
     MIN_TRAIN_DATE_MULTIPLE,
     MIN_VAL_DATES,
+    MIN_VAL_DATES_RESEARCH_GBM,
     MIN_VARYING_FEATURES,
+    TARGET_VAL_IC_SE,
     DegenerateDesignMatrixError,
     assert_design_matrix_supports_fit,
     build_purged_split,
     describe_design_matrix,
+    min_val_dates_for_target_se,
     val_ic_precision,
 )
 
@@ -351,6 +354,38 @@ def test_val_ic_precision_reports_nothing_rather_than_a_number_it_lacks():
     out = val_ic_precision([], [], [], label_horizon_days=10)
     assert out["n_val_dates_scored"] == 0
     assert out["val_ic_se"] is None
+
+
+# ── I9376: the derived date-count floor ─────────────────────────────────────
+
+def test_min_val_dates_for_target_se_matches_the_issues_own_arithmetic():
+    """(0.058 / 0.025)**2 ~= 5.38 -> ceil 6 -> 60 dates at h=10, the number
+    the issue names for the incumbent-architecture measurement."""
+    assert min_val_dates_for_target_se(0.058, 0.025, 10) == 60
+
+
+def test_min_val_dates_for_target_se_rejects_non_positive_inputs():
+    with pytest.raises(ValueError):
+        min_val_dates_for_target_se(0.0, 0.025, 10)
+    with pytest.raises(ValueError):
+        min_val_dates_for_target_se(0.05, 0.0, 10)
+    with pytest.raises(ValueError):
+        min_val_dates_for_target_se(0.05, 0.025, 0)
+
+
+def test_research_gbm_floor_is_derived_from_the_champion_measurement_not_hardcoded():
+    """MIN_VAL_DATES_RESEARCH_GBM must equal the SAME derivation a caller would
+    get from re-running min_val_dates_for_target_se against the module's own
+    documented champion-architecture measurement — never a bare literal that
+    could silently drift from it."""
+    assert MIN_VAL_DATES_RESEARCH_GBM == min_val_dates_for_target_se(
+        0.0528, TARGET_VAL_IC_SE, 10,
+    )
+    assert MIN_VAL_DATES_RESEARCH_GBM == 50
+    # Materially above the generic MIN_VAL_DATES=10 that let a 1.07-date
+    # block through (I9333) — this floor exists precisely because that one
+    # wasn't enough to make val_ic precise.
+    assert MIN_VAL_DATES_RESEARCH_GBM > MIN_VAL_DATES
 
 
 # ── Composition with the I9271 fit-validity gate ─────────────────────────────

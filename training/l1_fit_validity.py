@@ -131,6 +131,7 @@ _STATUS_PRECEDENCE = (
     "train_val_gap",
     "degenerate_output",
     "unmeasured",
+    "insufficient",
 )
 
 
@@ -378,6 +379,27 @@ def evaluate_l1_fits(fits: "dict | None",
                     "(champion-challenger §5.3)."
                 )))
 
+            # alpha-engine-config-I9376: `val_ic` passing `min_abs_val_ic`
+            # is not the same claim as `val_ic` being DISTINGUISHABLE from
+            # zero at this sample size. Only checked when no harder issue
+            # already fired above — this downgrades a `valid` to
+            # `insufficient`, never a `no_val_signal`/failure to a pass.
+            precision = (fit or {}).get("val_ic_precision") or {}
+            val_ic_se = _finite(precision.get("val_ic_se"))
+            if not issues and val_ic_se is not None \
+                    and val_ic_se >= spec.min_abs_val_ic:
+                issues.append(("insufficient", (
+                    f"{spec.name}: insufficient — val_ic {val_ic:.6f} clears "
+                    f"the min_abs_val_ic={spec.min_abs_val_ic} floor, but its "
+                    f"standard error {val_ic_se:.6f} "
+                    f"(n_eff={precision.get('n_eff')}, "
+                    f"n_val_dates_scored={precision.get('n_val_dates_scored')}) "
+                    f"is >= the floor itself, so the floor cannot discriminate "
+                    "this val_ic from noise at this sample size. Reported "
+                    "insufficient, NOT a pass "
+                    "(champion-challenger-policy §5.1; alpha-engine-config-I9376)."
+                )))
+
             # Recorded, never gating: early stopping that never fired is not a
             # failure, but it means `val_ic` was still improving at the last
             # round and is therefore an optimistic estimate rather than a
@@ -432,7 +454,13 @@ def evaluate_l1_fits(fits: "dict | None",
             "issues": [{"status": st, "reason": rs} for st, rs in issues],
         }
         if status != "valid":
-            findings.append(_Finding(spec.name, status, spec.severity, reason))
+            # I9376: `insufficient` is never blocking, regardless of the
+            # arm's declared severity — champion-challenger-policy §5.1, "a
+            # check that cannot be computed is reported insufficient and
+            # does not block." A required arm whose val_ic cannot be
+            # distinguished from noise is a gap in evidence, not a failure.
+            finding_severity = "optional" if status == "insufficient" else spec.severity
+            findings.append(_Finding(spec.name, status, finding_severity, reason))
 
     failures = [f for f in findings if f.severity == "required"]
     degradations = [f for f in findings if f.severity != "required"]
