@@ -106,12 +106,40 @@ class TrainingIOSpec:
     def summary_key(self, date_str: str) -> str:
         return self.summary_key_tmpl.format(date=date_str)
 
-    def oos_rows_key(self, date_str: str) -> str:
-        return f"{self.oos_rows_prefix}{date_str}.parquet"
+    def oos_rows_key(self, date_str: str, model_version: str) -> str:
+        """The dated OOS-diagnostic key for ONE run, scoped by the arm that
+        wrote it.
 
-    @property
-    def oos_rows_latest_key(self) -> str:
-        return f"{self.oos_rows_prefix}latest.parquet"
+        alpha-engine-config-I9378 — before this, the key was `{prefix}{date}.
+        parquet` with no arm identity at all. Every live-basis spec in a
+        rotation (the champion architecture AND every specialist, e.g.
+        `m-spec-60d`, `m-spec-90d`) shares one `TrainingIOSpec.live()`, so
+        they all resolved to the exact same key: a later specialist run
+        silently overwrote the champion run's diagnostic with its own panel,
+        measured 2026-08-14/-21/-28 (150000x34 objects wearing the champion's
+        date, spanning dates 5.5 months before the run that "wrote" them).
+        `model_version` makes the collision structurally unrepresentable —
+        the same discipline `for_run` already applies to the weight contract.
+        """
+        if not model_version:
+            raise ValueError(
+                "oos_rows_key requires a non-empty model_version — an "
+                "unscoped OOS-diagnostic key is the defect this prevents "
+                "(alpha-engine-config-I9378)."
+            )
+        return f"{self.oos_rows_prefix}{model_version}/{date_str}.parquet"
+
+    def oos_rows_latest_key(self, model_version: str) -> str:
+        """The 'latest' alias for ONE arm's OOS diagnostic — see
+        :meth:`oos_rows_key`. No longer a bare property: a 'latest' with no
+        arm identity is exactly the collision this issue closes."""
+        if not model_version:
+            raise ValueError(
+                "oos_rows_latest_key requires a non-empty model_version — an "
+                "unscoped OOS-diagnostic key is the defect this prevents "
+                "(alpha-engine-config-I9378)."
+            )
+        return f"{self.oos_rows_prefix}{model_version}/latest.parquet"
 
     def for_run(self, *, date_str: str, model_version: str) -> "TrainingIOSpec":
         """Return this spec with its WEIGHT-CONTRACT paths scoped to one run.
@@ -128,8 +156,11 @@ class TrainingIOSpec:
         output without a listing. Returns ``self`` unchanged for a shadow spec
         (already disjoint) or when scoping is switched off.
 
-        Summary / OOS-diagnostic paths are deliberately NOT scoped: they are
-        dated artifacts with their own freshness SLAs and their own consumers.
+        The summary path is deliberately NOT scoped by ``for_run``: it is a
+        dated artifact with its own freshness SLA and consumers. The
+        OOS-diagnostic key is NOT scoped by ``for_run`` either (the prefix
+        here doesn't change), but it IS scoped by ``model_version`` at the
+        call site — see :meth:`oos_rows_key` (alpha-engine-config-I9378).
         """
         if not self.run_scoped_outputs:
             return self
