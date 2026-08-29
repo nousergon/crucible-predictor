@@ -144,6 +144,68 @@ def test_val_ic_alone_fails_the_run():
         assert_l1_fits_valid(block)
 
 
+# ── I9376: a val_ic that PASSES the floor but is not distinguishable from
+# ── noise at this sample size is reported insufficient, never a pass ───────
+
+def test_wide_val_ic_se_downgrades_a_pass_to_insufficient():
+    """The measured 08-28-era geometry: 10 validation dates against a 10-day
+    label is n_eff ~ 1, so the per-date IC std (champion arch 0.0528) IS the
+    val_ic standard error — larger than the 0.05 min_abs_val_ic floor it is
+    being compared against. A val_ic that clears the floor here is not a
+    measurement of signal; it is noise that happened to clear it."""
+    fits = _fits("2026-08-21")
+    fits["research_gbm"].update(
+        val_ic=0.06, train_ic=0.09, best_iteration=500,
+        val_ic_precision={
+            "n_val_dates_scored": 10, "mean_per_date_ic": 0.06,
+            "per_date_ic_std": 0.0528, "n_eff": 1.0, "val_ic_se": 0.0528,
+            "label_horizon_days": 10,
+        },
+    )
+    block = evaluate_l1_fits(fits)
+    rg = block["arms"]["research_gbm"]
+    assert rg["status"] == "insufficient"
+    assert block["status"] == "degraded"
+    # Never blocking — a required arm's insufficiency does not fail the run.
+    assert_l1_fits_valid(block)  # must not raise
+    assert block["degradations"]
+    assert not block["failures"]
+
+
+def test_narrow_val_ic_se_is_still_a_plain_pass():
+    """The 2026-08-21 vintage's own precision (500 dates worth of n_eff via a
+    long panel) does not trip the new check — same fixture as
+    ``test_gate_passes_the_2026_08_21_vintage``, with an SE well under the
+    floor made explicit."""
+    fits = _fits("2026-08-21")
+    fits["research_gbm"]["val_ic_precision"] = {
+        "n_val_dates_scored": 500, "mean_per_date_ic": 0.213677,
+        "per_date_ic_std": 0.0528, "n_eff": 50.0, "val_ic_se": 0.007465,
+        "label_horizon_days": 10,
+    }
+    block = evaluate_l1_fits(fits)
+    assert block["arms"]["research_gbm"]["status"] == "valid"
+    assert block["status"] == "ok"
+
+
+def test_insufficient_never_masks_a_real_failure():
+    """A val_ic that FAILS the floor stays `no_val_signal` even when its SE is
+    also wide — insufficient only ever downgrades a would-be pass."""
+    fits = _fits("2026-08-21")
+    fits["research_gbm"].update(
+        val_ic=0.01, train_ic=0.02, best_iteration=500,
+        val_ic_precision={
+            "n_val_dates_scored": 10, "mean_per_date_ic": 0.01,
+            "per_date_ic_std": 0.0528, "n_eff": 1.0, "val_ic_se": 0.0528,
+            "label_horizon_days": 10,
+        },
+    )
+    block = evaluate_l1_fits(fits)
+    assert block["arms"]["research_gbm"]["status"] == "no_val_signal"
+    with pytest.raises(L1FitValidityError):
+        assert_l1_fits_valid(block)
+
+
 # ── Absence and unmeasurability are never a pass ────────────────────────────
 
 def test_absent_canonical_arm_is_a_failure_not_a_fallback():
