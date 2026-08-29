@@ -927,6 +927,23 @@ MACRO_NORM_FEATURES = [
 # ``data.dataset.time_series_zscore_normalize`` (default 60 = 3 months).
 MACRO_NORM_WINDOW = 252
 
+# Minimum fraction of OOS meta-panel rows that must carry REAL macro values
+# (a test_date present in regime_features_df) for a training run to be allowed
+# to produce a champion. Below this, training raises — see
+# ``training/meta_trainer.py`` "Macro-block coverage gate".
+#
+# alpha-engine-config-I9255: on 2026-08-21 coverage was 0.0 (the ArcticDB
+# ``macro`` library's VIX3M symbol had been truncated to 16 rows, which
+# collapsed RegimePredictor.build_features' panel from 799 dates to 16 via its
+# trailing dropna()). Every macro_* feature and regime_intensity_z reached the
+# L2 as a constant 0.0, took an exactly-zero coefficient, and the surviving
+# coefficients shrank ~2.9x — five live sessions with n_high_confidence = 0.
+#
+# Deliberately loose: a handful of uncovered dates at the edge of history is a
+# WARNING (logged), a dead macro block is a FAILED RUN. This is the hard stop,
+# not a tuning knob.
+META_MACRO_MIN_ROW_COVERAGE = 0.50
+
 # Regime predictor uses macro series directly (not GBM features)
 # Research calibrator uses signals.json fields (not price features)
 

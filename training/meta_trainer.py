@@ -1783,6 +1783,13 @@ def run_meta_training(
     n_rows_dropped_no_signals_snapshot = 0  # test_date predates first signals
     n_rows_dropped_ticker_missing = 0       # ticker absent from snapshot's universe
     n_rows_with_real_signals = 0            # rows actually retained for L2 training
+    # alpha-engine-config-I9255: macro-block coverage over the OOS meta panel.
+    # A test_date absent from regime_features_df gets a constant-0.0 macro row;
+    # when that is EVERY date the whole macro block reaches the L2 as dead
+    # columns with exactly-zero coefficients. Counted here, gated after the loop.
+    n_macro_rows_covered = 0
+    n_macro_rows_defaulted = 0
+    macro_dates_defaulted: set[str] = set()
     vol_fold_ics = []
     resid_mom_fold_ics = []  # W2: per-fold raw IC of the residual-momentum L1
 
@@ -1882,6 +1889,7 @@ def run_meta_training(
 
             macro_row: dict[str, float] = {}
             if test_date in regime_features_df.index:
+                n_macro_rows_covered += len(date_indices)
                 for src_name, meta_name in MACRO_FEATURE_META_MAP.items():
                     macro_row[meta_name] = float(regime_features_df.at[test_date, src_name])
                 # Stage D: regime-derived features (currently just
@@ -1897,6 +1905,20 @@ def run_meta_training(
                     else:
                         macro_row[meta_name] = 0.0
             else:
+                # alpha-engine-config-I9255: this branch is a SILENT DEGRADE on
+                # a producer. It fills every macro feature and
+                # regime_intensity_z with 0.0 — not even their declared neutral
+                # (vix_level's is 1.0) — so a date missing from
+                # regime_features_df is indistinguishable downstream from a
+                # genuine reading of zero. When it fired for EVERY date (the
+                # 2026-08-21 vintage, VIX3M truncated upstream), all seven
+                # columns became constant, the L2 gave each an exactly-zero
+                # coefficient, the surviving coefficients shrank ~2.9x, and the
+                # champion served five live sessions with zero high-confidence
+                # names. Count it here; the run is failed after the loop by the
+                # coverage gate below, which is where the count is complete.
+                n_macro_rows_defaulted += len(date_indices)
+                macro_dates_defaulted.add(str(test_date))
                 for meta_name in MACRO_FEATURE_META_MAP.values():
                     macro_row[meta_name] = 0.0
                 from model.meta_model import REGIME_DERIVED_FEATURE_META_MAP
@@ -2043,6 +2065,46 @@ def run_meta_training(
         dropped_no_snapshot=n_rows_dropped_no_signals_snapshot,
         dropped_ticker_missing=n_rows_dropped_ticker_missing,
     )
+    # ── Macro-block coverage gate (alpha-engine-config-I9255) ────────────────
+    # The macro / regime_intensity_z columns are market-wide: one value per
+    # date. When regime_features_df does not carry a fold's test_date they are
+    # filled with a constant 0.0 and NOTHING said so — the 2026-08-21 vintage
+    # trained its entire panel that way (VIX3M truncated upstream to 16 rows →
+    # RegimePredictor.build_features' dropna() cut the panel 799 → 16 dates),
+    # zeroed all seven coefficients, shrank the survivors ~2.9x, promoted, and
+    # served five live sessions with n_high_confidence = 0.
+    #
+    # A producer does not silently degrade: below the floor this RAISES. The
+    # floor is deliberately loose (half the panel) — a few uncovered dates at
+    # the edge of history is a warning, a dead block is a failed run.
+    _macro_rows_total = n_macro_rows_covered + n_macro_rows_defaulted
+    macro_row_coverage = (
+        n_macro_rows_covered / _macro_rows_total if _macro_rows_total else 0.0
+    )
+    if _macro_rows_total and macro_row_coverage < cfg.META_MACRO_MIN_ROW_COVERAGE:
+        raise RuntimeError(
+            f"Meta-trainer: macro-block coverage {macro_row_coverage:.4f} over "
+            f"the OOS meta panel ({n_macro_rows_covered} of {_macro_rows_total} "
+            f"rows carry real macro values) is below the "
+            f"{cfg.META_MACRO_MIN_ROW_COVERAGE:.2f} floor — "
+            f"{len(macro_dates_defaulted)} test dates are absent from "
+            f"regime_features_df, which has {len(regime_features_df.index)} "
+            f"dates. Every uncovered row reaches the L2 with a constant-0.0 "
+            f"macro block, so all six macro_* features and regime_intensity_z "
+            f"get an exactly-zero coefficient and the surviving coefficients "
+            f"shrink. Check the ArcticDB 'macro' library for a truncated series "
+            f"(regime_predictor.build_features logs the per-series coverage) "
+            f"before retraining. Do NOT promote a vintage trained this way "
+            f"(alpha-engine-config-I9255)."
+        )
+    if macro_row_coverage < 1.0:
+        log.warning(
+            "Macro-block coverage %.4f over the OOS meta panel — %d of %d rows "
+            "(%d distinct test dates) got the constant-0.0 macro fallback.",
+            macro_row_coverage, n_macro_rows_defaulted, _macro_rows_total,
+            len(macro_dates_defaulted),
+        )
+
     if _research_features_in_meta and n_rows_with_real_signals == 0:
         raise RuntimeError(
             "Meta-trainer: 0 rows survived the research-signal join. "
@@ -2747,10 +2809,13 @@ def run_meta_training(
     # Self-contained (own dates + fit_predict) so a failure in the W1/W3 blocks
     # above can't take it down. The canonical 21d target is unchanged.
     meta_l1_standalone_alpha_ic: dict = {"status": "not_run"}
+    # alpha-engine-config-I9255: features the standalone read classified DEAD.
+    meta_l1_dead_standalone_features: list[str] = []
     meta_oos_ic_leakfree_no_expected_move: dict = {"status": "not_run"}
     meta_oos_ic_leakfree_post2020: dict = {"status": "not_run"}
     try:
         from training.leakfree_meta_ic import (
+            dead_standalone_features as _d_dead,
             leakfree_meta_oos_ic as _d_lf,
             per_feature_standalone_ic as _d_pfsi,
         )
@@ -2795,6 +2860,24 @@ def run_meta_training(
                 fit_predict_fn=_d_fit_predict,
                 forward_days=cfg.FORWARD_DAYS,
                 embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", 0),
+            )
+
+        # alpha-engine-config-I9255: a feature classified DEAD by the
+        # standalone read (no variance ANYWHERE in the panel) is a PRODUCER
+        # defect — a linear L2 with a fitted intercept hands it an exactly-zero
+        # coefficient, which is indistinguishable in `meta_coefficients` from a
+        # legitimate prune. The 2026-08-21 vintage lost the entire macro block
+        # plus `regime_intensity_z` this way and nothing said so. Say it LOUDLY,
+        # and carry it into the manifest as its own field so the console and the
+        # dead-L1 sweep can read it without parsing per-feature entries.
+        meta_l1_dead_standalone_features = _d_dead(meta_l1_standalone_alpha_ic)
+        if meta_l1_dead_standalone_features:
+            log.error(
+                "DEAD meta features (no variance anywhere in the %d-row panel): "
+                "%s — each gets an exactly-zero L2 coefficient. This is an INPUT "
+                "OUTAGE, not a prune; check the producer before trusting this "
+                "vintage's coefficients (alpha-engine-config-I9255).",
+                int(meta_X.shape[0]), meta_l1_dead_standalone_features,
             )
 
         _em = meta_l1_standalone_alpha_ic.get("expected_move", {}) if isinstance(
@@ -4534,6 +4617,20 @@ def run_meta_training(
                 # W4 watch + L4469 P2 (OBSERVE): is the meta IC real alpha +
                 # pre-2020 drag. NOT gated.
                 "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+                "meta_l1_dead_standalone_features": meta_l1_dead_standalone_features,
+                # alpha-engine-config-I9255: is the macro block actually ARRIVING?
+                # `macro_row_coverage` is the fraction of OOS meta rows whose macro
+                # values came from regime_features_df rather than the constant-0.0
+                # fallback; `macro_series_coverage` is the per-upstream-series panel
+                # coverage RegimePredictor.build_features measured. Both are the
+                # numbers whose absence made the 2026-08-21 collapse invisible.
+                "macro_row_coverage": round(float(macro_row_coverage), 6),
+                "macro_series_coverage": dict(
+                    regime_features_df.attrs.get("macro_series_coverage", {})
+                ),
+                "macro_panel_retention": regime_features_df.attrs.get(
+                    "macro_panel_retention"),
+                "macro_panel_dates": int(len(regime_features_df.index)),
                 # config#940: which L2 features (if any) were excluded by the
                 # AUTO_PRUNE_NOISE_FEATURES standalone-IC noise filter. When the
                 # flag is OFF this records {"enabled": False} and l2_features is
@@ -4956,6 +5053,20 @@ def run_meta_training(
         # standalone alpha-IC; (A2) leak-free meta IC w/o expected_move; (B)
         # leak-free meta IC on post-2020-03-31 rows. Additive per S3 contract.
         "meta_l1_standalone_alpha_ic": meta_l1_standalone_alpha_ic,
+        "meta_l1_dead_standalone_features": meta_l1_dead_standalone_features,
+        # alpha-engine-config-I9255: is the macro block actually ARRIVING?
+        # `macro_row_coverage` is the fraction of OOS meta rows whose macro
+        # values came from regime_features_df rather than the constant-0.0
+        # fallback; `macro_series_coverage` is the per-upstream-series panel
+        # coverage RegimePredictor.build_features measured. Both are the
+        # numbers whose absence made the 2026-08-21 collapse invisible.
+        "macro_row_coverage": round(float(macro_row_coverage), 6),
+        "macro_series_coverage": dict(
+            regime_features_df.attrs.get("macro_series_coverage", {})
+        ),
+        "macro_panel_retention": regime_features_df.attrs.get(
+            "macro_panel_retention"),
+        "macro_panel_dates": int(len(regime_features_df.index)),
         "meta_oos_ic_leakfree_no_expected_move": meta_oos_ic_leakfree_no_expected_move,
         "meta_oos_ic_leakfree_post2020": meta_oos_ic_leakfree_post2020,
         # W4.1 (OBSERVE): nonlinear-L2 shadow leak-free meta IC — vs the linear
