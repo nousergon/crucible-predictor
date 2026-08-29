@@ -59,9 +59,40 @@ First adoption of the marker is this repo. `policy-shared-code`'s trigger
 is the SECOND adoption: when another repo's canary needs to declare itself,
 the stamp lifts into `krepis.aws.invoke-canary` — which is the only place
 that knows an invocation is a canary without being told — rather than being
-copied into a second `deploy.sh`. Checked 2026-08-25: no other fleet repo
-calls `safe_assert_stage_coverage` or an equivalent, so there is nothing to
-lift for yet.
+copied into a second `deploy.sh`.
+
+**A SECOND synthetic caller arrived, and it declared nothing.**
+`alpha-engine-config/scripts/check_prespend_gate_arm.py` (merged 2026-08-28,
+`alpha-engine-config-I9168`) probes each pre-spend gate by invoking its
+Lambda with **the Task's own Payload and `$.run_date` filled from
+`next_run_date()`** (`_payload_for` at `:455`, `probe_gate` at `:496`). That
+is precisely the shape `is_synthetic_invocation`'s docstring warned about —
+a caller with a real-looking run_date and no execution behind it — so its
+probes wrote real verdict objects into a real execution's prefix. Measured
+2026-08-29 on `s3://alpha-engine-research/_stage_coverage/2026-08-28/`:
+`LibPinDriftCheck`, `PipelineContractCheck` and `EvaluatorDeployDriftCheck`
+rewritten at 03:18:34–39Z and `WeeklyRunDayGate` /
+`EvaluatorDirectorDeployDriftCheck` at 02:14Z, by no execution at all. That
+matters because `alpha-engine-config-I8155`'s own gate predicate is an
+OBJECT COUNT over that prefix: a probe write inflates the denominator's
+numerator and lets the gate clear green on verdicts no run produced.
+
+Two halves land here. `"probe"` joins the closed synthetic set (the config
+script stamps it at its own single payload chokepoint), which stops the
+write. And every verdict this module causes to be written now carries
+`execution_arn` and `invocation_kind` — because until it did, a probe write
+and a real write were **indistinguishable in the artifact**: every object in
+that partition read `execution_arn: None`, including `SignalsEnvelope`,
+which no probe touched. A verdict nobody can attribute cannot be excluded
+from a count by anyone, ever, which is why the marker alone was not enough.
+
+`policy-shared-code`'s lift trigger is now met twice over
+(`crucible-backtester-PR752` keys the same exemption on `dry_run`; this repo
+keys it on `invocation_kind`). The SOTA home for both halves is
+`krepis.stage_coverage` itself: attribution as first-class `StageVerdict`
+fields, and a refusal to record any verdict lacking an execution ARN — the
+layer that knows an invocation is synthetic without being told. This
+module's per-caller marker is the stopgap, not the answer.
 
 **krepis is changing in the same arc**: `run_date` becomes a required
 keyword and a blank value raises `krepis.stage_coverage
@@ -93,7 +124,38 @@ INVOCATION_KIND_KEY = "invocation_kind"
 #: rather than a run of the pipeline. Closed set: anything else, including an
 #: absent/blank value, is treated as a real invocation, so a new probe kind
 #: has to be added here deliberately rather than inheriting the exemption.
-SYNTHETIC_INVOCATION_KINDS = frozenset({"canary"})
+#: `"probe"` is stamped by `alpha-engine-config/scripts/check_prespend_gate_arm.py`
+#: at its own `_payload_for` chokepoint; `"canary"` by
+#: `infrastructure/deploy.sh::run_canary_action`.
+SYNTHETIC_INVOCATION_KINDS = frozenset({"canary", "probe"})
+
+#: Event key carrying the Step Functions execution ARN (`$$.Execution.Id`),
+#: the fleet's established name for it — `nousergon-data`'s
+#: `step_function.json` already threads `"execution_arn.$": "$$.Execution.Id"`
+#: at four states. `execution_id` is accepted as an alias because two of those
+#: states spell it that way.
+EXECUTION_ARN_KEY = "execution_arn"
+EXECUTION_ARN_ALIASES = ("execution_arn", "execution_id")
+
+#: S3 key prefix `krepis.stage_coverage` writes verdict records under.
+#: Mirrored rather than imported because every krepis import in this module is
+#: defensive (the pinned SHA may predate the module) and this constant is read
+#: on a path that must work regardless. `policy-shared-code` §4 sanctions a
+#: mirrored constant ONLY with a contract test proving the copies match —
+#: `tests/test_stage_coverage_attribution.py::test_the_mirrored_verdict_prefix_matches_krepis`.
+VERDICT_KEY_PREFIX = "_stage_coverage/"
+
+
+class StageCoverageAttributionError(RuntimeError):
+    """A verdict record was about to be written that could not be attributed.
+
+    Raised only from :class:`_AttributingS3Client`, and only when the body it
+    was handed is not the JSON object every verdict record is. Deliberately
+    NOT swallowed here: `record_verdict` already wraps its `put_object` in a
+    fail-soft `except` that logs at ERROR, so raising surfaces the contract
+    break loudly on the handler's log group without destroying the stage's
+    own deliverable.
+    """
 
 
 def invocation_kind(event: dict[str, Any]) -> str:
@@ -112,6 +174,127 @@ def is_synthetic_invocation(event: dict[str, Any]) -> bool:
     into a real execution's prefix and count toward its denominator.
     """
     return invocation_kind(event) in SYNTHETIC_INVOCATION_KINDS
+
+
+def resolve_execution_arn(event: dict[str, Any]) -> str | None:
+    """Return the SF execution ARN `event` carries, or `None`.
+
+    Never fabricated and never derived: an invocation that did not arrive
+    with an execution identity does not have one. `None` is the honest and
+    load-bearing answer — it is what marks a verdict as unattributable, which
+    is the whole point of recording the field.
+    """
+    for key in EXECUTION_ARN_ALIASES:
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def invocation_attribution(event: dict[str, Any]) -> dict[str, Any]:
+    """Return the attribution fields stamped onto `event`'s verdict record.
+
+    `execution_arn` answers "which run produced this verdict"; `invocation_kind`
+    answers "what kind of caller produced it". Both are `None` when absent —
+    never `""`, so a consumer's `IS NOT NULL` / `.execution_arn != null` filter
+    reads the same in S3 Select, jq and Athena.
+    """
+    kind = invocation_kind(event)
+    return {
+        EXECUTION_ARN_KEY: resolve_execution_arn(event),
+        INVOCATION_KIND_KEY: kind or None,
+    }
+
+
+class _AttributingS3Client:
+    """An S3 client that stamps attribution onto every verdict record written.
+
+    `krepis.stage_coverage.record_verdict` serialises
+    `StageVerdict.to_dict()` and `put_object`s it; `StageVerdict` has no
+    attribution fields, and this repo cannot add them to another repo's
+    dataclass. Injecting at the client is the one seam that reaches the
+    ACTUAL written bytes rather than only the dict this module returns — and
+    the artifact is what a gate predicate reads, not the Lambda response.
+
+    Every other call is proxied through untouched, so the registry read and
+    the per-artifact `head_object` probes behave exactly as before.
+
+    This is a STOPGAP. See the module docstring: the fields belong on
+    `StageVerdict` in krepis, and the refusal-to-record belongs beside them.
+    """
+
+    def __init__(self, inner: Any, attribution: dict[str, Any]) -> None:
+        self._inner = inner
+        self._attribution = attribution
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def put_object(self, **kwargs: Any) -> Any:
+        key = kwargs.get("Key") or ""
+        if isinstance(key, str) and key.startswith(VERDICT_KEY_PREFIX):
+            kwargs["Body"] = self._stamp(key, kwargs.get("Body"))
+        return self._inner.put_object(**kwargs)
+
+    def _stamp(self, key: str, body: Any) -> bytes:
+        import json
+
+        if isinstance(body, bytes):
+            raw = body.decode("utf-8")
+        elif isinstance(body, str):
+            raw = body
+        else:
+            raise StageCoverageAttributionError(
+                f"verdict record {key!r} was handed a {type(body).__name__} body; "
+                "attribution cannot be stamped onto it and an unattributable "
+                "verdict must not be written silently (alpha-engine-config-I8155)"
+            )
+        try:
+            record = json.loads(raw)
+        except ValueError as exc:
+            raise StageCoverageAttributionError(
+                f"verdict record {key!r} is not JSON ({exc}); attribution "
+                "cannot be stamped onto it"
+            ) from exc
+        if not isinstance(record, dict):
+            raise StageCoverageAttributionError(
+                f"verdict record {key!r} deserialised to "
+                f"{type(record).__name__}, not an object"
+            )
+        record.update(self._attribution)
+        return json.dumps(record, indent=2, default=str).encode()
+
+
+def _attributing_s3_client(attribution: dict[str, Any], log: logging.Logger) -> Any:
+    """Build the attributing S3 client, or `None` if boto3/krepis cannot.
+
+    Returning `None` hands `assert_stage_coverage` its own default client —
+    the verdict is still written, just without attribution.
+    """
+    try:
+        import boto3
+
+        from krepis.aws_region import resolve_region
+
+        return _AttributingS3Client(
+            boto3.client("s3", region_name=resolve_region()), attribution
+        )
+    except Exception:  # noqa: BLE001
+        # Recorded, not swallowed (fleet "fail loud" rule): (a) the failure
+        # mode is boto3 or `krepis.aws_region` being unimportable, or client
+        # construction failing outright; (b) the handler's own deliverable —
+        # the gate verdict — is unaffected, and the coverage verdict itself is
+        # still written by krepis's own client, only without attribution;
+        # (c) recorded on the handler's log group at ERROR, which flow-doctor
+        # pages from.
+        log.error(
+            "stage-coverage attribution unavailable: could not build the "
+            "attributing S3 client, so this verdict will be written with no "
+            "execution_arn/invocation_kind and will be indistinguishable from "
+            "a probe write (alpha-engine-config-I8155).",
+            exc_info=True,
+        )
+        return None
 
 
 def resolve_event_run_date(event: dict[str, Any]) -> str | None:
@@ -198,7 +381,11 @@ def resolve_coverage_partition_date(event: dict[str, Any]) -> str | None:
 
 
 def unmeasured_stage_coverage(
-    stage: str, reason: str, *, window_start: datetime | None = None
+    stage: str,
+    reason: str,
+    *,
+    window_start: datetime | None = None,
+    attribution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the `stage_coverage` UNMEASURED payload without calling krepis.
 
@@ -227,6 +414,10 @@ def unmeasured_stage_coverage(
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "enforce": False,
         "is_finding": False,
+        # Attribution travels with the degrade path too: a reader of the
+        # handler response must be able to answer "which run, which kind of
+        # caller" on EVERY shape, not only the one that reached S3.
+        **(attribution or {EXECUTION_ARN_KEY: None, INVOCATION_KIND_KEY: None}),
     }
 
 
@@ -250,6 +441,8 @@ def safe_assert_stage_coverage(
     `stage_coverage` out of the response entirely, matching the existing
     ImportError convention at every call site.
     """
+    attribution = invocation_attribution(event)
+
     if is_synthetic_invocation(event):
         # Not a defect and not a run: a deploy-time canary probing the freshly
         # published Lambda version. INFO, not ERROR — `handler.py` attaches
@@ -269,6 +462,7 @@ def safe_assert_stage_coverage(
             "deployed artifact carries no execution identity by design "
             "(alpha-engine-config-I8155)",
             window_start=window_start,
+            attribution=attribution,
         )
 
     # alpha-engine-config-I8984: the PARTITION date, not the event's raw
@@ -289,6 +483,7 @@ def safe_assert_stage_coverage(
             f"event carried no run_date for stage {stage!r} — execution "
             "identity absent (alpha-engine-config-I8155)",
             window_start=window_start,
+            attribution=attribution,
         )
 
     try:
@@ -310,12 +505,24 @@ def safe_assert_stage_coverage(
         _ContractError = Exception  # pinned krepis predates the typed exception
 
     try:
-        return assert_stage_coverage(stage, run_date=run_date, window_start=window_start)
+        verdict = assert_stage_coverage(
+            stage,
+            run_date=run_date,
+            window_start=window_start,
+            s3_client=_attributing_s3_client(attribution, log),
+        )
     except _ContractError as exc:
         log.error(
             "stage-coverage assertion raised for %s (run_date=%r): %s",
             stage, run_date, exc, exc_info=True,
         )
         return unmeasured_stage_coverage(
-            stage, f"assert_stage_coverage raised: {exc}", window_start=window_start
+            stage,
+            f"assert_stage_coverage raised: {exc}",
+            window_start=window_start,
+            attribution=attribution,
         )
+
+    if isinstance(verdict, dict):
+        verdict.update(attribution)
+    return verdict
