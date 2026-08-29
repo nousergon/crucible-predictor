@@ -225,7 +225,13 @@ def _classify_regime(macro_features: dict) -> str:
 
     - ``bull``    if ``macro_spy_20d_return > +0.03`` (3% over 20 trading days)
     - ``bear``    if ``macro_spy_20d_return < -0.03``
-    - ``neutral`` otherwise
+    - ``neutral`` if the value is present and finite but between them
+    - ``unknown`` if the value is absent, ``None``, NaN or non-numeric
+
+    ``unknown`` (alpha-engine-config-I9258): this used to return ``neutral``
+    for an undefined input, making "the market was flat" and "we could not
+    tell" the same label. Callers MUST treat ``unknown`` as absent
+    measurement, never as a regime.
 
     This is a single-feature heuristic chosen for transparency. The retired
     Tier-0 regime classifier (`model/regime_predictor.py`) used a richer
@@ -241,11 +247,11 @@ def _classify_regime(macro_features: dict) -> str:
     own promotion gate. Per audit §6.2 + §6.3.
     """
     spy_20d = macro_features.get("macro_spy_20d_return")
-    if spy_20d is None or not isinstance(spy_20d, (int, float)):
-        return "neutral"
+    if spy_20d is None or isinstance(spy_20d, bool) or not isinstance(spy_20d, (int, float)):
+        return "unknown"
     import math
-    if math.isnan(float(spy_20d)):
-        return "neutral"
+    if not math.isfinite(float(spy_20d)):
+        return "unknown"
     if spy_20d > 0.03:
         return "bull"
     if spy_20d < -0.03:
@@ -3466,12 +3472,59 @@ def run_meta_training(
         "bull": row_regimes.count("bull"),
         "neutral": row_regimes.count("neutral"),
         "bear": row_regimes.count("bear"),
+        "unknown": row_regimes.count("unknown"),
     }
     log.info(
-        "Per-row regime distribution: bull=%d  neutral=%d  bear=%d  total=%d",
+        "Per-row regime distribution: bull=%d  neutral=%d  bear=%d  "
+        "unknown=%d  total=%d",
         regime_counts["bull"], regime_counts["neutral"], regime_counts["bear"],
-        len(row_regimes),
+        regime_counts["unknown"], len(row_regimes),
     )
+
+    # alpha-engine-config-I9258 — the regime labeller is a PRODUCER; a
+    # degenerate output is a defect to announce, not a market read to accept.
+    # 2026-08-21 and 2026-08-28 both labelled 100% of rows "neutral" (a
+    # truncated VIX3M series, I9256, zero-filled every macro feature) and
+    # nothing said so: the per-regime gate reported "all 1 evaluated regimes
+    # passed" and two models promoted on an unmeasured stratification.
+    #
+    # ``n_oos_rows_without_macro_coverage`` is the direct measurement of the
+    # cause — OOS rows whose date is absent from the regime feature frame and
+    # therefore took the 0.0 macro fill.
+    n_rows_without_macro_coverage = sum(
+        1 for r in oos_meta_rows if r.get("date") not in regime_features_df.index
+    )
+    regime_coverage = {
+        "n_regime_feature_dates": int(len(regime_features_df.index)),
+        "n_oos_rows": len(row_regimes),
+        "n_oos_rows_without_macro_coverage": int(n_rows_without_macro_coverage),
+        "n_unknown_regime_rows": regime_counts["unknown"],
+        "n_distinct_regimes": sum(
+            1 for k in ("bull", "neutral", "bear") if regime_counts[k] > 0
+        ),
+        "macro_series_coverage": dict(
+            getattr(regime_features_df, "attrs", {}).get("macro_coverage", {})
+        ),
+    }
+    if row_regimes and (
+        regime_coverage["n_distinct_regimes"] < 2
+        or regime_counts["unknown"] > 0
+        or n_rows_without_macro_coverage > 0
+    ):
+        log.error(
+            "REGIME LABELLING DEGENERATE — %d distinct regimes over %d OOS "
+            "rows (bull=%d neutral=%d bear=%d unknown=%d); %d rows have no "
+            "macro coverage and took the 0.0 fill; the regime feature frame "
+            "holds %d dates. Every per-regime diagnostic and the stratified "
+            "per-regime gate below are UNMEASURED this cycle. Root cause is "
+            "almost always a truncated macro series upstream — see "
+            "alpha-engine-config-I9256 / I9258.",
+            regime_coverage["n_distinct_regimes"], len(row_regimes),
+            regime_counts["bull"], regime_counts["neutral"],
+            regime_counts["bear"], regime_counts["unknown"],
+            n_rows_without_macro_coverage,
+            regime_coverage["n_regime_feature_dates"],
+        )
     for h in _DIAGNOSTIC_HORIZONS:
         y_h = np.array([r[f"actual_fwd_{h}d"] for r in oos_meta_rows])
         mask = np.isfinite(y_h)
@@ -4407,6 +4460,10 @@ def run_meta_training(
                 # is the prerequisite for any future regime-aware-
                 # threshold redesign.
                 "labels_up_rate_by_regime": labels_up_rate_by_regime,
+                # I9258 — the coverage behind the slice above. Without it a
+                # bull n=0 / bear n=0 manifest is indistinguishable from an
+                # honest all-neutral market.
+                "regime_coverage": regime_coverage,
                 # Horizon-of-record + label-domain top-level metadata (added
                 # 2026-05-09 post Track A PR 5/6 cutover) so downstream
                 # consumers — dashboard, backtester analytics, evaluator —

@@ -50,19 +50,31 @@ class TestClassifyRegime:
     def test_small_negative_is_neutral(self):
         assert _classify_regime({"macro_spy_20d_return": -0.015}) == "neutral"
 
-    def test_missing_field_returns_neutral(self):
-        # Defensive default when the macro feature isn't on the row at all.
-        assert _classify_regime({}) == "neutral"
+    # alpha-engine-config-I9258 — these four used to assert "neutral", which
+    # made "the market was flat" and "we could not tell" the same label. The
+    # 2026-08-21 and 2026-08-28 vintages labelled 100% of training rows
+    # neutral off the back of that conflation and nothing noticed.
+    def test_missing_field_returns_unknown(self):
+        assert _classify_regime({}) == "unknown"
 
-    def test_none_value_returns_neutral(self):
-        assert _classify_regime({"macro_spy_20d_return": None}) == "neutral"
+    def test_none_value_returns_unknown(self):
+        assert _classify_regime({"macro_spy_20d_return": None}) == "unknown"
 
-    def test_nan_value_returns_neutral(self):
-        assert _classify_regime({"macro_spy_20d_return": float("nan")}) == "neutral"
+    def test_nan_value_returns_unknown(self):
+        assert _classify_regime({"macro_spy_20d_return": float("nan")}) == "unknown"
 
-    def test_non_numeric_value_returns_neutral(self):
+    def test_inf_value_returns_unknown(self):
+        assert _classify_regime({"macro_spy_20d_return": float("inf")}) == "unknown"
+
+    def test_non_numeric_value_returns_unknown(self):
         # Defensive against schema drift — string in a numeric field shouldn't crash.
-        assert _classify_regime({"macro_spy_20d_return": "0.05"}) == "neutral"
+        assert _classify_regime({"macro_spy_20d_return": "0.05"}) == "unknown"
+
+    def test_exact_zero_is_neutral_not_unknown(self):
+        # 0.0 is a DEFINED flat read. It must stay distinguishable from the
+        # undefined cases above — this is the value the meta_trainer macro
+        # zero-fill produced, and telling the two apart is the whole point.
+        assert _classify_regime({"macro_spy_20d_return": 0.0}) == "neutral"
 
     def test_only_uses_spy_20d_return(self):
         # Other macro features should NOT influence classification — the
