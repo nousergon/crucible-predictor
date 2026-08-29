@@ -12,23 +12,39 @@ from __future__ import annotations
 import os
 import sys
 
+import statistics
+
 import pytest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from inference.stages.write_output import DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV
+
+# alpha-engine-config-I9267: derive the predicted_alpha spread from the
+# dispersion gate's own absolute-floor constant rather than a hardcoded
+# literal — a fixture-rot class this session already hit three times. The
+# old fixed `* 0.05` coefficient produced alpha_stdev ~0.011234, which this
+# fixture's own name calls "healthy" but which sits BELOW the new
+# DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV floor (0.015) and would spuriously
+# block. 1.5x the floor keeps a comfortable margin and tracks the constant
+# if it ever changes.
+_ALPHA_SPREAD_TARGET = DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV * 1.5
+
 
 def _healthy_predictions(n: int = 27):
     """Diverse p_up values across [0.10, 0.85] — gate should pass."""
+    p_ups = [0.10 + (i / (n - 1)) * 0.75 for i in range(n)]
+    raw_stdev = statistics.pstdev(p - 0.5 for p in p_ups)
+    scale = _ALPHA_SPREAD_TARGET / raw_stdev
     preds = []
-    for i in range(n):
-        p_up = 0.10 + (i / (n - 1)) * 0.75
+    for i, p_up in enumerate(p_ups):
         preds.append({
             "ticker": f"T{i:02d}",
             "p_up": round(p_up, 4),
             "p_down": round(1 - p_up, 4),
             "p_flat": 0.0,
-            "predicted_alpha": (p_up - 0.5) * 0.05,
+            "predicted_alpha": (p_up - 0.5) * scale,
             "predicted_direction": "UP" if p_up >= 0.5 else "DOWN",
             # |p_up - 0.5| * 2 — the live axis since PR #143. These fixtures
             # carried the retired max(p_up, p_down) form, which the gate's
