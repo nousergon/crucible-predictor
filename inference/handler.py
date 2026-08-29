@@ -155,6 +155,29 @@ KNOWN_ACTIONS = frozenset({
 })
 
 
+def _resolve_run_date(event: dict) -> str | None:
+    """Resolve the calendar date an SF Task intends for this invocation.
+
+    Every weekly-SF pre-spend gate that carries a calendar date sends it as
+    `"run_date.$": "$.run_date"` (nousergon-data/infrastructure/
+    step_function.json — WeeklyRunDayGate, LibPinDriftCheck,
+    PipelineContractCheck). This handler's own convention for every other
+    action (check_coverage, check_drift, check_self_test, and the daily/eod
+    SFs' TradingDayGate) is `event.get("date")`. `run_date` and `date` have
+    never both been sent by the same caller, and NO live caller — grepped
+    across step_function.json, step_function_daily.json,
+    step_function_eod.json and infrastructure/deploy.sh's canary invocations
+    (2026-08-29) — has ever sent `date` to this Lambda; `date` survives here
+    only because this repo's own unit tests exercise it and because
+    check_coverage/check_drift/check_self_test keep it as their read. `date`
+    is therefore a fallback, never the primary: WeeklyRunDayGate's `run_date`
+    was silently discarded for however long this mismatch stood, so the gate
+    evaluated `datetime.now(NYSE)` on every invocation instead of the SF's
+    intended run date (alpha-engine-config-I9221).
+    """
+    return event.get("run_date") or event.get("date")
+
+
 class UnknownAction(ValueError):
     """Raised when `event["action"]` names something this build cannot do.
 
@@ -222,7 +245,7 @@ def handler(event: dict, context) -> dict:
     # Replaces the prior on-box SSM trading_calendar check (config#1430).
     if event.get("action") == "check_trading_day":
         from inference.trading_day_gate import check_trading_day
-        _r = check_trading_day(event.get("date"))
+        _r = check_trading_day(_resolve_run_date(event))
         log.info(
             "Trading-day gate: %s (%s) -> %s%s",
             _r["check_date"], _r["day_name"], _r["marker"],
@@ -253,7 +276,7 @@ def handler(event: dict, context) -> dict:
     # Same zero-infra posture as check_trading_day (config#1824).
     if event.get("action") == "check_weekly_run_day":
         from inference.trading_day_gate import check_weekly_run_day
-        _r = check_weekly_run_day(event.get("date"))
+        _r = check_weekly_run_day(_resolve_run_date(event))
         log.info(
             "Weekly run-day gate: %s (%s) -> %s%s",
             _r["check_date"], _r["day_name"], _r["marker"],
@@ -330,7 +353,7 @@ def handler(event: dict, context) -> dict:
     fd = None
 
     action  = event.get("action", "predict")
-    date_str = event.get("date", None)
+    date_str = _resolve_run_date(event)
     dry_run  = bool(event.get("dry_run", False))
     raw_tickers = event.get("tickers") or []
     if isinstance(raw_tickers, str):
