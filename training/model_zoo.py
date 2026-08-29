@@ -798,7 +798,8 @@ def _resolve_rescored_serving_ic(manifests: dict, champ_arch_vid: str | None,
     }
 
 
-def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
+def _resolve_incumbent_from_bundle(
+        s3, bucket: str) -> tuple[str | None, dict, dict]:
     """Resolve the SERVING champion's identity and CPCV from its own immutable
     registry bundle. alpha-engine-config-I9018.
 
@@ -822,7 +823,13 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
 
     The one non-raising case is a bucket with no live manifest at all — a
     bootstrap rotation with nothing yet serving (champion-challenger-policy
-    §9.1). That returns ``(None, {})`` and is logged loudly.
+    §9.1). That returns ``(None, {}, {})`` and is logged loudly.
+
+    Returns ``(served_version, bundle_manifest, live_manifest)``. The LIVE
+    manifest is returned so callers can report what is serving from the pointer
+    itself. A bundle manifest's own ``served_version`` / ``served_date`` fields
+    are a PREDECESSOR STAMP — who was serving when THAT bundle trained — and
+    reading them as the current answer is alpha-engine-config-I9260.
     """
     try:
         live_manifest = _read_live_manifest(s3, bucket)
@@ -834,7 +841,7 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
             "manifest (alpha-engine-config-I9018).",
             getattr(cfg, "META_MANIFEST_KEY", "?"), exc,
         )
-        return None, {}
+        return None, {}, {}
 
     served_version = live_manifest.get("served_version")
     if not served_version:
@@ -865,7 +872,7 @@ def _resolve_incumbent_from_bundle(s3, bucket: str) -> tuple[str | None, dict]:
         served_version, _cpcv_mean(manifest),
         getattr(cfg, "META_MANIFEST_KEY", "?"),
     )
-    return served_version, manifest
+    return served_version, manifest, live_manifest
 
 
 class PromotionInputIntegrityError(RuntimeError):
@@ -1079,15 +1086,34 @@ def select_winner(
     # ``champion_arch.cpcv_mean_ic`` to 6dp. Registry bundles are immutable and
     # content-addressed, so this run structurally CANNOT write the number it is
     # about to be compared against.
-    serving_bundle_vid, serving_manifest = _resolve_incumbent_from_bundle(s3, bucket)
+    serving_bundle_vid, serving_manifest, serving_live_manifest = (
+        _resolve_incumbent_from_bundle(s3, bucket))
     champ_fwd = int(serving_manifest.get("forward_days") or getattr(cfg, "FORWARD_DAYS", 21))
     serving_ic = _cpcv_mean(serving_manifest)
-    serving_version = (
-        serving_manifest.get("served_version")
-        or serving_manifest.get("version")
-        or serving_bundle_vid
+    # alpha-engine-config-I9260 — a registry bundle manifest's OWN
+    # ``served_version`` / ``served_date`` is a PREDECESSOR STAMP: it records
+    # who was serving at the moment THAT bundle was trained, not who is serving
+    # now. Reading it here chained one hop backwards and made the leaderboard
+    # report v3.0-meta-2026-08-12-7d0d9328 as the serving version while
+    # ``incumbent_version_id`` correctly said v3.0-meta-2026-08-14-119e069b.
+    # The identity of the serving model has exactly one honest source and it is
+    # the same live pointer ``_resolve_incumbent_from_bundle`` already read.
+    serving_version = serving_bundle_vid
+    serving_date = (
+        serving_live_manifest.get("served_date")
+        or serving_live_manifest.get("date")
     )
-    serving_date = serving_manifest.get("served_date") or serving_manifest.get("date")
+    # The leaderboard must never carry two fields that disagree about which
+    # model is serving (champion-challenger-policy §7.5 — provenance true by
+    # construction). This is an equality by construction today; the assertion
+    # is what keeps it one if either source is re-pointed.
+    if serving_version != serving_bundle_vid:
+        raise PromotionInputIntegrityError(
+            f"model_zoo alpha-engine-config-I9260: serving_version "
+            f"{serving_version!r} disagrees with incumbent_version_id "
+            f"{serving_bundle_vid!r}. The leaderboard would assert two "
+            f"different serving models in one block; refusing to write it."
+        )
 
     # ── Read every candidate manifest up front (needed to locate champion-arch
     # BEFORE the eligibility loop, since the fresh champion-arch CPCV is now the
@@ -1258,10 +1284,19 @@ def select_winner(
     # Non-blocking on failure, per champion-challenger-policy §5.1: an
     # unmeasurable statistic is reported ``uncomputable`` and named on the
     # leaderboard. It is never a pass, and it never fails the rotation.
+    # ``reference_version_id`` drives the OBSERVE-ONLY scale-invariant block
+    # (alpha-engine-config-I9257): standardized dispersion ratio, top-N overlap
+    # and rank correlation, each against the SERVING version. Those exist
+    # because every verdict metric above is a raw-magnitude quantity, so a
+    # uniform rescaling of the linear predictor collapses all of them with no
+    # loss of ranking information — the 2026-08-28 rotation, where the
+    # champion-ARCHITECTURE control was vetoed alongside every challenger.
+    # They are nested and cannot arm a rule; no threshold moves.
     served_slice = served_slice_metrics(
         s3, bucket,
         list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
         date_str=date_str,
+        reference_version_id=serving_bundle_vid,
     )
     served_by_vid = served_slice.get("metrics") or {}
     incumbent_served = served_by_vid.get(serving_bundle_vid)
