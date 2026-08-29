@@ -443,6 +443,16 @@ def _compute_overfit_signal(
     return ratio, warn
 
 
+# I9333 — the forward window of `research_gbm`'s label (`actual_fwd_10d`), in
+# trading days. It is the PURGE width for that arm's early-stop split, and it
+# is deliberately NOT `cfg.FORWARD_DAYS` (21, the volatility/L2 horizon): a
+# purge narrower than the arm's own label horizon leaves train and validation
+# rows sharing forward window, which is the leak that let 2026-08-21 run all
+# 500 boosting rounds without early stopping firing once.
+_RESEARCH_GBM_LABEL_FIELD = "actual_fwd_10d"
+_RESEARCH_GBM_LABEL_HORIZON_DAYS = 10
+
+
 def _emit_research_gbm_overfit_metrics(
     *,
     train_ic: float | None,
@@ -2285,8 +2295,17 @@ def run_meta_training(
     # emits both train_ic and val_ic so the gap can be monitored. Per-fold
     # WF tightening tracked for ~30-week milestone (2026-06-20-ish).
     from model.research_gbm import ResearchGBMScorer, RESEARCH_GBM_FEATURES
+    from training.purged_split import (
+        DegenerateDesignMatrixError,
+        assert_design_matrix_supports_fit,
+        build_purged_split,
+        val_ic_precision,
+    )
 
     prod_research_gbm: ResearchGBMScorer | None = None
+    research_gbm_split_block: dict | None = None
+    research_gbm_matrix_block: dict | None = None
+    research_gbm_val_precision: dict | None = None
     research_gbm_metrics: dict | None = None
     research_gbm_train_ic: float | None = None
     research_gbm_train_val_ic_ratio: float | None = None
@@ -2312,21 +2331,77 @@ def run_meta_training(
                 1.0 if r.get("actual_fwd_10d", 0.0) > 0 else 0.0
                 for r, m in zip(oos_meta_rows, finite_mask) if m
             ], dtype=np.float32)
-            split_idx = int(n_finite * 0.8)
+            # I9333: the row-ordered dates behind the SAME finite mask, so the
+            # split is cut on the date axis and can never land inside a
+            # cross-section. `oos_meta_rows` is built fold-by-fold from a
+            # date-sorted panel; `build_purged_split` asserts the ordering
+            # rather than assuming it.
+            research_dates = [
+                str(r.get("date"))
+                for r, m in zip(oos_meta_rows, finite_mask) if m
+            ]
+
+            # I9333 deliverable 3 — refuse a degenerate design matrix BEFORE a
+            # booster exists. Since 2026-07-18 this arm has fitted 9 declared
+            # features of which ONE varies (`research_composite_score`);
+            # `conviction` and `sector_modifiers` are constants and the six
+            # macro columns were zero-filled. Upstream cause: -I9307.
+            research_gbm_matrix_block = assert_design_matrix_supports_fit(
+                "research_gbm", X_research, RESEARCH_GBM_FEATURES,
+            )
+
+            # I9333 deliverable 1 — purged, embargoed, multi-date early-stop
+            # split replacing `split_idx = int(n_finite * 0.8)`. The label is
+            # `actual_fwd_10d`, so the purge width is 10 trading dates and the
+            # embargo defaults to the same (the overlapping-label embargo, the
+            # repo's L4488a convention). No test block: this panel's only
+            # holdout is the early-stopping block.
+            research_split = build_purged_split(
+                research_dates,
+                label_horizon_days=_RESEARCH_GBM_LABEL_HORIZON_DAYS,
+                train_frac=0.80,
+                val_frac=None,
+            )
+            research_gbm_split_block = research_split.as_manifest_block()
+            if not research_split.ok:
+                raise RuntimeError(
+                    "research_gbm: refusing to fit on an unmeasurable split — "
+                    f"{research_split.reason} A split whose own properties do "
+                    "not meet their floors cannot be gated on, and fitting on "
+                    "a one-date holdout to avoid reporting that is exactly the "
+                    "coin flip this refuses (alpha-engine-config-I9333; "
+                    "champion-challenger-policy §5.1)."
+                )
+            tr_idx, va_idx = research_split.train_idx, research_split.val_idx
             prod_research_gbm = ResearchGBMScorer(
                 n_estimators=500, early_stopping_rounds=30,
             )
             prod_research_gbm.fit(
-                X_research[:split_idx], y_research[:split_idx],
-                X_research[split_idx:], y_research[split_idx:],
+                X_research[tr_idx], y_research[tr_idx],
+                X_research[va_idx], y_research[va_idx],
             )
             research_gbm_metrics = prod_research_gbm.metrics()
+
+            # I9333 — how precise `val_ic` actually is. Recorded, not gated:
+            # it is the number that says whether l1_fit_validity's
+            # `min_abs_val_ic` floor is being read against a statistic or
+            # against noise.
+            research_gbm_val_precision = val_ic_precision(
+                prod_research_gbm.predict(X_research[va_idx]),
+                y_research[va_idx],
+                [research_dates[i] for i in va_idx],
+                label_horizon_days=_RESEARCH_GBM_LABEL_HORIZON_DAYS,
+            )
+            log.info(
+                "research_gbm val_ic precision (I9333): %s",
+                research_gbm_val_precision,
+            )
 
             # Train_ic — Pearson IC on the same training split the GBM saw.
             # train_ic >> val_ic (e.g. >2×) signals overfitting; emit both
             # in the manifest so monitoring can flag a degenerating gap.
-            train_preds = prod_research_gbm.predict(X_research[:split_idx])
-            train_y = y_research[:split_idx]
+            train_preds = prod_research_gbm.predict(X_research[tr_idx])
+            train_y = y_research[tr_idx]
             if np.std(train_preds) > 1e-10 and np.std(train_y) > 1e-10:
                 research_gbm_train_ic = float(np.corrcoef(train_preds, train_y)[0, 1])
             log.info(
@@ -2388,10 +2463,15 @@ def run_meta_training(
                 "val_ic": float(prod_research_gbm._val_ic),
                 "train_ic": research_gbm_train_ic,
                 "n_estimators": int(prod_research_gbm.n_estimators),
-                "n_samples": int(n_finite),
+                "n_samples": int(research_split.n_train_rows),
                 "output_dispersion": measure_output_dispersion(
                     prod_research_gbm.predict(X_research)
                 ),
+                # I9333 — the split and the design matrix travel with the fit
+                # so a finding names the geometry it was produced under.
+                "split": research_gbm_split_block,
+                "design_matrix": research_gbm_matrix_block,
+                "val_ic_precision": research_gbm_val_precision,
             }
 
             # Recompute research_calibrator_prob in oos_meta_rows using the
@@ -2410,11 +2490,18 @@ def run_meta_training(
                 n_recomputed += 1
             log.info(
                 "research_calibrator_prob recomputed via GBM for %d oos_meta_rows "
-                "(in-sample for ~80%%, OOS-fitted for ~20%% per the GBM's "
-                "temporal early-stop split)",
+                "(in-sample for the purged training block, OOS for the "
+                "embargoed early-stop block and the purged gap — I9333)",
                 n_recomputed,
             )
         else:
+            l1_fits["research_gbm"] = {
+                "fitted": False,
+                "reason": (
+                    f"only {n_finite} finite-label rows in the panel; measured "
+                    f"{n_finite}, required >= 100 to fit at all."
+                ),
+            }
             log.warning(
                 "ResearchGBMScorer: only %d finite-label rows (need >=100) — "
                 "NOT fitted this cycle. Bucket-lookup ResearchCalibrator-sourced "
@@ -2431,10 +2518,20 @@ def run_meta_training(
         # fit-validity gate fails the run on that absence. A silent
         # substitution for the canonical producer of the meta-Ridge's largest
         # cross-sectional feature is the defect, not the recovery.
-        log.warning(
+        # I9333: the reason travels with the arm. `DegenerateDesignMatrixError`
+        # and an `insufficient` split both land here, and a gate finding that
+        # says only "absent" would lose the one sentence naming which constant
+        # columns or which split floor stopped the fit.
+        l1_fits.setdefault("research_gbm", {
+            "fitted": False,
+            "reason": f"{type(e).__name__}: {e}",
+            "split": research_gbm_split_block,
+            "design_matrix": research_gbm_matrix_block,
+        })
+        log.error(
             "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
             "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
-            "will fail this run on the absent arm: %s", e,
+            "will fail this run on the arm: %s", e,
         )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
@@ -4012,18 +4109,74 @@ def run_meta_training(
 
     # ── Step 8: Train production models on full data ─────────────────────────
     log.info("Training production models on full dataset...")
-    n_train = int(N * cfg.TRAIN_FRAC)
-    n_val_raw = int(N * cfg.VAL_FRAC)
-    val_end = min(n_train + n_val_raw, N)
+    # I9333 — the three production L1 GBMs (`volatility`,
+    # `volatility_macro_aug`, `volatility_risk_aug`) early-stop on this split,
+    # and until now it was the same defect `research_gbm` carried: a bare row
+    # index cut, `[:n_train]` for train and `[n_train:val_end]` for the
+    # early-stop block, with NO purge and NO embargo against the
+    # `cfg.FORWARD_DAYS` forward label. Adjacent train and validation rows
+    # shared their whole forward window, so the "held-out" early-stop signal
+    # was ~the training signal. The date-count defect that made
+    # `research_gbm`'s val_ic a one-date accident is NOT present here — this
+    # panel is ~167 trading dates at ~898 rows each, so a 15% block is ~25
+    # dates — but the leak is, and it is the same leak.
+    #
+    # The blocks are now cut on the DATE axis (a cut can no longer land inside
+    # a cross-section) with a purge of `cfg.FORWARD_DAYS` dates and an
+    # overlapping-label embargo of the same before the early-stop block.
+    #
+    # SOTA deviation, recorded rather than hidden (`principles.md` §2.4): the
+    # trailing gap between the early-stop block and the reporting test block is
+    # NOT cut. At 167 dates a trailing purge+embargo of 42 dates consumes the
+    # entire ~25-date test block, which would delete `test_ic`, the subsample
+    # IC gate and the momentum baseline's reported IC rather than harden them.
+    # The leading gap — the one that decides `best_iteration`, which is what
+    # I9333 is about — is applied. The trailing gap is gated on panel length
+    # and tracked separately; `embargo_edges` on the manifest records which
+    # edges were actually cut, so no reader can mistake this for a full
+    # two-sided split.
+    from training.purged_split import build_purged_split as _build_purged_split
+
+    prod_split = _build_purged_split(
+        all_dates,
+        label_horizon_days=int(cfg.FORWARD_DAYS),
+        train_frac=float(cfg.TRAIN_FRAC),
+        val_frac=float(cfg.VAL_FRAC),
+        test_gap=False,
+    )
+    prod_split_block = prod_split.as_manifest_block()
+    if not prod_split.ok:
+        raise RuntimeError(
+            "Refusing to fit the production L1 GBMs on an unmeasurable "
+            f"early-stop split — {prod_split.reason} "
+            "(alpha-engine-config-I9333). The live champion is untouched: "
+            "training writes a staging prefix and "
+            "model.registry.promote_to_champion is the only writer of the "
+            "serving prefix."
+        )
+    n_train = int(prod_split.n_train_rows)
+    val_start = int(prod_split.val_idx[0])
+    val_end = int(prod_split.val_idx[-1]) + 1
+    test_start = int(prod_split.test_idx[0]) if len(prod_split.test_idx) else N
+    log.info(
+        "Production L1 split (I9333): train rows [0:%d] over %d dates | purge "
+        "%d + embargo %d dates dropped %d rows | early-stop rows [%d:%d] over "
+        "%d dates | test rows [%d:%d] over %d dates",
+        n_train, prod_split.n_train_dates, prod_split.label_horizon_days,
+        prod_split.embargo_days,
+        prod_split.n_purged_rows + prod_split.n_embargoed_rows,
+        val_start, val_end, prod_split.n_val_dates, test_start, N,
+        prod_split.n_test_dates,
+    )
 
     # Momentum L1 component is the deterministic weighted-blend baseline.
     # No fit step — the formula is fixed (see model/momentum_scorer.py).
     # test_IC is computed against the held-out slice for manifest reporting
     # and parity with the volatility component below.
     mom_test_preds = momentum_scorer.predict_array(
-        X_mom_raw[val_end:], cfg.MOMENTUM_FEATURES,
+        X_mom_raw[test_start:], cfg.MOMENTUM_FEATURES,
     )
-    mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[val_end:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
+    mom_test_ic = float(np.corrcoef(mom_test_preds, y_fwd[test_start:])[0, 1]) if len(mom_test_preds) > 1 else 0.0
     log.info("Momentum production (deterministic baseline): test_IC=%.4f", mom_test_ic)
 
     # Volatility production model
@@ -4031,10 +4184,10 @@ def run_meta_training(
     prod_vol = GBMScorer(params=tuned_params, n_estimators=cfg.GBM_N_ESTIMATORS,
                          early_stopping_rounds=cfg.GBM_EARLY_STOPPING_ROUNDS)
     prod_vol.fit(X_vol[:n_train], np.abs(y_fwd[:n_train]),
-                 X_vol[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+                 X_vol[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
                  feature_names=cfg.VOLATILITY_FEATURES)
-    vol_test_preds = prod_vol.predict(X_vol[val_end:])
-    vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[val_end:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
+    vol_test_preds = prod_vol.predict(X_vol[test_start:])
+    vol_test_ic = float(np.corrcoef(vol_test_preds, np.abs(y_fwd[test_start:]))[0, 1]) if len(vol_test_preds) > 1 else 0.0
     log.info("Volatility production: test_IC=%.4f  best_iter=%d", vol_test_ic, prod_vol._best_iteration)
     # I9271: `volatility` shipped `test_ic` and nothing else for its whole
     # life — no `best_iteration`, no `val_ic` on any manifest — so the plain
@@ -4048,6 +4201,9 @@ def run_meta_training(
         "n_estimators": int(cfg.GBM_N_ESTIMATORS),
         "n_samples": int(n_train),
         "output_dispersion": None,
+        # I9333 — the purged, embargoed early-stop split this arm was fitted
+        # under, recorded on the arm's own row.
+        "split": prod_split_block,
     }
     peak_rss_mb = max(peak_rss_mb, _log_rss("after prod_vol (plain) fit"))
 
@@ -4084,12 +4240,12 @@ def run_meta_training(
         )
         prod_vol_macro_aug.fit(
             X_vol_aug[:n_train], np.abs(y_fwd[:n_train]),
-            X_vol_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            X_vol_aug[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
             feature_names=VOL_AUG_FEATURES,
         )
-        vol_aug_test_preds = prod_vol_macro_aug.predict(X_vol_aug[val_end:])
+        vol_aug_test_preds = prod_vol_macro_aug.predict(X_vol_aug[test_start:])
         vol_macro_aug_test_ic = (
-            float(np.corrcoef(vol_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            float(np.corrcoef(vol_aug_test_preds, np.abs(y_fwd[test_start:]))[0, 1])
             if len(vol_aug_test_preds) > 1 else 0.0
         )
         lift = vol_macro_aug_test_ic - vol_test_ic
@@ -4116,6 +4272,7 @@ def run_meta_training(
             "n_estimators": int(cfg.GBM_N_ESTIMATORS),
             "n_samples": int(n_train),
             "output_dispersion": None,
+            "split": prod_split_block,
         }
     except Exception as e:
         log.warning(
@@ -4161,12 +4318,12 @@ def run_meta_training(
         )
         prod_vol_risk_aug.fit(
             X_vol_risk_aug[:n_train], np.abs(y_fwd[:n_train]),
-            X_vol_risk_aug[n_train:val_end], np.abs(y_fwd[n_train:val_end]),
+            X_vol_risk_aug[val_start:val_end], np.abs(y_fwd[val_start:val_end]),
             feature_names=VOL_RISK_AUG_FEATURES,
         )
-        vol_risk_aug_test_preds = prod_vol_risk_aug.predict(X_vol_risk_aug[val_end:])
+        vol_risk_aug_test_preds = prod_vol_risk_aug.predict(X_vol_risk_aug[test_start:])
         vol_risk_aug_test_ic = (
-            float(np.corrcoef(vol_risk_aug_test_preds, np.abs(y_fwd[val_end:]))[0, 1])
+            float(np.corrcoef(vol_risk_aug_test_preds, np.abs(y_fwd[test_start:]))[0, 1])
             if len(vol_risk_aug_test_preds) > 1 else 0.0
         )
         lift = vol_risk_aug_test_ic - vol_test_ic
@@ -4193,6 +4350,7 @@ def run_meta_training(
             "n_estimators": int(cfg.GBM_N_ESTIMATORS),
             "n_samples": int(n_train),
             "output_dispersion": None,
+            "split": prod_split_block,
         }
     except Exception as e:
         log.warning(
@@ -4252,15 +4410,15 @@ def run_meta_training(
     from model.subsample_validator import (
         volatility_baseline_predict, validate_component,
     )
-    vol_subsample_mask_test = vol_nan_mask[val_end:]
+    vol_subsample_mask_test = vol_nan_mask[test_start:]
     vol_baseline_preds = volatility_baseline_predict(
-        X_vol_raw[val_end:], cfg.VOLATILITY_FEATURES,
+        X_vol_raw[test_start:], cfg.VOLATILITY_FEATURES,
     )
     vol_subsample_result = validate_component(
         component_name="volatility",
         component_preds=vol_test_preds,
         baseline_preds=vol_baseline_preds,
-        y_true=np.abs(y_fwd[val_end:]),
+        y_true=np.abs(y_fwd[test_start:]),
         subsample_mask=vol_subsample_mask_test,
     )
     vol_subsample_result.log()
@@ -4864,6 +5022,12 @@ def run_meta_training(
                                 else None
                             ),
                             "overfit_warn": research_gbm_overfit_warn,
+                            # I9333 — the split's own properties, so a reader
+                            # can tell a val_ic that is a statistic from one
+                            # that is a single cross-section's accident.
+                            "split": research_gbm_split_block,
+                            "design_matrix": research_gbm_matrix_block,
+                            "val_ic_precision": research_gbm_val_precision,
                             **(research_gbm_metrics or {}),
                         }}
                         if prod_research_gbm is not None else {}
@@ -5332,8 +5496,10 @@ def run_meta_training(
         "data_coverage_degraded": _data_coverage_degraded(arctic_coverage),
         "elapsed_s": round(elapsed_s, 1),
         "n_train": n_train,
-        "n_val": val_end - n_train,
-        "n_test": N - val_end,
+        "n_val": val_end - val_start,
+        "n_test": N - test_start,
+        # I9333 — the production L1 early-stop split's own properties.
+        "l1_early_stop_split": prod_split_block,
         "momentum_test_ic": round(mom_test_ic, 6),
         "volatility_test_ic": round(vol_test_ic, 6),
         # config#1815: components at/below cfg.L1_COMPONENT_IC_ALERT_FLOOR —
