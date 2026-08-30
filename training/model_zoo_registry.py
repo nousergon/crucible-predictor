@@ -70,7 +70,7 @@ makes it, the arms cost nothing and the leaderboard states why.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +157,13 @@ class Arm:
     reason: str                 # "" when applicable
     retired_date: "str | None" = None
     priority: int = 0
+    # I9319 — the spec's allowlisted override knobs, carried so the arena's
+    # RECIPE hash can be formed from the register rather than by re-reading
+    # ambient config at the hashing site. They are the arm's features and
+    # hyperparameters: changing one makes it a different arm
+    # (champion-challenger-policy §3.1). Deliberately NOT in ``as_dict`` — the
+    # leaderboard block is an audit surface for membership, not a config dump.
+    overrides: "dict" = field(default_factory=dict)
 
     @property
     def trainable(self) -> bool:
@@ -271,6 +278,7 @@ def resolve_arms(
             reason=reason,
             retired_date=spec.get("retired_date"),
             priority=int(spec.get("priority", 0) or 0),
+            overrides=dict(spec.get("overrides") or {}),
         ))
     return arms
 

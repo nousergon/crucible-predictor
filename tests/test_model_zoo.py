@@ -461,6 +461,8 @@ def test_select_winner_nan_cpcv_is_no_cpcv_not_below_margin(monkeypatch):
 
 
 def _run_select_fixture(monkeypatch, *, auto_promote):
+    from tests.arena_test_helpers import mock_arena_run_slot, mock_model_zoo_post_select_reads
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     s3 = _FakeS3({
@@ -472,10 +474,16 @@ def _run_select_fixture(monkeypatch, *, auto_promote):
     monkeypatch.setattr(reg, "list_versions", lambda s3c, b, stage=None: [
         {"version_id": "resid-v", "model_version": "spec-resid", "date": "2026-06-13"},
         {"version_id": "h60-v", "model_version": "spec-60d", "date": "2026-06-13"},
-    ])
+    ] if stage != "champion" else [])
     promotes = []
     monkeypatch.setattr(reg, "promote_to_champion",
                         lambda s3c, b, vid, **k: promotes.append(vid))
+    mock_arena_run_slot(monkeypatch, pointer_version_id="resid-v", moved=True)
+    mock_model_zoo_post_select_reads(monkeypatch)
+    monkeypatch.setattr(mz, "_alert_inert_rotation", lambda *a, **k: None)
+    monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
+    monkeypatch.setattr(mz, "send_zoo_digest_email", lambda *a, **k: True)
+    monkeypatch.setattr(mz, "_alert_promotion", lambda *a, **k: None)
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
         return {"status": "ok"}
@@ -483,6 +491,7 @@ def _run_select_fixture(monkeypatch, *, auto_promote):
     board = mz.run_rotation_and_select(
         "bkt", budget=5, specs=_SPECS, train_fn=_fake_train,
         registered_versions=[], s3=s3, auto_promote_winner=auto_promote,
+        date_str="2026-06-13",
     )
     return board, promotes, s3
 
@@ -522,6 +531,8 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
     """The core config#1051 closes-when #2: ≥1 active promote-eligible spec exists
     but the rotation trains 0 challengers (empty selection) → WARN + named CW
     metric + SNS, distinct from 'trained-but-lost'."""
+    from tests.arena_test_helpers import mock_arena_run_slot
+
     from krepis import alerts  # conftest autouse-stubs .publish
 
     cw_calls = []
@@ -536,6 +547,7 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
         return real_inert(bucket, date_str, **kw)
 
     monkeypatch.setattr(mz, "_alert_inert_rotation", _spy_inert)
+    mock_arena_run_slot(monkeypatch, pointer_version_id=None, moved=False)
 
     # budget=0 → selection is empty even though _SPECS has 2 active specs, so the
     # rotation trains nothing (the empty-selection branch of the inert bug).
@@ -568,10 +580,13 @@ def test_inert_rotation_alerts_when_active_specs_but_zero_trained(monkeypatch):
 def test_all_specs_errored_is_inert_and_alerts(monkeypatch):
     """Even with budget covering the active specs, if EVERY selected spec errors
     the rotation is inert (0 usable challengers) → alert fires."""
+    from tests.arena_test_helpers import mock_arena_run_slot
+
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
     alerted = []
     monkeypatch.setattr(mz, "_alert_inert_rotation",
                         lambda *a, **k: alerted.append(k))
+    mock_arena_run_slot(monkeypatch, pointer_version_id=None, moved=False)
 
     s3 = _FakeS3({
         cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True),
@@ -593,6 +608,8 @@ def test_trained_but_lost_does_not_alert_inert(monkeypatch):
     """A challenger trained but lost to the champion (winner-less leaderboard,
     candidates present) is NOT inert — no inert alert, CW metric reports the
     trained count (>0)."""
+    from tests.arena_test_helpers import mock_arena_run_slot
+
     cw_calls = []
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: cw_calls.append(n))
     inert = []
@@ -611,6 +628,9 @@ def test_trained_but_lost_does_not_alert_inert(monkeypatch):
         {"version_id": "resid-v", "model_version": "spec-resid", "date": "2026-06-13"},
         {"version_id": "h60-v", "model_version": "spec-60d", "date": "2026-06-13"},
     ])
+    mock_arena_run_slot(
+        monkeypatch, pointer_version_id=SERVING_INCUMBENT_VID, moved=False,
+    )
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
         return {"status": "ok"}
