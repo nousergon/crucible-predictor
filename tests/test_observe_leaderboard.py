@@ -2,9 +2,10 @@
 
 Pins:
   - realized rank-IC scoring of a shadow version vs champion over matured pairs;
-  - ``ready_for_full_promotion`` gates on REALIZED edge (>= soak weeks +
-    outcomes + beats-champion), NOT training DSR;
-  - 'too young' / 'insufficient outcomes' verdicts are explicit, not silent;
+  - since I9319/I9322 the leaderboard MEASURES only — no promotion-readiness
+    verdict; the M-slot pointer is decided by ``nousergon_lib.arena``;
+  - 'too young' / 'insufficient outcomes' are reported in ``verdict_reason``,
+    not as gates;
   - the leaderboard NEVER promotes / allocates (it is measurement only — there
     is no registry write path in this module).
 """
@@ -54,14 +55,10 @@ def _weekly_dates(n_weeks, per_week=5):
     return out
 
 
-def test_leaderboard_scores_realized_ic_and_promotion_ready():
-    # AAA rises (positive realized alpha), BBB falls (negative). A version that
-    # ranks AAA > BBB has positive realized rank-IC; the champion that ranks them
-    # backwards has negative IC → version beats champion → promotion-ready once
-    # the soak floors clear.
-    dates = _weekly_dates(5)  # >= 4 weeks
-    good = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)      # correct ranking
-    champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)     # inverted ranking
+def test_leaderboard_scores_realized_ic_and_beats_champion():
+    dates = _weekly_dates(5)
+    good = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
+    champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)
     res = ol.build_observe_leaderboard(
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-good": good},
@@ -70,18 +67,19 @@ def test_leaderboard_scores_realized_ic_and_promotion_ready():
     e = res["entries"][0]
     assert e["version_id"] == "v-good"
     assert e["realized_rank_ic"] is not None
-    assert e["realized_rank_ic"] > 0                        # ranked correctly
-    assert res["champion"]["realized_rank_ic"] < 0          # ranked backwards
+    assert e["realized_rank_ic"] > 0
+    assert res["champion"]["realized_rank_ic"] < 0
     assert e["beats_champion_realized"] is True
-    assert e["n_weeks_coverage"] >= ol.MIN_SOAK_WEEKS
+    assert e["n_weeks_coverage"] >= 4
     assert e["n_matured_outcomes"] >= ol.MIN_REALIZED_OUTCOMES
-    assert e["ready_for_full_promotion"] is True
-    assert res["ready_version_ids"] == ["v-good"]
+    assert "ready_for_full_promotion" not in e
+    assert "ready_version_ids" not in res
+    assert res["decision_authority"]["artifact"] == "arena/model/{date}.json"
 
 
-def test_leaderboard_soak_too_young_not_ready():
-    # Only 2 weeks of coverage — below MIN_SOAK_WEEKS → not promotion-ready even
-    # with a positive realized IC. The verdict says so explicitly.
+def test_leaderboard_soak_too_young_is_a_point_estimate_only():
+    """Two weeks still yields a per-version IC when pairs exist — but the
+    leaderboard no longer gates promotion-readiness on soak length (I9319)."""
     dates = _weekly_dates(2)
     good = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
     champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)
@@ -91,17 +89,16 @@ def test_leaderboard_soak_too_young_not_ready():
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
     )
     e = res["entries"][0]
-    assert e["ready_for_full_promotion"] is False
-    assert "soak too young" in e["verdict_reason"] or "insufficient" in e["verdict_reason"]
-    assert res["ready_version_ids"] == []
+    assert e["realized_rank_ic"] is not None
+    assert e["n_weeks_coverage"] == 2
+    assert "arena/model/{date}.json" in e["verdict_reason"]
+    assert "ready_for_full_promotion" not in e
 
 
-def test_leaderboard_loses_to_champion_not_ready():
-    # The version ranks backwards (negative IC) while the champion ranks
-    # correctly → does NOT beat champion → hold.
+def test_leaderboard_loses_to_champion():
     dates = _weekly_dates(5)
-    bad = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)       # inverted
-    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)     # correct
+    bad = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)
+    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
     res = ol.build_observe_leaderboard(
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-bad": bad},
@@ -109,13 +106,10 @@ def test_leaderboard_loses_to_champion_not_ready():
     )
     e = res["entries"][0]
     assert e["beats_champion_realized"] is False
-    assert e["ready_for_full_promotion"] is False
-    assert "hold" in e["verdict_reason"]
+    assert "realized rank-IC" in e["verdict_reason"]
 
 
-def test_leaderboard_unmatured_outcomes_reported_not_ready():
-    # Predictions whose 21d forward window has NOT closed (dated at the very end
-    # of the price history) → no matured outcomes → IC None, explicit verdict.
+def test_leaderboard_unmatured_outcomes_reported():
     last = _prices(120)["AAA"].index[-1]
     near_end = [(last - pd.Timedelta(days=k)).date().isoformat() for k in range(5)]
     rows = _pred_rows({"AAA": 0.9, "BBB": 0.1}, near_end)
@@ -126,13 +120,10 @@ def test_leaderboard_unmatured_outcomes_reported_not_ready():
     )
     e = res["entries"][0]
     assert e["realized_rank_ic"] is None
-    assert e["ready_for_full_promotion"] is False
-    assert "insufficient matured outcomes" in e["verdict_reason"]
+    assert "unmeasurable" in e["verdict_reason"]
 
 
 def test_leaderboard_is_measurement_only_no_registry_writes():
-    # The module must never promote/allocate: it has no registry-write surface.
-    # Confirm a run with write_to_s3=False touches no S3 and returns a pure dict.
     dates = _weekly_dates(5)
     rows = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
     res = ol.build_observe_leaderboard(
@@ -140,17 +131,13 @@ def test_leaderboard_is_measurement_only_no_registry_writes():
         shadow_pairs_by_version={"v": rows}, live_pairs=rows,
         prices_by_ticker=_prices(), sector_map={},
     )
-    assert "s3_key" not in res                              # nothing written
-    # The leaderboard RECOMMENDS an operator promote command in the verdict text
-    # but NEVER imports/calls a registry actuator — confirm the module has no
-    # promote/register symbol bound at module scope.
+    assert "s3_key" not in res
     import inspect
 
     src = inspect.getsource(ol)
     assert "promote_to_champion" not in src
     assert "register_to_observe" not in src
-    # source attribution proves the gate is realized-edge, not training DSR.
-    assert "NOT training DSR" in res["soak_criteria"]["gate"]
+    assert res["decision_authority"]["note"].startswith("This leaderboard MEASURES")
 
 
 def test_leaderboard_writes_dated_and_latest():
@@ -180,10 +167,8 @@ def test_leaderboard_writes_dated_and_latest():
 
 
 def test_champion_monitor_healthy_when_realized_edge_positive():
-    # The promoted champion ranks AAA (rising) > BBB (falling) → positive realized
-    # rank-IC over enough matured outcomes → chasing_noise False.
     dates = _weekly_dates(5)
-    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)        # correct ranking
+    champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
     res = ol.build_champion_realized_monitor(
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
@@ -196,10 +181,8 @@ def test_champion_monitor_healthy_when_realized_edge_positive():
 
 
 def test_champion_monitor_flags_noise_when_realized_ic_non_positive():
-    # The promoted champion ranks BACKWARDS (AAA falling-weight) → non-positive
-    # realized rank-IC over enough matured outcomes → chasing_noise True (alarm).
     dates = _weekly_dates(5)
-    champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)        # inverted ranking
+    champ = _pred_rows({"AAA": 0.1, "BBB": 0.9}, dates)
     res = ol.build_champion_realized_monitor(
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
@@ -210,8 +193,6 @@ def test_champion_monitor_flags_noise_when_realized_ic_non_positive():
 
 
 def test_champion_monitor_verdict_none_when_too_few_outcomes():
-    # Too few matured outcomes → no verdict assertable (chasing_noise None), stated
-    # explicitly rather than silently defaulting to "healthy".
     last = _prices(120)["AAA"].index[-1]
     near_end = [(last - pd.Timedelta(days=k)).date().isoformat() for k in range(3)]
     champ = _pred_rows({"AAA": 0.9, "BBB": 0.1}, near_end)
@@ -224,7 +205,6 @@ def test_champion_monitor_verdict_none_when_too_few_outcomes():
 
 
 def test_champion_monitor_is_measurement_only_no_actuator():
-    # The monitor never promotes/demotes/allocates — no registry actuator symbol.
     import inspect
 
     src = inspect.getsource(ol.build_champion_realized_monitor)
