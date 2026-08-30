@@ -55,6 +55,14 @@ def _weekly_dates(n_weeks, per_week=5):
     return out
 
 
+def _census(vid, dates):
+    """Bypass the registered-challenger S3 census in unit tests."""
+    return {
+        "registered_challenger_ids": [vid],
+        "shadow_dates_by_version": {vid: dates},
+    }
+
+
 def test_leaderboard_scores_realized_ic_and_beats_champion():
     dates = _weekly_dates(5)
     good = _pred_rows({"AAA": 0.9, "BBB": 0.1}, dates)
@@ -63,6 +71,7 @@ def test_leaderboard_scores_realized_ic_and_beats_champion():
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-good": good},
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+        **_census("v-good", dates),
     )
     e = res["entries"][0]
     assert e["version_id"] == "v-good"
@@ -87,6 +96,7 @@ def test_leaderboard_soak_too_young_is_a_point_estimate_only():
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-young": good},
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+        **_census("v-young", dates),
     )
     e = res["entries"][0]
     assert e["realized_rank_ic"] is not None
@@ -103,6 +113,7 @@ def test_leaderboard_loses_to_champion():
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-bad": bad},
         live_pairs=champ, prices_by_ticker=_prices(), sector_map={},
+        **_census("v-bad", dates),
     )
     e = res["entries"][0]
     assert e["beats_champion_realized"] is False
@@ -117,6 +128,7 @@ def test_leaderboard_unmatured_outcomes_reported():
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v-unmatured": rows},
         live_pairs=rows, prices_by_ticker=_prices(), sector_map={},
+        **_census("v-unmatured", near_end),
     )
     e = res["entries"][0]
     assert e["realized_rank_ic"] is None
@@ -130,6 +142,7 @@ def test_leaderboard_is_measurement_only_no_registry_writes():
         bucket="b", write_to_s3=False, date_str="2026-06-13", horizon_days=21,
         shadow_pairs_by_version={"v": rows}, live_pairs=rows,
         prices_by_ticker=_prices(), sector_map={},
+        **_census("v", dates),
     )
     assert "s3_key" not in res
     import inspect
@@ -284,7 +297,7 @@ def test_leaderboard_registered_challenger_with_no_shadow_ever_gets_explicit_unm
     assert "v-never-shadowed" in by_vid
     e = by_vid["v-never-shadowed"]
     assert e["measurability"] == ol.MEASURABILITY_UNMEASURABLE
-    assert e["ready_for_full_promotion"] is False
+    assert "ready_for_full_promotion" not in e
     assert "UNMEASURABLE" in e["verdict_reason"]
     assert e["n_matured_outcomes"] == 0
 
