@@ -1728,3 +1728,244 @@ class TestWritePredictionsAbsoluteFloorAndChampionExclusion:
                 patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", True, create=True):
             with pytest.raises(RuntimeError):
                 write_predictions(predictions, "2026-08-29", "bucket", {})
+
+
+# ── alpha-engine-config-I9445: champion-scoped, regime-invariant zero-streak ───
+#
+# Fixture numbers are LIVE, from `s3://alpha-engine-research/predictor/
+# predictions/{date}.json` read 2026-08-31 over the 80 sessions 2026-05-01..
+# 2026-08-31. The two facts under test:
+#
+#   * 2026-08-24..08-28 served `v3.0-meta-2026-08-21-7d3d1cce`, alpha_stdev
+#     0.01043722 -> 0.00709906, max `prediction_confidence` 0.2922 -> 0.2274,
+#     0 names above EITHER the 0.30 base or the 0.40 applied threshold. A real
+#     collapse; it must still alert on every one of those days.
+#   * 2026-08-31 served `v3.0-meta-2026-08-14-119e069b` — the healthy model the
+#     collapsed champion had ALREADY been rolled back to (alpha-engine-config-
+#     I9022). alpha_stdev recovered to 0.0192146 (above the 0.015 absolute
+#     floor), median confidence back to 0.1863, and 2 names cleared the 0.30
+#     base while 0 cleared the bull-regime-adjusted 0.40. It must NOT alert.
+
+class TestNHighConfidenceStreakIsChampionScoped:
+    """The streak is a statement about ONE model and cannot outlive it."""
+
+    # most-recent-first history as it stood on 2026-08-31, base-threshold counts
+    _HISTORY_ZEROS = [0, 0, 0, 0, 0]          # 08-28, 08-27, 08-26, 08-25, 08-24
+    _HISTORY_CHAMPS = ["v3.0-meta-2026-08-21-7d3d1cce"] * 5
+    _TODAY_CHAMP = "v3.0-meta-2026-08-14-119e069b"
+
+    def test_guard_red_without_the_fix(self):
+        """Champion ids omitted reproduces the 2026-08-31 alert: a streak of 6
+        attributed to a model that had served exactly one session."""
+        assert _n_high_confidence_zero_streak(0, self._HISTORY_ZEROS) == 6
+
+    def test_streak_stops_at_a_champion_change(self):
+        assert _n_high_confidence_zero_streak(
+            0, self._HISTORY_ZEROS,
+            today_champion_version_id=self._TODAY_CHAMP,
+            history_champion_version_ids=self._HISTORY_CHAMPS,
+        ) == 1
+
+    def test_measured_collapse_window_still_reaches_five(self):
+        """No relaxation: 2026-08-28 under the collapsed champion still counts
+        all five of its own sessions and still breaches the 3-day alert."""
+        streak = _n_high_confidence_zero_streak(
+            0, [0, 0, 0, 0, 5, 5, 2],
+            today_champion_version_id="v3.0-meta-2026-08-21-7d3d1cce",
+            history_champion_version_ids=["v3.0-meta-2026-08-21-7d3d1cce"] * 4
+            + ["champ-pre-promotion"] * 3,
+        )
+        assert streak == 5
+        assert streak >= wo.N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS
+
+    def test_unknown_champion_does_not_break_the_streak(self):
+        """An unreadable registry (or an artifact predating I8175's
+        champion_version_id) degrades to the old behaviour rather than
+        silently zeroing every streak."""
+        assert _n_high_confidence_zero_streak(
+            0, [0, 0, 0],
+            today_champion_version_id=self._TODAY_CHAMP,
+            history_champion_version_ids=[None, None, None],
+        ) == 4
+
+    def test_unknown_today_champion_does_not_break_the_streak(self):
+        assert _n_high_confidence_zero_streak(
+            0, [0, 0, 0],
+            today_champion_version_id=None,
+            history_champion_version_ids=self._HISTORY_CHAMPS,
+        ) == 4
+
+
+# `cfg.MIN_CONFIDENCE` resolves differently by environment — 0.30 in
+# production and on a developer checkout, 0.20 from `config/predictor.sample.
+# yaml:137` on a CI runner with no real config. That three-value drift is
+# alpha-engine-config-I9259 deliverable 3 and is NOT fixed here (#9259 carries
+# an explicit safe-to-act gate behind #9255). The tests below pin it to the
+# 0.30 the measured fixtures were produced under, so they assert the behaviour
+# under test rather than the environment they happen to run in.
+_LIVE_MIN_CONFIDENCE = 0.30
+
+
+class TestBaseVetoThresholdIsRegimeInvariant:
+    """`n_high_confidence_base` must be counted against a cut that does not
+    move with the market regime — `get_veto_threshold` moves it -0.20/+0.10."""
+
+    def test_falls_back_to_cfg_min_confidence(self):
+        with patch.object(wo, "_load_predictor_params_from_s3", return_value=None):
+            assert wo.base_veto_threshold("bucket") == pytest.approx(wo.cfg.MIN_CONFIDENCE)
+
+    def test_s3_predictor_params_override_wins(self):
+        with patch.object(wo, "_load_predictor_params_from_s3",
+                          return_value={"veto_confidence": 0.25}):
+            assert wo.base_veto_threshold("bucket") == pytest.approx(0.25)
+
+    def test_base_is_not_the_regime_adjusted_threshold(self):
+        """The measured 2026-08-31 confound: bull regime raised the applied cut
+        to 0.40 while the base stayed 0.30."""
+        with patch.object(wo, "_load_predictor_params_from_s3", return_value=None), \
+                patch.object(wo.cfg, "MIN_CONFIDENCE", _LIVE_MIN_CONFIDENCE):
+            base = wo.base_veto_threshold("bucket")
+            applied = wo.get_veto_threshold("bucket", market_regime="bullish")
+        assert applied == pytest.approx(base + 0.10)
+        assert base == pytest.approx(_LIVE_MIN_CONFIDENCE)
+
+
+class TestZeroStreakAlertOnMeasuredSessions:
+    """End-to-end through write_predictions on the live 2026-08-31 and
+    2026-08-27 distributions."""
+
+    @staticmethod
+    def _history_response(alpha_stdev, champion_version_id, n_hi=0, n_hi_base=None):
+        payload = {
+            "output_distribution_gate": {
+                "metrics": {"alpha_stdev": alpha_stdev, "stdev_p_up": 0.05},
+            },
+            "n_high_confidence": n_hi,
+            "champion_version_id": champion_version_id,
+        }
+        if n_hi_base is not None:
+            payload["n_high_confidence_base"] = n_hi_base
+        body = MagicMock()
+        body.read.return_value = json.dumps(payload).encode()
+        return {"Body": body}
+
+    def _mock_s3(self):
+        from botocore.exceptions import ClientError
+        # the five collapsed sessions, most-recent-first by date
+        history = {
+            "2026-08-28": (0.00709906, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-27": (0.00722553, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-26": (0.00822851, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-25": (0.00877974, "v3.0-meta-2026-08-21-7d3d1cce"),
+            "2026-08-24": (0.01043722, "v3.0-meta-2026-08-21-7d3d1cce"),
+        }
+
+        def get_object(Bucket, Key):
+            for d, (a, c) in history.items():
+                if Key == f"predictor/predictions/{d}.json":
+                    return self._history_response(a, c)
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+        mock_s3 = MagicMock()
+        mock_s3.get_object.side_effect = get_object
+        return mock_s3
+
+    @staticmethod
+    def _batch(alpha_stdev, confidences, n=30):
+        """`predicted_alpha` alternating ±alpha_stdev (population stdev is
+        exactly alpha_stdev), with `confidences` recycled across the rows."""
+        return [
+            {
+                "ticker": f"T{i}",
+                "predicted_alpha": alpha_stdev if i % 2 == 0 else -alpha_stdev,
+                "prediction_confidence": confidences[i % len(confidences)],
+            }
+            for i in range(n)
+        ]
+
+    def _run(self, predictions, date_str, champion, veto_threshold):
+        published = []
+        fake_alerts = MagicMock()
+        fake_alerts.publish_ops_alert.side_effect = lambda **kw: published.append(kw)
+        mock_boto3 = MagicMock()
+        mock_boto3.client.return_value = self._mock_s3()
+        with patch.dict("sys.modules", {"boto3": mock_boto3, "ops_alerts": fake_alerts}), \
+                patch.object(wo, "_resolve_champion_version_id", return_value=champion), \
+                patch.object(wo, "_load_predictor_params_from_s3", return_value=None), \
+                patch.object(wo.cfg, "MIN_CONFIDENCE", _LIVE_MIN_CONFIDENCE), \
+                patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING",
+                             False, create=True), \
+                patch("inference.stages.write_output._s3_put_json") as put:
+            write_predictions(
+                predictions, date_str, "bucket", {"model_version": "v1"},
+                veto_threshold=veto_threshold,
+            )
+        # _s3_put_json(s3, bucket, key, json_str)
+        artifact = json.loads(next(
+            c.args[3] for c in put.call_args_list
+            if c.args[2] == f"predictor/predictions/{date_str}.json"
+        ))
+        return artifact, published
+
+    def test_2026_08_31_healthy_rollback_does_not_alert(self):
+        """The alert Brian saw. Live 2026-08-31: healthy champion, alpha_stdev
+        0.0192146, 2 names above the 0.30 base and 0 above the bull-adjusted
+        0.40. Both defects have to be fixed for this to go quiet — the base
+        count is nonzero AND the champion changed."""
+        confidences = [0.3306, 0.3100] + [0.1863] * 8   # 2 clear 0.30, none clear 0.40
+        artifact, published = self._run(
+            self._batch(0.0192146, confidences, n=29),
+            "2026-08-31", "v3.0-meta-2026-08-14-119e069b", 0.40,
+        )
+        assert artifact["n_high_confidence"] == 0          # applied cut 0.40
+        assert artifact["n_high_confidence_base"] > 0      # base cut 0.30
+        assert artifact["veto_threshold_applied"] == pytest.approx(0.40)
+        assert artifact["veto_threshold_base"] == pytest.approx(_LIVE_MIN_CONFIDENCE)
+        assert artifact["n_high_confidence_zero_streak"] == 0
+        streak_alerts = [
+            a for a in published
+            if a.get("dedup_key", "").startswith("predictor_n_high_confidence_zero_streak")
+        ]
+        assert streak_alerts == []
+
+    def test_2026_08_27_collapse_still_alerts(self):
+        """No muting: the genuine collapse still raises, every day it persists,
+        and the message now carries the champion and the corroborating
+        dispersion verdict so the next reader can tell A from B."""
+        confidences = [0.2274, 0.0946, 0.0500]   # measured 08-27: max 0.2274
+        artifact, published = self._run(
+            self._batch(0.00722553, confidences, n=31),
+            "2026-08-28", "v3.0-meta-2026-08-21-7d3d1cce", 0.40,
+        )
+        assert artifact["n_high_confidence"] == 0
+        assert artifact["n_high_confidence_base"] == 0
+        assert artifact["n_high_confidence_zero_streak"] >= (
+            wo.N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS
+        )
+        streak_alerts = [
+            a for a in published
+            if a.get("dedup_key", "").startswith("predictor_n_high_confidence_zero_streak")
+        ]
+        assert len(streak_alerts) == 1
+        msg = streak_alerts[0]["message"]
+        assert "v3.0-meta-2026-08-21-7d3d1cce" in msg
+        assert "CORROBORATES a model collapse" in msg
+        assert streak_alerts[0]["severity"] == "warning"
+
+    def test_metric_has_a_rendered_consumer_on_the_gate_block(self):
+        """alpha-engine-config-I7353 finding 2 / I9019 'no prior consumer': the
+        number now rides the gate block already carried into predictions.json
+        AND metrics/latest.json, beside the dispersion verdict."""
+        artifact, _ = self._run(
+            self._batch(0.0192146, [0.3306, 0.1863], n=29),
+            "2026-08-31", "v3.0-meta-2026-08-14-119e069b", 0.40,
+        )
+        block = artifact["output_distribution_gate"]["metrics"]["n_high_confidence"]
+        assert block["applied_threshold"] == pytest.approx(0.40)
+        assert block["base_threshold"] == pytest.approx(_LIVE_MIN_CONFIDENCE)
+        assert block["basis"] == wo.N_HIGH_CONFIDENCE_BASIS
+        assert block["champion_version_id"] == "v3.0-meta-2026-08-14-119e069b"
+        assert block["dispersion_corroborates_collapse"] is False
+        assert block["observe_only"] is True
+        # observe-only: it must never move the allocation verdict
+        assert artifact["output_distribution_gate"]["passed"] is True

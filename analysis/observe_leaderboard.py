@@ -21,8 +21,10 @@ promote / demote / allocate):
    (``predictor/predictions_shadow/{version_id}/{date}.json``; the shadow runner
    still shadows registered CHALLENGER-stage versions) against realized 21d alpha
    alongside the champion. A diagnostic comparison surface; with the observe tier
-   retired it no longer GATES any promotion (its ``ready_for_full_promotion`` is
-   advisory only). Operator may still read it.
+   retired it no longer gates any promotion, and since I9319 it carries no
+   promotion-readiness verdict at all — the M-slot pointer is decided by
+   ``nousergon_lib.arena`` and recorded in ``arena/model/{date}.json``.
+   Operator may still read this for the realized numbers.
 
 Reuses the realized-alpha machinery from ``analysis/variant_cutover_gate.py``
 (``compute_realized_alpha_for_pairs``) and the S3 price / sector_map loaders from
@@ -83,11 +85,34 @@ _SHADOW_PREFIX = "predictor/predictions_shadow"
 _LIVE_PREDICTIONS_PREFIX = "predictor/predictions"
 OUTPUT_PREFIX = "predictor/model_zoo/observe_leaderboard"
 
-# #702 GATE-2 pre-registered soak criteria — the realized-edge promotion floor.
-MIN_SOAK_WEEKS = 4
-MIN_REALIZED_OUTCOMES = 20
-# Minimum matured pairs to compute a meaningful realized rank-IC at all.
+# ── Evidence bars: what survived §5.0 and what did not (I9319) ─────────────
+#
+# `champion-challenger-policy.md` §5.0 abolishes minimum-week bars and
+# minimum-cohort counts on every slot: they control no error rate at all, and
+# they are what deadlocked every promotion. The anytime-valid confidence
+# sequence in `nousergon_lib.arena.confseq` replaces them and subsumes them
+# naturally — the interval is very wide at week one, so no lead is supported,
+# and it narrows as evidence accrues.
+#
+# REMOVED (I9319): `MIN_SOAK_WEEKS = 4` and the `ready_for_full_promotion`
+# verdict it gated. That was exactly a minimum-week bar on the decision path
+# for the M slot. The decision now lives in `arena/model/{date}.json`.
+#
+# The line between the two kinds of floor, which is the whole judgement:
+#   * a floor on whether a MEASUREMENT IS WELL-FORMED survives;
+#   * a floor on whether EVIDENCE IS SUFFICIENT TO DECIDE does not.
+#
+# `_MIN_PAIRS_FOR_IC` is the first kind and only the first kind: a Spearman
+# correlation over fewer than ten pairs is not a weak statistic, it is not a
+# statistic. It is `ArenaConfig.min_paired_dates`'s shape. **It may never be
+# read as an evidence bar**, and nothing may use it to withhold a decision the
+# confidence sequence is willing to take.
 _MIN_PAIRS_FOR_IC = 10
+# `MIN_REALIZED_OUTCOMES` is retained for ONE purpose only: deciding whether
+# the noise-chasing ALARM can assert at all. An alarm that fires off three
+# matured pairs is noise about noise. It is not on any decision path, and
+# reinstating it as one would re-create what §5.0 removed.
+MIN_REALIZED_OUTCOMES = 20
 
 # ── alpha-engine-config-I9336: measurability vs. merely-thin ───────────────
 # Mirrors crucible-research/scoring/leaderboard_scoring.py::measurability_for
@@ -308,7 +333,8 @@ def _realized_rank_ic(pairs: list[dict]) -> tuple[float | None, int, int]:
 
 def _distinct_weeks(dates) -> int:
     """Count distinct ISO (year, week) buckets among the prediction dates — the
-    soak-coverage breadth (>= MIN_SOAK_WEEKS gates promotion-readiness)."""
+    coverage breadth, reported for a reader. It gates nothing: minimum-week
+    bars are abolished on this slot (champion-challenger-policy §5.0)."""
     import datetime
 
     weeks: set = set()
@@ -545,6 +571,31 @@ def _realized_rank_ic_by_version(pairs: list[dict]) -> list[dict]:
     return sorted(out, key=lambda r: (r["version_id"] is None, str(r["version_id"])))
 
 
+def per_date_rank_ic_by_version(pairs: list[dict]) -> dict:
+    """``{version_id: {date: rank_ic_or_None}}`` — the arena's score series.
+
+    alpha-engine-config-I9322. The same realized market-relative rank-IC
+    ``_realized_rank_ic_by_version`` already computes, at the granularity the
+    arena engine needs: **per date, not pooled**. Pooling across dates is what
+    the arena's longest-common-window pairing exists to avoid, so this stops
+    one step earlier and hands over the per-date series.
+
+    A ``None`` value means the day's cross-section was too thin to form a
+    correlation at all (``_MIN_PAIRS_FOR_IC``) — a well-formedness fact, which
+    the caller records as a MISS. It never means "this arm scored zero", and it
+    is never an evidence bar.
+    """
+    buckets: dict = {}
+    for p in pairs:
+        key = (p.get("champion_version_id"), str(p.get("date"))[:10])
+        buckets.setdefault(key, []).append(p)
+    out: dict = {}
+    for (vid, date), rows in buckets.items():
+        ic, _n, _weeks = _realized_rank_ic(rows)
+        out.setdefault(vid, {})[date] = ic
+    return out
+
+
 def _resolve_serving_champion_version_id(bucket: str, s3_client=None) -> str | None:
     """The registry version_id of the champion serving right now. None (honest
     absence) when the registry is unreadable."""
@@ -730,12 +781,15 @@ def build_observe_leaderboard(
     shadow_dates_by_version: dict[str, list[str]] | None = None,
 ) -> dict:
     """Score every shadow-run version against realized 21d alpha + emit the
-    leaderboard with a per-version ``ready_for_full_promotion`` verdict.
+    leaderboard.
 
-    REALIZED-edge driven (NOT training DSR): a version is promotion-ready iff it
-    has >= ``MIN_SOAK_WEEKS`` weeks coverage, >= ``MIN_REALIZED_OUTCOMES`` matured
-    outcomes, AND its realized rank-IC >= the champion's over the same window.
-    Measurement only — it NEVER promotes or allocates.
+    Pure MEASUREMENT — it never promotes or allocates, and since I9319 it no
+    longer carries a promotion-readiness verdict at all. The minimum-week and
+    minimum-cohort bars that verdict rested on are abolished
+    (champion-challenger-policy §5.0); the M slot's pointer is decided by
+    ``nousergon_lib.arena`` on realized market-relative rank-IC and recorded in
+    ``arena/model/{date}.json``. ``beats_champion_realized`` remains as a point
+    estimate for a reader, and is not a verdict.
 
     Test-injectable: ``shadow_pairs_by_version`` / ``live_pairs`` /
     ``prices_by_ticker`` / ``sector_map`` / ``registered_challenger_ids`` /
@@ -833,38 +887,33 @@ def build_observe_leaderboard(
         beats = (
             v_ic is not None and champ_ic is not None and v_ic >= champ_ic
         )
-        enough_data = (v_weeks >= MIN_SOAK_WEEKS and v_n >= MIN_REALIZED_OUTCOMES)
-        ready = bool(enough_data and beats)
         measurability, measurability_reason = measurability_for_shadow_arm(
             shadow_dates_by_version.get(vid, []), cohort_dates,
         )
         if v_ic is None:
             verdict_reason = (
-                f"insufficient matured outcomes: {v_n} (need >= {_MIN_PAIRS_FOR_IC} "
-                f"to compute realized IC; >= {MIN_REALIZED_OUTCOMES} to be promotion-ready)"
-            )
-        elif not enough_data:
-            verdict_reason = (
-                f"soak too young: {v_weeks} weeks / {v_n} matured outcomes "
-                f"(need >= {MIN_SOAK_WEEKS} weeks AND >= {MIN_REALIZED_OUTCOMES})"
+                f"unmeasurable: {v_n} matured pairs, below the {_MIN_PAIRS_FOR_IC} "
+                f"a Spearman correlation needs to exist at all. Not a weak "
+                f"result — no result (champion-challenger-policy §7.2)."
             )
         elif not beats:
             verdict_reason = (
-                f"realized rank-IC {v_ic:.4f} < champion {champ_ic:.4f} over the soak "
-                f"— hold; realized edge not demonstrated"
+                f"realized rank-IC {v_ic:.4f} < champion {champ_ic:.4f} over "
+                f"{v_weeks} weeks / {v_n} matured outcomes (point estimate)"
             )
         else:
             verdict_reason = (
-                f"READY: realized rank-IC {v_ic:.4f} >= champion {champ_ic:.4f} over "
-                f"{v_weeks} weeks / {v_n} matured outcomes. Operator may promote: "
-                f"python -m model.registry --bucket {bucket} --promote {vid}"
+                f"realized rank-IC {v_ic:.4f} >= champion {champ_ic:.4f} over "
+                f"{v_weeks} weeks / {v_n} matured outcomes (point estimate). "
+                f"Whether that lead is SUPPORTED, and whether the pointer moves, "
+                f"is decided by the anytime-valid sequence in "
+                f"arena/model/{{date}}.json — never here (I9319/I9322)."
             )
         if measurability == MEASURABILITY_UNMEASURABLE:
             # Overrides the insufficient/soak-too-young framing above: this is
             # not "not enough evidence yet", it is "produced no comparable
             # output" — a defect that resolves by fixing the shadow write
             # path, never by waiting (champion-challenger-policy §7.2).
-            ready = False
             verdict_reason = f"UNMEASURABLE: {measurability_reason}"
             starved.append(vid)
         entries.append({
@@ -873,7 +922,6 @@ def build_observe_leaderboard(
             "n_matured_outcomes": v_n,
             "n_weeks_coverage": v_weeks,
             "beats_champion_realized": beats,
-            "ready_for_full_promotion": ready,
             "verdict_reason": verdict_reason,
             "measurability": measurability,
             "measurability_reason": measurability_reason,
@@ -933,12 +981,12 @@ def build_observe_leaderboard(
         except Exception:  # noqa: BLE001 — alert is best-effort observability
             log.warning("observe_leaderboard: unmeasurable-arm alert itself failed", exc_info=True)
 
-    # Rank promotion-ready first, then by realized IC desc (None last).
+    # Rank by realized IC desc (None last). There is deliberately no
+    # promotion-readiness key to sort on any more: this artifact MEASURES, the
+    # arena cycle DECIDES, and a diagnostic that ranks by its own readiness
+    # verdict is one edit away from being read as the decision (I9319).
     entries.sort(
-        key=lambda e: (
-            not e["ready_for_full_promotion"],
-            -(e["realized_rank_ic"] if e["realized_rank_ic"] is not None else -1e9),
-        )
+        key=lambda e: -(e["realized_rank_ic"] if e["realized_rank_ic"] is not None else -1e9)
     )
 
     payload = {
@@ -947,10 +995,17 @@ def build_observe_leaderboard(
         "date": trading_day,
         "window_days": n_days,
         "horizon_days": horizon_days,
-        "soak_criteria": {
-            "min_weeks": MIN_SOAK_WEEKS,
-            "min_realized_outcomes": MIN_REALIZED_OUTCOMES,
-            "gate": "realized rank-IC >= champion realized rank-IC (NOT training DSR)",
+        # No `soak_criteria` block: the minimum-week and minimum-cohort bars
+        # it declared are abolished for this slot (champion-challenger-policy
+        # §5.0, alpha-engine-config-I9319). The evidence bar is the
+        # anytime-valid confidence sequence, and it lives in the arena cycle.
+        "decision_authority": {
+            "artifact": "arena/model/{date}.json",
+            "note": (
+                "This leaderboard MEASURES realized edge. It decides nothing. "
+                "The M slot's pointer is decided by nousergon_lib.arena on "
+                "realized market-relative rank-IC (I9322)."
+            ),
         },
         "champion": {
             "realized_rank_ic": champ_ic,
@@ -958,7 +1013,6 @@ def build_observe_leaderboard(
             "n_weeks_coverage": champ_weeks,
         },
         "entries": entries,
-        "ready_version_ids": [e["version_id"] for e in entries if e["ready_for_full_promotion"]],
     }
 
     if write_to_s3:
@@ -967,9 +1021,10 @@ def build_observe_leaderboard(
         )
 
     log.info(
-        "observe_leaderboard: %d version(s) scored; %d ready-for-full-promotion "
-        "(champion realized rank-IC=%s over %d matured / %d weeks)",
-        len(entries), len(payload["ready_version_ids"]), champ_ic, champ_n, champ_weeks,
+        "observe_leaderboard: %d version(s) scored (champion realized "
+        "rank-IC=%s over %d matured / %d weeks). Measurement only — the "
+        "pointer decision is arena/model/{date}.json.",
+        len(entries), champ_ic, champ_n, champ_weeks,
     )
     return payload
 

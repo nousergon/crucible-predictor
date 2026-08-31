@@ -70,10 +70,33 @@ def test_live_writes_the_staging_prefix_never_the_serving_prefix(fake_config):
         "predictor/metrics/training_summary_2026-06-30.json"
     )
     assert io.summary_latest_key == _LIVE_SUMMARY_LATEST
-    assert io.oos_rows_key("2026-06-30") == (
-        "predictor/diagnostics/oos_rows/2026-06-30.parquet"
+    assert io.oos_rows_key("2026-06-30", "v3.0-meta") == (
+        "predictor/diagnostics/oos_rows/v3.0-meta/2026-06-30.parquet"
     )
-    assert io.oos_rows_latest_key == "predictor/diagnostics/oos_rows/latest.parquet"
+    assert io.oos_rows_latest_key("v3.0-meta") == (
+        "predictor/diagnostics/oos_rows/v3.0-meta/latest.parquet"
+    )
+
+
+def test_oos_rows_key_requires_a_model_version(fake_config):
+    """alpha-engine-config-I9378 — an unscoped OOS-diagnostic key is exactly
+    the collision that let a specialist run overwrite the champion run's
+    panel; refusing a bare/absent model_version makes it unrepresentable."""
+    io = TrainingIOSpec.live()
+    with pytest.raises(ValueError, match="oos_rows_key requires"):
+        io.oos_rows_key("2026-06-30", "")
+    with pytest.raises(ValueError, match="oos_rows_latest_key requires"):
+        io.oos_rows_latest_key("")
+
+
+def test_oos_rows_keys_for_two_specs_in_one_rotation_are_disjoint(fake_config):
+    """The exact bug, reproduced at the key layer: a champion-arch spec and a
+    specialist spec (e.g. m-spec-60d) training in the same rotation, same
+    date, must never resolve to the same oos_rows key."""
+    io = TrainingIOSpec.live()
+    champion_key = io.oos_rows_key("2026-08-28", "v3.0-meta-2026-08-28-01cf7e1a")
+    specialist_key = io.oos_rows_key("2026-08-28", "m-spec-60d-2026-08-28-50bb8bdf")
+    assert champion_key != specialist_key
 
 
 def test_live_for_run_scopes_by_date_and_model_version(fake_config):
@@ -134,8 +157,8 @@ def test_shadow_crsp_outputs_are_isolated_under_shadow_prefixes():
     assert io.summary_latest_key == (
         "predictor/metrics_shadow/crsp/training_summary_latest.json"
     )
-    assert io.oos_rows_key("2026-06-30") == (
-        "predictor/diagnostics_shadow/crsp/oos_rows/2026-06-30.parquet"
+    assert io.oos_rows_key("2026-06-30", "v3.0-meta") == (
+        "predictor/diagnostics_shadow/crsp/oos_rows/v3.0-meta/2026-06-30.parquet"
     )
     assert io.predictions_prefix == "predictor/predictions_shadow/crsp/"
 
@@ -167,8 +190,8 @@ def test_shadow_paths_are_disjoint_from_live_champion():
         io.feature_list_key,
         io.summary_key("2026-06-30"),
         io.summary_latest_key,
-        io.oos_rows_key("2026-06-30"),
-        io.oos_rows_latest_key,
+        io.oos_rows_key("2026-06-30", "v3.0-meta"),
+        io.oos_rows_latest_key("v3.0-meta"),
         io.predictions_prefix,
     ]
     for sp in shadow_paths:

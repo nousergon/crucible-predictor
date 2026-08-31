@@ -36,8 +36,11 @@ of it.
 How it is measured
 ------------------
 Both models are scored, at promotion time, over ONE common real feature panel —
-this rotation's own OOS row dump, ``predictor/diagnostics/oos_rows/{date}.parquet``
-(written by the live champion-arch spec; shadow specs write elsewhere, see
+this rotation's own OOS row dump,
+``predictor/diagnostics/oos_rows/{model_version}/{date}.parquet``
+(written by the live champion-arch spec, keyed by ITS OWN model_version since
+alpha-engine-config-I9378 — a bare `{date}.parquet` key collided across every
+live-basis spec in a rotation; shadow specs write elsewhere, see
 ``training/io_spec.py``). Per panel date, the top ``top_n`` rows by predicted
 alpha are taken — the executor's own selection rule — and the dispersion of
 ``predicted_alpha`` and ``p_up`` WITHIN that slice is measured, plus the count of
@@ -122,24 +125,89 @@ def _get_bytes(s3, bucket: str, key: str) -> bytes:
     return s3.get_object(Bucket=bucket, Key=key)["Body"].read()
 
 
-def read_oos_panel(s3, bucket: str, date_str: str | None) -> tuple[object, str]:
+# alpha-engine-config-I9378 — a panel whose most recent trading date lags
+# the training run reading it by more than this many NYSE sessions is not
+# this rotation's vintage, whatever key it was read from. Measured incident:
+# the object at the champion's own dated key carried a panel ~120 trading
+# sessions (5.5 calendar months) stale, written by a LATER same-day
+# specialist run that shared the unscoped key. A generous, cadence-aware
+# bound (weekly retraining) catches that class without false-positiving on a
+# panel that simply trails by a session or two.
+MAX_OOS_PANEL_STALENESS_TRADING_DAYS = 30
+
+
+def _verify_oos_panel_freshness(panel, key: str, expected_date_str: "str | None") -> None:
+    """Raise if ``panel``'s date range is not plausibly THIS rotation's.
+
+    alpha-engine-config-I9378 deliverable 3: a reader of an ``oos_rows``
+    panel must verify the panel's date range is consistent with the run it
+    is being read against, and raise rather than silently answering from the
+    wrong panel. Only checked when both a max panel date and an expected
+    date are available — absence of either is reported by the caller as
+    ``uncomputable``, never treated as a pass on an unmeasured claim.
+
+    Trading-day arithmetic (``krepis.dates.trading_days_stale``), not
+    calendar days — the fleet-wide freshness convention
+    (``tests/test_freshness_uses_trading_days.py``).
+    """
+    if not expected_date_str or "date" not in getattr(panel, "columns", []):
+        return
+    import pandas as pd
+    from krepis.dates import trading_days_stale
+
+    dates = pd.to_datetime(panel["date"], errors="coerce").dropna()
+    if dates.empty:
+        return
+    panel_max = dates.max()
+    expected = pd.to_datetime(expected_date_str, errors="coerce")
+    if pd.isna(expected):
+        return
+    lag_sessions = trading_days_stale(panel_max.date(), expected.date())
+    if lag_sessions > MAX_OOS_PANEL_STALENESS_TRADING_DAYS:
+        raise RuntimeError(
+            f"OOS panel {key} is STALE by construction: its last date is "
+            f"{panel_max.date()}, {lag_sessions} NYSE sessions before the "
+            f"{expected_date_str} run reading it (floor "
+            f"{MAX_OOS_PANEL_STALENESS_TRADING_DAYS} sessions). This is the "
+            "signature of a specialist run overwriting the champion's "
+            "diagnostic at an unscoped key (alpha-engine-config-I9378) — "
+            "refusing to score against the wrong panel rather than silently "
+            "answering from it."
+        )
+
+
+def read_oos_panel(
+    s3, bucket: str, date_str: str | None, model_version: "str | None" = None,
+) -> tuple[object, str]:
     """The rotation's own OOS feature panel, plus the key it came from.
+
+    alpha-engine-config-I9378 — ``model_version`` scopes the key to the arm
+    that wrote it (the champion-arch spec this rotation, per the module
+    docstring). ``None`` falls back to the pre-fix unscoped prefix ONLY for
+    reading historical panels written before this fix landed; a caller with a
+    ``model_version`` in hand must always pass it.
 
     Prefers the dated key so the panel is provably THIS rotation's vintage;
     falls back to ``latest.parquet`` (logged) when the dated one is absent.
-    Raises when neither is readable — the caller turns that into
-    ``uncomputable``, never into a pass.
+    Every candidate is verified for date-range freshness against
+    ``date_str`` before being accepted — a stale panel raises exactly like an
+    unreadable one, and the caller turns that into ``uncomputable``, never
+    into a pass.
     """
     import pandas as pd
 
+    prefix = (
+        f"{_OOS_ROWS_PREFIX}{model_version}/" if model_version else _OOS_ROWS_PREFIX
+    )
     keys = []
     if date_str:
-        keys.append(f"{_OOS_ROWS_PREFIX}{date_str}.parquet")
-    keys.append(f"{_OOS_ROWS_PREFIX}latest.parquet")
+        keys.append(f"{prefix}{date_str}.parquet")
+    keys.append(f"{prefix}latest.parquet")
     last_exc: Exception | None = None
     for key in keys:
         try:
             panel = pd.read_parquet(_io.BytesIO(_get_bytes(s3, bucket, key)))
+            _verify_oos_panel_freshness(panel, key, date_str)
         except Exception as exc:  # noqa: BLE001 — tried in order, reported below
             last_exc = exc
             continue
@@ -148,11 +216,12 @@ def read_oos_panel(s3, bucket: str, date_str: str | None) -> tuple[object, str]:
                 "served-slice dispersion: dated OOS panel %s%s.parquet is not "
                 "readable — falling back to latest.parquet. The panel's vintage "
                 "is therefore not proven to be this rotation's.",
-                _OOS_ROWS_PREFIX, date_str,
+                prefix, date_str,
             )
         return panel, key
     raise RuntimeError(
-        f"no readable OOS feature panel at any of {keys} ({last_exc})"
+        f"no readable, freshness-verified OOS feature panel at any of {keys} "
+        f"({last_exc})"
     )
 
 
@@ -481,6 +550,7 @@ def _cross_version_diagnostics(alphas: dict, dates, reference_version_id, *,
 
 def served_slice_metrics(s3, bucket: str, version_ids, *,
                          date_str: str | None = None,
+                         model_version: str | None = None,
                          panel=None, panel_key: str | None = None,
                          reference_version_id: str | None = None) -> dict:
     """Served-slice metrics for every version in ``version_ids``, on ONE panel.
@@ -498,6 +568,11 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
     (champion-challenger-policy §5.1). A per-version failure is recorded in
     ``errors`` and named on the leaderboard; it is never a pass, and the veto
     simply cannot arm for that version.
+
+    ``model_version`` (alpha-engine-config-I9378) scopes the ``oos_rows`` key
+    read to the champion-arch spec that wrote this rotation's panel — pass
+    the champion-arch's own registered ``version_id``. Ignored when ``panel``
+    is supplied directly.
     """
     top_n, min_conf = _top_n(), _min_confidence()
     out: dict = {
@@ -511,7 +586,7 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
         return out
     if panel is None:
         try:
-            panel, panel_key = read_oos_panel(s3, bucket, date_str)
+            panel, panel_key = read_oos_panel(s3, bucket, date_str, model_version)
         except Exception as exc:  # noqa: BLE001 — reported, never a pass
             out["reason"] = f"OOS feature panel unavailable: {exc}"
             log.warning(

@@ -62,6 +62,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-I9018: 7 -> 6. The dated-archive write
     # (predictor/weights/meta/archive/{date}/) is GONE — training writes a
     # per-run staging prefix and the immutable registry bundle is the store.
+    "training/arena_model_slot.py": 2,  # arena/model-slot register + arena_cycle artifacts (alpha-engine-config-I9319)
     "training/meta_trainer.py": 6,
     # alpha-engine-config-I9018: 4 -> 3. The G2 live-contract RESTORE put is
     # GONE with G2 itself — training can no longer write the live contract, so

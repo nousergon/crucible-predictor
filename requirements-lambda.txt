@@ -30,12 +30,12 @@
 # now passes — load-bearing at runtime (a bootstrap on an older-krepis box
 # fails after the spot already exists and is billing), not only for CI
 # collection. Kept in lockstep with requirements.txt.
-krepis[flow-doctor]==0.59.39  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; bumped 0.59.31 -> 0.59.33 for alpha-engine-config-I8298 — 0.59.33 is the first krepis whose flow-doctor extra floors flow-doctor>=0.16.0, below which TelegramNotifier.validate() catches only URLError and a TimeoutError from an unreachable api.telegram.org escapes on the IMPORT path; that killed this Lambda five times on 2026-08-24 and degraded MarketHoursGate and DeployDriftCheck on the same postclose run. 0.59.31 and 0.59.32 both still declared flow-doctor>=0.8.1 (krepis-PR184 raised it but auto-version-bump keyed on src/ only, so it merged green and published nothing — krepis-PR185).
+krepis[flow-doctor]==0.59.41  # pinned per §139 — first-party/fast-moving deps are pinned, never floored; alpha-engine-config-I8155 requires StageVerdict to reject blank execution run_date and key only on it; bumped 0.59.31 -> 0.59.33 for alpha-engine-config-I8298 — 0.59.33 is the first krepis whose flow-doctor extra floors flow-doctor>=0.16.0, below which TelegramNotifier.validate() catches only URLError and a TimeoutError from an unreachable api.telegram.org escapes on the IMPORT path; that killed this Lambda five times on 2026-08-24 and degraded MarketHoursGate and DeployDriftCheck on the same postclose run. 0.59.31 and 0.59.32 both still declared flow-doctor>=0.8.1 (krepis-PR184 raised it but auto-version-bump keyed on src/ only, so it merged green and published nothing — krepis-PR185).
 # alpha-engine-config-I7634: checked whether this repo needs the krepis>=0.59.15
 # gitleaks/session_dlp prerequisite — it does not. No file here (including the
 # Lambda handlers) imports `krepis.LLMClient`; the `[flow-doctor]` extra is the
 # diagnosis wiring, not LLMClient itself.
-nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.93
+nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.99
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.1

@@ -62,8 +62,11 @@ class TestResolveBaseChampionVersion:
 # ── base competes in the pool + alerts on promote/observe ──────────────────
 
 
-def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
+def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic,
+                  arena_pointer=None, arena_moved=False):
     """Champion (serving) CPCV 0.10; a base-arch retrain + one variant compete."""
+    from tests.arena_test_helpers import mock_arena_run_slot, mock_model_zoo_post_select_reads
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta", raising=False)
@@ -92,6 +95,17 @@ def _pool_fixture(monkeypatch, *, auto_promote, base_ic, variant_ic):
 
     def _fake_train(bucket, *, date_str=None, dry_run=False):
         return {"status": "ok"}
+
+    margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
+    if arena_pointer is None:
+        if variant_ic >= base_ic + margin:
+            arena_pointer, arena_moved = "resid-v", True
+        elif base_ic >= 0.10 + margin:
+            arena_pointer, arena_moved = "base-today", False
+        else:
+            arena_pointer, arena_moved = "old-champ-v", False
+    mock_arena_run_slot(monkeypatch, pointer_version_id=arena_pointer, moved=arena_moved)
+    mock_model_zoo_post_select_reads(monkeypatch)
 
     board = mz.run_rotation_and_select(
         "bkt", budget=5, specs=_SPECS, train_fn=_fake_train,
@@ -136,7 +150,7 @@ class TestBaseInPool:
         assert board["champion_arch_refresh_version_id"] == "base-today"
         assert board["champion_arch_refresh_refused_reason"] is None
         assert board["promoted"] == "base-today"
-        assert board["promoted_kind"] == "champion-arch-refresh"
+        assert board["promoted_kind"] == "refit"
         assert promotes == ["base-today"]
 
     def test_a_refresh_that_does_not_beat_the_incumbent_is_refused(self, monkeypatch):
@@ -163,7 +177,7 @@ class TestBaseInPool:
         board, _, _ = _pool_fixture(monkeypatch, auto_promote=True,
                                     base_ic=0.12, variant_ic=0.25)
         assert board["winner_version_id"] == "resid-v"
-        assert board["promoted_kind"] == "challenger"
+        assert board["promoted_kind"] == "arena-pointer"
 
     def test_the_refresh_fires_exactly_when_it_beats_the_serving_incumbent(self, monkeypatch):
         """The sweep that used to prove "nothing ever promotes" now proves the
@@ -176,15 +190,19 @@ class TestBaseInPool:
         """
         margin = float(getattr(cfg, "MODEL_ZOO_PROMOTE_MARGIN", 0.01))
         for base_ic in (0.05, 0.15, 0.30, 0.90):
+            should_refresh = base_ic >= 0.10 + margin
             board, promotes, _ = _pool_fixture(
                 monkeypatch, auto_promote=True, base_ic=base_ic,
                 variant_ic=base_ic - 0.02,
+                arena_pointer="base-today" if should_refresh else "old-champ-v",
+                arena_moved=False,
             )
             assert board["winner_version_id"] is None, base_ic
-            should_refresh = base_ic >= 0.10 + margin
-            assert (board["champion_arch_refresh_version_id"] == "base-today") \
-                is should_refresh, base_ic
             assert promotes == (["base-today"] if should_refresh else []), base_ic
+            if should_refresh:
+                assert board["promoted_kind"] == "refit"
+            else:
+                assert board.get("promoted_kind") is None
             if not should_refresh:
                 assert (board["champion_arch_refresh_refused_reason"]
                         == "below_serving_incumbent_plus_margin"), base_ic

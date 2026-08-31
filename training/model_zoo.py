@@ -1348,6 +1348,9 @@ def select_winner(
         s3, bucket,
         list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
         date_str=date_str,
+        # alpha-engine-config-I9378 — the oos_rows panel this rotation is
+        # scoped by the champion-arch spec that wrote it, never a bare date.
+        model_version=champ_arch_vid,
         reference_version_id=serving_bundle_vid,
     )
     served_by_vid = served_slice.get("metrics") or {}
@@ -1911,6 +1914,39 @@ def select_winner(
     }
 
 
+#: `champion-challenger-policy.md` §3.1: **`promoted_kind:
+#: champion-arch-refresh` is abolished.** A retrain of an existing recipe is not
+#: a promotion event at all — the arm was already in the rotation and simply
+#: refit. A retrain that CHANGES the recipe is a new arm which must win a
+#: comparison like any other challenger. There is no third category.
+#:
+#: Exactly one predictor challenger has ever won a promotion (2026-07-17);
+#: every other transition used this kind. That statistic is the defect, which
+#: is why the string is refused by construction rather than discouraged in
+#: prose.
+ABOLISHED_PROMOTION_KINDS = ("champion-arch-refresh",)
+
+
+class AbolishedPromotionKindError(RuntimeError):
+    """A promotion kind `champion-challenger-policy.md` §3.1 abolished."""
+
+
+def _assert_no_arch_refresh_kind(kind) -> None:
+    """Refuse an abolished promotion kind, wherever it is about to be written."""
+    if kind in ABOLISHED_PROMOTION_KINDS:
+        raise AbolishedPromotionKindError(
+            f"promoted_kind={kind!r} is ABOLISHED (champion-challenger-policy "
+            f"§3.1, Brian ruling 2026-08-29). An arm is an immutable RECIPE and "
+            f"its weights refresh on the cadence the recipe declares, so a "
+            f"champion-architecture retrain is a REFIT — recorded via "
+            f"ArmRegister.refit(), changing no arm id and resetting no score "
+            f"series — and is not a promotion event. A retrain that changes the "
+            f"recipe is a NEW arm that must win the arena comparison like any "
+            f"other challenger. Legitimate kinds: 'arena-pointer' (the pointer "
+            f"moved to a different arm) and 'refit' (same arm, newer bundle)."
+        )
+
+
 def _write_leaderboard(s3, bucket: str, date_str: str | None, leaderboard: dict) -> None:
     # config#1083: write BOTH the dated key AND latest.json. The prior code wrote
     # only the dated key (or latest.json when date_str was None) — never both — so
@@ -2009,11 +2045,12 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
         "promoted": promoted,
         "promoted_kind": leaderboard.get("promoted_kind"),
         "winner_version_id": leaderboard.get("winner_version_id"),
-        # alpha-engine-config-I9061 — recorded alongside the winner so a reader
-        # of the marker alone can tell WHICH of the two promotion paths moved
-        # the pointer, without re-deriving it from ``promoted_kind``.
-        "champion_arch_refresh_version_id": leaderboard.get(
-            "champion_arch_refresh_version_id"),
+        # I9319 — the pointer is decided by the arena, so the marker records
+        # WHICH ARM it points at and the cycle artifact that decided it. The
+        # old `champion_arch_refresh_version_id` field is gone with the kind it
+        # served (policy §3.1): there is no second promotion path any more.
+        "arena_pointer_arm": leaderboard.get("arena_pointer_arm"),
+        "arena_cycle_keys": leaderboard.get("arena_cycle_keys"),
         "prior_champion_version_id": prior_champ_vid,
         # The registry version_id that should be SERVING after this rotation:
         # the promoted vid on a cutover, else the (unchanged) prior champion.
@@ -2137,12 +2174,16 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
         # challenger that beat champion-arch, or the champion-arch retrain that
         # beat the serving incumbent. They carry different revert reasoning.
         _kind = leaderboard.get("promoted_kind") or "?"
+        _assert_no_arch_refresh_kind(_kind)
         _kind_txt = (
-            "a CHALLENGER (beat the fresh champion-arch baseline)"
-            if _kind == "challenger" else
-            "the FRESH CHAMPION-ARCH retrain (no challenger won; it beat the "
-            "SERVING incumbent by margin and cleared every challenger gate)"
-            if _kind == "champion-arch-refresh" else _kind
+            "the ARENA POINTER MOVED to a different arm — it led the incumbent "
+            "on the longest window the two share, with the anytime-valid "
+            "sequence supporting the lead (champion-challenger-policy §5)"
+            if _kind == "arena-pointer" else
+            "a REFIT of the arm already serving — the recipe is unchanged and "
+            "its score series is continuous across it. Not a promotion "
+            "(champion-challenger-policy §3.1)"
+            if _kind == "refit" else _kind
         )
         msg = (
             f"[predictor] Model-zoo AUTO-PROMOTED a new champion ({date_str}).\n"
@@ -3059,12 +3100,66 @@ def select_and_finalize(
         # exclusive by construction — the refresh is only ever set when no
         # challenger won (see select_winner). Both then face the ENTRANCE gate
         # below, which reads ``promote_vid`` regardless of kind.
-        refresh_vid = leaderboard.get("champion_arch_refresh_version_id")
-        promote_vid = winner_vid or refresh_vid
-        promote_kind = (
-            "challenger" if winner_vid
-            else ("champion-arch-refresh" if refresh_vid else None)
+        # ── The M-slot ARENA decides the pointer (I9319 / I9322) ────────────
+        #
+        # What this replaced, and why it is a retirement rather than a tweak:
+        # the promotion decision used to be a CPCV-mean-IC margin comparison
+        # against a number this run had itself overwritten (`x >= x + 0`,
+        # 4/4 rotations 2026-08-07 → 2026-08-21; I9018 fixed the READ, this
+        # retires the GATE). It was also ranked on a statistic measured to have
+        # NO relationship with the outcome it predicts — n=6 attributed
+        # champion eras, Spearman +0.03, permutation p=0.90 (Brian's ruling,
+        # alpha-engine-config-I9322).
+        #
+        # The pointer now goes to the arm leading the incumbent on the longest
+        # window the two of them SHARE, among arms whose lead the anytime-valid
+        # confidence sequence supports, on REALIZED market-relative rank-IC.
+        # `nousergon_lib.arena` owns that decision entirely; nothing here
+        # re-derives any part of it (policy §10).
+        #
+        # `promoted_kind: champion-arch-refresh` is ABOLISHED (policy §3.1) and
+        # is structurally unwritable below: an arm is a RECIPE, so refreshing
+        # the champion arm's weights is a REFIT — the arm doing its job — and
+        # not a promotion event at all. `_assert_no_arch_refresh_kind` fails
+        # loud if the string is ever reintroduced.
+        from training import arena_model_slot as arena
+
+        _arena_run = arena.run_slot(
+            s3, bucket, as_of=date_str,
+            specs=specs,
+            incumbent_version_id=_prior_champ_vid,
+            diagnostics={
+                "cpcv_leaderboard": {
+                    "note": (
+                        "Promotion-time CPCV mean IC, RETAINED AS A DIAGNOSTIC "
+                        "ONLY. It is not the ranking basis and may never become "
+                        "one again without amending champion-challenger-policy "
+                        "§4 (alpha-engine-config-I9322)."
+                    ),
+                    "candidates": [
+                        {"version_id": c.get("version_id"),
+                         "cpcv_mean_ic": c.get("cpcv_mean_ic")}
+                        for c in leaderboard.get("candidates") or []
+                    ],
+                },
+            },
         )
+        leaderboard["arena_cycle_keys"] = _arena_run["keys"]
+        leaderboard["arena_decision"] = _arena_run["cycle"].decision.to_dict()
+        leaderboard["arena_pointer_arm"] = _arena_run["pointer_arm"]
+
+        promote_vid = _arena_run["pointer_version_id"]
+        if not promote_vid:
+            promote_kind = None
+        elif promote_vid == _prior_champ_vid:
+            # Same arm, same bundle: nothing to do.
+            promote_vid, promote_kind = None, None
+        elif _arena_run["cycle"].decision.moved:
+            promote_kind = "arena-pointer"
+        else:
+            # Same arm, newer bundle. A refit, not a promotion (policy §3.1).
+            promote_kind = "refit"
+        _assert_no_arch_refresh_kind(promote_kind)
 
         # ── ENTRANCE gate (alpha-engine-config-I8195) ────────────────────────────
         # Record, on EVERY rotation, which absolute bar was applied and whether the

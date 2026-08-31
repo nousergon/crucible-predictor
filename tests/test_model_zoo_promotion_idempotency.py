@@ -116,11 +116,14 @@ def _mk_marker(*, promoted, champion_after, mode="cutover"):
 
 
 def _select_fixture(monkeypatch, *, s3=None, objects=None, auto_promote=True,
-                    champion_vid=None, promote_boom=False):
+                    champion_vid=None, promote_boom=False,
+                    arena_pointer="resid-v", arena_moved=True):
     """Registry fixture mirroring test_model_zoo_parallel.py: one challenger
     (resid-v) registered for _DATE; ``champion_vid`` controls what
     list_versions(stage='champion') reports as the live champion. Returns
     (board_fn, promotes, s3, sent, inert) where board_fn runs the select."""
+    from tests.arena_test_helpers import mock_arena_run_slot, mock_model_zoo_post_select_reads
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
@@ -152,6 +155,10 @@ def _select_fixture(monkeypatch, *, s3=None, objects=None, auto_promote=True,
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
     monkeypatch.setattr(mz, "_alert_promotion", lambda *a, **k: None)
     monkeypatch.setattr(mz, "_alert_observe_recommendation", lambda *a, **k: None)
+    mock_arena_run_slot(
+        monkeypatch, pointer_version_id=arena_pointer, moved=arena_moved,
+    )
+    mock_model_zoo_post_select_reads(monkeypatch)
 
     def _run():
         return mz.run_select_only("bkt", date_str=_DATE, s3=s3, specs=_SPECS,
@@ -173,7 +180,7 @@ def test_marker_written_on_promotion_apply(monkeypatch):
     assert marker["schema_version"] == 1
     assert marker["run_date"] == _DATE
     assert marker["promoted"] == "resid-v"
-    assert marker["promoted_kind"] == "challenger"
+    assert marker["promoted_kind"] == "arena-pointer"
     assert marker["champion_version_id_after"] == "resid-v"
     assert marker["registry_bundle_prefix"] == "predictor/registry/resid-v/"
     assert marker["live_weights_prefix"] == "predictor/weights/meta/"
@@ -188,7 +195,9 @@ def test_marker_written_on_observe_finalize_with_no_promotion(monkeypatch):
     # including its ONE digest email — still happened; the marker (promoted=
     # None, champion unchanged) makes the re-run email-free too.
     run, promotes, s3, _, _ = _select_fixture(
-        monkeypatch, auto_promote=False, champion_vid="champ-0")
+        monkeypatch, auto_promote=False, champion_vid="champ-0",
+        arena_pointer="champ-0", arena_moved=False,
+    )
     board = run()
     assert board["promoted"] is None
     assert promotes == []
@@ -306,7 +315,7 @@ def test_no_marker_written_when_promote_fails(monkeypatch):
     # config#2870: a promote_to_champion exception must not go silent — the
     # only prior trace was board["promote_error"], persisted to S3 and never
     # surfaced to an operator.
-    assert promote_failed == [("resid-v", "challenger")]
+    assert promote_failed == [("resid-v", "arena-pointer")]
 
 
 def test_promote_failure_alert_not_fired_on_success(monkeypatch):
