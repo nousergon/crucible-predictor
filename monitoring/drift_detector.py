@@ -18,12 +18,27 @@ action.
 Three of those actions prescribe champion replacement, which runs through
 ``PredictorTraining`` on ``ne-weekly-freshness-pipeline``. This module therefore
 reads ONE external fact beyond the predictions themselves: the most recent
-SUCCEEDED cycle of that pipeline, from
+COMPLETED cycle of that pipeline, from
 ``s3://<bucket>/_sf_completion/ne-weekly-freshness-pipeline/{cycle_key}.json``
 (per-key GET, no listing, no Step Functions API — see
 ``_last_successful_weekly_cycle``). When it is stale the alert names the stale
 pipeline instead of prescribing a lever that is disconnected
 (alpha-engine-config#7536).
+
+alpha-engine-config-I8078: that read used to check ``status == "SUCCEEDED"``,
+which is status-BLIND — a ``WeeklyRunDayGate`` no-op skip (the weekday
+exercise cadence gating itself out in ~3s) and a mechanical-recovery tail
+that reached ``WriteCompletionMarker`` both also write ``status: SUCCEEDED``,
+with no way to tell either from a cycle that actually did the work. It now
+reads the marker's ``cycle_verdict`` via
+``nousergon_lib.pipeline_status.completion_marker.marker_verdict`` — the
+fleet's canonical verdict reader (alpha-engine-config-I8154/I8186), populated
+by ``WeeklyCoverageSweep`` augmenting the marker with the cycle's real shape
+after every real weekly cycle. A marker with no ``cycle`` block (written
+before the sweep existed, or a cycle the sweep could not augment) resolves to
+``VERDICT_UNKNOWN`` and is **not** treated as a completed cycle — degrading
+honestly (this alert falls back to "pipeline stale") rather than trusting a
+bare ``status`` field this module already knows cannot be trusted.
 
 Usage:
     python -m monitoring.drift_detector                    # check today
@@ -192,8 +207,8 @@ def _load_json_maybe_wrapped(s3, bucket: str, key: str) -> dict | None:
 def _last_successful_weekly_cycle(
     s3, bucket: str, target: date,
 ) -> tuple[str, int] | None:
-    """(cycle_key, cycles_ago) of the most recent SUCCEEDED weekly-freshness run,
-    or None if none of the recent cycles succeeded.
+    """(cycle_key, cycles_ago) of the most recent COMPLETED weekly-freshness
+    cycle, or None if none of the recent cycles completed.
 
     Champion replacement runs through ``PredictorTraining`` on
     ``ne-weekly-freshness-pipeline``, so "can the prescribed remedy run today"
@@ -208,7 +223,19 @@ def _last_successful_weekly_cycle(
     ``cycles_ago`` counts weekly cycles, not days, because staleness here is a
     property of the pipeline's own cadence: one missed Saturday is a miss, two
     is a standing outage.
+
+    alpha-engine-config-I8078: reads ``cycle_verdict`` via
+    ``nousergon_lib.pipeline_status.completion_marker.marker_verdict`` rather
+    than the marker's bare ``status`` — see the module docstring. A marker
+    whose ``cycle_verdict`` is missing or ``VERDICT_UNKNOWN`` (not yet
+    augmented by ``WeeklyCoverageSweep``, or a genuinely undetermined cycle)
+    does NOT count as completed here; this function degrades to reporting the
+    pipeline stale rather than manufacturing a pass out of an unverdicted
+    ``status: SUCCEEDED``.
     """
+    from nousergon_lib.pipeline_status.completion_marker import marker_verdict
+    from nousergon_lib.pipeline_status.cycle_shape import CycleVerdict
+
     # Most recent Saturday at or before the target (weekday(): Mon=0 … Sat=5).
     last_saturday = target - timedelta(days=(target.weekday() - 5) % 7)
     for cycles_ago in range(TRAINING_LOOKBACK_CYCLES):
@@ -217,7 +244,7 @@ def _last_successful_weekly_cycle(
             s3, bucket,
             f"_sf_completion/{WEEKLY_SF_NAME}/{cycle.isoformat()}.json",
         )
-        if rec and rec.get("status") == "SUCCEEDED":
+        if rec and marker_verdict(rec) == CycleVerdict.COMPLETED.value:
             return cycle.isoformat(), cycles_ago
     return None
 
@@ -241,9 +268,9 @@ def _champion_remedy(
             "inference hotfix; advisory — does not halt trading"
         ), True
     if training is None:
-        seen = (f"no SUCCEEDED cycle in the last {checked_cycles} weekly cycles")
+        seen = (f"no COMPLETED cycle in the last {checked_cycles} weekly cycles")
     else:
-        seen = f"last SUCCEEDED cycle was {training[0]}, {training[1]} cycles ago"
+        seen = f"last COMPLETED cycle was {training[0]}, {training[1]} cycles ago"
     return (
         f"do NOT reach for champion replacement yet — {WEEKLY_SF_NAME} is stale "
         f"({seen}), and champion promotion runs through its PredictorTraining "

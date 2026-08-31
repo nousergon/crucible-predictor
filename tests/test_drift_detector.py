@@ -542,11 +542,23 @@ def test_format_alert_report_is_severity_led():
 _SF_KEY_PREFIX = "_sf_completion/ne-weekly-freshness-pipeline"
 
 
-def _sf_route(cycle: str, status: str, wrapped: bool = True):
+def _sf_route(cycle: str, status: str, wrapped: bool = True, verdict: str | None = None):
     """One `_sf_completion` record. Real records are DOUBLE-encoded — the body
-    is a JSON string containing the JSON object — so the fixture is too."""
+    is a JSON string containing the JSON object — so the fixture is too.
+
+    ``verdict``, when given, simulates a marker ``WeeklyCoverageSweep`` has
+    augmented with the cycle's real shape (alpha-engine-config-I8186) —
+    ``cycle_verdict: "completed"|"skipped"|"incomplete"|"in_flight"`` set
+    alongside the SF's own bare ``status``. Omitted (the default) simulates
+    the un-augmented marker the state machine's own write always produces —
+    which is what a real marker looks like before the sweep has run against
+    it, and is deliberately NOT treated as a completed cycle
+    (alpha-engine-config-I8078: a bare ``status`` cannot distinguish a real
+    cycle from a gate-skip or a recovery tail)."""
     payload = {"sf": "ne-weekly-freshness-pipeline", "status": status,
                "cycle_key": cycle}
+    if verdict is not None:
+        payload["cycle_verdict"] = verdict
     return {f"{_SF_KEY_PREFIX}/{cycle}.json": (
         "json", json.dumps(payload) if wrapped else payload)}
 
@@ -569,7 +581,8 @@ def _degenerate_alpha_routes(target="2026-04-15"):
 
 def test_fresh_training_keeps_the_champion_replacement_prescription():
     # 2026-04-11 is the Saturday on/before 2026-04-15.
-    routes = {**_collapse_routes(), **_sf_route("2026-04-11", "SUCCEEDED")}
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "SUCCEEDED", verdict="completed")}
     alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc, "expected a confidence_collapse alert"
@@ -599,7 +612,7 @@ def test_one_missed_cycle_is_not_yet_stale():
     miss, and the remedy is still reachable on the next run."""
     routes = {**_collapse_routes(),
               **_sf_route("2026-04-11", "FAILED"),
-              **_sf_route("2026-04-04", "SUCCEEDED")}
+              **_sf_route("2026-04-04", "SUCCEEDED", verdict="completed")}
     alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc and cc[0]["champion_remedy_available"] is True
@@ -607,14 +620,46 @@ def test_one_missed_cycle_is_not_yet_stale():
 
 
 def test_no_completion_records_at_all_reads_as_stale():
-    """Absence is not health. With no SUCCEEDED cycle in the lookback the alert
+    """Absence is not health. With no COMPLETED cycle in the lookback the alert
     must not prescribe the remedy."""
     alerts = check_prediction_drift(
         _s3_with_routes(_collapse_routes()), "bucket", "2026-04-15")
     cc = [a for a in alerts if a["code"] == "confidence_collapse"]
     assert cc and cc[0]["champion_remedy_available"] is False
-    assert "no SUCCEEDED cycle" in cc[0]["action"]
+    assert "no COMPLETED cycle" in cc[0]["action"]
     assert cc[0]["last_successful_training_cycle"] is None
+
+
+def test_bare_status_succeeded_with_no_cycle_verdict_is_not_completed():
+    """alpha-engine-config-I8078 regression: a bare ``status: SUCCEEDED``
+    marker with no ``cycle_verdict`` — the shape the state machine's own
+    write ALWAYS produces, un-augmented, and the exact live shape of
+    ``s3://alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/
+    2026-08-22.json`` (fetched read-only 2026-08-29: a mechanical-recovery
+    tail entering 14 of ~35 states, status SUCCEEDED, no cycle block) — must
+    NOT be trusted as a completed cycle. Before this fix, ``status ==
+    "SUCCEEDED"`` alone would have prescribed champion replacement through a
+    cycle no one has verified actually did the work (a
+    ``WeeklyRunDayGate`` no-op gate-skip writes the identical bare shape)."""
+    routes = {**_collapse_routes(), **_sf_route("2026-04-11", "SUCCEEDED")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is False
+    assert "no COMPLETED cycle" in cc[0]["action"]
+    assert cc[0]["last_successful_training_cycle"] is None
+
+
+def test_augmented_completed_verdict_is_trusted_over_bare_status():
+    """The positive case: once ``WeeklyCoverageSweep`` has augmented the
+    marker with ``cycle_verdict: "completed"``, that is what makes the
+    cycle usable for champion replacement — not the bare ``status`` field,
+    which a stale un-augmented marker for the SAME cycle_key never carries."""
+    routes = {**_collapse_routes(),
+              **_sf_route("2026-04-11", "SUCCEEDED", verdict="completed")}
+    alerts = check_prediction_drift(_s3_with_routes(routes), "bucket", "2026-04-15")
+    cc = [a for a in alerts if a["code"] == "confidence_collapse"]
+    assert cc and cc[0]["champion_remedy_available"] is True
+    assert cc[0]["last_successful_training_cycle"] == "2026-04-11"
 
 
 def test_degraded_status_does_not_count_as_a_successful_cycle():
