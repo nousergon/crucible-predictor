@@ -116,3 +116,54 @@ jobs:
           --repo-root "$GITHUB_WORKSPACE/graded"
           --base "${{ github.event.pull_request.base.sha }}"
           --head "${{ github.event.pull_request.head.sha }}"
+
+      # ── ALERT MESSAGE SHAPE (alpha-engine-config-I9460) ──────────────────
+      #
+      # Step 1 above asks: is this alert SOURCE registered? This asks the next
+      # question: can the person who receives the page act on it without asking
+      # anyone anything, and will it stop firing once the condition stops
+      # standing?
+      #
+      # WHAT IT REPLACES. `alpha-engine-config-I9449` swept the fleet for alert
+      # messages defective in SHAPE rather than in truth and fixed the loudest
+      # instances across five repos. Measured from the 633 krepis dedup markers
+      # in s3://alpha-engine-research/_alerts/_dedup/ (publish_count increments
+      # only on a successful publish, so these are real deliveries): 134 pages
+      # in 11 days, 104 of them covered by that sweep. A sweep is a ONE-TIME
+      # cleanup — nothing stopped the class returning on the next PR, and every
+      # instance read as helpful in review, which is why each was written.
+      #
+      # Three rules, each pinned to a real fixed instance in
+      # nousergon-data/tests/test_alert_message_lint.py:
+      #   ALERT001 unanswerable ask   "Review and approve acceleration if the
+      #                                reallocation is intended."
+      #   ALERT002 go look it up      "review the optimizer shadow logs for the
+      #                                driver" / "(detail in journal)"
+      #   ALERT003 run-keyed dedup    freshness_digest_{date}_{fp}, and the
+      #                                router canary's ~430 identical hourly
+      #                                pages for one 18-day condition.
+      #
+      # WARN-ONLY, DELIBERATELY, AND HOW THAT ENDS. This step annotates and
+      # exits 0. It is warn-first because the lint is ONE implementation read
+      # by eleven repos from a floating ref, which is the exact shape that
+      # reverdicted the whole fleet's CI in 32 seconds on 2026-08-28 when a
+      # reusable workflow loaded its guard script unpinned. Warn-only removes
+      # that blast radius entirely while the rule earns its enforcement.
+      # `alpha-engine-config-I9471` carries the flip and the predicate that
+      # clears it.
+      #
+      # A MISSING SCRIPT WARNS RATHER THAN FAILING, FOR THIS STEP ONLY. Step 1
+      # hard-fails on a missing checkout and must keep doing so. Here the file
+      # may legitimately not exist yet: this workflow change and the script
+      # land in different repos, and a hard failure would redden eight repos'
+      # main for the length of that merge window. The enforcement flip converts
+      # BOTH halves — the miss and the findings — in one commit.
+      - name: A PR-added alert message must be actionable (warn-only)
+        run: |
+          set -euo pipefail
+          s="$GITHUB_WORKSPACE/registry/infrastructure/overseer/alert_message_lint.py"
+          if [ ! -f "$s" ]; then
+            echo "::warning title=alert-message-lint::$s is not on nousergon-data main yet, so the alert-message lint did not run. Warn-only by design while alpha-engine-config-I9460 lands across the fleet; alpha-engine-config-I9471 makes this a hard failure."
+            exit 0
+          fi
+          python3 "$s" --repo "${{ github.event.repository.name }}" --repo-root "$GITHUB_WORKSPACE/graded" --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}" --warn-only
