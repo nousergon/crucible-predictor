@@ -172,3 +172,69 @@ def test_handler_dispatches_weekly_gate_before_preflight(monkeypatch):
 
     assert result["is_weekly_run_day"] is True
     assert result["marker"] == "WEEKLY_RUN_DAY"
+
+
+# ── SF payload-key contract (alpha-engine-config-I9221) ──────────────────────
+#
+# nousergon-data/infrastructure/step_function.json's WeeklyRunDayGate,
+# LibPinDriftCheck and PipelineContractCheck Tasks send
+# `"run_date.$": "$.run_date"` to this Lambda — never `date`. The handler had
+# only ever read `event.get("date")`, so the SF's run_date was silently
+# discarded on every invocation and the gate evaluated `datetime.now(NYSE)`
+# instead. This test pins the SF's ACTUAL key (`run_date`) straight to the
+# handler's dispatch, with NO `date` key present at all — the shape every
+# real weekly-SF execution sends — so a regression back to `event.get("date")`
+# fails this test even though the "date"-keyed tests above would still pass.
+def test_handler_check_weekly_run_day_reads_run_date_key(monkeypatch):
+    """The exact payload shape WeeklyRunDayGate sends: only `run_date`,
+    no `date`. Two different dates prove the key is actually being read,
+    not merely tolerated alongside a `date` fallback."""
+
+    class _ExplodingPreflight:
+        def __init__(self, *a, **k):
+            raise AssertionError("PredictorPreflight must NOT be constructed for check_weekly_run_day")
+
+    fake_module = MagicMock(PredictorPreflight=_ExplodingPreflight)
+    monkeypatch.setitem(sys.modules, "inference.preflight", fake_module)
+
+    import inference.handler as h
+
+    run_day = h.handler(
+        {"action": "check_weekly_run_day", "run_date": "2026-07-11"}, None
+    )
+    assert run_day["check_date"] == "2026-07-11"
+    assert run_day["is_weekly_run_day"] is True
+
+    not_run_day = h.handler(
+        {"action": "check_weekly_run_day", "run_date": "2026-07-10"}, None
+    )
+    assert not_run_day["check_date"] == "2026-07-10"
+    assert not_run_day["is_weekly_run_day"] is False
+
+
+def test_handler_check_trading_day_reads_run_date_key(monkeypatch):
+    """Same contract for check_trading_day — no live caller sends either
+    key today, but the resolver is shared and must not regress."""
+
+    class _ExplodingPreflight:
+        def __init__(self, *a, **k):
+            raise AssertionError("PredictorPreflight must NOT be constructed for check_trading_day")
+
+    fake_module = MagicMock(PredictorPreflight=_ExplodingPreflight)
+    monkeypatch.setitem(sys.modules, "inference.preflight", fake_module)
+
+    import inference.handler as h
+    result = h.handler({"action": "check_trading_day", "run_date": "2026-06-30"}, None)
+
+    assert result["is_trading_day"] is True
+    assert result["check_date"] == "2026-06-30"
+
+
+def test_run_date_takes_priority_over_date_when_both_present():
+    """If a caller ever sent both (none do today), run_date must win — it is
+    the primary key per the SF contract, `date` is the fallback."""
+    import inference.handler as h
+
+    assert h._resolve_run_date({"run_date": "2026-07-11", "date": "2026-01-01"}) == "2026-07-11"
+    assert h._resolve_run_date({"date": "2026-01-01"}) == "2026-01-01"
+    assert h._resolve_run_date({}) is None
