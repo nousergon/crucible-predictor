@@ -48,6 +48,10 @@ def _representative_entry(**overrides) -> dict:
         "expected_move": 0.013,
         "research_calibrator_prob": 0.6,
         "predicted_alpha_std": 0.012,
+        # I9446 decomposition — additive optional fields; pinned here so a
+        # contract that rejected them would fail loud at the producer.
+        "predicted_alpha_std_epistemic": 0.0031,
+        "predicted_alpha_std_aleatoric": 0.0116,
         "barrier_win_prob": 0.55,
         "stance": "momentum",
         "stance_loadings": {"momentum": 0.7, "value": 0.1, "quality": 0.1, "catalyst": 0.1},

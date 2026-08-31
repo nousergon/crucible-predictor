@@ -471,9 +471,62 @@ def validate_live_batch_invariant_health(
         p_up_modal_fraction = 0.0
         stdev_p_up = 0.0
 
+    # --- α̂-uncertainty channel dispersion (OBSERVE-ONLY) --------------------
+    # alpha-engine-config-I9446. `predicted_alpha_std` is cross-sectionally
+    # degenerate by construction: it is sqrt(σ_n² + xᵀΣ_w x) and the σ_n term is
+    # a per-batch constant carrying 90–98% of the variance. Nothing watched its
+    # cross-section, so it shipped flat for three months. These record it on
+    # every batch — the epistemic CV is the number that says the uncertainty
+    # channel is alive, and `monitoring/drift_detector` alerts on it.
+    #
+    # OBSERVE-ONLY, deliberately: a degenerate uncertainty channel degrades
+    # position SIZING, it does not make the alpha vector untradable. Halting a
+    # trading day on it would be a false halt. The verdict-bearing dispersion
+    # statistic remains `alpha_stdev`.
+    def _cv(values: np.ndarray) -> float | None:
+        if values.size < 2:
+            return None
+        mean = float(np.mean(values))
+        if mean <= 0.0:
+            return None
+        return round(float(np.std(values) / mean), 6)
+
+    def _finite(key: str) -> np.ndarray:
+        vals = [p.get(key) for p in predictions]
+        return np.array(
+            [float(v) for v in vals
+             if isinstance(v, (int, float)) and not isinstance(v, bool)
+             and math.isfinite(float(v))],
+            dtype=float,
+        )
+
+    unc_total = _finite("predicted_alpha_std")
+    unc_epistemic = _finite("predicted_alpha_std_epistemic")
+    unc_aleatoric = _finite("predicted_alpha_std_aleatoric")
+    alpha_uncertainty_cv = _cv(unc_total)
+    alpha_uncertainty_epistemic_cv = _cv(unc_epistemic)
+    # Share of total predictive VARIANCE that is estimation (per-name) rather
+    # than observation noise. ~0.02–0.10 on the healthy champion; ~0.80+ on the
+    # 2026-08-21 champion whose posterior never updated off its prior.
+    if unc_epistemic.size and unc_total.size and float(np.mean(unc_total**2)) > 0.0:
+        alpha_uncertainty_epistemic_var_share = round(
+            float(np.mean(unc_epistemic**2) / np.mean(unc_total**2)), 6
+        )
+    else:
+        alpha_uncertainty_epistemic_var_share = None
+
     metrics = {
         "batch_size": len(predictions),
         "n_predictions_total": len(predictions),
+        # α̂-uncertainty channel health (OBSERVE-ONLY — see the block above).
+        "n_alpha_uncertainty_present": int(unc_total.size),
+        "n_alpha_uncertainty_decomposed": int(unc_epistemic.size),
+        "alpha_uncertainty_cv": alpha_uncertainty_cv,
+        "alpha_uncertainty_epistemic_cv": alpha_uncertainty_epistemic_cv,
+        "alpha_uncertainty_epistemic_var_share": alpha_uncertainty_epistemic_var_share,
+        "alpha_uncertainty_aleatoric": (
+            round(float(np.median(unc_aleatoric)), 8) if unc_aleatoric.size else None
+        ),
         # Recalibration-invariant tradable-signal health (drives the verdict):
         "n_alpha_present": n_present,
         "n_unique_alpha": n_unique_alpha,
