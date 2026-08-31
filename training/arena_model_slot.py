@@ -475,7 +475,7 @@ def _list_registry_versions(s3, bucket: str) -> list:
 def build_series(
     bucket: str, *, arm_id_by_label: dict, version_labels: dict,
     n_days: int = 90, horizon_days: int | None = None, s3_client=None,
-    pairs: list | None = None,
+    pairs: list | None = None, attribution_out: dict | None = None,
 ):
     """One :class:`ArmSeries` per arm — per-date realized market-relative rank-IC.
 
@@ -502,6 +502,34 @@ def build_series(
         )
 
     by_version = ol.per_date_rank_ic_by_version(pairs)
+
+    # alpha-engine-config-I8219 — the scoring basis' own provenance, recorded
+    # rather than logged. The `arm_id is None` branch below is a legitimate
+    # skip for a version no arm claims and a SILENT TOTAL LOSS OF THE LIVE
+    # RECORD when the rows arrive unattributed, and until this block the two
+    # rendered identically: measured 2026-08-31, `_load_live_pairs` dropped
+    # `champion_version_id` entirely, so every live champion prediction fell
+    # into the `None` bucket and was discarded here — the M slot ranked its
+    # arms on shadow output alone while emitting a well-formed cycle
+    # (champion-challenger-policy §7.2, §11).
+    attribution = dict(ol.attribution_coverage(pairs))
+    unclaimed = sorted(
+        str(vid) for vid in by_version
+        if arm_id_by_label.get(version_labels.get(vid)) is None
+    )
+    attribution["unclaimed_version_ids"] = unclaimed
+    attribution["n_versions_scored"] = len(by_version) - len(unclaimed)
+    if attribution.get("fully_unattributed"):
+        log.error(
+            "arena[M]: NOT ONE of %d prediction rows carries a champion_version_id "
+            "— the entire live record is being discarded and the slot is ranking "
+            "on shadow output alone. This is `unmeasurable`, not a thin cycle "
+            "(champion-challenger-policy §7.2, alpha-engine-config-I8219).",
+            attribution.get("n_pairs", 0),
+        )
+    if attribution_out is not None:
+        attribution_out.clear()
+        attribution_out.update(attribution)
 
     scores: dict[str, dict[str, float]] = {}
     misses: dict[str, set] = {}
@@ -550,14 +578,12 @@ def load_arm_pairs(bucket: str, *, version_ids, n_days: int, horizon_days: int,
 
     pairs = ol._load_live_pairs(bucket, n_days, s3_client=s3_client)
     for vid in version_ids:
-        shadow = ol._load_shadow_pairs(bucket, vid, n_days, s3_client=s3_client)
-        for p in shadow:
-            # The shadow directory names the arm that produced the row. The
-            # file's own `champion_version_id` is the LIVE champion at the time
-            # — reading it here would attribute every shadow row to the
-            # champion (policy §7.5: provenance true by construction).
-            p["champion_version_id"] = vid
-        pairs.extend(shadow)
+        # The shadow loader keys each row by the DIRECTORY that named the
+        # producer, never by the file's own `champion_version_id` (which is the
+        # LIVE champion at write time) — policy §7.5, provenance true by
+        # construction. That attribution now happens inside the loader's single
+        # row constructor, so nothing is re-stamped here (-I8219).
+        pairs.extend(ol._load_shadow_pairs(bucket, vid, n_days, s3_client=s3_client))
 
     tickers = {p["ticker"] for p in pairs if p.get("ticker")}
     sector_map = _load_sector_map_from_s3(bucket, s3_client=s3_client)
@@ -815,9 +841,10 @@ def run_slot(
     for arm_id, bundle in bundle_by_arm.items():
         manifests_by_arm[arm_id] = _read_manifest(s3, bucket, bundle["version_id"])
 
+    score_attribution: dict = {}
     series_by_arm = build_series(
         bucket, arm_id_by_label=arm_id_by_label, version_labels=version_labels,
-        n_days=n_days, s3_client=s3,
+        n_days=n_days, s3_client=s3, attribution_out=score_attribution,
     )
     # Every arm the register says is scored this cycle must have a series, even
     # an empty one — the engine refuses a missing series, and rightly: an arm
@@ -852,6 +879,11 @@ def run_slot(
         training=training_statuses({a: manifests_by_arm.get(a) for a in active}),
         diagnostics=diagnostics,
     )
+    # alpha-engine-config-I8219 — what the ladder above actually rests on. A
+    # cycle that scored nobody on live output must say so in its own artifact;
+    # a well-formed `arena_cycle` built from an empty live record is the
+    # "reads as coverage" failure (policy §7.4, §11).
+    doc["score_attribution"] = score_attribution
     assert_servable(cycle)
 
     # The engine's retirement verdicts are appended to the log here — the one

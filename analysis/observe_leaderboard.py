@@ -127,6 +127,22 @@ MEASURABILITY_UNMEASURABLE = "unmeasurable"
 # COHORT_LAG_UNMEASURABLE_DATES.
 MEASURABILITY_LAG_CYCLES = 3
 
+# ── alpha-engine-config-I8219: provenance of a pair row's champion attribution ─
+# Every pair row carries WHERE its ``champion_version_id`` came from, so an
+# unattributed row is never indistinguishable from a row whose attribution was
+# dropped in transit (champion-challenger-policy §7.5, and the defect this
+# constant was added for — see ``_prediction_pair_rows``).
+ATTR_STAMPED = "stamped"            # the artifact's own champion_version_id
+ATTR_PROMOTION_HISTORY = "promotion_history"  # resolved from promotions/{date}.json
+ATTR_SHADOW_PREFIX = "shadow_prefix"  # the shadow directory names the producer
+ATTR_UNATTRIBUTED = "unattributed"  # no stamp and no history covers this date
+
+# The durable, authoritative record of which registry version became champion on
+# which rotation date. ``model_zoo.py::_write_promotion_marker`` writes one object
+# per rotation and never rewrites one, so it is a complete cutover history for
+# every date from the first marker onward.
+_PROMOTIONS_PREFIX = "predictor/model_zoo/promotions"
+
 
 def _list_shadow_versions(bucket: str, s3_client=None) -> list[str]:
     """The version_ids under ``predictor/predictions_shadow/`` (one dir per
@@ -243,6 +259,149 @@ def measurability_for_shadow_arm(
     return MEASURABILITY_MEASURED, None
 
 
+def load_promotion_history(bucket: str, s3_client=None) -> list[dict]:
+    """The cutover history, OLDEST FIRST: ``[{"run_date", "champion_version_id"}]``.
+
+    alpha-engine-config-I8219. ``predictor/model_zoo/promotions/{run_date}.json``
+    is written once per rotation by ``model_zoo._write_promotion_marker`` and is
+    never rewritten, so it is the durable record of which registry version held
+    the champion pointer after each rotation. It is what lets a prediction
+    artifact written BEFORE the ``champion_version_id`` stamp shipped
+    (2026-08-25) still be attributed to the arm that actually produced it.
+
+    Without this, the whole live-prediction history is unattributable and every
+    per-arm realized series starts empty — the arm currently serving would have
+    no matured outcome of its own until ~30 calendar days after the stamp
+    shipped, which is exactly the unmeasurability -I8219 exists to remove.
+
+    Best-effort: an unreadable prefix yields ``[]``, which renders every row
+    ``unattributed`` — an honest absence, never a guess.
+    """
+    import boto3
+
+    s3 = s3_client or boto3.client("s3")
+    out: list[dict] = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        keys: list[str] = []
+        for page in paginator.paginate(Bucket=bucket, Prefix=f"{_PROMOTIONS_PREFIX}/"):
+            for obj in page.get("Contents", []) or []:
+                key = obj.get("Key", "")
+                if key.endswith(".json"):
+                    keys.append(key)
+        for key in sorted(keys):
+            try:
+                marker = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            except Exception:  # noqa: BLE001 — one unreadable marker is not the history
+                log.warning("promotion history: could not read %s; skipped", key, exc_info=True)
+                continue
+            run_date = marker.get("run_date")
+            champ = marker.get("champion_version_id_after")
+            if run_date and champ:
+                out.append({"run_date": str(run_date)[:10], "champion_version_id": champ})
+    except Exception:  # noqa: BLE001 — absence is reported, never invented
+        log.warning(
+            "promotion history: %s/ unreadable — pre-stamp predictions will be "
+            "reported unattributed (alpha-engine-config-I8219)",
+            _PROMOTIONS_PREFIX, exc_info=True,
+        )
+        return []
+    out.sort(key=lambda r: r["run_date"])
+    return out
+
+
+def champion_serving_on(prediction_date: str, history: list[dict]) -> str | None:
+    """The version that held the pointer when ``prediction_date``'s batch ran.
+
+    The rotation writes its marker under the trading day it ran FOR, and the
+    preopen inference for that same day has already run by then, so the champion
+    serving on date D is the ``champion_version_id_after`` of the newest marker
+    whose ``run_date`` is STRICTLY EARLIER than D.
+
+    Validated against live stamped artifacts 2026-08-31: predictions/2026-08-26
+    is stamped ``v3.0-meta-2026-08-21-7d3d1cce`` (newest earlier marker
+    2026-08-21) and predictions/2026-08-31 is stamped
+    ``v3.0-meta-2026-08-14-119e069b`` (newest earlier marker 2026-08-28) — both
+    reproduced exactly by this rule.
+
+    ``None`` when no marker precedes the date: the history does not cover it and
+    the row stays unattributed.
+    """
+    day = str(prediction_date)[:10]
+    champ = None
+    for row in history:
+        if row["run_date"] < day:
+            champ = row["champion_version_id"]
+        else:
+            break
+    return champ
+
+
+def _prediction_pair_rows(
+    data: dict, fallback_date: str, *,
+    version_id: str | None, attribution_source: str,
+) -> list[dict]:
+    """The pair rows for one predictions artifact — the SINGLE row constructor.
+
+    alpha-engine-config-I8219. Both prediction loaders build rows here rather
+    than each assembling its own dict, because they did not: ``_load_shadow_pairs``
+    carried ``champion_version_id`` and ``_load_live_pairs`` silently omitted it,
+    so every LIVE row reached the consumers keyed ``None``. Measured live
+    2026-08-31 on ``observe_leaderboard/latest.json``: ``attribution_status``
+    ``unstamped_predictions`` and ``realized_rank_ic_by_version`` a single
+    ``version_id: null`` bucket, against artifacts that carry the stamp. The
+    same rows feed ``training/arena_model_slot.build_series``, where an
+    unclaimed version is dropped — so the M slot's arena was ranking arms on
+    shadow output alone, with the serving champion's own live record discarded.
+
+    One constructor is the fix that survives the class: a third loader cannot
+    omit the field, because there is no second place to build the row.
+    """
+    date = data.get("date") or fallback_date
+    return [
+        {
+            "date": date,
+            "ticker": p.get("ticker"),
+            ALPHA_FIELD: p.get(ALPHA_FIELD),
+            "realized_alpha": None,
+            "champion_version_id": version_id,
+            "champion_version_id_source": attribution_source,
+        }
+        for p in data.get("predictions", []) or []
+    ]
+
+
+def attribution_coverage(pairs: list[dict]) -> dict:
+    """How many rows/dates carry an attributed version, and from which source.
+
+    alpha-engine-config-I8219 — the detection blindness, not the defect. Before
+    this, "no prediction in the window carries champion_version_id" was emitted
+    by an artifact whose own producer had dropped the field, and nothing in the
+    payload could tell that apart from artifacts genuinely predating the stamp.
+    A reader can now see which it is.
+    """
+    by_source: dict[str, int] = {}
+    dates: set = set()
+    dates_attributed: set = set()
+    n_attributed = 0
+    for p in pairs:
+        src = p.get("champion_version_id_source") or ATTR_UNATTRIBUTED
+        by_source[src] = by_source.get(src, 0) + 1
+        day = str(p.get("date"))[:10]
+        dates.add(day)
+        if p.get("champion_version_id") is not None:
+            n_attributed += 1
+            dates_attributed.add(day)
+    return {
+        "n_pairs": len(pairs),
+        "n_pairs_attributed": n_attributed,
+        "n_dates": len(dates),
+        "n_dates_attributed": len(dates_attributed),
+        "by_source": dict(sorted(by_source.items())),
+        "fully_unattributed": bool(pairs) and n_attributed == 0,
+    }
+
+
 def _load_shadow_pairs(bucket: str, version_id: str, n_days: int, s3_client=None) -> list[dict]:
     """Flatten the last ``n_days`` of a version's shadow predictions into
     (date, ticker, predicted_alpha) rows (realized_alpha filled downstream)."""
@@ -263,27 +422,43 @@ def _load_shadow_pairs(bucket: str, version_id: str, n_days: int, s3_client=None
         # alpha-engine-config-I8175 — the arm that produced this day's batch.
         # Carried per pair so the realized rank-IC can be ATTRIBUTED to a version
         # instead of pooled across whatever the champion slot happened to hold.
-        # None on artifacts written before the stamp shipped — reported as
-        # unattributed, never silently folded into the serving champion's number.
-        champion_version_id = data.get("champion_version_id")
-        for p in data.get("predictions", []):
-            pairs.append({
-                "date": data.get("date") or d.isoformat(),
-                "ticker": p.get("ticker"),
-                ALPHA_FIELD: p.get(ALPHA_FIELD),
-                "realized_alpha": None,
-                "champion_version_id": champion_version_id,
-            })
+        # The SHADOW directory names the producer, so the prefix is the
+        # provenance here and the file's own `champion_version_id` (the LIVE
+        # champion at write time) must NOT be read (policy §7.5).
+        pairs.extend(_prediction_pair_rows(
+            data, d.isoformat(),
+            version_id=version_id, attribution_source=ATTR_SHADOW_PREFIX,
+        ))
     return pairs
 
 
-def _load_live_pairs(bucket: str, n_days: int, s3_client=None) -> list[dict]:
-    """Flatten the last ``n_days`` of LIVE champion predictions (the baseline the
-    observe versions must beat on realized edge)."""
+def _load_live_pairs(bucket: str, n_days: int, s3_client=None,
+                     promotion_history: list[dict] | None = None) -> list[dict]:
+    """Flatten the last ``n_days`` of LIVE champion predictions, ATTRIBUTED.
+
+    alpha-engine-config-I8219. Every row carries ``champion_version_id`` and the
+    ``champion_version_id_source`` it came from:
+
+    * ``stamped`` — the artifact's own ``champion_version_id`` (live since
+      2026-08-25). Preferred whenever present.
+    * ``promotion_history`` — resolved from ``predictor/model_zoo/promotions/``
+      for artifacts written before the stamp shipped. Without this, three months
+      of live champion predictions are unattributable and every per-arm realized
+      series is empty until ~30 calendar days after the stamp — which would leave
+      -I8219's unmeasurability in place while looking fixed.
+    * ``unattributed`` — no stamp and no marker precedes the date. Reported, never
+      guessed, and never folded into another arm's series.
+
+    Where a row is stamped AND the history covers it, the two are compared and a
+    disagreement is logged loudly; the STAMP always wins, because it is the
+    producer's own record of itself.
+    """
     import boto3
     import datetime
 
     s3 = s3_client or boto3.client("s3")
+    if promotion_history is None:
+        promotion_history = load_promotion_history(bucket, s3_client=s3)
     today = datetime.date.today()
     pairs: list[dict] = []
     for d_offset in range(n_days):
@@ -294,13 +469,27 @@ def _load_live_pairs(bucket: str, n_days: int, s3_client=None) -> list[dict]:
             data = json.loads(obj["Body"].read())
         except Exception:  # noqa: BLE001
             continue
-        for p in data.get("predictions", []):
-            pairs.append({
-                "date": data.get("date") or d.isoformat(),
-                "ticker": p.get("ticker"),
-                ALPHA_FIELD: p.get(ALPHA_FIELD),
-                "realized_alpha": None,
-            })
+        date = str(data.get("date") or d.isoformat())[:10]
+        stamped = data.get("champion_version_id")
+        from_history = champion_serving_on(date, promotion_history)
+        if stamped:
+            version_id, source = stamped, ATTR_STAMPED
+            if from_history and from_history != stamped:
+                log.warning(
+                    "attribution: predictions/%s is stamped %s but the promotion "
+                    "history resolves %s — using the STAMP (the producer's own "
+                    "record). A persistent disagreement means the marker write "
+                    "and the inference stamp disagree about the cutover boundary "
+                    "(alpha-engine-config-I8219).",
+                    date, stamped, from_history,
+                )
+        elif from_history:
+            version_id, source = from_history, ATTR_PROMOTION_HISTORY
+        else:
+            version_id, source = None, ATTR_UNATTRIBUTED
+        pairs.extend(_prediction_pair_rows(
+            data, d.isoformat(), version_id=version_id, attribution_source=source,
+        ))
     return pairs
 
 
@@ -421,10 +610,13 @@ def _attributed_realized_rank_ic(
             "n_weeks_coverage": 0,
             "attribution_status": "unstamped_predictions",
             "reason": (
-                "no prediction in the window carries champion_version_id — these "
-                "artifacts predate the stamp (alpha-engine-config-I8175). The "
-                "aggregate below is a SLOT read and must not be attributed to any "
-                "one version."
+                "no prediction in the window could be attributed to a version — "
+                "neither the artifact's own champion_version_id stamp nor the "
+                "promotions/ cutover history covers any date in it. Read "
+                "`attribution_coverage` before concluding the artifacts predate "
+                "the stamp: until alpha-engine-config-I8219 this status was also "
+                "produced by the LOADER dropping the field. The aggregate below "
+                "is a SLOT read and must not be attributed to any one version."
             ),
         }
 
@@ -519,8 +711,9 @@ def _attributed_line_realized_rank_ic(
             "n_versions": 0,
             "attribution_status": "unstamped_predictions",
             "reason": (
-                "no prediction in the window is stamped with a version on this line — "
-                "these artifacts predate the champion_version_id stamp"
+                "no prediction in the window is attributed to a version on this "
+                "line, by stamp or by promotions/ history — see "
+                "`attribution_coverage` (alpha-engine-config-I8219)"
             ),
         }
     versions = {p.get("champion_version_id") for p in own}
@@ -740,6 +933,13 @@ def build_champion_realized_monitor(
         # Every version with matured outcomes in the window, so a mis-attributed
         # aggregate is visible rather than arguable.
         "realized_rank_ic_by_version": by_version,
+        # alpha-engine-config-I8219 — how much of the window could be attributed
+        # at all, and from which source. This is the guard, not the fix: an
+        # `unstamped_predictions` verdict is now checkable against the coverage
+        # that produced it, so "the artifacts predate the stamp" and "the loader
+        # dropped the field" can never again render identically
+        # (champion-challenger-policy §7.2).
+        "attribution_coverage": attribution_coverage(live_pairs),
         "chasing_noise": chasing_noise,
         "verdict_reason": verdict_reason,
         "note": (
