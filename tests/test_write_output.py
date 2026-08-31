@@ -1796,6 +1796,16 @@ class TestNHighConfidenceStreakIsChampionScoped:
         ) == 4
 
 
+# `cfg.MIN_CONFIDENCE` resolves differently by environment — 0.30 in
+# production and on a developer checkout, 0.20 from `config/predictor.sample.
+# yaml:137` on a CI runner with no real config. That three-value drift is
+# alpha-engine-config-I9259 deliverable 3 and is NOT fixed here (#9259 carries
+# an explicit safe-to-act gate behind #9255). The tests below pin it to the
+# 0.30 the measured fixtures were produced under, so they assert the behaviour
+# under test rather than the environment they happen to run in.
+_LIVE_MIN_CONFIDENCE = 0.30
+
+
 class TestBaseVetoThresholdIsRegimeInvariant:
     """`n_high_confidence_base` must be counted against a cut that does not
     move with the market regime — `get_veto_threshold` moves it -0.20/+0.10."""
@@ -1812,11 +1822,12 @@ class TestBaseVetoThresholdIsRegimeInvariant:
     def test_base_is_not_the_regime_adjusted_threshold(self):
         """The measured 2026-08-31 confound: bull regime raised the applied cut
         to 0.40 while the base stayed 0.30."""
-        with patch.object(wo, "_load_predictor_params_from_s3", return_value=None):
+        with patch.object(wo, "_load_predictor_params_from_s3", return_value=None), \
+                patch.object(wo.cfg, "MIN_CONFIDENCE", _LIVE_MIN_CONFIDENCE):
             base = wo.base_veto_threshold("bucket")
             applied = wo.get_veto_threshold("bucket", market_regime="bullish")
         assert applied == pytest.approx(base + 0.10)
-        assert base == pytest.approx(0.30)
+        assert base == pytest.approx(_LIVE_MIN_CONFIDENCE)
 
 
 class TestZeroStreakAlertOnMeasuredSessions:
@@ -1881,6 +1892,7 @@ class TestZeroStreakAlertOnMeasuredSessions:
         with patch.dict("sys.modules", {"boto3": mock_boto3, "ops_alerts": fake_alerts}), \
                 patch.object(wo, "_resolve_champion_version_id", return_value=champion), \
                 patch.object(wo, "_load_predictor_params_from_s3", return_value=None), \
+                patch.object(wo.cfg, "MIN_CONFIDENCE", _LIVE_MIN_CONFIDENCE), \
                 patch.object(wo.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING",
                              False, create=True), \
                 patch("inference.stages.write_output._s3_put_json") as put:
@@ -1908,7 +1920,7 @@ class TestZeroStreakAlertOnMeasuredSessions:
         assert artifact["n_high_confidence"] == 0          # applied cut 0.40
         assert artifact["n_high_confidence_base"] > 0      # base cut 0.30
         assert artifact["veto_threshold_applied"] == pytest.approx(0.40)
-        assert artifact["veto_threshold_base"] == pytest.approx(0.30)
+        assert artifact["veto_threshold_base"] == pytest.approx(_LIVE_MIN_CONFIDENCE)
         assert artifact["n_high_confidence_zero_streak"] == 0
         streak_alerts = [
             a for a in published
@@ -1950,7 +1962,7 @@ class TestZeroStreakAlertOnMeasuredSessions:
         )
         block = artifact["output_distribution_gate"]["metrics"]["n_high_confidence"]
         assert block["applied_threshold"] == pytest.approx(0.40)
-        assert block["base_threshold"] == pytest.approx(0.30)
+        assert block["base_threshold"] == pytest.approx(_LIVE_MIN_CONFIDENCE)
         assert block["basis"] == wo.N_HIGH_CONFIDENCE_BASIS
         assert block["champion_version_id"] == "v3.0-meta-2026-08-14-119e069b"
         assert block["dispersion_corroborates_collapse"] is False
