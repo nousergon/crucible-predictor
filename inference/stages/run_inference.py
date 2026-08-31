@@ -816,9 +816,23 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
         # Ridge pickles still return std=None during the first soak week —
         # downstream optimizer falls back to point-estimate sizing then.
         alpha_std: float | None = None
+        # alpha-engine-config-I9446: the predictive std is the SUM of a
+        # per-batch constant (learned observation noise σ_n) and the per-name
+        # estimation std sqrt(xᵀΣ_w x). σ_n carries 90–98% of the variance, so
+        # the total is cross-sectionally flat (CV ≤ 0.008 over every stored
+        # session since the 2026-06-01 BR cutover) and the executor's GUW
+        # penalty — whose Ω is an ESTIMATION-error covariance — degenerates to
+        # a uniform ridge. Emit the decomposition alongside the total so the
+        # per-name half is reachable by consumers and watchable by detectors.
+        # Pure function of `alpha_std`; no second predict call.
+        alpha_std_epistemic: float | None = None
+        alpha_std_aleatoric: float | None = None
         if meta_model is not None and meta_model.is_fitted:
             alpha, alpha_std = meta_model.predict_single_with_std(meta_features)
             alpha = float(alpha)
+            alpha_std_epistemic, alpha_std_aleatoric = (
+                meta_model.decompose_alpha_std(alpha_std)
+            )
         else:
             # Fallback: weighted average of Layer 1 outputs. Prior regime-based
             # term dropped along with the Tier 0 classifier removal (2026-04-16).
@@ -927,6 +941,35 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
             # (alpha-engine ~/Development/CLAUDE.md §"S3 Contract Safety").
             "predicted_alpha_std": (
                 round(float(alpha_std), 6) if alpha_std is not None else None
+            ),
+            # I9446 decomposition of the field above. Additive + null-safe:
+            # both are None for a legacy Ridge pickle or any estimator with no
+            # learned noise precision, exactly as `predicted_alpha_std` is.
+            #
+            # `_epistemic` = sqrt(xᵀΣ_w x), the estimation-error std of α̂ —
+            # the per-name quantity, and the one a Garlappi-Uppal-Wang Ω is
+            # defined over. Emitted at 8 dp, not 6: it lives two orders of
+            # magnitude below the total (0.009–0.023 on the healthy champion),
+            # and 6 dp would quantize away the cross-section this field exists
+            # to carry.
+            #
+            # `_aleatoric` = σ_n, constant across the batch by construction.
+            # Emitted because it is what makes the total flat — recording it
+            # per-row is what lets any consumer or replay reconstruct the split
+            # without loading the champion pickle.
+            #
+            # `predicted_alpha_std` itself is UNCHANGED (still the total) —
+            # the executor reads it today and a silent redefinition of a
+            # cross-repo contract field is exactly the class the M0 slot
+            # contract exists to prevent. The consumer switch to `_epistemic`
+            # is tracked separately.
+            "predicted_alpha_std_epistemic": (
+                round(float(alpha_std_epistemic), 8)
+                if alpha_std_epistemic is not None else None
+            ),
+            "predicted_alpha_std_aleatoric": (
+                round(float(alpha_std_aleatoric), 8)
+                if alpha_std_aleatoric is not None else None
             ),
             "p_up": round(p_up, 4),
             # Observe-only parallel calibration (config#1176) — balanced-Platt
