@@ -92,6 +92,57 @@ DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV = 0.015
 
 N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS = 3    # consecutive zero-n_high_confidence days
 
+# alpha-engine-config-I9445: the zero-streak alert fired on 2026-08-31 with a
+# streak of 6, on a session whose champion had ALREADY been rolled back to the
+# healthy `v3.0-meta-2026-08-14-119e069b` (alpha_stdev recovered 0.00710 ->
+# 0.01921, above DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV). Two independent
+# defects in the detector produced that, and neither is the underlying model
+# condition (which was real, and was remediated by the rollback):
+#
+#   (a) The streak spanned a CHAMPION CHANGE. `_n_high_confidence_zero_streak`
+#       counted the retired 2026-08-21 champion's five collapsed sessions
+#       (08-24..08-28) into its healthy successor's first session, so the
+#       replacement inherited the predecessor's verdict. This is the same
+#       self-referential shape I9267 removed from the relative dispersion
+#       median one screen above (DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY);
+#       the I9267 re-check of this function concluded it did not have that
+#       shape, which was correct about the DECAYING-REFERENCE variant and
+#       missed the CROSS-CHAMPION-ATTRIBUTION variant. A streak is a statement
+#       about one model's behaviour and cannot outlive that model.
+#
+#   (b) The count was taken against the REGIME-ADAPTED threshold. `n_high_
+#       confidence` counts `prediction_confidence` (== `|p_up - 0.5| * 2`)
+#       clearing `get_veto_threshold()`, which moves with the market regime
+#       (bear -0.20 / neutral 0.00 / bull +0.10 on a 0.30 base). Measured over
+#       the 80 live sessions 2026-05-01..2026-08-31, the applied-threshold
+#       count disagrees with the fixed-base count on 21 of them, so the series
+#       the streak walks is not comparable day over day. On 2026-08-31 the
+#       serving model produced 2 names at or above the 0.30 base and 0 above
+#       the bull-adjusted 0.40: the zero was manufactured by the threshold, not
+#       by the model.
+#
+# The fix keeps the condition and re-bases the measurement. `n_high_confidence`
+# is unchanged (the veto's own accounting); a sibling `n_high_confidence_base`
+# is emitted at the regime-INVARIANT base threshold and the streak walks that.
+#
+# Derivation of the basis, from the same 80 sessions (`predictor/predictions/
+# {date}.json`, field `prediction_confidence`):
+#
+#   * count-at-base-0.30 == 0 on exactly 14 of 80 sessions, and all 14 fall
+#     inside the two measured dispersion-collapse blocks — 2026-06-29..07-10
+#     (alpha_stdev 0.00658-0.01141) and 2026-08-24..08-28 (0.00710-0.01044).
+#     Every one is below DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV = 0.015.
+#   * It is NONZERO on all 66 healthy sessions. Zero is not a normal outcome
+#     for a healthy book, so the condition is kept, not relaxed.
+#   * count-at-APPLIED-threshold == 0 on 15 sessions: the same 14 plus
+#     2026-08-31, the one healthy session. That single extra day is the alert
+#     Brian saw.
+#
+# No threshold is lowered, no streak length is exempted and the alert is not
+# muted or downgraded: 2026-08-24..08-28 still alerts on every one of the five
+# days under both the old and the new basis.
+N_HIGH_CONFIDENCE_BASIS = "base_threshold"  # regime-invariant; see above
+
 
 def _load_trailing_batch_history(
     s3, bucket: str, date_str: str,
@@ -104,8 +155,9 @@ def _load_trailing_batch_history(
     only; that module is owned by another agent this session and is not touched here).
 
     Each entry: ``{"date": d, "alpha_stdev": float|None, "stdev_p_up": float|None,
-    "n_high_confidence": int|None}``, pulled from the prior batch's own
-    ``output_distribution_gate.metrics`` / top-level ``n_high_confidence``.
+    "n_high_confidence": int|None, "n_high_confidence_base": int|None,
+    "champion_version_id": str|None}``, pulled from the prior batch's own
+    ``output_distribution_gate.metrics`` / top-level fields.
 
     Best-effort, with a fast circuit breaker: a missing artifact (weekend/holiday/
     NoSuchKey) is a normal, expected gap and does not count against the breaker; any
@@ -165,6 +217,17 @@ def _load_trailing_batch_history(
             "alpha_stdev": gate_metrics.get("alpha_stdev"),
             "stdev_p_up": gate_metrics.get("stdev_p_up"),
             "n_high_confidence": data.get("n_high_confidence"),
+            # alpha-engine-config-I9445: the regime-INVARIANT sibling count.
+            # Artifacts written before that change do not carry it; fall back
+            # to the applied-threshold count so the streak keeps a continuous
+            # series across the cutover rather than breaking on a None (the
+            # 2026-08-24..08-28 sessions read 0 under BOTH bases, measured, so
+            # the historical streak is identical either way).
+            "n_high_confidence_base": (
+                data.get("n_high_confidence_base")
+                if data.get("n_high_confidence_base") is not None
+                else data.get("n_high_confidence")
+            ),
             # alpha-engine-config-I9267: which champion served this session, so
             # the caller can exclude same-champion sessions from the trailing
             # reference (see DISPERSION_EXCLUDE_SAME_CHAMPION_HISTORY above).
@@ -364,32 +427,73 @@ def _dispersion_gate_verdict(
 def _n_high_confidence_zero_streak(
     today_n_high_confidence,
     history_n_high_confidence: list,
+    *,
+    today_champion_version_id: str | None = None,
+    history_champion_version_ids: list | None = None,
 ) -> int:
-    """Consecutive trading days — today plus most-recent-first history — with
-    ``n_high_confidence == 0``. Stops at the first day whose value is nonzero OR
-    missing: a gap in the artifact ends the streak rather than silently extending
-    it (a missing day is not evidence the collapse continued through it).
+    """Consecutive trading days — today plus most-recent-first history — the
+    CURRENTLY SERVING champion has produced ``n_high_confidence == 0``.
 
-    alpha-engine-config-I9267 deliverable 4 — re-checked for the same
-    self-referential contamination shape as the relative dispersion gate
-    above. It does NOT have it: this is a plain forward count over the raw
-    series with no threshold or reference drawn from the population it
-    reports on (unlike the dispersion median, nothing here could decay toward
-    a persisting collapse). Each day's WARN alert also carries a
-    ``date_str``-keyed ``dedup_key`` (see the call site), so the alert fires
-    every day the streak persists rather than being suppressed after the
-    first breach — the five-day 2026-08-24..28 streak in the issue passed
-    WITHOUT BLOCKING because this detector was always designed non-blocking
-    (config#1373 item-2: sizing/conviction is the sizing layer's concern),
-    not because of a decaying reference. No change made here; this docstring
-    records the re-check.
+    Stops at the first day whose value is nonzero, missing, or **served by a
+    different champion**. A gap in the artifact ends the streak rather than
+    silently extending it (a missing day is not evidence the collapse continued
+    through it), and a champion change ends it because a streak is a statement
+    about one model's behaviour: a replacement model cannot inherit its
+    predecessor's verdict.
+
+    alpha-engine-config-I9445 — the champion scoping. Measured: on 2026-08-31
+    this function returned 6, counting the retired ``v3.0-meta-2026-08-21-
+    7d3d1cce``'s five collapsed sessions (2026-08-24..08-28) into the first
+    session of ``v3.0-meta-2026-08-14-119e069b``, the healthy model it had
+    already been rolled back to (alpha_stdev 0.01921, above the absolute
+    floor). The alert therefore survived the remediation it existed to
+    prompt, which is the one failure mode that makes an operator stop reading
+    a detector. With the scoping the same 2026-08-24..08-28 window still
+    reaches a streak of 5 and still alerts on each of those five days; only
+    the attribution to the successor is removed.
+
+    This is the CROSS-CHAMPION-ATTRIBUTION variant of the self-referential
+    shape I9267 removed from the relative dispersion median. I9267's re-check
+    of this function concluded it did not carry that shape — correct about the
+    DECAYING-REFERENCE variant it was looking for, and blind to this one.
+
+    ``history_champion_version_ids``, when omitted, disables the scoping and
+    the function behaves exactly as before (used by callers that have only the
+    raw series — e.g. a replay over artifacts predating
+    ``champion_version_id``, which has been stamped since
+    alpha-engine-config-I8175). A ``None`` champion on either side is treated
+    as UNKNOWN and does not itself break the streak, so an unreadable registry
+    degrades to the old behaviour instead of silently zeroing every streak.
+
+    ``today_n_high_confidence`` and ``history_n_high_confidence`` should be the
+    regime-INVARIANT base-threshold counts (see ``N_HIGH_CONFIDENCE_BASIS``);
+    the function is agnostic to which basis it is handed and does not enforce
+    it.
+
+    Each day's WARN alert also carries a ``date_str``-keyed ``dedup_key`` (see
+    the call site), so the alert fires every day the streak persists rather
+    than being suppressed after the first breach. The five-day 2026-08-24..28
+    streak passed WITHOUT BLOCKING because this detector was always designed
+    non-blocking (config#1373 item-2: sizing/conviction is the sizing layer's
+    concern).
     """
+    ids = list(history_champion_version_ids or [])
     streak = 0
-    for value in [today_n_high_confidence] + list(history_n_high_confidence):
+    for offset, value in enumerate([today_n_high_confidence] + list(history_n_high_confidence)):
         if value is None or not isinstance(value, (int, float)):
             break
         if int(value) != 0:
             break
+        if offset > 0 and ids:
+            # ids is indexed over the HISTORY series, so history day `offset`
+            # sits at ids[offset - 1].
+            prior = ids[offset - 1] if offset - 1 < len(ids) else None
+            if (
+                prior is not None
+                and today_champion_version_id is not None
+                and prior != today_champion_version_id
+            ):
+                break
         streak += 1
     return streak
 
@@ -511,6 +615,24 @@ def regime_conditional_veto_adjustment(
         return 0.0
     raw = float(intensity_z) * float(scale)
     return max(-float(cap), min(float(cap), raw))
+
+
+def base_veto_threshold(s3_bucket: str) -> float:
+    """The veto confidence threshold BEFORE any regime adjustment.
+
+    ``get_veto_threshold`` moves this number with the market regime (bear
+    -0.20 / neutral 0.00 / bull +0.10, plus the Wire-4 continuous and the
+    forced-bear / drawdown clamps), which is correct for the gbm_veto it
+    governs and wrong for a day-over-day COMPARISON: a count taken against a
+    moving cut is not the same measurement twice. This returns the same base
+    ``get_veto_threshold`` starts from — S3 ``predictor_params.veto_confidence``
+    when present, else ``cfg.MIN_CONFIDENCE`` — so ``n_high_confidence_base``
+    is comparable across sessions (alpha-engine-config-I9445).
+    """
+    params = _load_predictor_params_from_s3(s3_bucket)
+    if params and "veto_confidence" in params:
+        return float(params["veto_confidence"])
+    return float(cfg.MIN_CONFIDENCE)
 
 
 def get_veto_threshold(
@@ -1026,6 +1148,24 @@ def write_predictions(
         if p.get("prediction_confidence", 0) >= threshold
     )
 
+    # alpha-engine-config-I9445: the same count at the regime-INVARIANT base
+    # threshold. `n_high_confidence` above is taken against the regime-adapted
+    # cut and stays exactly as it was (it is the veto's own accounting); this
+    # sibling is what a day-over-day comparison may legitimately walk. Best
+    # effort — a base threshold that cannot be resolved falls back to the
+    # applied one, which reproduces the previous behaviour rather than
+    # producing a wrong number.
+    try:
+        base_threshold = base_veto_threshold(s3_bucket)
+    except Exception:  # noqa: BLE001 — forensic sibling metric, never the primary write path
+        log.warning("base veto threshold unresolvable; n_high_confidence_base falls back "
+                    "to the applied threshold %.4f", threshold, exc_info=True)
+        base_threshold = threshold
+    n_high_confidence_base = sum(
+        1 for p in predictions
+        if p.get("prediction_confidence", 0) >= base_threshold
+    )
+
     # alpha-engine-config-I9019: n_high_confidence has been emitted to
     # metrics.json with NO consumer anywhere in the fleet (principle 7: a
     # metric nothing gates on is unobserved, not healthy) — it sat at 0 for
@@ -1033,19 +1173,44 @@ def write_predictions(
     # zero-streak reaches N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS; WARN, not
     # blocking — sizing/conviction is the sizing layer's concern (config#1373
     # item-2), this only makes the silence visible.
+    #
+    # alpha-engine-config-I9445: walked over the regime-invariant base count and
+    # scoped to the serving champion — see N_HIGH_CONFIDENCE_BASIS above for the
+    # measured derivation of both.
     n_high_confidence_zero_streak = _n_high_confidence_zero_streak(
-        n_high_confidence, [h["n_high_confidence"] for h in _batch_history],
+        n_high_confidence_base,
+        [h["n_high_confidence_base"] for h in _batch_history],
+        today_champion_version_id=_today_champion_version_id,
+        history_champion_version_ids=[
+            h.get("champion_version_id") for h in _batch_history
+        ],
     )
+    # alpha-engine-config-I9445: the dispersion verdict computed above is the
+    # independent corroborating read on the SAME condition — `alpha_stdev`
+    # against both the cross-champion trailing median and the absolute floor
+    # derived from the healthy population. Carried into the alert (and into the
+    # artifact below) so a zero-streak is never delivered without the one number
+    # that says whether the model actually collapsed: every session in the two
+    # measured zero blocks sat below the 0.015 floor, and the 2026-08-31 session
+    # that produced the false streak sat at 0.01921, above it.
+    _dispersion_corroborates = not bool(dispersion_verdict["passed"])
     if n_high_confidence_zero_streak >= N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS:
         try:
             from ops_alerts import publish_ops_alert
+            _alpha_stdev_today = absolute_alpha_check.get("today")
             publish_ops_alert(
                 message=(
-                    f"n_high_confidence has been 0 for "
+                    f"n_high_confidence_base has been 0 for "
                     f"{n_high_confidence_zero_streak} consecutive trading days "
-                    f"ending {date_str} (veto_threshold={threshold}) — a metric "
-                    f"emitted to metrics.json with no prior consumer "
-                    f"(alpha-engine-config-I9019)."
+                    f"ending {date_str}, all served by champion "
+                    f"{_today_champion_version_id} "
+                    f"(base_threshold={base_threshold}, applied_threshold={threshold}) — "
+                    f"alpha_stdev={_alpha_stdev_today} vs absolute floor "
+                    f"{DISPERSION_ABSOLUTE_FLOOR_ALPHA_STDEV}: dispersion gate "
+                    f"{'CORROBORATES a model collapse' if _dispersion_corroborates else 'does NOT corroborate a collapse'}"
+                    f" ({absolute_alpha_check.get('reason')}). "
+                    f"Recorded on output_distribution_gate.metrics."
+                    f"n_high_confidence (alpha-engine-config-I9019, -I9445)."
                 ),
                 severity="warning",
                 source="alpha-engine-predictor/inference/stages/write_output.py::write_predictions",
@@ -1085,6 +1250,31 @@ def write_predictions(
                 "excluded_same_champion_sessions": dispersion_verdict["excluded_same_champion_sessions"],
                 "today_champion_version_id": _today_champion_version_id,
                 "stdev_p_up_observe_only": relative_p_up_check,
+            },
+            # alpha-engine-config-I9445 (closing the alpha-engine-config-I7353
+            # finding-2 / I9019 "no prior consumer" gap): `n_high_confidence`
+            # existed only as a top-level number and a page. Recorded HERE it
+            # rides the gate block that is already carried into BOTH
+            # predictions.json and metrics/latest.json and already rendered by
+            # the console's Predictor slice, next to the dispersion verdict that
+            # says whether a zero is corroborated by an actual collapse — so the
+            # number is read on a surface rather than only paged about.
+            #
+            # Observe-only: it does NOT feed `gate_passed` (see "blocking"
+            # below). Conviction/sizing is the sizing layer's concern
+            # (config#1373 item-2), and `alpha_stdev` remains the sole
+            # allocation-gating dispersion statistic.
+            "n_high_confidence": {
+                "applied": n_high_confidence,
+                "applied_threshold": threshold,
+                "base": n_high_confidence_base,
+                "base_threshold": base_threshold,
+                "basis": N_HIGH_CONFIDENCE_BASIS,
+                "zero_streak": n_high_confidence_zero_streak,
+                "zero_streak_alert_days": N_HIGH_CONFIDENCE_ZERO_STREAK_ALERT_DAYS,
+                "champion_version_id": _today_champion_version_id,
+                "dispersion_corroborates_collapse": _dispersion_corroborates,
+                "observe_only": True,
             },
         },
         "blocking": inference_gate_blocking,
@@ -1129,6 +1319,14 @@ def write_predictions(
         # fires on, carried alongside so the console/forensic trail shows the
         # same figure without recomputing it from history.
         "n_high_confidence_zero_streak": n_high_confidence_zero_streak,
+        # alpha-engine-config-I9445: the regime-INVARIANT sibling of
+        # `n_high_confidence`, and the two thresholds both counts were taken
+        # against, so a reader (and the next session's history load) can tell a
+        # model change from a regime change without re-deriving either.
+        # Additive per the S3 schema contract.
+        "n_high_confidence_base": n_high_confidence_base,
+        "veto_threshold_applied": threshold,
+        "veto_threshold_base": base_threshold,
         # Executor reads this for the hold-book safeguard (2026-06-01): a
         # strongly-biased batch (passed=False) must not drive an optimizer
         # rotation — the executor holds the current book instead.
@@ -1161,6 +1359,11 @@ def write_predictions(
         "n_predictions_today": len(predictions),
         "n_high_confidence": n_high_confidence,
         "n_high_confidence_zero_streak": n_high_confidence_zero_streak,
+        # alpha-engine-config-I9445 — mirrored onto metrics/latest.json for the
+        # same reason the streak is.
+        "n_high_confidence_base": n_high_confidence_base,
+        "veto_threshold_applied": threshold,
+        "veto_threshold_base": base_threshold,
         # config#1075: the tradable-universe coverage denominator + covered count
         # so the report card's inference_coverage grades a real value in [0,1]
         # (covered/universe) instead of a permanent N/A. Computed at the call site

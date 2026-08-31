@@ -20,6 +20,30 @@ optimizer-sota-upgrades-260526.md). With it, confident picks size up and
 diffuse picks size down — without it, the optimizer treats α̂ = 0.05 ±
 0.002 and α̂ = 0.05 ± 0.04 identically.
 
+MEASURED CAVEAT (alpha-engine-config-I9446). The two variance terms above
+behave completely differently across a batch, and only one of them carries
+cross-sectional information:
+
+  • σ²_n is a **scalar learned at fit time** — the same number for every name.
+  • xᵀ Σ_w x varies per name, but most of Σ_w's mass sits on the seven
+    market-wide META_FEATURES (`macro_*`, `regime_intensity_z`), whose x is
+    also identical for every name on a given date.
+
+Measured over all 62 stored `predictions/{date}.json` artifacts from the
+2026-06-01 BayesianRidge cutover through 2026-08-31, σ²_n carries 90–98% of
+σ²_pred on a healthy champion, and the cross-sectional coefficient of
+variation of `predicted_alpha_std` NEVER exceeded 0.008 (median ≈ 0.002).
+The executor's Garlappi-Uppal-Wang penalty term therefore degenerates to a
+uniform ridge — it discriminates between nothing. The per-name signal is
+real but buried: stripping the constant σ_n floor lifts the same batches'
+cross-sectional CV to 0.027–0.152, one to two orders of magnitude higher.
+
+So the producer emits the decomposition — `predicted_alpha_std` (total,
+unchanged), `predicted_alpha_std_epistemic` (sqrt(xᵀ Σ_w x)) and
+`predicted_alpha_std_aleatoric` (σ_n) — and `decompose_alpha_std` below is
+where that split is defined. The epistemic term is the one a robust-MVO Ω
+is defined over; see its docstring.
+
 Intentionally simple (Bayesian ridge, not GBM) to avoid overfitting on
 ~10 inputs. Trained on out-of-fold predictions from Layer 1 walk-forward
 validation.
@@ -500,6 +524,88 @@ class MetaModel:
             # cutover policy above.
             return float(self._model.predict(x)[0]), None
 
+    def aleatoric_std(self) -> float | None:
+        """The irreducible-noise (aleatoric) half of the posterior predictive std.
+
+        ``BayesianRidge.predict(X, return_std=True)`` returns the *predictive*
+        std, which is
+
+            σ_pred(x)² = 1/α̂            (learned observation-noise variance)
+                       + xᵀ Σ_w x       (posterior parameter / estimation variance)
+
+        The first term is a **scalar learned at fit time** — identical for every
+        name in a batch. Measured over the 62 stored ``predictions/{date}.json``
+        artifacts from 2026-06-01 (the BayesianRidge cutover) to 2026-08-31 it
+        carries 90–98% of σ_pred² on a healthy champion, which is why the
+        cross-sectional coefficient of variation of ``predicted_alpha_std`` has
+        never exceeded 0.008 and usually sits near 0.001
+        (alpha-engine-config-I9446).
+
+        Read off the estimator, NOT off ``self._learned_alpha``: the estimator
+        travels inside the pickle bytes, whereas ``_learned_alpha`` is restored
+        only from the ``.pkl.meta.json`` sidecar — and the registry prefix
+        (``predictor/registry/{version_id}/``) carries no sidecar, so a
+        registry-loaded champion has ``_learned_alpha is None``. Same
+        travels-with-the-bytes rule that ``feature_names`` follows.
+
+        Returns ``None`` for an estimator with no learned noise precision
+        (a legacy Ridge pickle), where the decomposition is undefined.
+        """
+        if not self._fitted or self._model is None:
+            return None
+        alpha_ = getattr(self._model, "alpha_", None)
+        if alpha_ is None:
+            alpha_ = self._learned_alpha
+        try:
+            alpha_ = float(alpha_)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(alpha_) or alpha_ <= 0.0:
+            return None
+        return float(np.sqrt(1.0 / alpha_))
+
+    def decompose_alpha_std(
+        self, total_std: float | None
+    ) -> tuple[float | None, float | None]:
+        """Split a posterior predictive std into (epistemic, aleatoric).
+
+        ``total_std`` is what ``predict_single_with_std`` already returned for
+        this name — the decomposition is a pure function of it plus the
+        estimator's learned noise precision, so it costs no second ``predict``
+        and cannot disagree with the emitted total.
+
+        The **epistemic** half, ``sqrt(xᵀ Σ_w x)``, is the estimation-error std
+        of α̂ itself. That — not the predictive std — is the quantity the
+        Garlappi-Uppal-Wang robust-MVO penalty's Ω is defined over
+        (Garlappi, Uppal & Wang 2007): Ω is the covariance of the *estimation
+        error of expected returns*. Folding the irreducible observation noise
+        1/α̂ into Ω both double-counts risk the covariance matrix already
+        carries AND adds a per-batch constant that annihilates the
+        cross-section the penalty exists to exploit.
+
+        Derived by subtraction rather than by recomputing ``xᵀ Σ_w x`` from
+        ``sigma_``: subtraction is exact against whatever the estimator
+        actually returned, and does not hard-code a specific sklearn internal
+        (a different Bayesian linear estimator that exposes a scalar noise
+        variance decomposes identically).
+
+        Returns ``(None, None)`` when the estimator exposes no noise precision,
+        or when ``total_std`` is None/non-finite — never a fabricated value.
+        Clamped at zero: floating-point can put ``total_std`` a few ulp under
+        the aleatoric floor when the epistemic term is genuinely ~0.
+        """
+        aleatoric = self.aleatoric_std()
+        if aleatoric is None or total_std is None:
+            return None, None
+        try:
+            total = float(total_std)
+        except (TypeError, ValueError):
+            return None, None
+        if not np.isfinite(total) or total < 0.0:
+            return None, None
+        epistemic_var = max(total * total - aleatoric * aleatoric, 0.0)
+        return float(np.sqrt(epistemic_var)), aleatoric
+
     def metrics(self) -> dict:
         return {
             "type": "meta_model_bayesian_ridge",
@@ -592,6 +698,22 @@ class MetaModel:
             mm._importance = meta.get("importance", {}) or {}
             mm._learned_alpha = meta.get("learned_alpha_noise_precision")
             mm._learned_lambda = meta.get("learned_lambda_weight_precision")
+        # The sidecar is NOT authoritative for the learned hyperparameters, and
+        # is not always present: `predictor/registry/{version_id}/` stores
+        # `meta_model.pkl` with no `.pkl.meta.json`, so a registry-loaded
+        # champion took `_learned_alpha = None` above and reported it as None in
+        # metrics(). The estimator carries both values inside the pickle bytes —
+        # prefer them, and at full precision (the sidecar rounds to 6 dp).
+        # Same travels-with-the-bytes rule as feature_names + meta_scaler.
+        for _attr, _src in (("_learned_alpha", "alpha_"), ("_learned_lambda", "lambda_")):
+            _v = getattr(mm._model, _src, None)
+            if _v is not None:
+                try:
+                    _v = float(_v)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(_v) and _v > 0.0:
+                    setattr(mm, _attr, _v)
         # Backwards-compat: a model saved before feature_names was persisted
         # (pre-PR #34) has only `coefficients`. Reconstruct feature_names from
         # the coefficients dict, excluding the intercept. This keeps previously

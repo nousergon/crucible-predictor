@@ -48,8 +48,11 @@ def test_manifest_and_feature_list_written_to_io_keys(src):
 
 
 def test_oos_rows_use_io_paths(src):
-    assert "io.oos_rows_key(date_str)" in src
-    assert "io.oos_rows_latest_key" in src
+    # alpha-engine-config-I9378 — scoped by the arm that wrote it, not date
+    # alone; both keys must be derived through the io-spec methods, never a
+    # bare hardcoded prefix.
+    assert "io.oos_rows_key(date_str, _oos_model_version)" in src
+    assert "io.oos_rows_latest_key(_oos_model_version)" in src
     assert 'f"predictor/diagnostics/oos_rows/{date_str}.parquet"' not in src
     assert '"predictor/diagnostics/oos_rows/latest.parquet"' not in src
 

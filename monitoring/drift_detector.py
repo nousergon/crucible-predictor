@@ -64,6 +64,20 @@ DEFAULT_BUCKET = "alpha-engine-research"
 # Thresholds
 DIRECTION_CLUSTER_THRESHOLD = 0.80  # >80% same direction = degenerate
 ALPHA_MIN_STDEV = 0.001            # Alpha stdev below this = degenerate
+# alpha-engine-config-I9446. Cross-sectional coefficient of variation of the
+# α̂-uncertainty channel, below which it carries no per-name information and the
+# executor's Garlappi-Uppal-Wang Ω degenerates to a uniform ridge.
+#
+# Measured on the epistemic component (`predicted_alpha_std_epistemic`) over the
+# stored `predictions/{date}.json` sessions whose serving champion is pinned by
+# `champion_version_id`:
+#     healthy   v3.0-meta-2026-08-14-119e069b, 6 sessions: 0.0269 … 0.1520
+#     degenerate v3.0-meta-2026-08-21-7d3d1cce, 5 sessions: 0.0001 … 0.0002
+# 0.01 separates them with ≥2.7x margin on the healthy side and ≥50x on the
+# degenerate side. It is NOT a threshold on the TOTAL `predicted_alpha_std`,
+# whose CV never exceeded 0.008 in ANY session including healthy ones — a floor
+# on the total could only ever be a permanent false positive.
+ALPHA_UNCERTAINTY_MIN_CV = 0.01
 CONSECUTIVE_DAYS_THRESHOLD = 3     # Direction clustering must persist N days
 
 # ── Confidence checks ─────────────────────────────────────────────────────────
@@ -312,6 +326,66 @@ def _champion_version_change(window_preds: list[dict]) -> tuple[str, str] | None
             changed = True
             break
     return (current, first_served) if changed else None
+
+
+def alpha_uncertainty_alerts(
+    today: list[dict], date_str: str, training_ctx: dict | None = None,
+) -> list[dict]:
+    """Alert when the α̂-uncertainty channel carries no cross-sectional content.
+
+    alpha-engine-config-I9446. Deliberately checked on the EPISTEMIC component
+    (``predicted_alpha_std_epistemic``), not on the emitted total. The total is
+    sqrt(σ_n² + xᵀΣ_w x) and σ_n is a per-batch constant carrying 90–98% of the
+    variance, so the total's cross-sectional CV never exceeded 0.008 in ANY of
+    the 62 stored sessions since the 2026-06-01 BayesianRidge cutover —
+    including every healthy one. A floor on the total could only ever be a
+    permanent false positive; a floor on the epistemic half separates the two
+    regimes by more than two orders of magnitude.
+
+    Artifacts written before the decomposition shipped carry no ``_epistemic``
+    field. Those are SKIPPED, not judged on the total.
+
+    Pure function of a day's prediction rows so it is replayable against stored
+    sessions — see ``tests/test_alpha_uncertainty_decomposition.py``, which runs
+    it over one healthy and one degenerate real session.
+    """
+    training_ctx = training_ctx or {}
+    unc = [p.get("predicted_alpha_std_epistemic") for p in today]
+    unc = [float(u) for u in unc
+           if isinstance(u, (int, float)) and not isinstance(u, bool)
+           and np.isfinite(float(u))]
+    if len(unc) < 2:
+        return []
+    unc_arr = np.array(unc, dtype=float)
+    unc_mean = float(np.mean(unc_arr))
+    unc_cv = float(np.std(unc_arr) / unc_mean) if unc_mean > 0.0 else 0.0
+    if unc_cv >= ALPHA_UNCERTAINTY_MIN_CV:
+        return []
+    return [_alert(
+        code="alpha_uncertainty_degeneration",
+        severity=WARN,
+        headline="Alpha-uncertainty degeneration",
+        detail=(f"cross-sectional CV of predicted_alpha_std_epistemic is "
+                f"{unc_cv:.5f} across {len(unc)} names, below the "
+                f"{ALPHA_UNCERTAINTY_MIN_CV} floor — every name carries "
+                f"effectively the same estimation uncertainty"),
+        cause="the meta-model's posterior parameter covariance puts its mass on the "
+              "market-wide META_FEATURES (macro_*, regime_intensity_z), whose inputs "
+              "are identical for every ticker on a date — so xᵀΣ_w x is a constant "
+              "and the per-name uncertainty signal is gone. Seen when a champion's "
+              "posterior barely updates off its prior (the 2026-08-21 champion held "
+              "sigma_ == 1/lambda_ on 10 of its 16 columns)",
+        action="check the served champion's BayesianRidge sigma_ diagonal against "
+               "1/lambda_ — columns sitting exactly at the prior mean the fit learned "
+               "nothing there, which makes the champion the defect rather than the "
+               "field. The executor's alpha-uncertainty penalty sizes on a uniform "
+               "ridge until this clears",
+        value=round(unc_cv, 6),
+        threshold=ALPHA_UNCERTAINTY_MIN_CV,
+        n_names=len(unc),
+        date=date_str,
+        **training_ctx,
+    )]
 
 
 def check_prediction_drift(
@@ -621,6 +695,11 @@ def check_prediction_drift(
                 date=date_str,
                 **training_ctx,
             ))
+
+    # α̂-uncertainty degeneration — the sizing channel carries no cross-section.
+    alerts.extend(
+        alpha_uncertainty_alerts(today, date_str, training_ctx)
+    )
 
     return alerts
 

@@ -240,7 +240,7 @@ level_neutralization:
 # Trade-on-none, non-critical, time-guarded. No-op until challengers exist.
 shadow_versions:
   enabled: true                  # observe-only (challengers never trade)
-  max_n: 3                       # max challengers shadowed per inference run
+  max_n: 5                       # arena cap (§6.1); all zoo arms in one run when n<=5
 
 # ── Model zoo (L4488c) — declarative variant specs for champion/challenger ───
 # Each spec is a config OVERLAY trained via `python -m training.model_zoo

@@ -180,10 +180,13 @@ def test_resolve_registered_specs_for_date_empty_on_total_failure(monkeypatch):
 # ── run_select_only (the parallel select entrypoint) ─────────────────────────
 
 
-def _select_fixture(monkeypatch, *, registered, auto_promote=True):
+def _select_fixture(monkeypatch, *, registered, auto_promote=True,
+                    arena_pointer=None, arena_moved=True):
     """Set up an S3 + registry where ``registered`` is the list of (spec_id,
     model_version, version_id, fwd, cpcv, gate) tuples that registered for the
     date. Returns (board, promotes, s3)."""
+    from tests.arena_test_helpers import mock_arena_run_slot, mock_model_zoo_post_select_reads
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(cfg, "MODEL_ZOO_PROMOTE_MIN_IC", 0.0, raising=False)
@@ -203,6 +206,14 @@ def _select_fixture(monkeypatch, *, registered, auto_promote=True):
     promotes = []
     monkeypatch.setattr(reg, "promote_to_champion",
                         lambda s3c, b, vid, **k: promotes.append(vid))
+    if arena_pointer is None and registered:
+        arena_pointer = registered[0][2]
+    mock_arena_run_slot(
+        monkeypatch,
+        pointer_version_id=arena_pointer,
+        moved=arena_moved if arena_pointer else False,
+    )
+    mock_model_zoo_post_select_reads(monkeypatch)
     board = mz.run_select_only(
         "bkt", date_str="2026-06-13", s3=s3, specs=_SPECS,
         auto_promote_winner=auto_promote,
@@ -256,6 +267,8 @@ def test_run_select_only_sends_one_digest(monkeypatch):
 
 def test_run_select_only_inert_alert_on_empty_pool(monkeypatch):
     # No spec registered AND no base champion-arch → truly inert select → alert.
+    from tests.arena_test_helpers import mock_arena_run_slot
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(reg, "list_versions", lambda s3c, b, stage=None: [])
@@ -264,6 +277,7 @@ def test_run_select_only_inert_alert_on_empty_pool(monkeypatch):
     monkeypatch.setattr(mz, "_alert_inert_rotation", lambda *a, **k: alerted.append(k))
     cw = []
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: cw.append(n))
+    mock_arena_run_slot(monkeypatch, pointer_version_id=None, moved=False)
 
     s3 = _FakeS3({cfg.META_MANIFEST_KEY: _mk_manifest(21, 0.10, True)})
     board = mz.run_select_only("bkt", date_str="2026-06-13", s3=s3,
@@ -276,6 +290,8 @@ def test_run_select_only_inert_alert_on_empty_pool(monkeypatch):
 
 def test_run_select_only_no_inert_alert_when_base_present(monkeypatch):
     # The base champion-arch alone in the pool is a candidate — NOT inert.
+    from tests.arena_test_helpers import mock_arena_run_slot
+
     import model.registry as reg
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     monkeypatch.setattr(cfg, "MODEL_VERSION_LABEL", "v3.0-meta", raising=False)
@@ -283,6 +299,7 @@ def test_run_select_only_no_inert_alert_when_base_present(monkeypatch):
     alerted = []
     monkeypatch.setattr(mz, "_alert_inert_rotation", lambda *a, **k: alerted.append(k))
     monkeypatch.setattr(mz, "_emit_challengers_trained_metric", lambda n: None)
+    mock_arena_run_slot(monkeypatch, pointer_version_id="base-v", moved=False)
 
     # Only the base champion-arch is registered (label == MODEL_VERSION_LABEL).
     s3 = _FakeS3({
