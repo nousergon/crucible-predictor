@@ -948,6 +948,30 @@ def build_meta_matrix(oos_meta_rows, train_meta_features):
     return matrix
 
 
+def declared_absent_features(oos_meta_rows, train_meta_features) -> list[str]:
+    """``RESEARCH_META_FEATURES`` absent from EVERY OOS row — the producer has
+    not deployed (alpha-engine-config-I5949) and ``build_meta_matrix`` zero-
+    filled the column under the fail-soft contract.
+
+    Passed to ``evaluate_arm_validity`` so its ``constant_input_column``
+    assertion can tell a declared, logged, zero-filled absence from a
+    degenerate input. Only the fail-soft family qualifies: a non-research
+    feature absent everywhere raises ``KeyError`` in ``build_meta_matrix``
+    and never reaches here. Measured 2026-09-05: three such columns failed
+    the arm on the gate's first live Saturday.
+    """
+    from model.meta_model import RESEARCH_META_FEATURES
+
+    soft = frozenset(RESEARCH_META_FEATURES)
+    total = len(oos_meta_rows)
+    if total == 0:
+        return []
+    return [
+        f for f in train_meta_features
+        if f in soft and all(f not in r for r in oos_meta_rows)
+    ]
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -2586,6 +2610,7 @@ def run_meta_training(
         _expected_move_in_meta, _research_features_in_meta, _meta_standardize,
     )
     meta_X_all = build_meta_matrix(oos_meta_rows, TRAIN_META_FEATURES)
+    _declared_absent = declared_absent_features(oos_meta_rows, TRAIN_META_FEATURES)
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
@@ -2720,6 +2745,9 @@ def run_meta_training(
         prior_standardized_coef=_arm_history["prior_standardized_coef"],
         prior_coef_norms=_arm_history["prior_coef_norms"],
         min_norm_ratio=float(getattr(cfg, "ARM_COEF_NORM_MIN_RATIO", 0.50)),
+        declared_absent=_declared_absent,
+        panel_n=len(oos_meta_rows),
+        prior_panel_ns=_arm_history.get("prior_panel_ns"),
     )
     arm_validity["history"] = {
         "status": _arm_history["status"],
@@ -2728,9 +2756,12 @@ def run_meta_training(
     }
     log.info(
         "Arm validity (I9290): arm=%s status=%s coef_norm=%s history=%s "
-        "(%d vintage(s))",
+        "(%d vintage(s)) panel_n=%s reference=%s over %s comparable vintage(s) "
+        "declared_absent=%s",
         _arm_label, arm_validity["status"], arm_validity["coef_norm"],
         _arm_history["status"], _arm_history["n_vintages"],
+        arm_validity.get("panel_n"), arm_validity.get("coef_norm_reference"),
+        arm_validity.get("coef_norm_reference_vintages"), _declared_absent,
     )
     assert_arm_valid(arm_validity)
 

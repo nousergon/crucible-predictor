@@ -120,6 +120,15 @@ FEATURE_BLOCKS: dict[str, tuple[str, ...]] = {
 # shrinkage.
 _ZERO = 1e-12
 
+# A prior vintage is a collapse reference only when its meta panel is within
+# this factor of the current fit's (either direction). 2x separates the
+# week-over-week growth the research join has shown (6006 -> 10465 -> 14940)
+# from the 4-6x gap to the 2410-row vintages that dominated the median on
+# 2026-09-05. Measured 2026-09-05: n / xsec-norm 2410/0.3142 -> 6006/0.2701
+# -> 10465/0.1214 -> 14940/0.1114 — the norm moved with the panel, and the
+# macro repair between the last two moved it not at all.
+COMPARABLE_PANEL_RATIO = 2.0
+
 
 def coef_norm(standardized_coef: "dict | None") -> "float | None":
     """L2 norm of an arm's standardized coefficient vector.
@@ -237,6 +246,9 @@ def evaluate_arm_validity(
     prior_standardized_coef: "dict | None" = None,
     prior_coef_norms: "list | None" = None,
     min_norm_ratio: float = 0.50,
+    declared_absent: "list | None" = None,
+    panel_n: "int | None" = None,
+    prior_panel_ns: "list | None" = None,
 ) -> dict:
     """Grade one freshly-fitted arm. Pure — no S3, no config, unit-testable.
 
@@ -258,6 +270,28 @@ def evaluate_arm_validity(
         their median,
         so one bad week does not move the bar it will be judged against next
         week.
+    declared_absent : list[str], optional
+        ``RESEARCH_META_FEATURES`` absent from 100% of the OOS rows and
+        zero-filled by ``build_meta_matrix``'s fail-soft contract (the
+        producer has not deployed — alpha-engine-config-I5949). A column that
+        is constant BECAUSE it was declared absent is not a degenerate arm: the
+        contract said so at WARNING, inference zeroes the same column, and the
+        arm is honestly smaller than its declared list. Such columns are named
+        on the check and exempted from ``constant_input_column``; any OTHER
+        constant column still fails. Measured 2026-09-05: the gate's first live
+        Saturday refused a healthy arm on exactly these three columns.
+    panel_n, prior_panel_ns : optional
+        The fitted panel's row count and the same for each entry of
+        ``prior_coef_norms`` (parallel lists; ``None`` for a vintage whose
+        manifest does not record it). When both are given, the collapse
+        reference is the median over vintages whose panel is within
+        ``[1/COMPARABLE_PANEL_RATIO, COMPARABLE_PANEL_RATIO]`` of this one —
+        a standardized-coefficient norm is not comparable across a 4-6x
+        change in panel size (measured n / xsec-norm: 2410/0.3142 ->
+        6006/0.2701 -> 10465/0.1214 -> 14940/0.1114, with the macro block
+        dead on the third and alive on the fourth). No comparable vintage ->
+        ``insufficient``, never a pass. Without size information the whole
+        history's median gates as before.
     """
     checks: list[_Check] = []
     # Both are recorded; only the cross-sectional one gates. The full-vector
@@ -275,7 +309,15 @@ def evaluate_arm_validity(
             "(champion-challenger-policy §5.1).",
         ))
     else:
-        dead_cols = constant_input_columns(meta_X, feature_names)
+        all_dead = constant_input_columns(meta_X, feature_names)
+        absent = [c for c in all_dead if c in set(declared_absent or [])]
+        dead_cols = [c for c in all_dead if c not in set(absent)]
+        absent_note = (
+            f" {len(absent)} further constant column(s) are declared-absent "
+            f"RESEARCH_META_FEATURES zero-filled by the fail-soft contract "
+            f"(producer not deployed, alpha-engine-config-I5949) and are exempt: "
+            f"{absent}." if absent else ""
+        )
         if dead_cols:
             blocks = sorted({_block_of(c) or "ungrouped" for c in dead_cols})
             checks.append(_Check(
@@ -285,10 +327,14 @@ def evaluate_arm_validity(
                 f"the whole training panel: {dead_cols} (blocks: {blocks}); "
                 f"measured panel std <= {_ZERO}, required > {_ZERO}. A linear "
                 "L2 gives each an exactly-zero coefficient, so this arm is "
-                "structurally smaller than its declared feature list.",
+                "structurally smaller than its declared feature list."
+                + absent_note,
             ))
         else:
-            checks.append(_Check("constant_input_column", "pass", ""))
+            checks.append(_Check(
+                "constant_input_column", "pass",
+                (f"{arm}: no undeclared constant column." + absent_note) if absent else "",
+            ))
 
     # ── 2. a whole declared block dead that WAS live last vintage ───────────
     if not isinstance(prior_standardized_coef, dict) or not prior_standardized_coef:
@@ -330,10 +376,27 @@ def evaluate_arm_validity(
             checks.append(_Check("dead_feature_block", "pass", ""))
 
     # ── 3. coefficient-norm collapse against the arm's OWN history ──────────
-    ref_norms = [
-        float(n) for n in (prior_coef_norms or [])
-        if isinstance(n, (int, float)) and math.isfinite(float(n)) and float(n) > 0
-    ]
+    # Reference = the arm's prior vintages, restricted to those fitted on a
+    # COMPARABLE panel when sizes are known (see the docstring): the 8/28
+    # vintage at n=10465 is a reference for a 14940-row fit; the served 8/14
+    # vintage at n=2410 is not.
+    ref_norms: list[float] = []
+    excluded_sizes: list = []
+    sizes = list(prior_panel_ns) if prior_panel_ns is not None else None
+    for i, n in enumerate(prior_coef_norms or []):
+        if not (isinstance(n, (int, float)) and math.isfinite(float(n)) and float(n) > 0):
+            continue
+        if panel_n and sizes is not None:
+            pn = sizes[i] if i < len(sizes) else None
+            comparable = (
+                isinstance(pn, (int, float)) and not isinstance(pn, bool) and pn > 0
+                and (1.0 / COMPARABLE_PANEL_RATIO) <= (pn / float(panel_n)) <= COMPARABLE_PANEL_RATIO
+            )
+            if not comparable:
+                excluded_sizes.append(pn)
+                continue
+        ref_norms.append(float(n))
+    reference = None
     if norm is None:
         checks.append(_Check(
             "coef_norm_collapse", "insufficient",
@@ -341,6 +404,15 @@ def evaluate_arm_validity(
             f"any of the {len(XSEC_FEATURES)} declared cross-sectional "
             "features, so its cross-sectional norm is unmeasurable. Reported "
             "insufficient, NOT a pass.",
+        ))
+    elif not ref_norms and excluded_sizes:
+        checks.append(_Check(
+            "coef_norm_collapse", "insufficient",
+            f"{arm}: no prior vintage of this arm was fitted on a panel "
+            f"comparable to this one (panel_n={panel_n}; prior panel sizes "
+            f"{excluded_sizes}, comparable = within {COMPARABLE_PANEL_RATIO}x), "
+            f"so a collapse cannot be measured (current xsec norm {norm:.6f}). "
+            "Reported insufficient, NOT a pass.",
         ))
     elif not ref_norms:
         checks.append(_Check(
@@ -353,12 +425,17 @@ def evaluate_arm_validity(
         ordered = sorted(ref_norms)
         reference = ordered[len(ordered) // 2]  # median of the arm's own history
         ratio = norm / reference if reference else None
+        scope = (
+            f"over {len(ref_norms)} comparable vintage(s) (panel_n={panel_n}; "
+            f"{len(excluded_sizes)} non-comparable excluded: {excluded_sizes})"
+            if panel_n and sizes is not None else f"over {len(ref_norms)} vintage(s)"
+        )
         if ratio is not None and ratio < min_norm_ratio:
             checks.append(_Check(
                 "coef_norm_collapse", "fail",
                 f"{arm}: coef_norm_collapse — CROSS-SECTIONAL standardized "
                 f"coefficient norm {norm:.6f} against this arm's trailing median "
-                f"{reference:.6f} over {len(ref_norms)} vintage(s); measured "
+                f"{reference:.6f} {scope}; measured "
                 f"ratio {ratio:.4f}, required >= {min_norm_ratio}. The model "
                 "shrank toward the intercept, which is what a starved or dead "
                 "feature block does to a Ridge.",
@@ -377,6 +454,10 @@ def evaluate_arm_validity(
         "coef_norm": round(norm, 6) if norm is not None else None,
         "xsec_coef_norm": round(norm, 6) if norm is not None else None,
         "full_coef_norm": round(full_norm, 6) if full_norm is not None else None,
+        "coef_norm_reference": round(reference, 6) if reference is not None else None,
+        "coef_norm_reference_vintages": len(ref_norms),
+        "panel_n": int(panel_n) if panel_n else None,
+        "declared_absent": sorted(declared_absent or []),
         "checks": [c.as_dict() for c in checks],
         "failures": [c.as_dict() for c in failures],
         "insufficient": [c.as_dict() for c in insufficient],
@@ -423,14 +504,19 @@ def load_arm_history(bucket: str, arm: str, *, s3=None, max_vintages: int = 8) -
     not measure (champion-challenger-policy §5.1), and an uncomputed gate
     reported as a pass is the defect the gate exists to prevent.
 
-    Returns ``{"prior_standardized_coef", "prior_coef_norms", "n_vintages",
-    "status", "reason"}``.
+    Returns ``{"prior_standardized_coef", "prior_coef_norms", "prior_panel_ns",
+    "n_vintages", "status", "reason"}``. ``prior_panel_ns`` is parallel to
+    ``prior_coef_norms``: each vintage's meta-panel row count read from its
+    manifest's ``track_a_canonical_diagnostic.n_total`` (``None`` when the
+    manifest does not carry it), so the collapse reference can be restricted
+    to comparable panels.
     """
     import json
 
     out: dict = {
         "prior_standardized_coef": None,
         "prior_coef_norms": [],
+        "prior_panel_ns": [],
         "n_vintages": 0,
         "status": "unavailable",
         "reason": None,
@@ -457,6 +543,7 @@ def load_arm_history(bucket: str, arm: str, *, s3=None, max_vintages: int = 8) -
 
     versions.sort(key=lambda v: str(v.get("date") or ""), reverse=True)
     norms: list[float] = []
+    panel_ns: list = []
     latest_coef: "dict | None" = None
     for v in versions[:max_vintages]:
         key = f"predictor/registry/{v['version_id']}/manifest.json"
@@ -481,11 +568,14 @@ def load_arm_history(bucket: str, arm: str, *, s3=None, max_vintages: int = 8) -
         n = xsec_coef_norm(coef)
         if n is not None:
             norms.append(n)
+            pn = (manifest.get("track_a_canonical_diagnostic") or {}).get("n_total")
+            panel_ns.append(int(pn) if isinstance(pn, (int, float)) and not isinstance(pn, bool) and pn > 0 else None)
         if latest_coef is None and isinstance(coef, dict) and coef:
             latest_coef = coef
 
     out["prior_standardized_coef"] = latest_coef
     out["prior_coef_norms"] = norms
+    out["prior_panel_ns"] = panel_ns
     out["n_vintages"] = len(norms)
     out["status"] = "ok" if norms else "unavailable"
     if not norms:

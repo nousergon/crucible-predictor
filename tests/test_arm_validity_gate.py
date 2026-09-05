@@ -229,3 +229,130 @@ class TestWiring:
         import model.registry as reg
 
         assert hasattr(reg, "promote_to_champion")
+
+
+# ── 2026-09-05: the gate's first live Saturday refused a healthy arm twice ─────
+#
+# Measured on watch-rerun-2026-09-04-1 (nous-ergon-ops-I1049's sibling):
+#
+#   constant_input_column — 3 of 16 meta features have ZERO variance:
+#       ['guidance_direction', 'risk_factor_count_delta_raw', 'management_tone_zscore']
+#   coef_norm_collapse — xsec norm 0.111357 vs trailing median 0.311126 over 8
+#       vintages; ratio 0.3579 < 0.5
+#
+# The three constant columns are RESEARCH_META_FEATURES absent from 100% of
+# the OOS rows — the producer has not deployed (alpha-engine-config-I5949) and
+# build_meta_matrix zero-fills them BY CONTRACT, then this module refused the
+# zeros it was handed. And the norm history it compared against is confounded
+# by panel size: n / xsec-norm across the last four vintages read
+# 2410/0.3142 -> 6006/0.2701 -> 10465/0.1214 -> 14940/0.1114. The 8/28
+# vintage, with the macro block dead, sat at 0.1214; the 9/5 vintage, macro
+# repaired and alive, sits at 0.1114 — so the drop is not the macro death the
+# docstring attributes it to, and a "collapse" judged against a 4-6x smaller
+# panel is not a measurement of the arm.
+
+_XSEC_ONLY_COEFS = {
+    # xsec norm == 0.1114 exactly (one feature carries it); macro alive.
+    "research_calibrator_prob": 0.1114, "momentum_score": 0.0, "expected_move": 0.0,
+    **{n: 0.05 for n in _MACRO},
+}
+
+
+class TestDeclaredAbsentFailSoftColumns:
+    def test_a_declared_absent_fail_soft_column_does_not_fail_the_arm(self):
+        feats = _ALL + ["guidance_direction"]
+        X = np.column_stack([_panel(macro_dead=False), np.zeros(200)])
+        coefs = {**_coefs(macro_dead=False), "guidance_direction": 0.0}
+        v = evaluate_arm_validity(
+            arm="v3.0-meta", standardized_coef=coefs, meta_X=X, feature_names=feats,
+            prior_standardized_coef=_coefs(macro_dead=False), prior_coef_norms=[0.17, 0.18],
+            declared_absent=["guidance_direction"],
+        )
+        assert v["status"] == "valid", v
+        check = next(c for c in v["checks"] if c["check"] == "constant_input_column")
+        assert check["status"] == "pass"
+        assert "guidance_direction" in check["reason"]
+        assert "I5949" in check["reason"]
+
+    def test_an_undeclared_constant_column_still_fails(self):
+        feats = _ALL + ["guidance_direction"]
+        X = np.column_stack([_panel(macro_dead=False), np.zeros(200)])
+        coefs = {**_coefs(macro_dead=False), "guidance_direction": 0.0}
+        v = evaluate_arm_validity(
+            arm="v3.0-meta", standardized_coef=coefs, meta_X=X, feature_names=feats,
+            prior_standardized_coef=_coefs(macro_dead=False), prior_coef_norms=[0.17, 0.18],
+        )
+        assert v["status"] == "invalid"
+        assert {f["check"] for f in v["failures"]} == {"constant_input_column"}
+
+    def test_a_declared_absent_column_that_is_NOT_constant_is_not_exempted(self):
+        """The exemption is for a zero-filled absent producer; a live column
+        declared absent by mistake must not hide a real constant elsewhere."""
+        feats = _ALL + ["guidance_direction"]
+        X = np.column_stack([_panel(macro_dead=True), np.zeros(200)])
+        coefs = {**_coefs(macro_dead=True), "guidance_direction": 0.0}
+        v = evaluate_arm_validity(
+            arm="v3.0-meta", standardized_coef=coefs, meta_X=X, feature_names=feats,
+            prior_standardized_coef=_coefs(macro_dead=False), prior_coef_norms=[0.17],
+            declared_absent=["guidance_direction"],
+        )
+        check = next(c for c in v["checks"] if c["check"] == "constant_input_column")
+        assert check["status"] == "fail"
+        assert "macro_vix_level" in check["reason"]
+        assert "guidance_direction" not in check["reason"].split("ZERO variance")[1].split("(blocks")[0]
+
+    def test_declared_absent_features_helper_names_only_the_fully_absent_soft_ones(self):
+        from training.meta_trainer import declared_absent_features
+        rows = [
+            {"momentum_score": 0.1, "management_tone_zscore": 0.2},
+            {"momentum_score": 0.2},
+            {"momentum_score": 0.3},
+        ]
+        feats = ["momentum_score", "guidance_direction", "management_tone_zscore"]
+        assert declared_absent_features(rows, feats) == ["guidance_direction"]
+        # a NON-soft feature absent everywhere is a contract breach, never "declared absent"
+        assert declared_absent_features(rows, ["expected_move"]) == []
+
+
+class TestCollapseAgainstAComparablePanel:
+    def _run(self, *, panel_n, prior_panel_ns, prior_coef_norms=(0.3142, 0.2701, 0.1214)):
+        return evaluate_arm_validity(
+            arm="v3.0-meta", standardized_coef=_XSEC_ONLY_COEFS,
+            meta_X=_panel(macro_dead=False), feature_names=_ALL,
+            prior_standardized_coef=_coefs(macro_dead=False),
+            prior_coef_norms=list(prior_coef_norms),
+            panel_n=panel_n, prior_panel_ns=list(prior_panel_ns) if prior_panel_ns is not None else None,
+        )
+
+    def test_the_measured_four_vintages_pass_against_the_comparable_one(self):
+        v = self._run(panel_n=14940, prior_panel_ns=[2410, 6006, 10465])
+        check = next(c for c in v["checks"] if c["check"] == "coef_norm_collapse")
+        assert check["status"] == "pass", check
+        assert v["status"] == "valid"
+        assert v["coef_norm_reference"] == pytest.approx(0.1214)
+        assert v["coef_norm_reference_vintages"] == 1
+
+    def test_without_panel_sizes_the_whole_history_median_still_gates(self):
+        """Backwards-compatible: no size information -> the pre-fix behaviour."""
+        v = self._run(panel_n=None, prior_panel_ns=None)
+        check = next(c for c in v["checks"] if c["check"] == "coef_norm_collapse")
+        assert check["status"] == "fail"
+        assert "0.2701" in check["reason"]
+
+    def test_no_comparable_vintage_is_insufficient_not_a_pass(self):
+        v = self._run(panel_n=14940, prior_panel_ns=[2410, 2410, 2410])
+        check = next(c for c in v["checks"] if c["check"] == "coef_norm_collapse")
+        assert check["status"] == "insufficient"
+        assert "14940" in check["reason"] and "2410" in check["reason"]
+        assert v["status"] == "degraded"  # insufficient never blocks (rule 1)
+
+    def test_a_real_collapse_against_a_comparable_vintage_still_fails(self):
+        v = self._run(panel_n=14940, prior_panel_ns=[14000, 15000], prior_coef_norms=(0.30, 0.31))
+        check = next(c for c in v["checks"] if c["check"] == "coef_norm_collapse")
+        assert check["status"] == "fail"
+        assert v["status"] == "invalid"
+
+    def test_a_vintage_with_unknown_panel_size_is_not_treated_as_comparable(self):
+        v = self._run(panel_n=14940, prior_panel_ns=[None, None, 10465])
+        assert v["coef_norm_reference_vintages"] == 1
+        assert v["coef_norm_reference"] == pytest.approx(0.1214)
