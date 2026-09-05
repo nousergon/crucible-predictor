@@ -191,4 +191,16 @@ def test_a_research_free_failure_reaches_the_ops_alert_surface():
         "inference/stages/research_free.py no longer publishes an ops alert on "
         "failure — a non-critical stage that only logs is a silent swallow."
     )
-    assert "severity=\"error\"" in src or "severity='error'" in src
+    # The source literal must stay a REGISTERED alert class. `predictor_inference`
+    # (nousergon-data infrastructure/overseer/playbooks.yaml) is the operator-ruled
+    # `severities: [dynamic]` row covering every failure shape inside this Lambda;
+    # inventing a new literal here reddens the alert-class PR guard until a
+    # companion nousergon-data row lands.
+    assert '"alpha-engine-predictor-inference"' in src, (
+        "the research_free stage's alert source is no longer the registered "
+        "predictor_inference class — an unregistered source has no Overseer "
+        "playbook and fails the alert-class PR guard."
+    )
+    # Measurement-coverage signal, not a trading halt — severity and response
+    # are chosen together (the 2026-08-28 alert-destination lesson).
+    assert 'severity="warning"' in src or "severity='warning'" in src

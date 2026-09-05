@@ -42,10 +42,28 @@ publishes an ops alert before returning:
   was already written by ``write_output``, upstream of this stage, and is
   not read or mutated here. The executor's input is unaffected.
 - (c) recording surface: ``ops_alerts.publish_ops_alert`` (SNS +
-  flow-doctor forum topic) at ``error`` severity, dedup-keyed per date,
-  plus the ERROR log line. The weekly consumer provides the second
-  detection layer: a missing artifact raises ``FillingShadowError`` naming
-  this producer.
+  flow-doctor forum topic) plus the ERROR log line. The weekly consumer
+  provides the second detection layer: a missing artifact raises
+  ``FillingShadowError`` naming this producer.
+
+Alert registration and shape
+----------------------------
+The alert source is ``alpha-engine-predictor-inference`` — the EXISTING
+``predictor_inference`` row in nousergon-data
+``infrastructure/overseer/playbooks.yaml::alert_classes`` (operator ruling
+2026-08-21, alpha-engine-config-I7740), which is deliberately ONE
+``severities: [dynamic]`` row covering every failure shape inside this
+Lambda. A failure here is one of those shapes, so it needs no new class and
+no companion registry PR.
+
+Severity is ``warning`` with the row's ``drain-queue`` response, not
+``critical``/operator: this is a MEASUREMENT-COVERAGE signal (the weekly
+``scanner_predictor_direct`` arm goes unmeasurable), never a trading-halt
+condition — the same pairing, for the same reason, as
+``predictor_shadow_leaderboard_unmeasurable_arm``.
+
+The dedup key is the CONDITION, not the run — a producer broken for a week
+must page once, not once per weekday (ALERT003).
 """
 from __future__ import annotations
 
@@ -56,10 +74,19 @@ from inference.pipeline import PipelineContext
 
 log = logging.getLogger(__name__)
 
-_ALERT_SOURCE = "predictor.research_free"
+# Registered class ``predictor_inference`` (nousergon-data
+# infrastructure/overseer/playbooks.yaml::alert_classes) — see the module
+# docstring. Do NOT replace this with a new literal without landing the
+# companion registry row first; the alert-class PR guard fails on an
+# unregistered PR-added source.
+_ALERT_SOURCE = "alpha-engine-predictor-inference"
+
+# Condition-keyed, NOT run-keyed: a producer broken every weekday must page
+# once for the outage, not once per run (ALERT003).
+_DEDUP_KEY = "predictor_research_free_producer_failed"
 
 
-def _alert(message: str, *, date_str: str) -> None:
+def _alert(message: str) -> None:
     """Publish the degradation to the ops surface. Never raises — an alerting
     failure must not take down a stage that is already only reporting."""
     try:
@@ -67,9 +94,9 @@ def _alert(message: str, *, date_str: str) -> None:
 
         publish_ops_alert(
             message,
-            severity="error",
+            severity="warning",
             source=_ALERT_SOURCE,
-            dedup_key=f"{_ALERT_SOURCE}:{date_str}",
+            dedup_key=_DEDUP_KEY,
         )
     except Exception:  # noqa: BLE001 - see (c) above; the ERROR log survives
         log.error(
@@ -118,7 +145,6 @@ def run(ctx: PipelineContext) -> None:
             f"crucible-research's scanner_predictor_direct filling arm consumes this "
             f"artifact weekly and will fail loud on the next canonical Saturday "
             f"(alpha-engine-config-I10067).",
-            date_str=ctx.date_str,
         )
         return
 
