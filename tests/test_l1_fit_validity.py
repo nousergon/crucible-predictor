@@ -397,3 +397,89 @@ def test_market_wide_features_are_excluded_by_name():
     assert "macro_vix_level" not in XSEC_FEATURES
     assert "regime_intensity_z" not in XSEC_FEATURES
     assert "research_calibrator_prob" in XSEC_FEATURES
+
+
+# ── 2026-09-05: a split that could not be BUILT is `insufficient`, not a failure ──
+#
+# Measured on weekly SF watch-rerun-2026-09-04-2 (after the arm-validity gate
+# had passed): `build_purged_split` reported INSUFFICIENT for research_gbm —
+# "the validation block had to take 90.7% of the panel's rows to span 50
+# dates; measured 0.9068, required <= 0.4 … rows-per-date range 1..895 over
+# 107 dates". The arm was registered fitted=False, and this gate graded that
+# `not_fitted` → required → the task failed. Both modules' rule 1 says the
+# opposite: "a check that cannot be computed is reported insufficient and does
+# not block" (champion-challenger-policy §5.1) — the same rule this file
+# already applies to a val_ic whose standard error swamps its floor (I9376).
+# A split whose floors the PANEL cannot meet is that case one step earlier.
+# It is loud (status on the manifest, a degradation finding, a WARNING), the
+# bucket-lookup fallback is declared, and any OTHER reason for fitted=False —
+# a degenerate design matrix, a booster that never built — still fails.
+
+_INSUFFICIENT_SPLIT_BLOCK = {
+    "status": "insufficient",
+    "reason": (
+        "the validation block had to take 90.7% of the panel's rows to span 50 "
+        "dates; measured 0.9068, required <= 0.4."
+    ),
+    "min_val_dates": 50, "max_val_row_fraction": 0.4,
+}
+
+
+def test_a_split_the_panel_cannot_support_is_insufficient_not_a_failure():
+    fits = dict(HEALTHY_VOL_FITS)
+    fits["research_gbm"] = {
+        "fitted": False,
+        "reason": "UnmeasurableSplitError: research_gbm: refusing to fit on an unmeasurable split — " + _INSUFFICIENT_SPLIT_BLOCK["reason"],
+        "not_fitted_kind": "split_insufficient",
+        "split": dict(_INSUFFICIENT_SPLIT_BLOCK),
+        "design_matrix": {"n_rows": 14940, "n_varying_features": 6},
+    }
+    block = evaluate_l1_fits(fits)
+    rg = block["arms"]["research_gbm"]
+    assert rg["status"] == "insufficient", rg
+    assert "90.7%" in rg["reason"] and "research_calibrator_prob" in rg["reason"]
+    assert block["status"] == "degraded"
+    assert block["failures"] == []
+    assert [d["arm"] for d in block["degradations"]] == ["research_gbm"]
+    assert_l1_fits_valid(block)  # must not raise
+
+
+def test_fitted_false_for_any_other_reason_is_still_a_failure():
+    fits = dict(HEALTHY_VOL_FITS)
+    fits["research_gbm"] = {
+        "fitted": False,
+        "reason": "DegenerateDesignMatrixError: 5 of 6 research columns are constant",
+        "split": {"status": "ok", "reason": None},
+        "design_matrix": {"n_rows": 14940, "n_varying_features": 1},
+    }
+    block = evaluate_l1_fits(fits)
+    assert block["arms"]["research_gbm"]["status"] == "not_fitted"
+    with pytest.raises(L1FitValidityError):
+        assert_l1_fits_valid(block)
+
+
+def test_fitted_false_with_no_split_record_is_still_a_failure():
+    fits = dict(HEALTHY_VOL_FITS)
+    fits["research_gbm"] = {"fitted": False, "reason": "booster never built"}
+    block = evaluate_l1_fits(fits)
+    assert block["arms"]["research_gbm"]["status"] == "not_fitted"
+    with pytest.raises(L1FitValidityError):
+        assert_l1_fits_valid(block)
+
+
+def test_an_insufficient_split_block_without_the_typed_refusal_is_still_a_failure():
+    """A degenerate design matrix caught in the same try/except carries an
+    `insufficient` split block too (tests/test_purged_split.py pins that
+    shape). Only the TYPED split refusal downgrades; the split block alone
+    must not."""
+    fits = dict(HEALTHY_VOL_FITS)
+    fits["research_gbm"] = {
+        "fitted": False,
+        "reason": "DegenerateDesignMatrixError: 1 varying column(s) of 9",
+        "not_fitted_kind": "error",
+        "split": dict(_INSUFFICIENT_SPLIT_BLOCK),
+    }
+    block = evaluate_l1_fits(fits)
+    assert block["arms"]["research_gbm"]["status"] == "not_fitted"
+    with pytest.raises(L1FitValidityError):
+        assert_l1_fits_valid(block)
