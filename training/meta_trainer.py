@@ -2398,7 +2398,8 @@ def run_meta_training(
             )
             research_gbm_split_block = research_split.as_manifest_block()
             if not research_split.ok:
-                raise RuntimeError(
+                from training.purged_split import UnmeasurableSplitError
+                raise UnmeasurableSplitError(
                     "research_gbm: refusing to fit on an unmeasurable split — "
                     f"{research_split.reason} A split whose own properties do "
                     "not meet their floors cannot be gated on, and fitting on "
@@ -2556,17 +2557,33 @@ def run_meta_training(
         # and an `insufficient` split both land here, and a gate finding that
         # says only "absent" would lose the one sentence naming which constant
         # columns or which split floor stopped the fit.
+        from training.purged_split import UnmeasurableSplitError
+        _split_insufficient = isinstance(e, UnmeasurableSplitError)
         l1_fits.setdefault("research_gbm", {
             "fitted": False,
             "reason": f"{type(e).__name__}: {e}",
+            # 2026-09-05: a split the PANEL cannot support is graded
+            # `insufficient` (non-blocking, named on the manifest) by the
+            # Step 8a-iii gate; every other cause of fitted=False still fails
+            # the run. Machine-readable so the gate does not parse prose.
+            "not_fitted_kind": "split_insufficient" if _split_insufficient else "error",
             "split": research_gbm_split_block,
             "design_matrix": research_gbm_matrix_block,
         })
-        log.error(
-            "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
-            "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
-            "will fail this run on the arm: %s", e,
-        )
+        if _split_insufficient:
+            log.warning(
+                "ResearchGBMScorer NOT fitted — the purged split could not be "
+                "built on this panel; research_calibrator_prob falls back to the "
+                "bucket lookup THIS CYCLE and the L1 fit-validity gate (Step "
+                "8a-iii) records the arm as INSUFFICIENT (a named degradation, "
+                "not a pass, not a failure): %s", e,
+            )
+        else:
+            log.error(
+                "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
+                "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
+                "will fail this run on the arm: %s", e,
+            )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
     # Audit Track A PR 5/6 cutover (2026-05-09): the meta-Ridge now trains on

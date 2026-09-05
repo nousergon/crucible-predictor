@@ -113,6 +113,7 @@ log = logging.getLogger(__name__)
 
 __all__ = [
     "DegenerateDesignMatrixError",
+    "UnmeasurableSplitError",
     "PurgedSplit",
     "MIN_VAL_DATES",
     "MAX_VAL_DATE_WEIGHT",
@@ -195,6 +196,17 @@ TARGET_VAL_IC_SE = 0.025
 MIN_VAL_DATES_RESEARCH_GBM = min_val_dates_for_target_se(
     _RESEARCH_GBM_MEASURED_PER_DATE_IC_STD, TARGET_VAL_IC_SE, 10,
 )
+
+
+class UnmeasurableSplitError(RuntimeError):
+    """The caller refused to fit because ``build_purged_split`` reported
+    ``insufficient`` — the PANEL cannot carry a validation block that meets
+    its floors. Typed so the fit record can say so machine-readably
+    (``not_fitted_kind="split_insufficient"``) and ``l1_fit_validity`` can
+    grade it ``insufficient`` rather than ``not_fitted``: no fit was
+    attempted, so there is nothing to fail — and nothing to pass
+    (champion-challenger-policy §5.1). 2026-09-05: research_gbm's 50-date
+    block would have taken 90.7% of a 107-date panel's rows."""
 
 
 class DegenerateDesignMatrixError(RuntimeError):
