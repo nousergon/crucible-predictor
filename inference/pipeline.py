@@ -183,6 +183,13 @@ STAGES = [
     # affects predictions.
     ("regime_fast_signal", "inference.stages.regime_fast_signal", False),
     ("write_output",   "inference.stages.write_output",   False),
+    # Daily research-free counterfactual producer (alpha-engine-config-I10067).
+    # Runs AFTER write_output so the live predictions artifact is already on S3
+    # and cannot be delayed or affected by it. Non-critical because nothing on
+    # the live trading path consumes predictions_research_free/{date}.json —
+    # but the stage does NOT rely on this handler's log-and-continue: it
+    # publishes an ops alert itself on failure (see the stage docstring).
+    ("research_free",  "inference.stages.research_free",  False),
     # Champion/challenger Phase 1 shadow runner (L4469). Runs LAST — after the
     # live predictions are written — and is non-critical: it re-scores the same
     # prices/universe with each registered challenger's weights into
