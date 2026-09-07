@@ -158,6 +158,20 @@ jobs:
       # land in different repos, and a hard failure would redden eight repos'
       # main for the length of that merge window. The enforcement flip converts
       # BOTH halves — the miss and the findings — in one commit.
+      # alpha-engine-config-I10147. WARN-ONLY MEANS WARN-ONLY, INCLUDING ON A
+      # CRASH. Measured 2026-09-07: metron run 33718023593 hit
+      # `ModuleNotFoundError: No module named 'yaml'` in this exact step (the
+      # lint imports `alert_class_pr_guard` -> `alert_class_registry_drift`
+      # -> `yaml`) and the crash, under `set -euo pipefail`, failed the job --
+      # indistinguishable from an enforced finding, and it blocked seven
+      # metron PRs for four days. Separately, `alert_message_lint.py::main`
+      # itself returns 1 (not 0) on its own UNMEASURED paths (bad
+      # --repo-root, a GuardError while scanning) even under --warn-only --
+      # only the *findings* path honors the flag. Both are the same shape:
+      # a nonzero exit from the invocation must never propagate through
+      # `set -e` while warn-only is in force. The crash is RECORDED, never
+      # silenced -- via the same `::warning` GitHub Actions annotation a real
+      # finding uses, visible on the PR's Checks / Files-changed tab.
       - name: A PR-added alert message must be actionable (warn-only)
         run: |
           set -euo pipefail
@@ -166,4 +180,11 @@ jobs:
             echo "::warning title=alert-message-lint::$s is not on nousergon-data main yet, so the alert-message lint did not run. Warn-only by design while alpha-engine-config-I9460 lands across the fleet; alpha-engine-config-I9471 makes this a hard failure."
             exit 0
           fi
+          set +e
           python3 "$s" --repo "${{ github.event.repository.name }}" --repo-root "$GITHUB_WORKSPACE/graded" --base "${{ github.event.pull_request.base.sha }}" --head "${{ github.event.pull_request.head.sha }}" --warn-only
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=alert-message-lint::the lint exited $rc instead of 0 -- a CRASH or an internal UNMEASURED error, NOT a finding (findings exit 0 under --warn-only). This run recorded NOTHING about this PR's alert messages -- see the job log above this line for the traceback. Warn-only by design while the lint earns its enforcement (alpha-engine-config-I9471 carries the flip); alpha-engine-config-I10147 is this crash-safety fix."
+          fi
+          exit 0
