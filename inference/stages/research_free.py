@@ -109,6 +109,24 @@ def run(ctx: PipelineContext) -> None:
     if not getattr(cfg, "RESEARCH_FREE_INFERENCE_ENABLED", True):
         log.info("research_free: disabled (RESEARCH_FREE_INFERENCE_ENABLED=False) — skip.")
         return
+    if ctx.dry_run or ctx.local:
+        # Mirrors inference.stages.regime_fast_signal's dry_run/local guard.
+        # The deploy-time canary (infrastructure/deploy.sh's predict(dry_run)
+        # action) invokes this same pipeline with dry_run=True, off the Step
+        # Function, off any trading-day gate, and off any calendar. This
+        # producer's own precondition is "today's scanner-passing pool exists
+        # at candidates/{date}/candidates.json" — an artifact this stage never
+        # writes and has no way to conjure for a canary date, a non-trading
+        # day, or any date the weekly Scanner has not (yet) run for. Loading
+        # it anyway and raising RuntimeError/NoSuchKey on the expected miss
+        # paged twice from a single Labor Day (2026-09-07) deploy canary
+        # invocation whose OWN contract, stated at the daily_predict.py
+        # heartbeat call site, is "no S3 writes, no email"
+        # (alpha-engine-config-I10141 investigation). A dry_run invocation
+        # produces no live artifact for any consumer to read, so there is
+        # nothing here for the read to be correct ABOUT.
+        log.info("research_free: skipped (dry_run/local)")
+        return
     if getattr(ctx, "weights_prefix_override", None):
         # A cloned shadow context re-scores with a challenger's weights; the
         # research-free counterfactual is defined against the CHAMPION only.
