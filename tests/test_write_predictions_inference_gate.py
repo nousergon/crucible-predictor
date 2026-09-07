@@ -191,6 +191,64 @@ class TestGateEdgeCases:
         # No S3 writes in dry-run.
         assert mock_put.call_count == 0
 
+    def test_dry_run_degenerate_batch_does_not_page_at_error_level(self, caplog):
+        # alpha-engine-config-I10141 investigation, 2026-09-07: the deploy-time
+        # canary (infrastructure/deploy.sh's predict(dry_run) action) invokes
+        # write_predictions with dry_run=True off the Step Function, off any
+        # trading-day gate, and off any calendar. A degenerate/compressed
+        # batch there is expected (stale holiday data, a canary's synthetic
+        # inputs) and must not page — the canary's own documented contract
+        # (daily_predict.py's emit_heartbeat call site) is "no S3 writes, no
+        # email". log.error() bypasses that contract because
+        # handler.py attaches flow-doctor's handler at ERROR; log.warning()
+        # does not. This pins the downgrade without touching the gate verdict
+        # itself (still recorded faithfully in gate_block/metrics).
+        import logging
+        from inference.stages.write_output import write_predictions
+        from inference.stages import write_output as wo_module
+        with patch("inference.stages.write_output._s3_put_json"), \
+             patch.object(wo_module.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
+            with caplog.at_level(logging.WARNING, logger="inference.stages.write_output"):
+                write_predictions(
+                    _degenerate_predictions(),
+                    "2026-05-07",
+                    "test-bucket",
+                    {"model_version": "test"},
+                    dry_run=True,
+                )
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert not error_records, (
+            f"dry_run invocation paged at ERROR: {[r.getMessage() for r in error_records]}"
+        )
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and "Output-distribution gate FAILED" in r.getMessage()
+        ]
+        assert warning_records, "expected the gate-failure line downgraded to WARNING under dry_run"
+
+    def test_non_dry_run_degenerate_batch_still_pages_at_error_level(self, caplog):
+        # The half that had to survive: a REAL (non-dry-run) invocation with a
+        # degenerate batch must still page at ERROR — only the canary path is
+        # exempted.
+        import logging
+        from inference.stages.write_output import write_predictions
+        from inference.stages import write_output as wo_module
+        with patch("inference.stages.write_output._s3_put_json"), \
+             patch.object(wo_module.cfg, "OUTPUT_DISTRIBUTION_GATE_INFERENCE_BLOCKING", False, create=True):
+            with caplog.at_level(logging.WARNING, logger="inference.stages.write_output"):
+                write_predictions(
+                    _degenerate_predictions(),
+                    "2026-05-07",
+                    "test-bucket",
+                    {"model_version": "test"},
+                    dry_run=False,
+                )
+        error_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.ERROR and "Output-distribution gate FAILED" in r.getMessage()
+        ]
+        assert error_records, "expected the gate-failure line to remain ERROR outside dry_run"
+
     def test_dry_run_under_blocking_with_degenerate_batch_still_raises(self):
         # Even in dry-run, fail-closed should fire — operator wants to
         # know about a degenerate batch BEFORE simulating a release.
