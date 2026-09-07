@@ -785,6 +785,15 @@ ARM_COEF_NORM_MIN_RATIO = float(_cfg.get("arm_coef_norm_min_ratio", 0.50))
 _shadow_cfg = _cfg.get("shadow_versions", {})
 SHADOW_VERSIONS_ENABLED = _shadow_cfg.get("enabled", True)
 SHADOW_VERSIONS_MAX_N = int(_shadow_cfg.get("max_n", 5))
+
+# Daily research-free counterfactual producer (alpha-engine-config-I10067).
+# Gates ``inference/stages/research_free.py``, which invokes
+# ``inference/research_free_inference.py::run_research_free_inference`` after
+# write_output. Default-ON: the artifact is the declared live input of
+# crucible-research's ``scanner_predictor_direct`` filling arm, so a default-off
+# producer would leave that arm unmeasurable every week. The kill switch exists
+# for the operator, not as a posture.
+RESEARCH_FREE_INFERENCE_ENABLED = _cfg.get("research_free_inference", {}).get("enabled", True)
 RESID_MOM_BETA_WINDOW = _resid_mom_cfg.get("beta_window", 60)
 RESID_MOM_WINDOW = _resid_mom_cfg.get("window", 252)
 RESID_MOM_SKIP_DAYS = _resid_mom_cfg.get("skip_days", 21)

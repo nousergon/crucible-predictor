@@ -1069,10 +1069,24 @@ def write_predictions(
         gate_reason = inference_gate_result.reason
 
     if not gate_passed:
-        log.error(
+        # dry_run downgrades ERROR -> WARNING rather than skipping the check:
+        # the deploy-time canary (infrastructure/deploy.sh's predict(dry_run)
+        # action) invokes this same write_predictions() with real universe/
+        # price data off the Step Function, off any trading-day gate, and off
+        # any calendar — so a stale/holiday batch can legitimately fail
+        # dispersion. handler.py attaches flow-doctor's handler at ERROR, so
+        # an unconditional log.error() here pages for an invocation whose OWN
+        # documented contract (see daily_predict.py's emit_heartbeat call
+        # site) is "no S3 writes, no email". Two such pages fired from one
+        # canary invocation landing on Labor Day, 2026-09-07
+        # (alpha-engine-config-I10141 investigation). The gate verdict and its
+        # metrics are unchanged and still recorded in gate_block below — only
+        # the log level (and therefore flow-doctor's page) is conditional.
+        (log.warning if dry_run else log.error)(
             "Output-distribution gate FAILED at inference-time on %d-row batch: %s "
-            "(blocking=%s)",
+            "(blocking=%s)%s",
             len(predictions), gate_reason, inference_gate_blocking,
+            " [dry_run: not paging]" if dry_run else "",
         )
     else:
         log.info(
