@@ -319,11 +319,39 @@ def evaluate_l1_fits(fits: "dict | None",
             # stopped the fit — the constant columns, or the split property
             # that could not be met — which is the whole diagnostic value.
             why = (fit.get("reason") or "").strip()
-            issues.append(("not_fitted", (
-                f"{spec.name} recorded fitted=False; measured: no booster, "
-                "required: a fitted arm."
-                + (f" Reason: {why}" if why else "")
-            )))
+            split = fit.get("split") or {}
+            if (
+                fit.get("not_fitted_kind") == "split_insufficient"
+                and isinstance(split, dict) and split.get("status") == "insufficient"
+            ):
+                # 2026-09-05 (weekly SF watch-rerun-2026-09-04-2): the purged
+                # split itself reported INSUFFICIENT — the PANEL cannot carry a
+                # validation block that meets its floors (research_gbm: 50
+                # dates would take 90.7% of the rows; rows-per-date 1..895 over
+                # 107 dates). No fit was attempted, so there is nothing to
+                # grade: a check that cannot be computed is reported
+                # `insufficient` and does not block (champion-challenger-policy
+                # §5.1) — the same rule I9376 applies to a val_ic whose SE
+                # swamps its floor, one step earlier. It is a NAMED degradation
+                # on the manifest (the declared fallback supplies
+                # `canonical_for`), never a pass; any other fitted=False —
+                # a degenerate design matrix, a booster that never built —
+                # is still `not_fitted` and fails a required arm.
+                issues.append(("insufficient", (
+                    f"{spec.name}: insufficient — the purged split could not be "
+                    f"built on this panel ({(split.get('reason') or '').strip()}), "
+                    "so no fit was attempted and no floor can be read. The "
+                    f"declared fallback supplies {spec.canonical_for or 'its score'} "
+                    "this cycle. Reported insufficient, NOT a pass "
+                    "(champion-challenger-policy §5.1)."
+                    + (f" Fit record: {why}" if why else "")
+                )))
+            else:
+                issues.append(("not_fitted", (
+                    f"{spec.name} recorded fitted=False; measured: no booster, "
+                    "required: a fitted arm."
+                    + (f" Reason: {why}" if why else "")
+                )))
         else:
             if best_it is None:
                 issues.append(("unmeasured", (

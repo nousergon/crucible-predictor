@@ -948,6 +948,30 @@ def build_meta_matrix(oos_meta_rows, train_meta_features):
     return matrix
 
 
+def declared_absent_features(oos_meta_rows, train_meta_features) -> list[str]:
+    """``RESEARCH_META_FEATURES`` absent from EVERY OOS row — the producer has
+    not deployed (alpha-engine-config-I5949) and ``build_meta_matrix`` zero-
+    filled the column under the fail-soft contract.
+
+    Passed to ``evaluate_arm_validity`` so its ``constant_input_column``
+    assertion can tell a declared, logged, zero-filled absence from a
+    degenerate input. Only the fail-soft family qualifies: a non-research
+    feature absent everywhere raises ``KeyError`` in ``build_meta_matrix``
+    and never reaches here. Measured 2026-09-05: three such columns failed
+    the arm on the gate's first live Saturday.
+    """
+    from model.meta_model import RESEARCH_META_FEATURES
+
+    soft = frozenset(RESEARCH_META_FEATURES)
+    total = len(oos_meta_rows)
+    if total == 0:
+        return []
+    return [
+        f for f in train_meta_features
+        if f in soft and all(f not in r for r in oos_meta_rows)
+    ]
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -2374,7 +2398,8 @@ def run_meta_training(
             )
             research_gbm_split_block = research_split.as_manifest_block()
             if not research_split.ok:
-                raise RuntimeError(
+                from training.purged_split import UnmeasurableSplitError
+                raise UnmeasurableSplitError(
                     "research_gbm: refusing to fit on an unmeasurable split — "
                     f"{research_split.reason} A split whose own properties do "
                     "not meet their floors cannot be gated on, and fitting on "
@@ -2532,17 +2557,33 @@ def run_meta_training(
         # and an `insufficient` split both land here, and a gate finding that
         # says only "absent" would lose the one sentence naming which constant
         # columns or which split floor stopped the fit.
+        from training.purged_split import UnmeasurableSplitError
+        _split_insufficient = isinstance(e, UnmeasurableSplitError)
         l1_fits.setdefault("research_gbm", {
             "fitted": False,
             "reason": f"{type(e).__name__}: {e}",
+            # 2026-09-05: a split the PANEL cannot support is graded
+            # `insufficient` (non-blocking, named on the manifest) by the
+            # Step 8a-iii gate; every other cause of fitted=False still fails
+            # the run. Machine-readable so the gate does not parse prose.
+            "not_fitted_kind": "split_insufficient" if _split_insufficient else "error",
             "split": research_gbm_split_block,
             "design_matrix": research_gbm_matrix_block,
         })
-        log.error(
-            "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
-            "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
-            "will fail this run on the arm: %s", e,
-        )
+        if _split_insufficient:
+            log.warning(
+                "ResearchGBMScorer NOT fitted — the purged split could not be "
+                "built on this panel; research_calibrator_prob falls back to the "
+                "bucket lookup THIS CYCLE and the L1 fit-validity gate (Step "
+                "8a-iii) records the arm as INSUFFICIENT (a named degradation, "
+                "not a pass, not a failure): %s", e,
+            )
+        else:
+            log.error(
+                "ResearchGBMScorer fit FAILED — research_calibrator_prob falls back "
+                "to the bucket lookup and the L1 fit-validity gate (Step 8a-iii) "
+                "will fail this run on the arm: %s", e,
+            )
 
     # ── Step 7: Train meta-model on pooled OOS ───────────────────────────────
     # Audit Track A PR 5/6 cutover (2026-05-09): the meta-Ridge now trains on
@@ -2586,6 +2627,7 @@ def run_meta_training(
         _expected_move_in_meta, _research_features_in_meta, _meta_standardize,
     )
     meta_X_all = build_meta_matrix(oos_meta_rows, TRAIN_META_FEATURES)
+    _declared_absent = declared_absent_features(oos_meta_rows, TRAIN_META_FEATURES)
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
@@ -2720,6 +2762,9 @@ def run_meta_training(
         prior_standardized_coef=_arm_history["prior_standardized_coef"],
         prior_coef_norms=_arm_history["prior_coef_norms"],
         min_norm_ratio=float(getattr(cfg, "ARM_COEF_NORM_MIN_RATIO", 0.50)),
+        declared_absent=_declared_absent,
+        panel_n=len(oos_meta_rows),
+        prior_panel_ns=_arm_history.get("prior_panel_ns"),
     )
     arm_validity["history"] = {
         "status": _arm_history["status"],
@@ -2728,9 +2773,12 @@ def run_meta_training(
     }
     log.info(
         "Arm validity (I9290): arm=%s status=%s coef_norm=%s history=%s "
-        "(%d vintage(s))",
+        "(%d vintage(s)) panel_n=%s reference=%s over %s comparable vintage(s) "
+        "declared_absent=%s",
         _arm_label, arm_validity["status"], arm_validity["coef_norm"],
         _arm_history["status"], _arm_history["n_vintages"],
+        arm_validity.get("panel_n"), arm_validity.get("coef_norm_reference"),
+        arm_validity.get("coef_norm_reference_vintages"), _declared_absent,
     )
     assert_arm_valid(arm_validity)
 
