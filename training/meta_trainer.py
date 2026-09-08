@@ -3577,6 +3577,72 @@ def run_meta_training(
         log.warning("W4.2 dead-L1 monitor failed (OBSERVE, non-fatal): %s", _e)
         dead_l1_observe = {"status": "error", "error": str(_e)}
 
+    # Cross-sectional variance share of the fitted L2 — the FIT-TIME detector
+    # for the collapse class that had only ever been discovered at inference
+    # time, on live tickers, wearing a calibrator's name
+    # (alpha-engine-config, 2026-09-08).
+    #
+    # `dead_l1_observe` above answers "which features did the Ridge shrink to
+    # zero". This answers the different and load-bearing question: of the
+    # variance the model DOES produce, how much of it separates two names on
+    # the SAME day. A model can keep every coefficient alive and still put all
+    # of them on features that are constant within a date (macro level, VIX,
+    # yield-curve slope, regime intensity) — it then has a healthy pooled IC,
+    # a healthy dispersion RATIO against the incumbent, and separates nothing.
+    #
+    # This is a MEASUREMENT here, never a raise: refusal belongs at promotion
+    # (training/promotion_behavioral_veto.py, whose docstring states the
+    # doctrine), and raising here would take the weekly zoo down on one
+    # challenger's defect. The scalar is mirrored into the manifest's
+    # `behavioral_metrics` forward slot, which is what arms the veto's
+    # xsec_variance_share floor rule with no code change there.
+    xsec_variance_share_observe: dict = {"status": "not_run"}
+    try:
+        from training.xsec_variance_share import (
+            cross_sectional_variance_share as _xsec_share,
+        )
+
+        _xsec_dates = [
+            r.get("date")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
+        _xsec_coefs = {
+            k: v for k, v in (meta_model._coefficients or {}).items()
+            if k != "intercept"
+        }
+        xsec_variance_share_observe = _xsec_share(
+            meta_X, _xsec_dates, TRAIN_META_FEATURES, _xsec_coefs,
+            intercept=float((meta_model._coefficients or {}).get("intercept", 0.0)),
+        )
+        _v = xsec_variance_share_observe.get("verdict")
+        if _v == "ok":
+            log.info(
+                "Cross-sectional variance share: %.4f (xsec_sd=%.6g, "
+                "total_sd=%.6g, %s cross-sectionally dead features) — the L2 "
+                "separates names within a date.",
+                xsec_variance_share_observe["xsec_variance_share"],
+                xsec_variance_share_observe["xsec_sd"],
+                xsec_variance_share_observe["total_sd"],
+                xsec_variance_share_observe["n_xsec_dead_features"],
+            )
+        else:
+            # LOUD. This is the defect the promotion veto will refuse on, and
+            # the training log is where it is nameable at its true layer.
+            log.error(
+                "CROSS-SECTIONAL COLLAPSE at fit time (verdict=%s): %s | dead "
+                "features=%s",
+                _v, xsec_variance_share_observe.get("reason"),
+                xsec_variance_share_observe.get("xsec_dead_features"),
+            )
+    except Exception as _e:
+        # Recorded as an ERROR status, never as a missing key: `unmeasurable`
+        # is not a pass anywhere that reads this (see
+        # xsec_variance_share.assert_cross_sectionally_live).
+        log.warning("Cross-sectional variance share failed: %s", _e)
+        xsec_variance_share_observe = {
+            "status": "error", "verdict": "unmeasurable", "error": str(_e),
+        }
+
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
     # linear curve_leakfree (W3.2)? Reuses leakfree_horizon_ic_curve with the
@@ -5311,6 +5377,15 @@ def run_meta_training(
                 # diagnostic: no de-weight/delete, serving L2 untouched.
                 "meta_oos_ic_leakfree_per_l1_dropout": meta_oos_ic_leakfree_per_l1_dropout,
                 "dead_l1_observe": dead_l1_observe,
+                # Fit-time cross-sectional collapse detector
+                # (alpha-engine-config, 2026-09-08). The scalar is
+                # mirrored into behavioral_metrics below, which is
+                # what the promotion veto reads.
+                "xsec_variance_share": xsec_variance_share_observe,
+                "behavioral_metrics": {
+                    "xsec_variance_share":
+                        xsec_variance_share_observe.get("xsec_variance_share"),
+                },
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 # alpha-engine-config-I9024 §2 — the SERVING incumbent's frozen
                 # weights evaluated over THESE folds. The apples-to-apples
@@ -5818,6 +5893,13 @@ def run_meta_training(
         # serving L2 untouched; retirement is a later persistence-gated step
         # (≥N weekly cohorts + Shapley ≤ 0, config#624). Additive per S3 contract.
         "dead_l1_observe": dead_l1_observe,
+        # Fit-time cross-sectional collapse detector (alpha-engine-config,
+        # 2026-09-08); the scalar mirror is what arms the promotion veto.
+        "xsec_variance_share": xsec_variance_share_observe,
+        "behavioral_metrics": {
+            "xsec_variance_share":
+                xsec_variance_share_observe.get("xsec_variance_share"),
+        },
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.

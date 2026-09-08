@@ -1153,6 +1153,18 @@ structurally expected."""
 _MIN_BATCH_SIZE_FOR_VARIANCE_GATE = 5
 
 
+def _arm_identity(ctx) -> tuple[str, str | None]:
+    """Which arm this inference pass is scoring: the live champion, or one of
+    the observe-only shadow challengers re-scored by
+    ``inference.stages.shadow_versions``.
+
+    Defaults to ``"champion"`` when the attribute is absent, so a caller that
+    predates the field can never silently downgrade a live-trading page.
+    """
+    vid = getattr(ctx, "shadow_version_id", None)
+    return ("shadow", vid) if vid else ("champion", None)
+
+
 def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     """Heuristic cross-sectional confidence rescaling (calibrator-guarded).
 
@@ -1187,20 +1199,63 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         p_up_values = [p.get("p_up", 0.5) or 0.5 for p in ctx.predictions]
         unique_count = len({round(v, 4) for v in p_up_values})
         n_preds = len(p_up_values)
+        _arm, _vid = _arm_identity(ctx)
+        # The number that DISCRIMINATES the cause. `unique_p_up` conflates a
+        # model whose alphas have collapsed with a calibrator that has no
+        # resolution at the batch's scale; the distinct-alpha count separates
+        # them. Measured 2026-09-08: the three shadow arms that fired this gate
+        # had 6 distinct alphas across 29 tickers (24 identical) while the live
+        # champion had 29 — the defect was in the challengers' L2, not in the
+        # calibrator the message named.
+        _n_distinct_alpha = len({
+            round(float(p.get("predicted_alpha") or 0.0), 9)
+            for p in ctx.predictions
+        })
+        _attribution = {
+            "arm": _arm,
+            "shadow_version_id": _vid,
+            "n_distinct_predicted_alpha": _n_distinct_alpha,
+        }
 
         if (
             n_preds >= _MIN_BATCH_SIZE_FOR_VARIANCE_GATE
             and unique_count < _MIN_UNIQUE_P_UP_BINS
         ):
-            log.error(
-                "VARIANCE FALLBACK ENGAGED: calibrator outputs collapsed to "
-                "%d unique p_up bins across %d tickers (threshold=%d). "
-                "This is the 2026-04-28 calibrator-collapse pathology — "
-                "investigate calibrator + meta-model training. Falling "
-                "through to linear heuristic rescale to recover variance "
-                "for today's batch.",
+            # SEVERITY IS ARM-DEPENDENT, and that is not a downgrade of the
+            # finding (alpha-engine-config, 2026-09-08). A collapse on the live
+            # champion is a trading-path event: the batch the executor consumes
+            # was rescued by a heuristic, and it pages. A collapse on a shadow
+            # challenger — which trades on NONE — is a fact about a promotable
+            # arm: it is recorded, logged with the version id, and read by the
+            # promotion gate; paging it as a live ERROR is a false page. On
+            # 2026-09-08 three such false pages fired on a day the live batch
+            # was healthy (8 unique bins, degraded=false).
+            _msg_args = (
                 unique_count, n_preds, _MIN_UNIQUE_P_UP_BINS,
+                _n_distinct_alpha,
             )
+            if _arm == "champion":
+                log.error(
+                    "VARIANCE FALLBACK ENGAGED on the LIVE champion: "
+                    "calibrator outputs collapsed to %d unique p_up bins "
+                    "across %d tickers (threshold=%d; %d distinct "
+                    "predicted_alpha). Falling through to linear heuristic "
+                    "rescale to recover variance for today's batch. A LOW "
+                    "distinct-alpha count means the meta-model collapsed, not "
+                    "the calibrator.",
+                    *_msg_args,
+                )
+            else:
+                log.warning(
+                    "Variance fallback engaged on SHADOW arm %s (trades on "
+                    "none): calibrator outputs collapsed to %d unique p_up "
+                    "bins across %d tickers (threshold=%d; %d distinct "
+                    "predicted_alpha). Not a live-trading event — recorded on "
+                    "the shadow artifact for the promotion gate. A LOW "
+                    "distinct-alpha count means this challenger's meta-model "
+                    "collapsed, not the calibrator.",
+                    _vid, *_msg_args,
+                )
             ctx.calibration_degradation = {
                 "degraded": True,
                 "basis": "linear_heuristic_fallback",
@@ -1209,13 +1264,16 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
                 "threshold": _MIN_UNIQUE_P_UP_BINS,
                 "batch_size": n_preds,
                 "calibrator_method": getattr(_cal, "method", None),
+                **_attribution,
             }
             # Fall through to the linear rescaling block below.
         else:
             log.info(
                 "Skipping cross-sectional rescaling — isotonic calibrator "
-                "active (method=%s, ECE_after=%.4f, unique_p_up_bins=%d)",
-                _cal.method, _cal._ece_after or 0.0, unique_count,
+                "active (arm=%s, method=%s, ECE_after=%.4f, "
+                "unique_p_up_bins=%d, distinct_alpha=%d)",
+                _arm, _cal.method, _cal._ece_after or 0.0, unique_count,
+                _n_distinct_alpha,
             )
             ctx.calibration_degradation = {
                 "degraded": False,
@@ -1225,6 +1283,7 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
                 "threshold": _MIN_UNIQUE_P_UP_BINS,
                 "batch_size": n_preds,
                 "calibrator_method": getattr(_cal, "method", None),
+                **_attribution,
             }
             for p in ctx.predictions:
                 p["calibration_basis"] = "calibrator"
@@ -1235,6 +1294,7 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
             "rescaling. This path should only fire before the first "
             "post-migration retrain ships an isotonic calibrator to S3."
         )
+        _arm, _vid = _arm_identity(ctx)
         ctx.calibration_degradation = {
             "degraded": True,
             "basis": "linear_heuristic_fallback",
@@ -1243,6 +1303,12 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
             "threshold": _MIN_UNIQUE_P_UP_BINS,
             "batch_size": len(ctx.predictions),
             "calibrator_method": None,
+            "arm": _arm,
+            "shadow_version_id": _vid,
+            "n_distinct_predicted_alpha": len({
+                round(float(p.get("predicted_alpha") or 0.0), 9)
+                for p in ctx.predictions
+            }),
         }
     # Floor for the batch max_abs alpha when the linear-heuristic rescale
     # is engaged (no calibrator OR calibrator-collapse variance fallback).

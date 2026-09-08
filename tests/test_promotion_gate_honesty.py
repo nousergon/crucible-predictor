@@ -475,6 +475,11 @@ def test_uncomputable_behavioral_metrics_are_named_not_silent(monkeypatch):
     assert cand["behavioral_veto_status"] == "insufficient"
     assert set(cand["behavioral_veto_uncomputable"]) == {
         "alpha_stdev", "model_hit_rate_30d", "n_high_confidence", "stdev_p_up",
+        # `xsec_variance_share` joined the veto on 2026-09-08 and is produced by
+        # training/meta_trainer.py from that vintage on. Manifests written
+        # before it carry nothing, so it is uncomputable here for exactly the
+        # reason this test exists — and it is NAMED, not silently skipped.
+        "xsec_variance_share",
     }
 
 
@@ -500,7 +505,9 @@ def test_zero_high_confidence_and_sub_coinflip_hit_rate_veto():
     assert vetoed == {
         "alpha_stdev", "stdev_p_up", "n_high_confidence", "model_hit_rate_30d",
     }
-    assert verdict["uncomputable"] == []
+    # `xsec_variance_share` (added 2026-09-08) is not on this 2026-08-21-era
+    # fixture, so it is uncomputable and NAMED — the point of this module.
+    assert verdict["uncomputable"] == ["xsec_variance_share"]
 
 
 # ── the raises must reach the caller, not be logged and forgotten ────────────

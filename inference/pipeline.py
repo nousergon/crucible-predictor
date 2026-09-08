@@ -59,6 +59,13 @@ class PipelineContext:
     # executor.
     weights_prefix_override: Optional[str] = None
 
+    # The registered version_id this context is scoring, set alongside
+    # weights_prefix_override on a cloned shadow context and NEVER on the live
+    # one. Read by run_inference to attribute the calibration verdict to an arm
+    # (alpha-engine-config, 2026-09-08): without it an observe-only
+    # challenger's collapse pages as a live-trading ERROR.
+    shadow_version_id: Optional[str] = None
+
     # ── Model state (set by load_model) ──────────────────────────────────────
     scorer: object = None           # primary GBM scorer
     mse_scorer: object = None       # MSE model
