@@ -82,7 +82,38 @@ DISPERSION_METRICS: tuple[str, ...] = ("alpha_stdev", "stdev_p_up")
 ZERO_VETO_METRICS: tuple[str, ...] = ("n_high_confidence",)
 
 # Metrics vetoed on falling below an absolute floor.
-FLOOR_VETO_METRICS: dict[str, float] = {"model_hit_rate_30d": 0.50}
+#
+# ``xsec_variance_share`` (training/xsec_variance_share.py) is the share of the
+# fitted L2's variance that lives WITHIN a date. It is deliberately an absolute
+# floor and not a ratio against the incumbent: the 2026-09-08 arms carried a
+# perfectly respectable dispersion ratio while holding essentially all of that
+# dispersion in the time-series axis, so every ratio rule here passed them.
+# A model below the floor moves every name together and separates none —
+# whatever its IC, it is not doing the cross-sectional task.
+FLOOR_VETO_METRICS: dict[str, float] = {
+    "model_hit_rate_30d": 0.50,
+    "xsec_variance_share": 0.10,
+}
+
+# Per-metric refusal text. A floor rule that reports the wrong reason sends the
+# reader to the wrong defect — which is exactly how the 2026-09-08 collapse was
+# read as a calibrator problem for the first hour of its investigation.
+_FLOOR_VETO_REASON: dict[str, str] = {
+    "model_hit_rate_30d": (
+        "{name} {c} is below the {floor} floor — realized direction accuracy "
+        "at or under a coin flip"
+    ),
+    "xsec_variance_share": (
+        "{name} {c} is below the {floor} floor — less than {floor:.0%} of this "
+        "model's fitted variance is CROSS-SECTIONAL, so it moves every name "
+        "together and separates none. Its served alphas collapse onto a "
+        "handful of values and any calibrator applied to them plateaus, which "
+        "surfaces downstream as a calibrator-collapse page on live tickers "
+        "(measured 2026-09-08 on spec-sota-combine-2026-07-{{24,29,30}}: 6 "
+        "distinct predicted_alpha across 29 names)"
+    ),
+}
+_FLOOR_VETO_REASON_DEFAULT = "{name} {c} is below the {floor} floor"
 
 # The metric names a served-slice measurement may contribute. Restricting the
 # merge to these keeps the measurement's bookkeeping fields (``n_dates``,
@@ -220,10 +251,9 @@ def evaluate_behavioral_veto(
         if c < floor:
             vetoes.append({
                 "metric": name, "candidate": c, "rule": f">= {floor}",
-                "reason": (
-                    f"{name} {c} is below the {floor} floor — realized "
-                    f"direction accuracy at or under a coin flip"
-                ),
+                "reason": _FLOOR_VETO_REASON.get(
+                    name, _FLOOR_VETO_REASON_DEFAULT,
+                ).format(name=name, c=c, floor=floor),
             })
 
     if vetoes:
