@@ -1268,12 +1268,18 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
             }
             # Fall through to the linear rescaling block below.
         else:
+            # alpha-engine-config-I10181 — this line must NAME which ECE it is
+            # printing. It printed `ECE_after` for months; under isotonic that
+            # is the IN-SAMPLE number, ~0 by construction, and a reader who
+            # checked it was reassured by an identity.
+            _ece_oos = getattr(_cal, "_ece_after_oos", None)
             log.info(
                 "Skipping cross-sectional rescaling — isotonic calibrator "
-                "active (arm=%s, method=%s, ECE_after=%.4f, "
-                "unique_p_up_bins=%d, distinct_alpha=%d)",
-                _arm, _cal.method, _cal._ece_after or 0.0, unique_count,
-                _n_distinct_alpha,
+                "active (arm=%s, method=%s, ECE_after_IN_SAMPLE=%.4f, "
+                "ECE_after_OOS=%s, unique_p_up_bins=%d, distinct_alpha=%d)",
+                _arm, _cal.method, _cal._ece_after or 0.0,
+                "n/a" if _ece_oos is None else format(_ece_oos, ".4f"),
+                unique_count, _n_distinct_alpha,
             )
             ctx.calibration_degradation = {
                 "degraded": False,

@@ -3596,6 +3596,11 @@ def run_meta_training(
     # challenger's defect. The scalar is mirrored into the manifest's
     # `behavioral_metrics` forward slot, which is what arms the veto's
     # xsec_variance_share floor rule with no code change there.
+    from training.promotion_behavioral_veto import (
+        XSEC_SD_ABSOLUTE_FLOOR as _XSEC_SD_ABSOLUTE_FLOOR,
+        XSEC_SD_MIN_RATIO_VS_INCUMBENT as _XSEC_SD_MIN_RATIO,
+    )
+
     xsec_variance_share_observe: dict = {"status": "not_run"}
     try:
         from training.xsec_variance_share import (
@@ -3642,6 +3647,60 @@ def run_meta_training(
         xsec_variance_share_observe = {
             "status": "error", "verdict": "unmeasurable", "error": str(_e),
         }
+
+    # alpha-engine-config-I10185 — the MAGNITUDE leg's like-for-like reference:
+    # the SERVING incumbent's frozen coefficients scored on THIS candidate's
+    # panel. `xsec_sd` has units and moves with the vintage, so comparing a
+    # candidate's number against the incumbent's STORED number measures the two
+    # panels as much as the two models. Held constant here, it measures the
+    # model. Never raises; a null is read as uncomputable by the veto, which
+    # still refuses a below-floor candidate (absence is never a pass).
+    xsec_incumbent_same_panel: dict = {"status": "not_run"}
+    try:
+        from training.xsec_magnitude import incumbent_xsec_sd_on_candidate_panel
+        import boto3 as _b3_xsec
+
+        xsec_incumbent_same_panel = incumbent_xsec_sd_on_candidate_panel(
+            _b3_xsec.client("s3"), bucket,
+            meta_X=meta_X,
+            dates=[
+                r.get("date")
+                for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+            ],
+            train_meta_features=TRAIN_META_FEATURES,
+        )
+    except Exception as _e:  # noqa: BLE001 — diagnostic, never fails training
+        log.warning("Incumbent same-panel xsec_sd failed: %s", _e)
+        xsec_incumbent_same_panel = {
+            "status": "error", "reason": str(_e), "xsec_sd": None,
+            "basis": "incumbent_coefficients_on_candidate_panel",
+        }
+
+    # The scalars the promotion veto reads, assembled once so both manifest
+    # emission sites carry the identical block.
+    _cand_xsec_sd = xsec_variance_share_observe.get("xsec_sd")
+    _inc_xsec_sd = xsec_incumbent_same_panel.get("xsec_sd")
+    xsec_behavioral_metrics: dict = {
+        "xsec_variance_share": xsec_variance_share_observe.get(
+            "xsec_variance_share"),
+        "xsec_sd": _cand_xsec_sd,
+        "xsec_sd_incumbent_same_panel": _inc_xsec_sd,
+        "xsec_sd_ratio_vs_incumbent_same_panel": (
+            float(_cand_xsec_sd) / float(_inc_xsec_sd)
+            if (_cand_xsec_sd is not None and _inc_xsec_sd not in (None, 0))
+            else None
+        ),
+    }
+    if _cand_xsec_sd is not None:
+        log.info(
+            "Cross-sectional MAGNITUDE (alpha-engine-config-I10185): candidate "
+            "xsec_sd=%.6g, incumbent-on-this-panel=%s, ratio=%s. The promotion "
+            "veto refuses a candidate that is BOTH below the %s absolute floor "
+            "and below %sx that reference.",
+            _cand_xsec_sd, _inc_xsec_sd,
+            xsec_behavioral_metrics["xsec_sd_ratio_vs_incumbent_same_panel"],
+            _XSEC_SD_ABSOLUTE_FLOOR, _XSEC_SD_MIN_RATIO,
+        )
 
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
@@ -4153,12 +4212,20 @@ def run_meta_training(
         cal_method, len(oos_meta_preds), float(oos_up_labels.mean()),
         float(np.std(oos_meta_preds)),
     )
+    # alpha-engine-config-I10181 — the row dates, so the calibrator can measure
+    # an ECE on a time-ordered, embargoed held-out block. Without them its only
+    # quality number is in-sample and, under isotonic, ~0 by construction.
+    _cal_dates = [
+        r.get("date") for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+    ]
     calibrator = PlattCalibrator(method=cal_method)
     calibrator.fit(
         oos_meta_preds, oos_up_labels,
         label_clip=float(cfg.LABEL_CLIP),
         class_weight=cfg.CALIBRATION_CLASS_WEIGHT,
         C=cfg.CALIBRATION_C,
+        dates=_cal_dates,
+        embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", None),
     )
     if not calibrator.is_fitted:
         raise RuntimeError(
@@ -4168,9 +4235,15 @@ def run_meta_training(
             f"sample threshold."
         )
     log.info(
-        "%s direction calibrator: ECE_before=%.4f  ECE_after=%.4f  (%.1f%% reduction)",
+        "%s direction calibrator: ECE_before=%.4f  ECE_after_IN_SAMPLE=%.4f  "
+        "ECE_after_OOS=%s (n_oos=%d). The in-sample number is not evidence of "
+        "calibration under isotonic — it is ~0 by construction "
+        "(alpha-engine-config-I10181); the OOS number is the one that can go "
+        "bad.",
         cal_method, calibrator._ece_before, calibrator._ece_after,
-        (1 - calibrator._ece_after / max(calibrator._ece_before, 1e-8)) * 100,
+        "n/a" if calibrator._ece_after_oos is None
+        else format(calibrator._ece_after_oos, ".4f"),
+        calibrator._n_oos_samples,
     )
 
     # ── Step 7b-shadow: Fit shadow calibrator + run gates (observability) ────
@@ -4191,11 +4264,16 @@ def run_meta_training(
     if shadow_method:
         try:
             shadow_calibrator = PlattCalibrator(method=shadow_method)
+            # Same rows, same dates, same embargo — so the shadow-vs-live
+            # comparison is of two calibrators and not of two quantities
+            # (alpha-engine-config-I10181).
             shadow_calibrator.fit(
                 oos_meta_preds, oos_up_labels,
                 label_clip=float(cfg.LABEL_CLIP),
                 class_weight=cfg.CALIBRATION_SHADOW_CLASS_WEIGHT,
                 C=cfg.CALIBRATION_SHADOW_C,
+                dates=_cal_dates,
+                embargo_days=getattr(cfg, "WF_EMBARGO_DAYS", None),
             )
             if shadow_calibrator.is_fitted:
                 log.info(
@@ -4687,14 +4765,61 @@ def run_meta_training(
     # flips to blocking via predictor_params.json.
     from model.output_distribution_gate import (
         validate_calibrator_distribution,
+        validate_fitted_batch_distribution,
         validate_stratified_per_regime,
     )
     output_dist_result = validate_calibrator_distribution(calibrator)
+
+    # alpha-engine-config-I10185 — the SAME four invariants on the candidate's
+    # OWN fitted output, not on a synthetic range the gate chose. The sweep
+    # above spans a fixed [-0.05, 0.05]; a model whose entire output lands
+    # inside one flat region of an otherwise-healthy calibrator passes it and
+    # collapses in production (measured 2026-05-07 on the live champion, and
+    # 2026-09-08 on three shadow arms). The synthetic path REMAINS — it catches
+    # calibrator-internal defects this one cannot — it simply may not be the
+    # only one. Never raises: a failure here reports and does not block, which
+    # is why it is ANDed into the gate verdict only when the gate is blocking.
+    output_dist_fitted_result = None
+    try:
+        output_dist_fitted_result = validate_fitted_batch_distribution(
+            calibrator, meta_preds_oos_insample,
+        )
+        if not output_dist_fitted_result.passed:
+            log.error(
+                "alpha-engine-config-I10185 OUTPUT-DISTRIBUTION gate FAILED on "
+                "the candidate's OWN fitted output (%s): %s. The synthetic "
+                "sweep says passed=%s — that disagreement is the finding, not "
+                "a contradiction: the sweep measures the calibrator's shape "
+                "over a range the gate chose, this measures the model's own.",
+                output_dist_fitted_result.failed_check,
+                output_dist_fitted_result.reason, output_dist_result.passed,
+            )
+        else:
+            log.info(
+                "Output-distribution gate on the candidate's own fitted output: "
+                "passed (fitted_alpha_stdev=%s, n=%s).",
+                output_dist_fitted_result.metrics.get("fitted_alpha_stdev"),
+                output_dist_fitted_result.metrics.get("n_fitted"),
+            )
+    except Exception as _e:  # noqa: BLE001 — reported, never fails a rotation
+        log.warning(
+            "Output-distribution gate on the candidate's own fitted output "
+            "failed to compute (%s) — recorded as unmeasurable, NOT a pass.", _e,
+        )
+
     output_dist_blocking = bool(
         cfg.OUTPUT_DISTRIBUTION_GATE_BLOCKING
         if hasattr(cfg, "OUTPUT_DISTRIBUTION_GATE_BLOCKING") else False
     )
-    output_dist_gate_passed = output_dist_result.passed if output_dist_blocking else True
+    # Both evaluations gate. A candidate must clear the synthetic sweep AND its
+    # own fitted batch; a result that could not be computed is not a pass.
+    output_dist_gate_passed = (
+        (
+            output_dist_result.passed
+            and output_dist_fitted_result is not None
+            and output_dist_fitted_result.passed
+        ) if output_dist_blocking else True
+    )
 
     # Audit Phase 2a-PROMOTE Option C (2026-05-07): stratified per-regime
     # variant. The synthetic-sweep gate above catches calibrator-internal
@@ -5197,7 +5322,16 @@ def run_meta_training(
                     "isotonic_calibrator": {
                         "key": f"{prefix}isotonic_calibrator.pkl",
                         "ece_before": round(calibrator._ece_before or 0.0, 6),
+                        # In-sample; see alpha-engine-config-I10181. The full
+                        # calibrator.metrics() block (with ece_after_oos) is
+                        # carried under the manifest's `calibration` key.
                         "ece_after": round(calibrator._ece_after or 0.0, 6),
+                        "ece_after_in_sample": round(calibrator._ece_after or 0.0, 6),
+                        "ece_after_oos": (
+                            None if calibrator._ece_after_oos is None
+                            else round(calibrator._ece_after_oos, 6)
+                        ),
+                        "n_oos_samples": int(calibrator._n_oos_samples or 0),
                         "n_samples": calibrator._n_samples,
                     },
                     # Audit Phase 3 PR 4/5 (2026-05-09 cutover):
@@ -5382,10 +5516,11 @@ def run_meta_training(
                 # mirrored into behavioral_metrics below, which is
                 # what the promotion veto reads.
                 "xsec_variance_share": xsec_variance_share_observe,
-                "behavioral_metrics": {
-                    "xsec_variance_share":
-                        xsec_variance_share_observe.get("xsec_variance_share"),
-                },
+                # alpha-engine-config-I10185 — the like-for-like magnitude
+                # reference, persisted so a future session reads it instead of
+                # re-deriving a parquet join.
+                "xsec_incumbent_same_panel": xsec_incumbent_same_panel,
+                "behavioral_metrics": xsec_behavioral_metrics,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 # alpha-engine-config-I9024 §2 — the SERVING incumbent's frozen
                 # weights evaluated over THESE folds. The apples-to-apples
@@ -5432,6 +5567,30 @@ def run_meta_training(
                     "blocking": output_dist_blocking,
                     "would_have_blocked_if_blocking": (
                         not output_dist_result.passed
+                    ),
+                    # alpha-engine-config-I10185 — the same four invariants on
+                    # the candidate's OWN fitted y_hat. Each evaluation's
+                    # `metrics.input` names which input produced it, so a
+                    # reader can never mistake a statement about the
+                    # calibrator's shape for one about the model's scale.
+                    "fitted_batch": (
+                        {
+                            "passed": output_dist_fitted_result.passed,
+                            "failed_check": output_dist_fitted_result.failed_check,
+                            "reason": output_dist_fitted_result.reason,
+                            "metrics": output_dist_fitted_result.metrics,
+                            "would_have_blocked_if_blocking": (
+                                not output_dist_fitted_result.passed
+                            ),
+                        } if output_dist_fitted_result is not None
+                        else {
+                            "passed": None,
+                            "reason": (
+                                "computation failed — recorded as unmeasurable, "
+                                "never as a pass"
+                            ),
+                            "metrics": {"input": "candidate_fitted_y_hat"},
+                        }
                     ),
                     # Phase 2a-PROMOTE Option C (2026-05-07): stratified
                     # per-regime sub-gate. Persisted regardless of
@@ -5896,10 +6055,9 @@ def run_meta_training(
         # Fit-time cross-sectional collapse detector (alpha-engine-config,
         # 2026-09-08); the scalar mirror is what arms the promotion veto.
         "xsec_variance_share": xsec_variance_share_observe,
-        "behavioral_metrics": {
-            "xsec_variance_share":
-                xsec_variance_share_observe.get("xsec_variance_share"),
-        },
+        # alpha-engine-config-I10185 — the like-for-like magnitude reference.
+        "xsec_incumbent_same_panel": xsec_incumbent_same_panel,
+        "behavioral_metrics": xsec_behavioral_metrics,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
         # over C(N,k) combinations). Feeds the W1.3 Deflated-Sharpe / PBO gate.

@@ -786,9 +786,19 @@ class TestSubstrateInventoryKeys:
             "research_calibrator": None,
         }
         assert metrics["l2_ic"] == 0.132
+        # alpha-engine-config-I10181 — `ece_after` keeps its key and its
+        # (in-sample) meaning, and the block now NAMES it rather than letting a
+        # reader assume it is a held-out number. The OOS fields are absent from
+        # this fixture's sidecar, so they read as None: a sidecar written before
+        # I10181 carries no out-of-sample error, and that is reported as absent
+        # rather than filled in with the in-sample value.
         assert metrics["confidence_calibration"] == {
             "method": "isotonic",
             "ece_before": 0.087,
+            "ece_after_in_sample": 0.021,
+            "ece_after_oos": None,
+            "ece_oos_reason": None,
+            "n_oos_samples": None,
             "ece_after": 0.021,
             "n_samples": 1500,
         }

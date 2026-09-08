@@ -149,7 +149,7 @@ def validate_calibrator_distribution(
             passed=True,
             failed_check=None,
             reason="calibrator not fitted (linear fallback active — by construction monotonic continuous)",
-            metrics={"calibrator_fitted": False},
+            metrics={"calibrator_fitted": False, "input": "synthetic_alpha_sweep"},
         )
 
     synthetic_alphas = np.linspace(alpha_range[0], alpha_range[1], n_synthetic)
@@ -161,6 +161,12 @@ def validate_calibrator_distribution(
         "calibrator_fitted": True,
         "n_synthetic": n_synthetic,
         "alpha_range": list(alpha_range),
+        # WHICH input this evaluation was fed (alpha-engine-config-I10185).
+        # The synthetic sweep and the candidate's own fitted y_hat now both
+        # land in the manifest's output_distribution_gate block, and a reader
+        # who cannot tell them apart cannot tell a statement about the
+        # calibrator's shape from a statement about the model's output scale.
+        "input": "synthetic_alpha_sweep",
     }
     return _evaluate_distribution_invariants(
         p_ups=p_ups,
@@ -174,6 +180,108 @@ def validate_calibrator_distribution(
         floor=floor,
         ceiling=ceiling,
         extra_metrics=extra_metrics,
+    )
+
+
+
+def validate_fitted_batch_distribution(
+    calibrator,
+    fitted_alphas,
+    *,
+    min_unique_p_up: int = 8,
+    max_modal_fraction: float = 0.5,
+    max_saturation_rate: float = 0.25,
+    min_stdev: float = 0.005,
+    max_direction_skew: float = 0.85,
+    floor: float = 0.011,
+    ceiling: float = 0.989,
+) -> OutputDistributionGateResult:
+    """The same four invariants, evaluated on the CANDIDATE'S OWN fitted output.
+
+    alpha-engine-config-I10185. ``validate_calibrator_distribution`` above
+    sweeps 25 evenly-spaced synthetic alphas over a FIXED ``[-0.05, 0.05]``
+    range. That measures the calibrator's shape over an interval chosen by the
+    gate — a real and useful question, and structurally NOT a question about the
+    candidate's own output scale, which is the quantity that collapsed on
+    2026-09-08.
+
+    Measured: ``v3.0-meta-2026-09-04-cc3271ea``'s promotion-time gate PASSED
+    (``n_unique_p_up`` 15, ``stdev_p_up`` 0.191, ``modal_fraction`` 0.16) on
+    ``n_synthetic = 25`` over ``alpha_range = [-0.05, 0.05]``, while that
+    model's training-panel cross-sectional sd was 0.010350 and its first served
+    batch produced ``alpha_stdev`` 0.005819 with zero high-confidence names.
+
+    ``fitted_alphas`` is the candidate's own in-sample meta prediction vector
+    over its training panel — the closest thing available at promotion time to
+    the batch the executor will consume. The synthetic sweep is kept: this is an
+    ADDITIONAL check, not a replacement.
+
+    An empty batch is ``unmeasurable`` and FAILS. A gate that cannot see is not
+    a gate that passed.
+    """
+    import numpy as np
+
+    alphas = np.asarray(list(fitted_alphas), dtype=float).ravel()
+    alphas = alphas[np.isfinite(alphas)]
+    n = int(alphas.shape[0])
+
+    if not getattr(calibrator, "_fitted", True):
+        return OutputDistributionGateResult(
+            passed=True,
+            failed_check=None,
+            reason=(
+                "calibrator not fitted (linear fallback active — by "
+                "construction monotonic continuous)"
+            ),
+            metrics={
+                "calibrator_fitted": False,
+                "input": "candidate_fitted_y_hat",
+                "n_fitted": n,
+                "fitted_alpha_stdev": float(np.std(alphas)) if n else None,
+            },
+        )
+
+    if n == 0:
+        return OutputDistributionGateResult(
+            passed=False,
+            failed_check="unmeasurable",
+            reason=(
+                "no fitted predictions were supplied, so the candidate's own "
+                "output scale could not be observed. Unmeasurable is not a "
+                "pass (champion-challenger-policy §7.2)"
+            ),
+            metrics={
+                "calibrator_fitted": True,
+                "input": "candidate_fitted_y_hat",
+                "n_fitted": 0,
+                "fitted_alpha_stdev": None,
+            },
+        )
+
+    results = [calibrator.calibrate_prediction(float(a)) for a in alphas]
+    p_ups = np.array([r["p_up"] for r in results])
+    directions = [r.get("predicted_direction") for r in results]
+
+    return _evaluate_distribution_invariants(
+        p_ups=p_ups,
+        directions=directions,
+        source_label=f"candidate's own fitted output ({n} rows)",
+        min_unique_p_up=min_unique_p_up,
+        max_modal_fraction=max_modal_fraction,
+        max_saturation_rate=max_saturation_rate,
+        min_stdev=min_stdev,
+        max_direction_skew=max_direction_skew,
+        floor=floor,
+        ceiling=ceiling,
+        extra_metrics={
+            "calibrator_fitted": True,
+            "input": "candidate_fitted_y_hat",
+            "n_fitted": n,
+            # The number that collapsed, on the axis it collapsed on.
+            # Recorded on a PASS as well: a field present only on the failure
+            # path cannot be trended and its absence reads as healthy.
+            "fitted_alpha_stdev": float(np.std(alphas)),
+        },
     )
 
 
