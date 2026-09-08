@@ -1983,6 +1983,14 @@ def run(ctx: PipelineContext) -> None:
         metrics["confidence_calibration"] = {
             "method": "isotonic",
             "ece_before": gbm_meta.get("isotonic_ece_before"),
+            # Named, not merely carried (alpha-engine-config-I10181): under
+            # isotonic the in-sample number is ~0 by construction and cannot go
+            # bad, so a surface that renders it unlabelled is reporting an
+            # identity as a quality signal.
+            "ece_after_in_sample": gbm_meta.get("isotonic_ece_after"),
+            "ece_after_oos": gbm_meta.get("isotonic_ece_after_oos"),
+            "ece_oos_reason": gbm_meta.get("isotonic_ece_oos_reason"),
+            "n_oos_samples": gbm_meta.get("isotonic_n_oos_samples"),
             "ece_after": gbm_meta.get("isotonic_ece_after"),
             "n_samples": gbm_meta.get("isotonic_n_samples"),
         }
@@ -2342,7 +2350,13 @@ def _load_gbm_meta(ctx: PipelineContext) -> dict:
                 "volatility_test_ic": mm.get("volatility", {}).get("test_ic"),
                 "research_calibrator_n_samples": mm.get("research_calibrator", {}).get("n_samples"),
                 "isotonic_ece_before": iso.get("ece_before"),
+                # alpha-engine-config-I10181 — `ece_after` is the IN-SAMPLE
+                # number and keeps that meaning; the OOS one is carried
+                # alongside so the report card can name which it renders.
                 "isotonic_ece_after": iso.get("ece_after"),
+                "isotonic_ece_after_oos": iso.get("ece_after_oos"),
+                "isotonic_ece_oos_reason": iso.get("ece_oos_reason"),
+                "isotonic_n_oos_samples": iso.get("n_oos_samples"),
                 "isotonic_n_samples": iso.get("n_samples"),
             }
 

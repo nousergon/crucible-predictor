@@ -115,6 +115,36 @@ _FLOOR_VETO_REASON: dict[str, str] = {
 }
 _FLOOR_VETO_REASON_DEFAULT = "{name} {c} is below the {floor} floor"
 
+# ── the MAGNITUDE leg (alpha-engine-config-I10185) ───────────────────────────
+#
+# ``xsec_variance_share`` above is a RATIO, and PR611's module docstring names
+# its invariance under a uniform coefficient rescale as a deliberate design
+# property. So it structurally cannot see a SCALE collapse — a model that keeps
+# 70% of its variance inside the date and simply produces 4.7x less of it.
+# Measured on the live champion v3.0-meta-2026-09-04-cc3271ea: share 0.702720
+# (passes the 0.10 floor by 7x) with xsec_sd 0.010350, against the 2026-08-14
+# incumbent's 0.048588 on the IDENTICAL panel. Its first served batch collapsed
+# to alpha_stdev 0.005819 and produced zero high-confidence names.
+#
+# The absolute floor is not a new number. It is the predictor's own absolute
+# serving ``alpha_stdev`` floor (alpha-engine-config-I9267, "derived from the
+# measured healthy population"), applied to the TRAINING panel — where the same
+# quantity is knowable before the model ever serves a batch. On the champion it
+# was already below that floor at fit time and nothing looked.
+XSEC_SD_ABSOLUTE_FLOOR: float = 0.015
+
+# The relative floor is this module's existing dispersion bar (MIN_DISPERSION_
+# RATIO), reused deliberately: halving the spread the executor ranks on is a
+# different model, not a better one.
+XSEC_SD_MIN_RATIO_VS_INCUMBENT: float = 0.5
+
+# The incumbent's xsec_sd RECOMPUTED ON THE CANDIDATE'S OWN PANEL. The panel
+# must be held constant or the comparison measures the data, not the model —
+# which is why this is a field of the CANDIDATE's manifest (written by
+# training/xsec_magnitude.py at fit time) and is never taken from the incumbent
+# manifest's own ``xsec_sd``.
+XSEC_SD_INCUMBENT_SAME_PANEL = "xsec_sd_incumbent_same_panel"
+
 # The metric names a served-slice measurement may contribute. Restricting the
 # merge to these keeps the measurement's bookkeeping fields (``n_dates``,
 # ``top_n``, ``min_confidence``) out of the metric namespace the rules read, so
@@ -122,6 +152,12 @@ _FLOOR_VETO_REASON_DEFAULT = "{name} {c} is below the {floor} floor"
 _SERVED_METRIC_NAMES: frozenset = frozenset(
     DISPERSION_METRICS + ZERO_VETO_METRICS + tuple(FLOOR_VETO_METRICS)
 )
+
+# ``xsec_sd`` and its same-panel reference are FIT-TIME properties of the
+# training design matrix. A served-slice measurement has no such quantity, so
+# admitting one here would rank a served number against a fitted one — the
+# cross-basis comparison the served-slice merge exists to prevent.
+assert "xsec_sd" not in _SERVED_METRIC_NAMES
 
 
 def behavioral_metrics(manifest: dict | None,
@@ -164,6 +200,124 @@ def _as_float(value):
     except (TypeError, ValueError):
         return None
     return v if v == v else None  # NaN is not a measurement
+
+
+
+def _evaluate_xsec_magnitude(cand: dict) -> tuple[list[dict], dict, list[str]]:
+    """The MAGNITUDE leg (alpha-engine-config-I10185): is the candidate's
+    cross-sectional dispersion, measured on its OWN training panel, too small in
+    absolute terms AND too small against the incumbent scored on that same panel?
+
+    Returns ``(vetoes, measured, uncomputable)``.
+
+    Both sub-legs must fire, and that conjunction is measured, not assumed.
+    Every registered ``v3.0-meta`` coefficient vector (20, 2026-06-06 ..
+    2026-09-04) was scored on the one persisted fitted panel (2026-09-04), so
+    the panel is held constant and the number measures the model:
+
+    * an absolute floor of 0.015 puts exactly two below it — 2026-09-04
+      (0.010350, the case this leg exists for) and 2026-08-21 (0.014842, the
+      worked-example bad promotion this module's docstring already names) —
+      with the nearest passing arm at 0.020270, 1.35x the floor;
+    * a RATIO-only rule would additionally have refused 2026-06-26 (0.026215,
+      comfortably above the floor, 0.393x an unusually wide predecessor), a
+      candidate with no evidence of any defect.
+
+    Two conditions arm the absolute leg ON ITS OWN, because in both the relative
+    leg has no valid reference and ``unmeasurable`` is never a pass:
+
+    1. no same-panel incumbent number at all;
+    2. a same-panel incumbent number that is itself below the absolute floor —
+       a broken reference cannot exonerate anything, and this is what stops a
+       joint drift (both models shrinking together) from walking under the gate.
+    """
+    vetoes: list[dict] = []
+    measured: dict = {}
+    uncomputable: list[str] = []
+
+    c = _as_float(cand.get("xsec_sd"))
+    ref = _as_float(cand.get(XSEC_SD_INCUMBENT_SAME_PANEL))
+    if ref is None or ref <= 0:
+        uncomputable.append(XSEC_SD_INCUMBENT_SAME_PANEL)
+    if c is None:
+        uncomputable.append("xsec_sd")
+        return vetoes, measured, uncomputable
+
+    ratio = (c / ref) if (ref is not None and ref > 0) else None
+    measured["xsec_sd"] = {
+        "candidate": c,
+        "floor": XSEC_SD_ABSOLUTE_FLOOR,
+        "incumbent_same_panel": ref,
+        "ratio_vs_incumbent_same_panel": (
+            None if ratio is None else round(ratio, 6)
+        ),
+        "min_ratio": XSEC_SD_MIN_RATIO_VS_INCUMBENT,
+        # WHICH panel both numbers came from. A reader must never have to
+        # assume this: the whole point of the leg is that the incumbent's
+        # stored, differently-scaled number is the wrong comparison.
+        "basis": "candidate_training_panel",
+    }
+
+    below_floor = c < XSEC_SD_ABSOLUTE_FLOOR
+    if not below_floor:
+        return vetoes, measured, uncomputable
+
+    common = (
+        f"xsec_sd {c} is below the {XSEC_SD_ABSOLUTE_FLOOR} floor — the "
+        f"cross-sectional standard deviation of this model's own fitted output, "
+        f"on its own training panel, is smaller than the absolute alpha_stdev "
+        f"floor its predictions must clear to be served at all "
+        f"(alpha-engine-config-I9267). This is a SCALE collapse: the model can "
+        f"still rank names (xsec_variance_share is a ratio and passes) while "
+        f"producing far too little dispersion for the executor to size on"
+    )
+    if ref is None or ref <= 0:
+        vetoes.append({
+            "metric": "xsec_sd", "candidate": c,
+            "rule": f">= {XSEC_SD_ABSOLUTE_FLOOR}",
+            "reason": (
+                f"{common}. No incumbent xsec_sd was recomputed on this "
+                f"candidate's panel, so the relative leg could not be "
+                f"evaluated and cannot exonerate it "
+                f"(alpha-engine-config-I10185)"
+            ),
+        })
+        return vetoes, measured, uncomputable
+
+    if ref < XSEC_SD_ABSOLUTE_FLOOR:
+        vetoes.append({
+            "metric": "xsec_sd", "candidate": c, "incumbent_same_panel": ref,
+            "ratio": None if ratio is None else round(ratio, 6),
+            "rule": f">= {XSEC_SD_ABSOLUTE_FLOOR}",
+            "reason": (
+                f"{common}. The incumbent's same-panel xsec_sd ({ref}) is "
+                f"ITSELF below the floor, so it is not a valid reference — a "
+                f"broken reference cannot exonerate a candidate, and a drift "
+                f"in which both models shrink together must not walk under "
+                f"this gate (alpha-engine-config-I10185)"
+            ),
+        })
+        return vetoes, measured, uncomputable
+
+    if ratio is not None and ratio < XSEC_SD_MIN_RATIO_VS_INCUMBENT:
+        vetoes.append({
+            "metric": "xsec_sd", "candidate": c, "incumbent_same_panel": ref,
+            "ratio": round(ratio, 6),
+            "rule": (
+                f">= {XSEC_SD_ABSOLUTE_FLOOR} OR >= "
+                f"{XSEC_SD_MIN_RATIO_VS_INCUMBENT}x the incumbent on the same panel"
+            ),
+            "reason": (
+                f"{common}, and it is {ratio:.0%} of the incumbent's "
+                f"{ref} measured on the IDENTICAL panel (so the comparison is "
+                f"of the models, not of the data). Measured 2026-09-08: the "
+                f"champion that shipped with exactly this shape (0.010350 vs "
+                f"0.048588) collapsed its first served batch to alpha_stdev "
+                f"0.005819 with zero high-confidence names "
+                f"(alpha-engine-config-I10185)"
+            ),
+        })
+    return vetoes, measured, uncomputable
 
 
 def evaluate_behavioral_veto(
@@ -255,6 +409,13 @@ def evaluate_behavioral_veto(
                     name, _FLOOR_VETO_REASON_DEFAULT,
                 ).format(name=name, c=c, floor=floor),
             })
+
+    # alpha-engine-config-I10185 — the MAGNITUDE leg. Independent of the
+    # xsec_variance_share floor above: a candidate must clear BOTH.
+    _mag_vetoes, _mag_measured, _mag_uncomputable = _evaluate_xsec_magnitude(cand)
+    vetoes.extend(_mag_vetoes)
+    measured.update(_mag_measured)
+    uncomputable.extend(_mag_uncomputable)
 
     if vetoes:
         status = "veto"

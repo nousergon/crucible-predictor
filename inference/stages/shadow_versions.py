@@ -69,8 +69,77 @@ def _clone_for_shadow(
     return shadow
 
 
+def _eligible_challengers(
+    challengers: list[dict], manifests_by_vid: dict | None,
+) -> list[dict]:
+    """Drop arms that must not occupy a rotation slot at all
+    (alpha-engine-config-I10180).
+
+    Two mechanisms, and both are needed:
+
+    1. a DECLARED retirement (``model/retired_arms.py``) — the only thing that
+       can reach a pre-2026-09-08 vintage, whose manifest carries no
+       ``xsec_variance_share`` and for which the metric is not computable after
+       the fact, because only one fitted meta panel is persisted;
+    2. the manifest's own ``xsec_variance_share`` below the floor — the general
+       rule, which arms itself with no code change the moment a vintage carries
+       the metric.
+
+    An ABSENT or unreadable value never excludes: absent is uncomputable, not
+    degenerate, and excluding on absence would empty the rotation of every older
+    vintage at once. Both exclusions run BEFORE the ``max_n`` window, so a
+    retired arm frees its slot for an arm that could win rather than merely
+    shrinking the day's shadow set.
+    """
+    from model.retired_arms import RETIRED_SHADOW_VERSIONS
+    from training.xsec_variance_share import XSEC_VARIANCE_SHARE_FLOOR
+
+    out: list[dict] = []
+    for v in challengers:
+        vid = v.get("version_id") or ""
+        reason = RETIRED_SHADOW_VERSIONS.get(vid)
+        if reason:
+            log.info(
+                "Shadow runner: %s is RETIRED and is not shadowed — %s",
+                vid, reason,
+            )
+            continue
+        manifest = (manifests_by_vid or {}).get(vid)
+        if not isinstance(manifest, dict):
+            # Absent census entry / unreadable manifest: keep the arm and say
+            # so. Excluding here would be a second blindness defect wearing a
+            # fix's name.
+            if manifests_by_vid is not None and vid in manifests_by_vid:
+                log.warning(
+                    "Shadow runner: %s's manifest could not be read — arm KEPT "
+                    "in the rotation; an unreadable manifest is not evidence "
+                    "of a degenerate arm.", vid,
+                )
+            out.append(v)
+            continue
+        share = ((manifest.get("behavioral_metrics") or {})
+                 .get("xsec_variance_share"))
+        try:
+            share = None if share is None else float(share)
+        except (TypeError, ValueError):
+            share = None
+        if share is not None and share < XSEC_VARIANCE_SHARE_FLOOR:
+            log.warning(
+                "Shadow runner: %s is cross-sectionally degenerate "
+                "(xsec_variance_share=%.6f < %.2f) and is not shadowed — it "
+                "moves every name together and separates none, so its shadow "
+                "rows are not a measurement of a model "
+                "(alpha-engine-config-I10180).",
+                vid, share, XSEC_VARIANCE_SHARE_FLOOR,
+            )
+            continue
+        out.append(v)
+    return out
+
+
 def _select_challengers_for_cycle(
     challengers: list[dict], max_n: int, date_str: str,
+    *, manifests_by_vid: dict | None = None,
 ) -> list[dict]:
     """Rotate which up-to-``max_n`` challengers get shadowed today
     (alpha-engine-config-I9336).
@@ -99,6 +168,7 @@ def _select_challengers_for_cycle(
     rather than structurally starving the same tail. Unconditionally shadowing
     an unbounded pool every cycle is explicitly INVALID (Lambda soft-timeout).
     """
+    challengers = _eligible_challengers(challengers, manifests_by_vid)
     if max_n <= 0 or len(challengers) <= max_n:
         return challengers
     ordered = sorted(challengers, key=lambda v: v.get("version_id") or "")
@@ -181,8 +251,29 @@ def run(ctx: PipelineContext) -> None:
         return
 
     max_n = int(getattr(cfg, "SHADOW_VERSIONS_MAX_N", 5))
+    # alpha-engine-config-I10180 — the eligibility read. One small GET per
+    # registered arm, before the rotation window, so a degenerate arm frees its
+    # slot instead of merely shrinking the day's shadow set. A manifest that
+    # cannot be read maps to None and the arm is KEPT (see
+    # ``_eligible_challengers``).
+    manifests_by_vid: dict = {}
+    for _v in challengers:
+        _vid = _v.get("version_id")
+        if not _vid:
+            continue
+        try:
+            manifests_by_vid[_vid] = json.loads(
+                s3c.get_object(
+                    Bucket=ctx.bucket,
+                    Key=f"{_REGISTRY_PREFIX}{_vid}/manifest.json",
+                )["Body"].read()
+            )
+        except Exception:  # noqa: BLE001 — an unreadable manifest keeps the arm
+            manifests_by_vid[_vid] = None
     # alpha-engine-config-I9336: rotate, don't always cut the same tail.
-    challengers = _select_challengers_for_cycle(challengers, max_n, ctx.date_str)
+    challengers = _select_challengers_for_cycle(
+        challengers, max_n, ctx.date_str, manifests_by_vid=manifests_by_vid,
+    )
     if not challengers:
         log.info("Shadow runner: no registered challengers — no-op.")
         return

@@ -122,6 +122,10 @@ MIN_REALIZED_OUTCOMES = 20
 # consider lifting both into nousergon-lib (shared-code-policy.md).
 MEASURABILITY_MEASURED = "measured"
 MEASURABILITY_UNMEASURABLE = "unmeasurable"
+#: alpha-engine-config-I10180 — the arm was retired from the rotation, so
+#: it stops writing shadows by design. Distinct from `unmeasurable`, which
+#: is a defect to repair, and from `measured`, which it is not.
+MEASURABILITY_RETIRED = "retired"
 # An arm that wrote none of the most recent N cohort dates has stopped
 # producing comparable output — mirrors crucible-research's
 # COHORT_LAG_UNMEASURABLE_DATES.
@@ -1070,7 +1074,15 @@ def build_observe_leaderboard(
     # OTHER currently-registered challenger's shadow-write dates. Falls back
     # to every known version's dates if the registered census is empty
     # (read failure) — degrade gracefully rather than suppress the check.
-    cohort_source_vids = registered_challenger_ids or all_vids
+    # alpha-engine-config-I10180 — a RETIRED arm's dates are residue, not the
+    # population a live arm is judged against. Including them would let a
+    # retired arm's last writes make a live arm look covered (or, once the
+    # retired arm stops writing, drag the cohort's recent cycles).
+    from model.retired_arms import RETIRED_ON, is_retired, retirement_reason
+
+    cohort_source_vids = [
+        v for v in (registered_challenger_ids or all_vids) if not is_retired(v)
+    ]
     cohort_dates = sorted({
         d for vid in cohort_source_vids for d in shadow_dates_by_version.get(vid, [])
     })
@@ -1090,6 +1102,16 @@ def build_observe_leaderboard(
         measurability, measurability_reason = measurability_for_shadow_arm(
             shadow_dates_by_version.get(vid, []), cohort_dates,
         )
+        # alpha-engine-config-I10180. A retired arm stops writing shadows BY
+        # DESIGN, so `unmeasurable` is the wrong word for it and the page it
+        # raises would be a new false page created by the fix for a false page.
+        # It is still given a row, with its historical scores and an explicit
+        # marker, because those rows exist and a reader who cannot tell a
+        # retired arm's IC from a live one's is reading a mixture.
+        arm_retired = is_retired(vid)
+        if arm_retired:
+            measurability = MEASURABILITY_RETIRED
+            measurability_reason = retirement_reason(vid)
         if v_ic is None:
             verdict_reason = (
                 f"unmeasurable: {v_n} matured pairs, below the {_MIN_PAIRS_FOR_IC} "
@@ -1109,7 +1131,13 @@ def build_observe_leaderboard(
                 f"is decided by the anytime-valid sequence in "
                 f"arena/model/{{date}}.json — never here (I9319/I9322)."
             )
-        if measurability == MEASURABILITY_UNMEASURABLE:
+        if arm_retired:
+            verdict_reason = (
+                f"RETIRED from the shadow rotation on {RETIRED_ON}: "
+                f"{measurability_reason} Its rows below are historical and must "
+                f"not be compared against a live arm's."
+            )
+        elif measurability == MEASURABILITY_UNMEASURABLE:
             # Overrides the insufficient/soak-too-young framing above: this is
             # not "not enough evidence yet", it is "produced no comparable
             # output" — a defect that resolves by fixing the shadow write
@@ -1125,6 +1153,11 @@ def build_observe_leaderboard(
             "verdict_reason": verdict_reason,
             "measurability": measurability,
             "measurability_reason": measurability_reason,
+            # Explicit on EVERY row, never only on the retired ones: an absent
+            # field is indistinguishable from a healthy one, which is the whole
+            # reason this leaderboard emits explicit rows at all.
+            "retired": bool(arm_retired),
+            "retired_reason": retirement_reason(vid),
         })
 
     if starved:

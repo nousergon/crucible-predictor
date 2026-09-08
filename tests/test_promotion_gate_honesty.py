@@ -480,6 +480,14 @@ def test_uncomputable_behavioral_metrics_are_named_not_silent(monkeypatch):
         # before it carry nothing, so it is uncomputable here for exactly the
         # reason this test exists — and it is NAMED, not silently skipped.
         "xsec_variance_share",
+        # Same for the MAGNITUDE leg (alpha-engine-config-I10185): the
+        # candidate's own training-panel `xsec_sd` and the incumbent's `xsec_sd`
+        # recomputed on that SAME panel. Both are fit-time numbers written by
+        # training/xsec_magnitude.py from the 2026-09-08 vintage on; an older
+        # manifest carries neither, and neither may be inferred from anything
+        # the older manifest does carry.
+        "xsec_sd",
+        "xsec_sd_incumbent_same_panel",
     }
 
 
@@ -505,9 +513,12 @@ def test_zero_high_confidence_and_sub_coinflip_hit_rate_veto():
     assert vetoed == {
         "alpha_stdev", "stdev_p_up", "n_high_confidence", "model_hit_rate_30d",
     }
-    # `xsec_variance_share` (added 2026-09-08) is not on this 2026-08-21-era
-    # fixture, so it is uncomputable and NAMED — the point of this module.
-    assert verdict["uncomputable"] == ["xsec_variance_share"]
+    # `xsec_variance_share` and the I10185 magnitude leg's two numbers (added
+    # 2026-09-08) are not on this 2026-08-21-era fixture, so each is
+    # uncomputable and NAMED — the point of this module.
+    assert verdict["uncomputable"] == [
+        "xsec_sd", "xsec_sd_incumbent_same_panel", "xsec_variance_share",
+    ]
 
 
 # ── the raises must reach the caller, not be logged and forgotten ────────────
