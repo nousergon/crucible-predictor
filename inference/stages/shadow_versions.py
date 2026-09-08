@@ -46,7 +46,9 @@ _IDENTITY_FIELDS = (
 )
 
 
-def _clone_for_shadow(ctx: PipelineContext, *, weights_prefix: str) -> PipelineContext:
+def _clone_for_shadow(
+    ctx: PipelineContext, *, weights_prefix: str, version_id: str | None = None,
+) -> PipelineContext:
     """Fresh context that reuses the live run's loaded data but resets the
     model/result state and points the loader at a challenger's bundle."""
     shadow = PipelineContext()
@@ -60,6 +62,10 @@ def _clone_for_shadow(ctx: PipelineContext, *, weights_prefix: str) -> PipelineC
             else list(val) if isinstance(val, list) else val,
         )
     shadow.weights_prefix_override = weights_prefix
+    # Arm identity for the calibration verdict (alpha-engine-config,
+    # 2026-09-08). Stamped ONLY here, so the live context that feeds the
+    # executor always reads as the champion.
+    shadow.shadow_version_id = version_id
     return shadow
 
 
@@ -114,6 +120,16 @@ def _write_shadow(ctx: PipelineContext, version_id: str) -> None:
         "model_version": getattr(ctx, "model_version", "unknown"),
         "n_predictions": len(ctx.predictions),
         "shadow": True,  # marker — NEVER consumed by the executor
+        # WHICH basis produced the p_up values below, and whether the alpha was
+        # centered (alpha-engine-config, 2026-09-08). Emitted unconditionally,
+        # including as null: an absent key is indistinguishable from a healthy
+        # one, and on 2026-09-08 the variance fallback rewrote every served
+        # p_up on three shadow arms from the linear heuristic while no shadow
+        # artifact recorded it. A consumer scoring `predictions_shadow/` must
+        # be able to tell a calibrator p_up from a heuristic one without
+        # reading the Lambda log.
+        "calibration_degradation": getattr(ctx, "calibration_degradation", None),
+        "level_neutralization": getattr(ctx, "level_neutralization", None),
         "predictions": ctx.predictions,
     }
     key = f"{_SHADOW_PREFIX}/{version_id}/{ctx.date_str}.json"
@@ -192,7 +208,7 @@ def run(ctx: PipelineContext) -> None:
             break
         try:
             shadow_ctx = _clone_for_shadow(
-                ctx, weights_prefix=f"{_REGISTRY_PREFIX}{vid}/",
+                ctx, weights_prefix=f"{_REGISTRY_PREFIX}{vid}/", version_id=vid,
             )
             load_model.run(shadow_ctx)
             run_inference.run(shadow_ctx)
