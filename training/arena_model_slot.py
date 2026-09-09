@@ -643,6 +643,8 @@ def training_statuses(manifests_by_arm: dict) -> dict:
 def serving_preconditions(
     *, arm_ids, manifests_by_arm: dict, incumbent_arm: str | None,
     served_metrics_by_arm: dict | None = None,
+    serving_manifest: dict | None = None,
+    serving_served_metrics: dict | None = None,
 ) -> dict:
     """Hard gates on SERVING, evaluated here and handed to the engine.
 
@@ -660,12 +662,43 @@ def serving_preconditions(
     An ``insufficient`` behavioural verdict is reported and NON-BLOCKING
     (§5.1: you cannot gate on a statistic you did not measure), and it is never
     rendered as a pass — it reaches the artifact as its own reason string.
+
+    ``serving_manifest`` — the manifest of the bundle that is ACTUALLY SERVING
+    -------------------------------------------------------------------------
+    alpha-engine-config-I10290. ``manifests_by_arm`` maps each arm to its
+    NEWEST registered bundle. On a REFIT — the pointer HOLDS on the incumbent
+    arm while that arm registers a newer bundle (§3.1: the arm doing its job) —
+    the incumbent arm's newest bundle IS the candidate bundle, so the veto
+    compared a manifest against ITSELF: every ratio is exactly 1.0 and the
+    guard is structurally incapable of refusing a refit, however far the new
+    weights have collapsed. That is §7.4's "a guard that cannot fail … is
+    worse, because it reads as coverage".
+
+    Measured on the 2026-09-04 rotation, the worked example: the arena HELD
+    (``moved: false``, ``status: held``) on ``M:champion-arch:4db81ad0d630``,
+    the refit ``v3.0-meta-2026-09-04-cc3271ea`` replaced the serving
+    ``v3.0-meta-2026-08-14-119e069b``, and the served book on its first day
+    collapsed — mean confidence 0.1619 → 0.0593, cross-sectional ``p_up`` stdev
+    0.0907 → 0.0217 (ratio 0.24), ``predicted_alpha`` stdev 0.01898 → 0.00582
+    (ratio 0.31), names clearing ``MIN_CONFIDENCE`` 2 → 0 (max confidence
+    0.107, so the WHOLE book sits under the executor's veto).
+
+    Passing the SERVING bundle's manifest explicitly makes the incumbent side
+    of the comparison the thing that is actually serving, on a refit as much as
+    on a pointer move. It is a strict widening: when the pointer moves to a
+    DIFFERENT arm, the serving bundle is the incumbent arm's own newest bundle
+    and this changes nothing.
     """
     engine = _arena()
     from training.promotion_behavioral_veto import evaluate_behavioral_veto
 
     served = served_metrics_by_arm or {}
-    incumbent_manifest = (manifests_by_arm or {}).get(incumbent_arm)
+    incumbent_manifest = serving_manifest
+    if incumbent_manifest is None:
+        incumbent_manifest = (manifests_by_arm or {}).get(incumbent_arm)
+    incumbent_served = serving_served_metrics
+    if incumbent_served is None:
+        incumbent_served = served.get(incumbent_arm)
     out: dict = {}
     for arm_id in arm_ids:
         manifest = (manifests_by_arm or {}).get(arm_id)
@@ -674,7 +707,7 @@ def serving_preconditions(
         verdict = evaluate_behavioral_veto(
             manifest, incumbent_manifest,
             candidate_served_metrics=served.get(arm_id),
-            incumbent_served_metrics=served.get(incumbent_arm),
+            incumbent_served_metrics=incumbent_served,
         )
         checks.append(engine.ServingPrecondition(
             name="behavioral_veto",
@@ -799,6 +832,7 @@ def emit_cycle(s3, bucket: str, doc: dict, *, as_of: str) -> list:
 def run_slot(
     s3, bucket: str, *, as_of: str, specs=None, incumbent_version_id: str | None = None,
     n_days: int = 90, served_metrics_by_arm: dict | None = None,
+    served_metrics_by_version_id: dict | None = None,
     diagnostics: dict | None = None, write: bool = True,
 ) -> dict:
     """The whole M-slot cycle, end to end. One call from the rotation.
@@ -812,6 +846,23 @@ def run_slot(
     cadence its own recipe declares, not a promotion (policy §3.1). That is why
     there is no ``champion-arch-refresh`` kind any more and why one cannot be
     written: the concept it named has no event of its own.
+
+    ``served_metrics_by_version_id`` (alpha-engine-config-I10290)
+    -------------------------------------------------------------
+    The served-slice dispersion measurement (``training/served_slice_dispersion
+    .py``) is keyed by registry ``version_id``, because that is what the caller
+    has: it runs inside ``select_winner`` before any arm id exists. It is the
+    ONLY scale-DEPENDENT measurement of the quantity the executor actually
+    consumes, and policy §7.3 is explicit that the gate belongs on that
+    quantity rather than on a transform of it — the manifest's ``stdev_p_up``
+    is a 25-point SYNTHETIC calibrator sweep, two transforms removed.
+
+    Until now no caller passed ``served_metrics_by_arm`` at all, so that
+    measurement was computed, written to the leaderboard, and then dropped
+    before the serving precondition ran: the veto's strongest input had never
+    once reached the gate. A parameter no caller supplies is a guard that
+    cannot fire (§7.4). This translates version-keyed metrics onto arm ids
+    here, where the mapping exists.
 
     ``TrainingIntegrityError`` and :class:`ArenaSlotUnservable` both propagate.
     """
@@ -867,6 +918,35 @@ def run_slot(
                 incumbent_version_id,
             )
 
+    # I10282 — the manifest of what is ACTUALLY SERVING, not of the incumbent
+    # arm's newest bundle. On a refit those two differ, and the difference is
+    # the whole point: without this the veto compares the candidate bundle
+    # against itself. Read once; None (no incumbent, or an unreadable manifest)
+    # falls back to today's behaviour inside serving_preconditions.
+    serving_manifest = (
+        _read_manifest(s3, bucket, incumbent_version_id)
+        if incumbent_version_id else None
+    )
+
+    # I10282 — version-keyed served-slice metrics onto arm ids, using the same
+    # arm→newest-bundle mapping the manifests came from. A metric for a bundle
+    # that is not any arm's newest is dropped: it would describe a different
+    # artifact from the one the precondition is judging.
+    if served_metrics_by_version_id:
+        _by_arm = dict(served_metrics_by_arm or {})
+        for _arm_id, _bundle in bundle_by_arm.items():
+            _m = served_metrics_by_version_id.get(_bundle.get("version_id"))
+            if isinstance(_m, dict) and _m:
+                _by_arm[_arm_id] = _m
+        # The SERVING bundle's own served metrics are the incumbent side of the
+        # ratio on a refit, where the incumbent arm's entry above is the
+        # CANDIDATE's. Recorded under a reserved key the arm ids cannot collide
+        # with, and handed to the veto as the incumbent measurement.
+        served_metrics_by_arm = _by_arm
+        _serving_served = served_metrics_by_version_id.get(incumbent_version_id)
+    else:
+        _serving_served = None
+
     active = register.active_arms()
     cycle, doc = run_model_slot_cycle(
         as_of=as_of, register=register, series_by_arm=series_by_arm,
@@ -875,6 +955,8 @@ def run_slot(
             arm_ids=active, manifests_by_arm=manifests_by_arm,
             incumbent_arm=incumbent_arm,
             served_metrics_by_arm=served_metrics_by_arm,
+            serving_manifest=serving_manifest,
+            serving_served_metrics=_serving_served,
         ),
         training=training_statuses({a: manifests_by_arm.get(a) for a in active}),
         diagnostics=diagnostics,

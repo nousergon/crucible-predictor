@@ -3124,10 +3124,27 @@ def select_and_finalize(
         # loud if the string is ever reintroduced.
         from training import arena_model_slot as arena
 
+        # alpha-engine-config-I10290 — the served-slice dispersion measured in
+        # select_winner above (``leaderboard["served_slice_dispersion"]``,
+        # keyed by registry version_id) is the ONLY scale-DEPENDENT measurement
+        # of the quantity the executor consumes. It was computed, written to
+        # the leaderboard, and then DROPPED here: run_slot's
+        # ``served_metrics_by_arm`` had no caller, so the behavioural veto's
+        # strongest input never once reached the serving precondition (§7.4 —
+        # a guard that cannot fire reads as coverage). Passed through now.
+        # ``status != "measured"`` leaves the mapping empty, which is the
+        # reported, non-blocking `uncomputable` posture (§5.1), not a pass.
+        _served_slice = leaderboard.get("served_slice_dispersion") or {}
+        _served_by_vid = (
+            (_served_slice.get("metrics") or {})
+            if _served_slice.get("status") == "measured" else {}
+        )
+
         _arena_run = arena.run_slot(
             s3, bucket, as_of=date_str,
             specs=specs,
             incumbent_version_id=_prior_champ_vid,
+            served_metrics_by_version_id=_served_by_vid,
             diagnostics={
                 "cpcv_leaderboard": {
                     "note": (
