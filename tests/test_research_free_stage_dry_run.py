@@ -70,12 +70,18 @@ def test_dry_run_skip_produces_no_error_log(caplog):
 
 
 def test_real_invocation_still_calls_the_producer():
-    # The half that had to survive: a real (non-dry-run, non-local) run must
-    # still reach the producer. Not exercising a real S3/ArcticDB round trip
-    # here — just confirming the new guard doesn't also swallow the live path.
+    # The half that had to survive: a real (non-dry-run, non-local) run on
+    # the weekly-SF run day must still reach the producer. 2026-09-05 is a
+    # Saturday whose previous day (2026-09-04, Friday) is that week's last
+    # trading session, so inference.trading_day_gate.check_weekly_run_day
+    # returns is_weekly_run_day=True for it (see
+    # test_research_free_weekly_cadence_gate.py for the cadence-gate cases
+    # this stage now runs BEFORE reaching the producer). Not exercising a
+    # real S3/ArcticDB round trip here — just confirming neither guard
+    # swallows the live path.
     with patch(
         "inference.research_free_inference.run_research_free_inference"
     ) as mock_run:
         mock_run.return_value = {"status": "ok", "n_written": 0, "n_errors": 0}
-        research_free.run(_ctx(dry_run=False, local=False))
+        research_free.run(_ctx(date_str="2026-09-05", dry_run=False, local=False))
     mock_run.assert_called_once()

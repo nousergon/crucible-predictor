@@ -20,6 +20,38 @@ failed every canonical Saturday. Wiring the intended daily producer here is
 what lets the consumer read a live producer contract
 (alpha-engine-config-I10067).
 
+Weekly-vs-daily cadence gate (alpha-engine-config-I10301)
+-----------------------------------------------------------
+This stage is wired into the DAILY (Mon-Fri) weekday preopen pipeline, but
+its sole precondition — ``candidates/{date}/candidates.json`` — is written
+only on the weekly Scanner's self-selected THU-SAT run day (config#1824's
+WeeklyRunDayGate predicate, evaluated by a separate state machine,
+``ne-weekly-freshness-pipeline``, that this stage is never part of). A real
+(non-dry_run) weekday invocation on any OTHER day therefore hits a
+same-day-key artifact that, by design, does not exist — measured paging
+every trading morning since 2026-08-22, distinct from and outlasting the
+deploy-canary instance of the same underlying mismatch fixed under
+alpha-engine-config-I10146 (which only guarded ``dry_run``/``local``).
+
+``run()`` resolves "is today a scanner-run day" from the SAME pure-calendar
+predicate the weekly SF's own gate uses
+(``inference/trading_day_gate.py::check_weekly_run_day`` — zero S3/infra
+dependency) BEFORE calling the producer, rather than treating the resulting
+``NoSuchKey`` as a bare try/except. A non-run-day miss is the expected,
+designed state and is logged only. A run-day miss (the artifact SHOULD
+exist and doesn't — a genuine scanner-side failure) still raises and still
+pages via the existing failure-handling path below.
+
+Consequence for this producer's own output (alpha-engine-config-I10301):
+because this stage only ever runs Mon-Fri and ``is_weekly_run_day`` is only
+True on the rare Thu/Fri-holiday-shifted week (ordinarily Saturday, which
+this stage never sees at all), ``predictor/predictions_research_free/`` is
+expected to stay EMPTY in the common case, by design, until either this
+stage is also invoked from the weekly pipeline or the producer is changed
+to read the most recently available candidates artifact rather than an
+exact same-day key. See alpha-engine-config-I10301 for that follow-up; not
+done here.
+
 Placement and failure posture
 -----------------------------
 Registered AFTER ``write_output`` and, like ``shadow_versions``, marked
@@ -139,6 +171,41 @@ def run(ctx: PipelineContext) -> None:
         # already written by the first invocation of the day — rewriting it
         # here would be identical work, so skip rather than duplicate it.
         log.info("research_free: skipped on supplemental (explicit_tickers) run.")
+        return
+
+    # ── Weekly-vs-daily cadence gate (alpha-engine-config-I10301) ──────────
+    # candidates/{date}/candidates.json is written ONLY on the weekly
+    # scanner's self-selected run day (config#1824's WeeklyRunDayGate
+    # predicate: normally Saturday, shifted to Friday/Thursday around a
+    # holiday) — this producer's OWN docstring already says as much
+    # ("...or any date the weekly Scanner has not (yet) run for", see the
+    # dry_run branch above), but that reasoning was only ever wired into the
+    # dry_run/canary guard. A REAL, non-dry_run weekday invocation hits the
+    # identical precondition every single non-run-day, forever — measured
+    # paging every trading morning since 2026-08-22 (alpha-engine-config-
+    # I10146 diagnosed one instance of this as a deploy canary; the ordinary
+    # scheduled 2026-09-09 firing is not a canary and shares no cause with
+    # that issue).
+    #
+    # Resolved from the SAME pure-calendar predicate the weekly SF's own
+    # WeeklyRunDayGate state uses to self-select its single THU-SAT firing
+    # (inference/trading_day_gate.py::check_weekly_run_day — zero S3/infra
+    # dependency, already exercised by inference/handler.py's
+    # action=check_weekly_run_day). This is a real, tested branch, not a
+    # bare try/except around the S3 NoSuchKey: on a day the calendar says is
+    # NOT the weekly run day, "candidates.json is absent" is the designed,
+    # expected state and is logged only, no alert. On a day the calendar
+    # DOES say is the weekly run day, an absent/malformed artifact is a
+    # genuine scanner-side failure and still raises + pages loud below.
+    from inference.trading_day_gate import check_weekly_run_day
+
+    weekly_verdict = check_weekly_run_day(ctx.date_str)
+    if not weekly_verdict.get("is_weekly_run_day"):
+        log.info(
+            "research_free: skipped — %s is not the weekly-SF run day (%s); "
+            "candidates/%s/candidates.json is not expected to exist.",
+            ctx.date_str, weekly_verdict.get("reason"), ctx.date_str,
+        )
         return
 
     from inference.research_free_inference import run_research_free_inference
