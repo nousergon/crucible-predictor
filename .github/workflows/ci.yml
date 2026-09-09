@@ -29,7 +29,17 @@ jobs:
         run: cp config/predictor.sample.yaml config/predictor.yaml
 
       - name: Run tests
-        run: pytest tests/ -v --ignore=tests/test_inference.py --ignore=tests/test_model.py --cov=. --cov-report=term-missing
+        # No --ignore list here on purpose. It carried
+        # `--ignore=tests/test_inference.py --ignore=tests/test_model.py` for
+        # two modules deleted in dc4c3d6 ("Remove legacy MLP code"): pytest
+        # accepts an --ignore path that does not exist, so the flags sat inert
+        # and unread. A workflow-side exclusion list is a twin of a fact the
+        # test tree already carries and it drifts silently — see
+        # alpha-engine-config-I10257, where the same shape in
+        # crucible-evaluator's ci.yml reddened that repo's main. If a module
+        # ever needs excluding from a job here, declare it ON the module with a
+        # pytest marker and deselect the marker.
+        run: pytest tests/ -v --cov=. --cov-report=term-missing
 
       - name: Security audit
         run: |
