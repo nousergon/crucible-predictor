@@ -133,6 +133,44 @@ def test_a_healthy_shadow_arm_is_attributed_too():
     assert ctx.calibration_degradation["shadow_version_id"] == vid
 
 
+def test_champion_collapse_writes_an_explicitly_unactionable_batch():
+    """alpha-engine-config-I10179 (Brian ruling 2026-09-08, option (c)): a
+    collapsed calibrator on the LIVE champion must force
+    prediction_confidence to 0.0 on every row so the executor's existing
+    MIN_CONFIDENCE = 0.30 veto declines the whole book by its own rule — the
+    discriminator is this same arm attribution from -I10178."""
+    ctx = _Ctx(_collapsed_batch())
+    ri._rescale_cross_sectional(ctx)
+    assert ctx.calibration_degradation["arm"] == "champion"
+    assert ctx.calibration_degradation["degraded"] is True
+    for p in ctx.predictions:
+        assert p["prediction_confidence"] == 0.0
+        assert p["calibration_basis"] == "linear_heuristic_fallback"
+    # Ranking is preserved even though the batch is unactionable — the linear
+    # heuristic's p_up ordering still reflects the underlying alpha ordering,
+    # per the recorded delta in the ruling (a rank-ordering measurement this
+    # PR does not attempt).
+    assert len({p["p_up"] for p in ctx.predictions}) > 1
+
+
+def test_shadow_collapse_keeps_todays_confidence_behaviour():
+    """The champion-only branch above must NOT engage for an observe-only
+    shadow arm — it trades on nothing, so today's confidence computation
+    (not forced to 0.0) is preserved (the fallback fired three times on
+    shadow arms in -I10178 and nothing traded on it)."""
+    vid = "spec-sota-combine-2026-07-24-8578f8ae"
+    ctx = _Ctx(_collapsed_batch(), shadow_version_id=vid)
+    ri._rescale_cross_sectional(ctx)
+    assert ctx.calibration_degradation["arm"] == "shadow"
+    confidences = {p["prediction_confidence"] for p in ctx.predictions}
+    assert confidences != {0.0}, (
+        "a shadow-arm collapse must not be forced unactionable — only the "
+        "live champion path is neutered"
+    )
+    for p in ctx.predictions:
+        assert p["calibration_basis"] == "linear_heuristic_fallback"
+
+
 def test_a_context_without_the_attribute_defaults_to_champion():
     """Old contexts (and any caller that predates the field) must read as the
     live path, never as an unattributed arm that quietly downgrades a page."""

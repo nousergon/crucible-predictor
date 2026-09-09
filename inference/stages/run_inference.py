@@ -1191,6 +1191,17 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
     toward 0.5 for everything. META_ALPHA_CLIP floors the batch max_abs
     so tiny, noisy alpha spreads don't inflate to extreme confidences.
     """
+    # alpha-engine-config-I10179 (Brian ruling 2026-09-08, option (c)): when the
+    # LIVE CHAMPION's calibrator collapses, the linear-heuristic fallback below
+    # still recovers cross-sectional VARIANCE (so ranking is preserved), but the
+    # batch's `prediction_confidence` is forced to 0.0 on every row so the
+    # executor's existing `MIN_CONFIDENCE = 0.30` veto declines the whole book
+    # by its own rule. This is a RESIDUAL-RISK posture, not a halt path: the
+    # artifact is still written (refusing to emit would fall back to trading
+    # the PRIOR day's book — the 2026-06-29 false-halt shape, -I9086) and this
+    # never fires for an observe-only shadow arm, which trades on nothing and
+    # whose collapse is a promotion-gate fact, not a live-trading event.
+    _champion_collapse = False
     _cal = getattr(ctx, "calibrator", None)
     _calibrated = _cal is not None and getattr(_cal, "is_fitted", False)
     if _calibrated:
@@ -1235,12 +1246,16 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
                 _n_distinct_alpha,
             )
             if _arm == "champion":
+                _champion_collapse = True
                 log.error(
                     "VARIANCE FALLBACK ENGAGED on the LIVE champion: "
                     "calibrator outputs collapsed to %d unique p_up bins "
                     "across %d tickers (threshold=%d; %d distinct "
                     "predicted_alpha). Falling through to linear heuristic "
-                    "rescale to recover variance for today's batch. A LOW "
+                    "rescale to recover variance for today's batch, but "
+                    "prediction_confidence is forced to 0.0 on every row "
+                    "(alpha-engine-config-I10179) so the executor's existing "
+                    "MIN_CONFIDENCE veto declines the whole book. A LOW "
                     "distinct-alpha count means the meta-model collapsed, not "
                     "the calibrator.",
                     *_msg_args,
@@ -1350,7 +1365,15 @@ def _rescale_cross_sectional(ctx: "PipelineContext") -> None:
         p["p_up"] = round(p_up, 4)
         p["p_down"] = round(p_down, 4)
         p["predicted_direction"] = direction
-        p["prediction_confidence"] = round(confidence, 4)
+        # alpha-engine-config-I10179: a collapsed calibrator on the LIVE
+        # champion writes an explicitly UNACTIONABLE batch. p_up/p_down/
+        # predicted_direction still carry the linear heuristic's rank
+        # ordering (ranking is preserved even when the probabilities are
+        # meaningless), but prediction_confidence is forced to 0.0 so the
+        # executor's existing MIN_CONFIDENCE = 0.30 veto declines every row
+        # by its own rule — no new halt path. Shadow arms (which trade on
+        # nothing) and the no-calibrator-loaded path are unaffected.
+        p["prediction_confidence"] = 0.0 if _champion_collapse else round(confidence, 4)
         # The served p_up on this row did NOT come from the calibrator. Stamped
         # per-row so a consumer that reads one prediction (executor sizing, the
         # veto, the dashboard) can see the basis without reading batch-level
