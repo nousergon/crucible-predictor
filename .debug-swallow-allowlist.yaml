@@ -1,0 +1,121 @@
+# .debug-swallow-allowlist.yaml -- baseline for tests/test_no_debug_only_swallows.py
+# (alpha-engine-config-I10031 class, alpha-engine-config-I10226 fleet sweep).
+#
+# The class this guards: an `except Exception` whose body only records the
+# failure at logger.debug(...)/log.debug(...) or discards it as a bare
+# `pass` -- invisible on any entrypoint whose root logger runs at INFO. A new
+# site with no entry fails the build. An entry whose `expires` has passed
+# fails loudly -- re-justify or remove, never silently re-grandfather. An
+# entry that no longer matches anything ALSO fails, so the allowance cannot
+# quietly widen after the site it covered is gone or fixed. Mirrors
+# `.provider-linkage-allowlist.yaml` / `crucible-executor`'s own
+# `.debug-swallow-allowlist.yaml` (alpha-engine-config-I10031/-I9295).
+#
+# `path` + `line` identify the `except` line itself (the line the guard's
+# AST walk reports, via `nousergon_lib.testing.debug_swallow_guard`). Every
+# entry requires a `reason` naming (a) the failure mode swallowed and (c)
+# the concrete recording surface (or the explicit "no recording surface --
+# carve-out" for a transport/teardown/expected-absence-with-fallback
+# swallow the fleet rule's own carve-out clause covers), per
+# `~/Development/CLAUDE.md` "Fail loud and fast."
+#
+# alpha-engine-config-I10226 sweep of this repo: the AST detector found 8
+# live sites (vs the issue's crude 11-site grep estimate -- the detector
+# only matches a bare `except Exception:`/`except Exception as e:` whose
+# entire body is literally `pass` or a call to a variable NAMED `logger`
+# (`logger.debug(...)`); most of this repo's modules log via a variable
+# named `log`, so a `log.debug(...)`-only swallow is out of THIS class's
+# scope by the shared detector's own scoped definition -- same scoping the
+# fleet's crude grep measurement used). Of the 8: 2 were RECORDED LOUD
+# (raising was architecturally unsafe -- see the inline (a)/(c) comments at
+# model/registry.py and inference/stages/load_model.py) and no longer match
+# the debug-only-or-pass shape, so they carry no allowlist entry; the
+# remaining 6 below are genuine carve-outs (dev-tooling / teardown /
+# best-effort-secondary-write / index-nicety / expected-absence-with-
+# fallback), each with an inline (a)/(c) comment at the site.
+
+schema_version: 1
+entries:
+  # ── OFFLINE dev-mode stub (daily_predict.py) ─────────────────────────────
+  - path: inference/daily_predict.py
+    line: 321
+    reason: >-
+      nousergon_lib.health import failure while stubbing write_health for
+      the local --offline CLI dev harness. No recording surface --
+      dev-tooling carve-out; this block never runs on a production/Lambda
+      entrypoint and the stub is best-effort (unstubbed write_health just
+      runs as-is on failure).
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Optional companion-file download (load_model.py) ─────────────────────
+  - path: inference/stages/load_model.py
+    line: 58
+    reason: >-
+      Optional {s3_key}.meta.json companion download failed (absent for
+      older training cycles that predate it). No recording surface --
+      expected-absence-with-fallback, same class as crucible-executor's
+      optimizer_shadow.py carve-out; nothing downstream reads the meta.json
+      unconditionally.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Best-effort secondary local-cache write (write_output.py) ────────────
+  - path: inference/stages/write_output.py
+    line: 571
+    reason: >-
+      Local predictor-params cache write (fault-tolerance nicety) failed
+      after the primary S3 read already succeeded this call. No recording
+      surface -- best-effort carve-out; `_predictor_params_cache` is
+      already set from the successful S3 read, so this run is unaffected,
+      and a subsequent failed local-cache READ (a separate, out-of-scope
+      site) already logs its own failure.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Index-reassignment nicety (regime/drawdown.py) ────────────────────────
+  - path: regime/drawdown.py
+    line: 889
+    reason: >-
+      Date-column parse/reindex of the eod_pnl NAV series failed
+      (malformed/unexpected date dtype). No recording surface -- carve-out;
+      the series keeps its default integer index and the drawdown
+      computation below is index-agnostic, so this is a display/debugging
+      nicety, not a correctness dependency.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── LightGBM Dataset teardown (training/leakfree_meta_ic.py) ─────────────
+  - path: training/leakfree_meta_ic.py
+    line: 749
+    reason: >-
+      Booster.free_dataset() teardown failed after predict() already
+      consumed the trees. No recording surface -- teardown carve-out, same
+      class as crucible-executor's connection-teardown swallows; a failed
+      release only leaks one fold's C-level Dataset until process exit, it
+      does not affect `preds`.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+  # ── Documented literal fallback (training/train_handler.py) ──────────────
+  - path: training/train_handler.py
+    line: 1021
+    reason: >-
+      Reading the base champion's model_version_label via `_cfg._cfg`
+      failed (attr absent, not a dict, or malformed). No recording surface
+      -- expected-absence-with-fallback, same class as crucible-executor's
+      eod_reconcile.py carve-out; the documented literal default
+      ("v3.0-meta") immediately below is the intended fallback.
+    expires: "2027-03-08"
+    tracking: alpha-engine-config-I10226
+
+# model/registry.py:522 (pre-edit line) and inference/stages/load_model.py:209
+# (pre-edit line) are deliberately NOT listed here: both were RECORDED LOUD
+# (logger.warning/log.warning with a named failure mode and recording
+# surface) rather than carved out, per alpha-engine-config-I10226's triage --
+# see the inline (a)/(c) comments at each site. Raising was judged
+# architecturally unsafe at both (registry.py's restamp sits inside an
+# already-successful promotion whose demote/promote calls must not abort;
+# load_model.py's calibrator load has no safe outer handler to bubble to
+# without aborting inference entirely for a degraded-but-servable
+# condition), so RECORD-LOUD was the correct disposition, not RAISE.

@@ -737,6 +737,13 @@ def gbm_blender_fit_predict(**lgb_params) -> Callable:
         # (the c5.large incident 2026-06-01). predict() above already used the
         # trees, so freeing the dataset is numerically inert — mirrors
         # GBMScorer's free_dataset (PR #193). Per [[reference-lightgbm-free-dataset-post-fit]].
+        # (a) LightGBM's free_dataset() teardown failed (already-freed
+        # Dataset, an unsupported booster variant, etc). (c) no recording
+        # surface -- teardown carve-out: predict() above already consumed
+        # the trees, so a failed release is numerically inert for `preds`;
+        # it only means this one fold's C-level Dataset leaks until the
+        # process exits, same class as executor's connection-teardown
+        # swallows.
         try:
             model.booster_.free_dataset()
         except Exception:  # best-effort; never block the observe diagnostic

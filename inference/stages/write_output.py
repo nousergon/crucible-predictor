@@ -556,7 +556,16 @@ def _load_predictor_params_from_s3(s3_bucket: str) -> dict | None:
         if "veto_confidence" in data:
             _predictor_params_cache = data
             log.info("Loaded predictor params from S3: veto_confidence=%.2f", data["veto_confidence"])
-            # Persist to local cache for fault tolerance
+            # Persist to local cache for fault tolerance. (a) the local
+            # cache write failed (disk full, read-only fs on a Lambda
+            # invocation, etc). (c) no recording surface -- best-effort
+            # carve-out: `data` was already read from S3 successfully this
+            # call and `_predictor_params_cache` is already set above, so a
+            # failed local cache write has no effect on this run; it only
+            # means the NEXT run's S3-outage fallback (below) has nothing to
+            # fall back to, and that fallback path's own outer try/except
+            # (a separate site, not in scope here) already records a failed
+            # local-cache read.
             try:
                 _PREDICTOR_PARAMS_CACHE_PATH.write_text(json.dumps(data, indent=2))
             except Exception:

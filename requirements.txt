@@ -82,7 +82,13 @@ krepis[flow-doctor]==0.59.53  # pinned per §139 — first-party/fast-moving dep
 # gitleaks/session_dlp prerequisite — it does not. No file here imports
 # `krepis.LLMClient` (`grep -rn "LLMClient" --include="*.py" .` is empty); the
 # `[flow-doctor]` extra pulled in is the diagnosis wiring, not LLMClient itself.
-nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.99
+# Bumped v0.124.99 -> v0.124.115 (alpha-engine-config-I10226): tests/test_no_debug_only_swallows.py
+# is a thin call-site over nousergon_lib.testing.debug_swallow_guard (lifted from
+# crucible-executor's AST class guard, nousergon-lib-PR398). 0.124.115 is the
+# expected next patch after PR398 merges (0.124.114 is current at pin time) --
+# this pin is a placeholder that will 404 until nousergon-lib-PR398 merges and
+# auto-version-bump publishes it; CI on this branch is expected red until then.
+nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.23.0

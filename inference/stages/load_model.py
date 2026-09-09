@@ -48,7 +48,11 @@ def _load_meta_models(ctx: PipelineContext) -> None:
         import boto3 as _b3
         _s3 = _b3.client("s3")
         _s3.download_file(ctx.bucket, s3_key, str(local))
-        # Also try meta.json
+        # Also try meta.json. (a) the companion metadata file is absent for
+        # older training cycles that predate it. (c) no recording surface --
+        # expected-absence-with-fallback, same class as executor's
+        # optimizer_shadow.py carve-out: nothing downstream reads
+        # `{local}.meta.json` unconditionally, its absence is a normal state.
         try:
             _s3.download_file(ctx.bucket, f"{s3_key}.meta.json", str(local) + ".meta.json")
         except Exception:
@@ -206,8 +210,19 @@ def _load_meta_models(ctx: PipelineContext) -> None:
             path = _dl(cfg.CALIBRATOR_WEIGHTS_KEY, "meta_calibrator.pkl")
             ctx.calibrator = PlattCalibrator.load(path)
             log.info("Loaded Platt calibrator for meta-model output")
-        except Exception:
-            pass
+        except Exception as e:
+            # (a) failed to load the live Platt calibrator — ctx.calibrator
+            # stays None and inference silently falls back to the raw,
+            # uncalibrated meta-model probability for every ticker today.
+            # Unlike the shadow calibrator below (genuinely OBSERVE-ONLY,
+            # never feeds the authoritative output), this IS the
+            # authoritative calibration path, so a silent miss here changes
+            # what gets served without any record. (c) recorded here at
+            # WARNING as the recording surface.
+            log.warning(
+                "Platt calibrator unavailable, falling back to raw "
+                "uncalibrated meta-model probability: %s", e,
+            )
 
     # Shadow calibrator — OBSERVE-ONLY dual-output (config#1176). Training
     # already fits a parallel calibrator (predictor.yaml calibration.shadow_method
