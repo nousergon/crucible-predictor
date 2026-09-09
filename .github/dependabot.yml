@@ -11,6 +11,17 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # PAUSED — Crucible v2 phase-4 decommission (alpha-engine-config-I10251,
+    # Brian ruling 2026-09-08). This repo is a v1 component scheduled for
+    # retirement by alpha-engine-config-I9760, so a weekly pip version bump here
+    # costs a CI cycle and a backlog-triage entry on code that is being deleted.
+    # A limit of 0 suppresses VERSION updates only: Dependabot SECURITY updates
+    # carry their own separate limit and still open PRs (measured 2026-09-08),
+    # which is why the block is kept rather than deleted. The github-actions
+    # block below is deliberately UNTOUCHED — supply-chain SHA re-pins keep
+    # flowing, and repo_baseline_sweep.py RB-4.3 asserts that block's presence.
+    # Restore the pre-pause value at cutover — see I10251's closes-when.
+    open-pull-requests-limit: 0
     cooldown:
       semver-major-days: 30
     groups:
