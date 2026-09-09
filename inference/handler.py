@@ -396,10 +396,17 @@ def handler(event: dict, context) -> dict:
     if action == "check_drift":
         from monitoring.drift_detector import check_drift
         result = check_drift(bucket=bucket, date_str=date_str, dry_run=dry_run)
+        # alpha-engine-config-I10281: name the artifact only when one was
+        # actually written. On the canary (dry_run) check_drift SKIPS the S3
+        # write by design, and this line claimed `-> drift_{date}.json`
+        # regardless — a record asserting an action that never happened, on the
+        # same invocation that was paging an operator.
         log.info(
-            "Drift check %s: status=%s severity=%s n_alerts=%d → drift_%s.json",
+            "Drift check %s: status=%s severity=%s n_alerts=%d %s",
             result["date"], result["status"], result.get("severity"),
-            result.get("n_alerts", 0), result["date"],
+            result.get("n_alerts", 0),
+            ("(canary: synthetic probe, no artifact written)" if dry_run
+             else f"→ drift_{result['date']}.json"),
         )
         return result
 

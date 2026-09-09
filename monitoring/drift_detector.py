@@ -783,10 +783,39 @@ def check_drift(
         except Exception as e:
             logger.warning("Drift results S3 write failed: %s", e)
 
+    # ── Emission (alpha-engine-config-I10281) ────────────────────────────────
+    # ``DRIFT ALERT`` is the OPERATOR-FACING token: a log-pattern subscriber
+    # pages on it. ``dry_run=True`` is the deploy canary — a synthetic probe of
+    # a freshly-published, NOT-YET-LIVE Lambda version (``infrastructure/
+    # deploy.sh``), invoked once per deploy against whatever day's artifacts
+    # happen to exist. It observes no production run, so it has nothing to
+    # report to an operator, and every OTHER canary stage already says so in
+    # its own words ("invocation_kind='canary' is synthetic … No verdict
+    # written", alpha-engine-config-I8155). This was the one stage that did
+    # not: on 2026-09-08 six deploys emitted six byte-identical
+    # ``DRIFT ALERT [CRITICAL] Confidence collapse`` lines for the SAME
+    # 2026-09-08 condition and paged Brian four times. The finding was true;
+    # the repetition was a probe re-reading one day's artifacts once per
+    # deploy. Duplicate suppression at the notifier cannot fix that — the
+    # canary should never have raised an operator alert in the first place, so
+    # the suppression belongs HERE, at the emitting layer.
+    #
+    # The structured result is UNCHANGED in every mode: the canary still
+    # exercises the whole read path and still returns status/severity/
+    # alert_details, so deploy.sh's assertion on the shape of this result is
+    # unaffected. Only the operator-facing TOKEN is withheld.
     if details:
         for d in details:
+            if dry_run:
+                logger.info(
+                    "drift check (canary, synthetic probe of a not-yet-live "
+                    "version — NOT an operator alert): %s", d["line"],
+                )
+                continue
             log_fn = logger.error if d["severity"] == CRITICAL else logger.warning
             log_fn("DRIFT ALERT %s", d["line"])
+    elif dry_run:
+        logger.info("drift check (canary): no drift detected for %s", date_str)
     else:
         logger.info("No drift detected for %s", date_str)
 
