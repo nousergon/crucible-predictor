@@ -308,7 +308,13 @@ if __name__ == "__main__":
         # instead of restating it means the next rescale reaches this stub too.
         _wo.get_veto_threshold = lambda *a, **k: cfg.MIN_CONFIDENCE
 
-        # Stub health write
+        # Stub health write. (a) nousergon_lib.health import failed (the
+        # OFFLINE dev harness runs without the full production dependency
+        # set installed). (c) no recording surface -- dev-tooling carve-out,
+        # same class as executor's connection-teardown swallows: this whole
+        # block is gated behind the local --offline CLI flag, never reached
+        # on a production/Lambda entrypoint, and the stub is purely
+        # best-effort (if it fails, write_health just runs unstubbed).
         try:
             import nousergon_lib.health as _health
             _health.write_health = lambda *a, **k: None

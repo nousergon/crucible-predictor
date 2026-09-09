@@ -881,6 +881,11 @@ def read_eod_pnl_nav(
         try:
             idx = pd.to_datetime(df.loc[series.index, date_cols[0]])
             series.index = idx
+        # (a) date-column parse/reindex failed (malformed or unexpected
+        # date-column dtype). (c) no recording surface -- carve-out: `series`
+        # keeps its default integer index and the drawdown computation below
+        # is index-agnostic (it only uses `series.values`/positional ops), so
+        # this is a display/debugging nicety, not a correctness dependency.
         except Exception:  # noqa: BLE001 — index is a nicety, not required
             pass
     if len(series) < 2:

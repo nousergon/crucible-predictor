@@ -1009,6 +1009,11 @@ def _cfg_default_label(_cfg) -> str:
     the live attr can't tell us the base — we read the underlying yaml default
     via ``config._cfg`` when present, else fall back to the documented default.
     """
+    # (a) reading the underlying yaml default via `_cfg._cfg` failed (attr
+    # absent, not a dict, or malformed). (c) no recording surface --
+    # expected-absence-with-fallback, same class as executor's
+    # eod_reconcile.py carve-out: the documented literal default below is
+    # the intended fallback, not a degraded state.
     try:
         raw = getattr(_cfg, "_cfg", None)
         if isinstance(raw, dict):

@@ -31,10 +31,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # alpha-engine-config-I9018 — the two prefixes are SEPARATE and must stay so.
 #
@@ -519,8 +522,22 @@ def promote_to_champion(
             Body=json.dumps(_m, indent=2).encode(),
             ContentType="application/json",
         )
-    except Exception:  # noqa: BLE001 — observability restamp, never blocks promote
-        pass
+    except Exception as e:
+        # (a) failed to restamp served_version/served_date onto the live
+        # manifest.json after a successful promotion — raising here would
+        # abort the demote/promote calls immediately below, which must not
+        # fail (the weights are already live + correct; only this audit
+        # metadata write failed). (c) recorded here at WARNING — the only
+        # surface, since the manifest lineage this restamp would have fixed
+        # is now silently stale until the next promotion.
+        logger.warning(
+            "model/registry.py promote(): failed to restamp served_version/"
+            "served_date on %smanifest.json after promotion of %s — "
+            "manifest lineage is stale until the next promote: %s",
+            live_prefix,
+            version_id,
+            e,
+        )
 
     # Demote any prior champion(s), then mark this one champion (exactly one).
     for other in list_versions(s3, bucket, stage="champion", registry_prefix=registry_prefix):
