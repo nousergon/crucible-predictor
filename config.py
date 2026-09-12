@@ -633,6 +633,40 @@ def assert_model_specs_loaded() -> None:
 MODEL_ZOO_AUTO_PROMOTE_WINNER = _flag_env_or_yaml(
     "MODEL_ZOO_AUTO_PROMOTE_WINNER", _cfg.get("model_zoo_auto_promote_winner", False)
 )
+
+# ── The pre-registered out-of-sample commitment window (I10259) ──────────────
+# `alpha-engine-config/private-docs/ALPHA_EXPERIMENT_COMMITMENT.yaml` declares
+# the 252-session freeze (Brian rulings 2026-09-08 / -I9679, 2026-09-09 /
+# -I10302). Until 2026-09-12 nothing in this repo read it, and the weekly
+# ModelZooSelect promoted straight over the frozen version on its first
+# rotation after the freeze — see training/commitment.py's docstring.
+#
+# The default is the CHECKOUT ON THE TRAINING BOX, which
+# infrastructure/spot_train.sh --model-zoo-select already `git pull`s
+# immediately before the select step runs, so the ruling the promoter reads is
+# the one on alpha-engine-config main as of that pull and not a copy baked into
+# this repo's image. Env-overridable for a laptop dry-run or a relocated
+# checkout; a configured-but-MISSING file is a REFUSAL, never a pass
+# (training/model_zoo.py::_commitment_refusal).
+ALPHA_EXPERIMENT_COMMITMENT_PATH = os.environ.get(
+    "ALPHA_EXPERIMENT_COMMITMENT_PATH",
+    _cfg.get("alpha_experiment_commitment_path")
+    or "/home/ec2-user/alpha-engine-config/private-docs/ALPHA_EXPERIMENT_COMMITMENT.yaml",
+)
+# The S3 copy the DAILY inference detector reads (published on merge by
+# alpha-engine-config). The Lambda has no alpha-engine-config checkout, so the
+# detector cannot read the path above — the S3 publication is what makes the
+# ruling reachable from inference at all.
+ALPHA_EXPERIMENT_COMMITMENT_S3_KEY = os.environ.get(
+    "ALPHA_EXPERIMENT_COMMITMENT_S3_KEY",
+    "_commitment/ALPHA_EXPERIMENT_COMMITMENT.yaml",
+)
+# Producer key for the detector's own verdict — the durable surface on which a
+# voided window is visible to the console and to any later reader.
+COMMITMENT_WINDOW_STATE_KEY = os.environ.get(
+    "COMMITMENT_WINDOW_STATE_KEY",
+    "predictor/commitment/window_state.json",
+)
 # config#2889 — independent second-party IC recomputation from realized outcomes
 # (Brian's 2026-07-18 Decision Queue Option-B ruling). The self-reported CPCV mean
 # IC drives BOTH promotion and the report-card grade with no independent check; a
