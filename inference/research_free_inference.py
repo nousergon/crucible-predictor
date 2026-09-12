@@ -37,6 +37,28 @@ full discovery narrative — this repeats only what's load-bearing here):
   (``crucible-research/data/scanner_orchestrator.py::build_candidates_artifact``,
   config#1458). This module reads THAT artifact directly; it never touches
   ``scanner_evaluations`` (sqlite) at all.
+- **Candidates pool resolution is a bounded lookback, not an exact same-day
+  key (alpha-engine-config-I10301).** The weekly Scanner writes
+  ``candidates/{d}/candidates.json`` only on its own self-selected run day
+  (normally Saturday), while this producer is invoked from the WEEKDAY
+  preopen pipeline (alpha-engine-config-I10067) — the two schedules never
+  coincide, so an exact-date read against ``date_str`` finds nothing on
+  every ordinary weekday. ``run_research_free_inference`` instead resolves
+  the MOST RECENT ``candidates/{d}/candidates.json`` with ``d <= date_str``,
+  walking back day by day (``get_object`` per candidate date — no
+  ``ListBucket`` dependency) up to ``_CANDIDATES_LOOKBACK_DAYS`` (8) days.
+  The resolved pool's own date is recorded in the written envelope as
+  ``candidates_date`` (and the walk-back distance as
+  ``candidates_lookback_days``) alongside the existing fields — the output
+  artifact itself stays keyed by TODAY
+  (``predictions_research_free/{date_str}.json``), and per-ticker feature
+  scoring stays same-day (``end=date_str``); only the scanner-passing POOL
+  and rank-normalization universe come from the resolved (possibly older)
+  candidates artifact. No candidates artifact within the 8-day bound is a
+  genuine precondition failure and still raises (fail-hard, per this
+  module's existing doctrine below) rather than serving an unboundedly
+  stale pool forever — a real Scanner outage must still surface. The 8-day
+  bound is an assumption stated for I10301, overridable by Brian.
 - **Residual-momentum features MUST be computed from close history via this
   repo's own ``data/residual_momentum_features.py``, not read as precomputed
   ArcticDB universe-library columns.** Confirmed by the backtester's build
@@ -98,7 +120,7 @@ import json
 import logging
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +140,14 @@ PREDICTIONS_RESEARCH_FREE_KEY = cfg.PREDICTIONS_RESEARCH_FREE_KEY
 PREDICTIONS_RESEARCH_FREE_LATEST_KEY = cfg.PREDICTIONS_RESEARCH_FREE_LATEST_KEY
 
 _CANDIDATES_PREFIX = "candidates"
+
+# Bounded walk-back for resolving the most-recent scanner-passing pool
+# against a producer that now runs daily while its sole source
+# (candidates/{d}/candidates.json) is written only on the weekly Scanner's
+# self-selected run day (alpha-engine-config-I10301). A real Scanner outage
+# must still surface rather than serve an unboundedly stale pool forever —
+# see module docstring. Assumption stated for I10301, overridable by Brian.
+_CANDIDATES_LOOKBACK_DAYS = 8
 
 
 
@@ -155,6 +185,47 @@ def load_candidates_artifact(
             f"cannot determine the scanner-passing pool"
         )
     return artifact
+
+
+def load_candidates_artifact_with_lookback(
+    bucket: str,
+    date_str: str,
+    *,
+    lookback_days: int = _CANDIDATES_LOOKBACK_DAYS,
+    s3_client=None,
+) -> tuple[dict, str, int]:
+    """Return ``(artifact, candidates_date, lookback_offset)`` for the MOST
+    RECENT ``candidates/{d}/candidates.json`` with ``d <= date_str``, walking
+    back one calendar day at a time (a ``get_object`` per candidate date —
+    no ``ListBucket`` dependency) up to ``lookback_days`` days.
+
+    ``candidates_date`` is the resolved pool's own date (``== date_str`` on
+    the common exact-match case); ``lookback_offset`` is how many days back
+    from ``date_str`` it was found (0 == exact match). Raises RuntimeError
+    if no artifact is found within the bound — a genuine precondition
+    failure (Scanner outage longer than the bound), not something this
+    producer should silently degrade for (see module docstring).
+    """
+    d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    last_exc: Exception | None = None
+    for offset in range(lookback_days + 1):
+        d_try = (d - timedelta(days=offset)).strftime("%Y-%m-%d")
+        try:
+            artifact = load_candidates_artifact(bucket, d_try, s3_client=s3_client)
+        except RuntimeError as exc:
+            last_exc = exc
+            continue
+        if offset > 0:
+            log.info(
+                "Candidates pool for %s resolved to %s (%d day(s) back) — no "
+                "same-day candidates.json (alpha-engine-config-I10301).",
+                date_str, d_try, offset,
+            )
+        return artifact, d_try, offset
+    raise RuntimeError(
+        f"no candidates.json found within {lookback_days} day(s) at or before "
+        f"{date_str} (s3://{bucket}/{_CANDIDATES_PREFIX}/) — last error: {last_exc}"
+    )
 
 
 def load_scanner_pool(
@@ -455,7 +526,9 @@ def run_research_free_inference(
     bucket = bucket or cfg.S3_BUCKET
     research_meta_features = frozenset(RESEARCH_META_FEATURES)
 
-    candidates_artifact = load_candidates_artifact(bucket, date_str, s3_client=s3_client)
+    candidates_artifact, candidates_date, candidates_lookback_days = (
+        load_candidates_artifact_with_lookback(bucket, date_str, s3_client=s3_client)
+    )
     pool_tickers = sorted({
         rec["ticker"] for rec in candidates_artifact["scanner_eval_log"]
         if rec.get("ticker") and rec.get("quant_filter_pass") == 1
@@ -597,6 +670,8 @@ def run_research_free_inference(
     envelope = {
         "schema_version": SCHEMA_VERSION,
         "date": date_str,
+        "candidates_date": candidates_date,
+        "candidates_lookback_days": candidates_lookback_days,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "n_predictions": len(entries),
         "n_scanner_pool": len(pool_tickers),
