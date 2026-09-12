@@ -177,6 +177,16 @@ class PipelineHardFail(Exception):
 # Critical stages abort the pipeline on failure. Non-critical stages log and continue.
 STAGES = [
     ("load_model",     "inference.stages.load_model",     True),
+    # Out-of-sample commitment window detector (alpha-engine-config-I10259).
+    # Placed immediately after load_model — the earliest point at which "what
+    # is this session serving?" is a settled question — and BEFORE any
+    # prediction is written, so a voided window is recorded against the same
+    # session the breach affected rather than a later one. Non-critical and it
+    # touches no ctx field: a commitment window is an EVALUATION commitment,
+    # and voiding it changes what the eventual verdict may claim, never whether
+    # today's book is valid. It publishes its own ops alert (see the stage
+    # docstring) rather than relying on run_pipeline's log-and-continue.
+    ("commitment_guard", "inference.stages.commitment_guard", False),
     ("load_universe",  "inference.stages.load_universe",  True),
     ("load_prices",    "inference.stages.load_prices",    True),
     ("run_inference",  "inference.stages.run_inference",  True),

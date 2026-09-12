@@ -51,3 +51,42 @@ def _block_real_alert_publish(monkeypatch):
         return
     monkeypatch.setattr(alerts, "publish", MagicMock(name="alerts.publish"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_commitment_window(monkeypatch, tmp_path):
+    """Point ``ALPHA_EXPERIMENT_COMMITMENT_PATH`` at an explicit NO-WINDOW file
+    for every test (alpha-engine-config-I10259).
+
+    ``training/model_zoo.py``'s COMMITMENT gate fails CLOSED: a commitment path
+    that is configured and whose file is MISSING is a refusal, because a
+    promoter that cannot read the ruling it is subject to must not promote. The
+    default path is the training box's ``alpha-engine-config`` checkout, which
+    does not exist on a laptop or a CI runner — so without this fixture every
+    pre-existing promotion test would exercise the fail-closed branch instead of
+    the promotion it was written to assert, and would report the gate's
+    correctness as those tests' failure.
+
+    The ambient state is stated rather than bypassed: a real file declaring
+    ``rotation: active`` and no ``freeze_date``, which is what "no window is
+    declared" looks like on disk. Tests that care about the gate
+    (``tests/test_commitment_window_gate_and_detector.py``) override
+    ``cfg.ALPHA_EXPERIMENT_COMMITMENT_PATH`` themselves, in both directions —
+    including the missing-file and unparseable-file refusals — so the fail-closed
+    behaviour is still covered, here rather than everywhere.
+    """
+    path = tmp_path / "ALPHA_EXPERIMENT_COMMITMENT.yaml"
+    path.write_text("rotation: active\n")
+    monkeypatch.setenv("ALPHA_EXPERIMENT_COMMITMENT_PATH", str(path))
+    # Both surfaces, unconditionally: `config` resolves the value at IMPORT
+    # time, which is before this fixture runs, so the env var alone would leave
+    # `cfg.ALPHA_EXPERIMENT_COMMITMENT_PATH` pointing at the box checkout. Not
+    # guarded by try/except — every test in this repo imports `config`, so an
+    # import failure here is a broken suite and must surface, not be swallowed
+    # into a fixture that then silently does half its job.
+    import config as cfg
+
+    monkeypatch.setattr(
+        cfg, "ALPHA_EXPERIMENT_COMMITMENT_PATH", str(path), raising=False,
+    )
+    yield

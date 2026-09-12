@@ -98,4 +98,8 @@ class TestRunPipeline:
         ctx = PipelineContext(date_str="2026-04-08", start_ts=time.monotonic())
         run_pipeline(ctx)
 
-        assert call_count["n"] == 2
+        # Derived from the registered stage list, not a literal: load_universe
+        # is the aborting stage, so exactly the stages up to and including it
+        # ran. A bare `== 2` re-breaks every time a stage is inserted above it.
+        n_through_abort = [s[0] for s in STAGES].index("load_universe") + 1
+        assert call_count["n"] == n_through_abort

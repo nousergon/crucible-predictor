@@ -2316,6 +2316,136 @@ def _alert_promote_failure(bucket, date_str, promote_vid, promote_kind, exc) -> 
         log.warning("model_zoo: promote-failure alert failed", exc_info=True)
 
 
+def _commitment_refusal(date_str, promote_vid, promote_kind) -> dict | None:
+    """The out-of-sample COMMITMENT gate — alpha-engine-config-I10259.
+
+    ``alpha-engine-config/private-docs/ALPHA_EXPERIMENT_COMMITMENT.yaml``
+    declares a 252-session freeze pinning the serving champion, with
+    ``rotation: suspended`` (Brian rulings 2026-09-08 / -I9679 and 2026-09-09 /
+    -I10302). Measured 2026-09-12: no code in this repo read that file, and this
+    very cutover auto-promoted ``spec-sota-combine-2026-09-11-753cfbed``
+    (``arena-pointer``, CPCV IC -0.043) over the frozen version on the first
+    weekly rotation after the freeze
+    (``predictor/model_zoo/promotions/2026-09-11.json``). The suspension existed
+    only in prose; this makes it an actuator.
+
+    Returns ``None`` when the promotion may proceed, or a
+    ``leaderboard["promotion_refused"]`` payload when it may not.
+
+    FAIL CLOSED on an unreadable ruling. A commitment path that is configured
+    (or defaulted) and whose file is MISSING or unparseable is NOT "no window":
+    it is a promoter that cannot read the decision it is subject to. Promoting
+    then is exactly the 2026-09-12 failure with a different cause — the box
+    checkout not pulled, the file moved, the YAML broken — so it refuses
+    instead. The refusal is loud and self-clearing: fix the path (or land the
+    ruling) and the next rotation promotes.
+    """
+    from training import commitment as _commit
+
+    path = _commit.commitment_path()
+    try:
+        doc = _commit.load_commitment(path)
+    except Exception as exc:  # noqa: BLE001 — CommitmentUnreadable and anything else
+        reason = (
+            f"COMMITMENT gate (alpha-engine-config-I10259): the commitment file "
+            f"{path} exists but could not be read as a ruling ({type(exc).__name__}: "
+            f"{exc}). A promoter that cannot read the freeze it is subject to must "
+            f"not promote. REFUSED."
+        )
+        log.error("model_zoo %s", reason, exc_info=True)
+        _alert_commitment_refusal(date_str, promote_vid, promote_kind, reason,
+                                  dedup_suffix="unreadable")
+        return {
+            "would_have_promoted": promote_vid,
+            "would_have_been_kind": promote_kind,
+            "reason": reason,
+            "commitment": {"path": path, "status": "unreadable", "error": str(exc)},
+        }
+
+    if doc is None:
+        reason = (
+            f"COMMITMENT gate (alpha-engine-config-I10259): no commitment file at "
+            f"{path} — the ruling this promoter is subject to is UNREADABLE, which "
+            f"is not the same as absent. On the training box that path is a checkout "
+            f"`infrastructure/spot_train.sh --model-zoo-select` pulls immediately "
+            f"before this step, so its absence means the pull did not happen or the "
+            f"file moved. REFUSED rather than promoted on a ruling nobody read; set "
+            f"ALPHA_EXPERIMENT_COMMITMENT_PATH or restore the checkout and re-run."
+        )
+        log.error("model_zoo %s", reason)
+        _alert_commitment_refusal(date_str, promote_vid, promote_kind, reason,
+                                  dedup_suffix="missing")
+        return {
+            "would_have_promoted": promote_vid,
+            "would_have_been_kind": promote_kind,
+            "reason": reason,
+            "commitment": {"path": path, "status": "missing"},
+        }
+
+    if not _commit.window_active(doc, date_str):
+        return None
+
+    frozen = _commit.frozen_version_ids(doc)
+    if promote_vid in frozen:
+        # Promoting the pinned version IS the frozen state; the cutover above
+        # already no-ops when the pointer does not move, so this is belt-and-
+        # braces rather than a live path.
+        return None
+
+    reason = (
+        f"COMMITMENT gate (alpha-engine-config-I10259): the pre-registered "
+        f"out-of-sample window declared in {path} is ACTIVE (freeze_date "
+        f"{(_commit.freeze_date(doc) or '?')}, rotation: suspended) and pins "
+        f"{frozen or '(none declared)'}. Promoting {promote_kind or '?'} "
+        f"{promote_vid} would VOID the window. REFUSED — the live champion is "
+        f"unchanged."
+    )
+    log.error("model_zoo %s", reason)
+    _alert_commitment_refusal(date_str, promote_vid, promote_kind, reason,
+                              dedup_suffix=str(promote_vid))
+    return {
+        "would_have_promoted": promote_vid,
+        "would_have_been_kind": promote_kind,
+        "reason": reason,
+        "commitment": _commit.describe(doc, path=path),
+    }
+
+
+def _alert_commitment_refusal(date_str, promote_vid, promote_kind, reason,
+                              *, dedup_suffix: str) -> None:
+    """A commitment REFUSAL is the gate working, so it is a ``warning``, not a
+    page — but it is never silent: a suspended rotation that keeps producing
+    winners is exactly what the operator needs to see weekly, and an UNREADABLE
+    ruling is a real operator task.
+
+    Dedup is CONDITION-keyed, not run-keyed (ALERT003): the same refused
+    candidate, or the same unreadable path, pages once per dedup window rather
+    than once per rotation attempt. Never raises — alerting failure must not
+    fail the Step Function on a path whose verdict is already persisted in the
+    leaderboard.
+    """
+    msg = (
+        f"[predictor] Model-zoo promotion REFUSED by the out-of-sample "
+        f"commitment window ({date_str}).\n"
+        f"  candidate: {promote_kind or '?'} {promote_vid}\n"
+        f"  {reason}\n"
+        f"  Live weights ({_live_weights_prefix()}meta_model.pkl) are UNCHANGED. "
+        f"To lift the freeze, amend private-docs/ALPHA_EXPERIMENT_COMMITMENT.yaml "
+        f"in alpha-engine-config (a ruling, not a config flip); to clear an "
+        f"UNREADABLE ruling, restore the checkout at the path named above."
+    )
+    try:
+        from ops_alerts import publish_ops_alert
+
+        publish_ops_alert(
+            message=msg, severity="warning",
+            source="alpha-engine-predictor/training/model_zoo.py::run_rotation_and_select",
+            dedup_key=f"model_zoo_commitment_refused_{dedup_suffix}",
+        )
+    except Exception:  # noqa: BLE001 — alert failure must not fail the SF
+        log.warning("model_zoo: commitment-refusal alert failed", exc_info=True)
+
+
 def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> None:
     """Observe-mode: a challenger beat the champion but auto-promote is OFF — a
     low-priority (info) heads-up so the operator reviews the leaderboard + can
@@ -2444,7 +2574,17 @@ def _apply_realized_edge_demote(s3, bucket: str, date_str, verdict: dict, histor
     operator has ruled the no-good-arm state AND that state has an actuator here.
     Records what it did on the verdict — a demote that cannot record itself is the
     fleet's dominant bug class (a record asserting an action that never happened),
-    so an execution failure is recorded and alarmed, never swallowed silently."""
+    so an execution failure is recorded and alarmed, never swallowed silently.
+
+    DELIBERATELY NOT COMMITMENT-GATED (alpha-engine-config-I10259). This is the
+    one pointer move the out-of-sample window permits: the commitment file's own
+    text is "a red-line demotion deliberately and loudly VOIDS this window.
+    There is no exempt transition." Routing this through
+    ``_commitment_refusal`` would disarm the kill switch for the length of the
+    window, which is the opposite of what the freeze asks for. The void it
+    causes is DETECTED and paged by
+    ``inference/stages/commitment_guard.py`` on the next trading morning —
+    loudly, as the ruling requires."""
     state = verdict.get("demote_to")
     if state == "hold_incumbent":
         verdict["action"] = "held_incumbent"
@@ -3226,6 +3366,18 @@ def select_and_finalize(
                 "promote %s — %s", promote_vid, _slot_bar.get("reason"),
             )
             promote_vid, promote_kind = None, None
+
+        # ── COMMITMENT gate (alpha-engine-config-I10259) ─────────────────────
+        # Evaluated LAST, after the arena and the ENTRANCE gate, and only on the
+        # branch that would actually move the pointer: the freeze is not a
+        # ranking input, it is a prohibition on acting. Its verdict lands in the
+        # same `promotion_refused` field the ENTRANCE gate uses, so one reader
+        # of the leaderboard sees every reason a rotation did not promote.
+        if promote_vid and auto_promote_winner:
+            _commit_refusal = _commitment_refusal(date_str, promote_vid, promote_kind)
+            if _commit_refusal is not None:
+                leaderboard["promotion_refused"] = _commit_refusal
+                promote_vid, promote_kind = None, None
 
         if promote_vid and auto_promote_winner:
             try:
