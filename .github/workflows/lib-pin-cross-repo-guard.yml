@@ -83,11 +83,6 @@ jobs:
           echo "crucible-predictor (this PR): $own_pin"
           echo "crucible-backtester (main):     $sibling_pin"
 
-          if [ "$own_pin" = "$sibling_pin" ]; then
-            echo "co-install parity OK: both pin $own_pin"
-            exit 0
-          fi
-
           # ── alpha-engine-config-I7934 ──────────────────────────────────────
           # A lockstep bump moves BOTH repos, so at the moment either PR runs,
           # the sibling's main still holds the OLD pin. Comparing only against
@@ -107,31 +102,35 @@ jobs:
           # This does NOT weaken the invariant. It defers it by one merge, and
           # the weekly SF's LibPinDriftGate (check_lib_pin_drift, main vs main)
           # still hard-fails if the second half never lands.
-          echo "pins differ — checking whether the lockstep partner is in flight on crucible-backtester"
+          #
+          # The pass/fail DECISION (including this lookaside) lives in
+          # scripts/lib_pin_cross_repo_guard.py, unit-tested in
+          # tests/test_lib_pin_cross_repo_guard.py (alpha-engine-config-I10762)
+          # — this step only fetches and hands off already-resolved inputs.
+          sibling_prs_json='[]'
+          sibling_unreachable=0
 
-          api="https://api.github.com/repos/nousergon/crucible-backtester/pulls?state=open&per_page=100"
-          if ! prs=$(curl -sS --fail --max-time 20 -H 'Accept: application/vnd.github+json' "$api"); then
-            echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin, AND the GitHub API could not be reached to check for an in-flight lockstep partner. Failing closed — this is 'no answer', not 'no partner'."
-            exit 1
-          fi
+          if [ "$own_pin" != "$sibling_pin" ]; then
+            echo "pins differ — checking whether the lockstep partner is in flight on crucible-backtester"
 
-          match=""
-          while IFS=$'\t' read -r num sha; do
-            [ -n "$num" ] || continue
-            raw="https://raw.githubusercontent.com/nousergon/crucible-backtester/$sha/requirements.txt"
-            body=$(curl -sS --fail --max-time 20 "$raw" 2>/dev/null) || continue
-            head_pin=$(printf '%s' "$body" | grep -oE "$PIN_RE" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            if [ "$head_pin" = "$own_pin" ]; then
-              match="$num"
-              break
+            api="https://api.github.com/repos/nousergon/crucible-backtester/pulls?state=open&per_page=100"
+            if ! prs=$(curl -sS --fail --max-time 20 -H 'Accept: application/vnd.github+json' "$api"); then
+              sibling_unreachable=1
+            else
+              entries="[]"
+              while IFS=$'\t' read -r num sha; do
+                [ -n "$num" ] || continue
+                raw="https://raw.githubusercontent.com/nousergon/crucible-backtester/$sha/requirements.txt"
+                body=$(curl -sS --fail --max-time 20 "$raw" 2>/dev/null) || body=""
+                head_pin=$(printf '%s' "$body" | grep -oE "$PIN_RE" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+                entries=$(python3 -c 'import json, sys; entries = json.loads(sys.argv[1]); entries.append({"number": int(sys.argv[2]), "pin": sys.argv[3] or None}); print(json.dumps(entries))' "$entries" "$num" "$head_pin")
+              done < <(printf '%s' "$prs" | python3 -c 'import json,sys; sys.stdout.write("".join("%s\t%s\n" % (p["number"], p["head"]["sha"]) for p in json.load(sys.stdin)))')
+              sibling_prs_json="$entries"
             fi
-          done < <(printf '%s' "$prs" | python3 -c 'import json,sys; sys.stdout.write("".join("%s\t%s\n" % (p["number"], p["head"]["sha"]) for p in json.load(sys.stdin)))')
-
-          if [ -n "$match" ]; then
-            echo "::notice::co-install parity DEFERRED: crucible-backtester@main is still $sibling_pin, but crucible-backtester#$match is open and already pins $own_pin. This is the other half of the lockstep arc. Merge both — the weekly SF's LibPinDriftGate fails if the second half never lands."
-            echo "co-install parity OK (lockstep partner in flight): crucible-backtester#$match pins $own_pin"
-            exit 0
           fi
 
-          echo "::error::co-install parity break: this PR would pin crucible-predictor to $own_pin while crucible-backtester@main is pinned to $sibling_pin, and NO open crucible-backtester PR pins $own_pin. spot_backtest.sh co-installs both into one venv (alpha-engine-config-I7835) — open the matching crucible-backtester pin PR and this check will pass on re-run."
-          exit 1
+          if [ "$sibling_unreachable" = "1" ]; then
+            python3 scripts/lib_pin_cross_repo_guard.py --own-pin "$own_pin" --sibling-pin "$sibling_pin" --sibling-api-unreachable
+          else
+            python3 scripts/lib_pin_cross_repo_guard.py --own-pin "$own_pin" --sibling-pin "$sibling_pin" --sibling-prs-json "$sibling_prs_json"
+          fi
