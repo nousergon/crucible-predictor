@@ -74,20 +74,14 @@ def test_setup_regime_lambda_script_exists_and_executable() -> None:
     assert "image-config" in content
 
 
-def test_iam_role_grants_logs_to_regime_lambda_log_group() -> None:
-    """The shared IAM role's CloudWatchLogs statement must include the
-    regime Lambda's log group; otherwise the function can be created
-    but cannot write logs."""
-    import json
-    role_file = REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-predictor-role.json"
-    policy = json.loads(role_file.read_text())
-    logs_statement = next(s for s in policy["Statement"] if s["Sid"] == "CloudWatchLogs")
-    resources = logs_statement["Resource"]
-    if isinstance(resources, str):
-        resources = [resources]
-    assert any(
-        "alpha-engine-predictor-regime-substrate" in r for r in resources
-    ), "IAM role's CloudWatchLogs statement must grant access to the regime Lambda's log group"
+# The IAM role's CloudWatchLogs log-group coverage for the regime and
+# regime-eval Lambdas used to be asserted here, against a public copy of
+# the policy (infrastructure/iam/alpha-engine-predictor-role.json) that
+# nothing applied to live AWS. That copy is deleted
+# (alpha-engine-config-I8143): IAM for this role is codified and applied
+# from the private nous-ergon-ops repo, whose own cross-repo contract
+# tests (the tests/test_cross_repo_sf_iam_contract.py pattern) are where
+# a log-group coverage assertion belongs. See infrastructure/iam/README.md.
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -126,22 +120,8 @@ def test_setup_regime_eval_lambda_script_exists_and_executable() -> None:
     assert "image-config" in content
 
 
-def test_iam_role_grants_logs_to_regime_eval_lambda_log_group() -> None:
-    """The shared IAM role's CloudWatchLogs statement must also include
-    the T1 retrospective eval Lambda's log group."""
-    import json
-    role_file = REPO_ROOT / "infrastructure" / "iam" / "alpha-engine-predictor-role.json"
-    policy = json.loads(role_file.read_text())
-    logs_statement = next(s for s in policy["Statement"] if s["Sid"] == "CloudWatchLogs")
-    resources = logs_statement["Resource"]
-    if isinstance(resources, str):
-        resources = [resources]
-    assert any(
-        "alpha-engine-predictor-regime-retrospective-eval" in r for r in resources
-    ), (
-        "IAM role's CloudWatchLogs statement must grant access to the "
-        "T1 retrospective eval Lambda's log group"
-    )
+# The eval Lambda's equivalent log-group-coverage assertion was removed
+# for the same reason — see the note above the substrate-Lambda block.
 
 
 # ─────────────────────────────────────────────────────────────────────

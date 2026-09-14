@@ -21,7 +21,7 @@ store:
   # shared/durable across processes and instances, so cooldown state
   # actually persists. Table provisioned out-of-band; runtime role only
   # needs CRUD (Put/Get/Query/Scan/DescribeTable), not CreateTable — see
-  # infrastructure/iam/alpha-engine-predictor-role.json.
+  # the private nous-ergon-ops repo's alpha-engine-predictor-role policy.
   type: dynamodb
   table_name: flow-doctor-store
   region: us-east-1

@@ -30,7 +30,6 @@ from pathlib import Path
 import pytest
 
 WORKFLOWS = Path(__file__).resolve().parents[1] / ".github" / "workflows"
-IAM_DRIFT = WORKFLOWS / "iam-drift-check.yml"
 
 # A workflow naming any of these reads live AWS and compares it against
 # codified source.
@@ -44,19 +43,12 @@ def _trigger_block(text: str) -> str:
     return m.group(1)
 
 
-def test_iam_drift_check_has_no_pull_request_trigger():
-    text = IAM_DRIFT.read_text(encoding="utf-8")
-    triggers = _trigger_block(text)
-    assert not re.search(r"^\s{2}pull_request:", triggers, re.MULTILINE), (
-        "iam-drift-check.yml grades live AWS against codified source. On a PR "
-        "it can only report drift the author did not cause and cannot clear "
-        "(Brian ruling 2026-08-10). Keep it on push:[main] + schedule."
-    )
-    # Removing it from PRs is only correct because it still runs elsewhere.
-    assert re.search(r"^\s{2}push:", triggers, re.MULTILINE), "no push trigger"
-    assert re.search(r"^\s{4}branches: \[main\]", triggers, re.MULTILINE)
-    assert re.search(r"^\s{2}schedule:", triggers, re.MULTILINE), "no daily sweep"
-    assert "check-drift.py" in text, "the checker invocation is gone entirely"
+# The repo-specific test asserting iam-drift-check.yml's own trigger shape
+# was removed alongside that workflow (alpha-engine-config-I8143): IAM for
+# this role is codified, applied, and drift-checked in the private
+# nous-ergon-ops repo now, not here. The class guard below still stands —
+# it protects any FUTURE workflow in this repo from reintroducing a live
+# drift comparison on the pull_request path.
 
 
 @pytest.mark.parametrize(
