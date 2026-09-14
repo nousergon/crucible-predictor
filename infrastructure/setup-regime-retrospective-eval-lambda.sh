@@ -19,7 +19,9 @@
 # Prerequisites:
 #   - AWS CLI configured
 #   - IAM role ``alpha-engine-predictor-role`` already exists with log-group
-#     access for this Lambda's group (per infrastructure/iam/apply.sh).
+#     access for this Lambda's group (codified and applied from the
+#     private nous-ergon-ops repo — see infrastructure/iam/README.md,
+#     not this repo).
 #   - ECR repo ``alpha-engine-predictor`` has at least one image tagged
 #     ``:latest`` (the inference deploy has run at least once).
 #   - The regime substrate Lambda's been running long enough that
@@ -75,7 +77,7 @@ aws ecr describe-images \
 
 echo "==> Verifying IAM role exists: ${ROLE_ARN}"
 aws iam get-role --role-name "${ROLE_NAME}" --query "Role.RoleName" --output text >/dev/null \
-  || { echo "ERROR: Role ${ROLE_NAME} does not exist. Run infrastructure/iam/apply.sh first."; exit 1; }
+  || { echo "ERROR: Role ${ROLE_NAME} does not exist. Apply it from the private nous-ergon-ops repo (see infrastructure/iam/README.md here) first."; exit 1; }
 
 # ── Create the function ───────────────────────────────────────────────────────
 echo "==> Creating Lambda function: ${FUNCTION_NAME}"
