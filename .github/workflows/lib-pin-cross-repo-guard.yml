@@ -123,13 +123,7 @@ jobs:
                 raw="https://raw.githubusercontent.com/nousergon/crucible-backtester/$sha/requirements.txt"
                 body=$(curl -sS --fail --max-time 20 "$raw" 2>/dev/null) || body=""
                 head_pin=$(printf '%s' "$body" | grep -oE "$PIN_RE" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-                entries=$(python3 -c '
-import json, sys
-entries = json.loads(sys.argv[1])
-pin = sys.argv[3] or None
-entries.append({"number": int(sys.argv[2]), "pin": pin})
-print(json.dumps(entries))
-' "$entries" "$num" "$head_pin")
+                entries=$(python3 -c 'import json, sys; entries = json.loads(sys.argv[1]); entries.append({"number": int(sys.argv[2]), "pin": sys.argv[3] or None}); print(json.dumps(entries))' "$entries" "$num" "$head_pin")
               done < <(printf '%s' "$prs" | python3 -c 'import json,sys; sys.stdout.write("".join("%s\t%s\n" % (p["number"], p["head"]["sha"]) for p in json.load(sys.stdin)))')
               sibling_prs_json="$entries"
             fi
