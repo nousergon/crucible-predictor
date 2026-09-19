@@ -88,6 +88,11 @@ class _FakeS3:
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.puts = {}
+        #: Raw bytes of every PUT, JSON or not. `puts` stays JSON-only so the
+        #: existing assertions keep reading parsed documents; the verdict
+        #: projection (alpha-engine-config-I11101) writes a bare word, and its
+        #: whole contract IS the exact bytes, so it is asserted from here.
+        self.raw_puts = {}
 
     def get_object(self, Bucket, Key):  # noqa: N803
         if Key not in self.objects:
@@ -101,7 +106,9 @@ class _FakeS3:
         return {"Body": _B()}
 
     def put_object(self, Bucket, Key, Body, ContentType=None):  # noqa: N803
-        self.puts[Key] = json.loads(Body)
+        self.raw_puts[Key] = Body
+        if ContentType in (None, "application/json"):
+            self.puts[Key] = json.loads(Body)
         self.objects[Key] = Body
 
 
@@ -655,7 +662,12 @@ class TestTheEmittedCycle:
         _cycle, doc = self._cycle()
         s3 = _FakeS3()
         keys = ams.emit_cycle(s3, "b", doc, as_of="2026-08-29")
-        assert keys == ["arena/model/2026-08-29.json", "arena/model/latest.json"]
+        assert keys == [
+            "arena/model/2026-08-29.json",
+            "arena/model/latest.json",
+            "arena/model/2026-08-29.verdict",
+            "arena/model/latest.verdict",
+        ]
         assert s3.puts["arena/model/latest.json"]["slot"] == "M"
 
     def test_a_malformed_cycle_is_never_written(self):
@@ -663,6 +675,69 @@ class TestTheEmittedCycle:
         with pytest.raises(Exception):
             ams.emit_cycle(s3, "b", {"slot": "M"}, as_of="2026-08-29")
         assert s3.puts == {}
+        assert s3.raw_puts == {}
+
+    # ── alpha-engine-config-I11101: the verdict projection ──────────────────
+
+    def test_the_verdict_projection_is_the_bare_status_word_and_nothing_else(self):
+        """The weekly SF compares the WHOLE body against one word, because it
+        cannot safely parse anything (States.StringToJson raises an uncatchable
+        States.Runtime on a malformed artifact — proven against live Step
+        Functions 2026-09-19). So every byte written here is the contract: no
+        trailing newline, no quotes, no JSON wrapper."""
+        _cycle, doc = self._cycle()
+        s3 = _FakeS3()
+        ams.emit_cycle(s3, "b", doc, as_of="2026-08-29")
+        body = s3.raw_puts["arena/model/2026-08-29.verdict"]
+        assert body == doc["decision"]["status"].encode("utf-8")
+        assert body == body.strip(), "no leading or trailing whitespace"
+        assert s3.raw_puts["arena/model/latest.verdict"] == body
+
+    def test_the_projection_cannot_disagree_with_the_cycle_it_is_taken_from(self):
+        """It is a PROJECTION, not a second source of truth. Both keys are
+        derived from the same validated doc inside the same function, so the
+        only way they could diverge is if someone recomputed the status."""
+        _cycle, doc = self._cycle()
+        s3 = _FakeS3()
+        ams.emit_cycle(s3, "b", doc, as_of="2026-08-29")
+        written = s3.puts["arena/model/2026-08-29.json"]["decision"]["status"]
+        assert s3.raw_puts["arena/model/2026-08-29.verdict"].decode() == written
+
+    def test_every_status_the_contract_allows_round_trips(self):
+        """The vocabulary is read from arena_cycle.schema.json rather than
+        restated, so a schema change is picked up here automatically. This
+        asserts that every word the schema permits is writable — a status the
+        SF would have no arm for must fail at the PRODUCER, not two systems
+        downstream."""
+        _cycle, doc = self._cycle()
+        for status in sorted(ams._verdict_vocabulary()):
+            s3 = _FakeS3()
+            variant = json.loads(json.dumps(doc))
+            variant["decision"]["status"] = status
+            ams._emit_verdict_projection(s3, "b", variant, as_of="2026-08-29")
+            assert s3.raw_puts["arena/model/2026-08-29.verdict"] == status.encode()
+
+    def test_a_status_outside_the_contract_vocabulary_fails_loud(self):
+        _cycle, doc = self._cycle()
+        variant = json.loads(json.dumps(doc))
+        variant["decision"]["status"] = "probably-fine"
+        s3 = _FakeS3()
+        with pytest.raises(ValueError, match="outside the verdict vocabulary"):
+            ams._emit_verdict_projection(s3, "b", variant, as_of="2026-08-29")
+        assert s3.raw_puts == {}
+
+    def test_the_vocabulary_is_the_schema_enum_not_a_local_copy(self):
+        from nousergon_lib.contracts import load_schema
+
+        enum = (
+            load_schema("arena_cycle")["properties"]["decision"]
+            ["properties"]["status"]["enum"]
+        )
+        assert ams._verdict_vocabulary() == frozenset(enum)
+        assert "unservable" in enum, (
+            "the whole point of the projection is carrying this one value to "
+            "the weekly SF (alpha-engine-config-I11106/-I11101)"
+        )
 
     def test_cpcv_is_retained_as_a_diagnostic_and_is_not_the_score(self):
         register, by_label = ams.build_register(
