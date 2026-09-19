@@ -90,9 +90,16 @@ class _MarkerPutBoomS3(_FakeS3):
         super().put_object(Bucket, Key, Body, ContentType=ContentType)
 
 
+# A healthy served-cut xsec_sd, clear of XSEC_SD_ABSOLUTE_FLOOR (0.015). An
+# ABSENT xsec_sd is itself a promotion veto since alpha-engine-config-I11106,
+# and no test in this file is about that rule.
+HEALTHY_XSEC_SD = 0.030
+
+
 def _mk_manifest(forward_days, cpcv_ic, gate_pass):
     return {
         "forward_days": forward_days,
+        "behavioral_metrics": {"xsec_sd": HEALTHY_XSEC_SD},
         "meta_model_oos_ic_cpcv": {"mean_ic": cpcv_ic} if cpcv_ic is not None else {},
         "meta_model_promotion_stats": {
             "downside": {"passes_downside_gate": gate_pass},

@@ -37,8 +37,15 @@ INCUMBENT_IC = 0.131924
 CANDIDATE_IC = 0.305594
 
 
+# Clear of XSEC_SD_ABSOLUTE_FLOOR (0.015). Carried by default because an ABSENT
+# xsec_sd is a veto in its own right since alpha-engine-config-I11106; none of
+# these tests is about that rule, so every fixture states a healthy value
+# rather than being refused for an unrelated reason.
+HEALTHY_XSEC_SD = 0.030
+
+
 def _manifest(*, mean_ic, n_combos=44, stdev_p_up=None, second_opinion=None,
-              stale=False, forward_days=21):
+              stale=False, forward_days=21, xsec_sd=HEALTHY_XSEC_SD):
     cpcv = {"mean_ic": mean_ic, "n_combos": n_combos}
     if second_opinion is not None:
         cpcv["second_opinion"] = second_opinion
@@ -53,6 +60,8 @@ def _manifest(*, mean_ic, n_combos=44, stdev_p_up=None, second_opinion=None,
             "overfit": {"passes_overfit_gate": True, "dsr": 1.0},
         },
     }
+    if xsec_sd is not None:
+        m["behavioral_metrics"] = {"xsec_sd": xsec_sd}
     if stdev_p_up is not None:
         m["output_distribution_gate"] = {"metrics": {"stdev_p_up": stdev_p_up}}
     return m
@@ -466,13 +475,19 @@ def test_uncomputable_behavioral_metrics_are_named_not_silent(monkeypatch):
     """
     monkeypatch.setattr(cfg, "FORWARD_DAYS", 21, raising=False)
     s3 = _s3(
-        incumbent=_manifest(mean_ic=INCUMBENT_IC),
-        candidates={CANDIDATE_VID: _manifest(mean_ic=CANDIDATE_IC)},
+        incumbent=_manifest(mean_ic=INCUMBENT_IC, xsec_sd=None),
+        candidates={CANDIDATE_VID: _manifest(mean_ic=CANDIDATE_IC, xsec_sd=None)},
     )
     board = mz.select_winner(
         s3, "bkt", trained=_trained(("champion-arch", CANDIDATE_VID)), margin=0.0)
     cand = board["candidates"][0]
-    assert cand["behavioral_veto_status"] == "insufficient"
+    # alpha-engine-config-I11106: a manifest carrying NO xsec_sd is now refused
+    # rather than passed over. The status is therefore `veto`, not
+    # `insufficient` — but every unmeasured metric is still NAMED, which is what
+    # this test guards. The two facts are reported separately on purpose: the
+    # veto says "not promotable", the uncomputable list says "never measured",
+    # and they call for different repairs.
+    assert cand["behavioral_veto_status"] == "veto"
     assert set(cand["behavioral_veto_uncomputable"]) == {
         "alpha_stdev", "model_hit_rate_30d", "n_high_confidence", "stdev_p_up",
         # `xsec_variance_share` joined the veto on 2026-09-08 and is produced by
@@ -509,13 +524,17 @@ def test_zero_high_confidence_and_sub_coinflip_hit_rate_veto():
     )
     assert verdict["status"] == "veto"
     vetoed = {v["metric"] for v in verdict["vetoes"]}
-    # The 2026-08-21 candidate trips all four.
+    # The 2026-08-21 candidate trips all four, plus `xsec_sd` — which this
+    # 2026-08-21-era fixture does not carry at all, and whose ABSENCE is itself
+    # a refusal since alpha-engine-config-I11106.
     assert vetoed == {
         "alpha_stdev", "stdev_p_up", "n_high_confidence", "model_hit_rate_30d",
+        "xsec_sd",
     }
     # `xsec_variance_share` and the I10185 magnitude leg's two numbers (added
-    # 2026-09-08) are not on this 2026-08-21-era fixture, so each is
-    # uncomputable and NAMED — the point of this module.
+    # 2026-09-08) are not on this fixture, so each is uncomputable and NAMED —
+    # the point of this module. `xsec_sd` appears in BOTH lists: refused, and
+    # never measured.
     assert verdict["uncomputable"] == [
         "xsec_sd", "xsec_sd_incumbent_same_panel", "xsec_variance_share",
     ]

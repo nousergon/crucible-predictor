@@ -29,9 +29,18 @@ class _FakeS3:
         pass
 
 
+# A healthy served-cut xsec_sd, clear of XSEC_SD_ABSOLUTE_FLOOR (0.015).
+# Carried by every manifest fixture because an ABSENT xsec_sd is itself a
+# promotion veto since alpha-engine-config-I11106; none of the tests in this
+# file is about that rule, so each states a healthy value rather than being
+# refused for a reason it is not asking about.
+HEALTHY_XSEC_SD = 0.030
+
+
 def _mk_manifest(forward_days, cpcv_ic, *, second_opinion=None):
     return {
         "forward_days": forward_days,
+        "behavioral_metrics": {"xsec_sd": HEALTHY_XSEC_SD},
         "meta_model_oos_ic_cpcv": {
             "mean_ic": cpcv_ic,
             "second_opinion": second_opinion or {},

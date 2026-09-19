@@ -3600,6 +3600,10 @@ def run_meta_training(
         XSEC_SD_ABSOLUTE_FLOOR as _XSEC_SD_ABSOLUTE_FLOOR,
         XSEC_SD_MIN_RATIO_VS_INCUMBENT as _XSEC_SD_MIN_RATIO,
     )
+    from training.served_cut_mask import (
+        BASIS_FIT_PANEL as _BASIS_FIT_PANEL,
+        BASIS_SERVED_CUT as _BASIS_SERVED_CUT,
+    )
 
     xsec_variance_share_observe: dict = {"status": "not_run"}
     try:
@@ -3611,14 +3615,21 @@ def run_meta_training(
             r.get("date")
             for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
         ]
+        _xsec_tickers = [
+            r.get("ticker")
+            for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
+        ]
         _xsec_coefs = {
             k: v for k, v in (meta_model._coefficients or {}).items()
             if k != "intercept"
         }
+        _xsec_intercept = float(
+            (meta_model._coefficients or {}).get("intercept", 0.0))
         xsec_variance_share_observe = _xsec_share(
             meta_X, _xsec_dates, TRAIN_META_FEATURES, _xsec_coefs,
-            intercept=float((meta_model._coefficients or {}).get("intercept", 0.0)),
+            intercept=_xsec_intercept,
         )
+        xsec_variance_share_observe["basis"] = _BASIS_FIT_PANEL
         _v = xsec_variance_share_observe.get("verdict")
         if _v == "ok":
             log.info(
@@ -3648,40 +3659,170 @@ def run_meta_training(
             "status": "error", "verdict": "unmeasurable", "error": str(_e),
         }
 
+    # alpha-engine-config-I11106 — the SERVED-CUT basis, which is what the
+    # promotion veto gates on from here.
+    #
+    # The block above measures the fitted panel: every row of `meta_X`, ~896
+    # names per date. `XSEC_SD_ABSOLUTE_FLOOR` (0.015) is NOT a fit-panel
+    # number — alpha-engine-config-I9267 derived it from served `alpha_stdev`
+    # over batches of 26-30 names. Measured on the serving champion
+    # v3.0-meta-2026-08-14-119e069b, the same model's own output:
+    #
+    #     served cut (attractiveness_top_20)   0.007408   0.49x floor  FAILS
+    #     whole served batch (35 names)        0.016768   1.12x floor
+    #     fit-time panel (what the veto read)  0.048588   3.24x floor  passed
+    #
+    # a 6.56x overstatement, i.e. the gate was 6.6x too LENIENT. Restricting
+    # the rows to each date's `attractiveness_top_20 ∪ held` puts the
+    # measurement on the population the threshold came from
+    # (champion-challenger-policy.md §7.3).
+    #
+    # BOTH figures are kept and emitted under distinct keys. The fit-panel one
+    # is not redundant: it is the only basis computable before a served cut
+    # exists for a date, and the DIVERGENCE between the two is itself the
+    # finding — a reader must see it rather than infer it.
+    served_cut_mask_report: dict = {"status": "not_run"}
+    xsec_variance_share_served: dict = {"status": "not_run"}
+    _served_mask = None
+    try:
+        from training.served_cut_mask import resolve_served_cut_mask
+        import boto3 as _b3_cut
+
+        _served_mask, served_cut_mask_report = resolve_served_cut_mask(
+            _b3_cut.client("s3"), bucket, _xsec_dates, _xsec_tickers,
+        )
+        if _served_mask is not None and bool(_served_mask.any()):
+            xsec_variance_share_served = _xsec_share(
+                meta_X[_served_mask],
+                [d for d, _k in zip(_xsec_dates, _served_mask) if _k],
+                TRAIN_META_FEATURES, _xsec_coefs, intercept=_xsec_intercept,
+            )
+        else:
+            # NEVER the full panel. An unresolvable served cut is unmeasurable,
+            # and unmeasurable is a refusal at the veto — substituting the
+            # fit-panel number here would reinstate the exact 6.6x-lenient
+            # comparison this change removes.
+            _served_mask = None
+            xsec_variance_share_served = {
+                "status": served_cut_mask_report.get("status") or "unresolvable",
+                "verdict": "unmeasurable",
+                "xsec_sd": None,
+                "total_sd": None,
+                "xsec_variance_share": None,
+                "n_rows": 0,
+                "n_dates": 0,
+                "reason": served_cut_mask_report.get("reason"),
+            }
+        xsec_variance_share_served["basis"] = _BASIS_SERVED_CUT
+        _sv = xsec_variance_share_served.get("verdict")
+        if _sv == "ok":
+            log.info(
+                "Cross-sectional variance share ON THE SERVED CUT "
+                "(alpha-engine-config-I11106): %.4f (xsec_sd=%.6g over %s rows "
+                "/ %s dates). This is the figure the promotion veto gates on; "
+                "the fit-panel figure (xsec_sd=%s over %s rows) is recorded "
+                "beside it.",
+                xsec_variance_share_served["xsec_variance_share"],
+                xsec_variance_share_served["xsec_sd"],
+                xsec_variance_share_served.get("n_rows"),
+                xsec_variance_share_served.get("n_dates"),
+                xsec_variance_share_observe.get("xsec_sd"),
+                xsec_variance_share_observe.get("n_rows"),
+            )
+        else:
+            log.error(
+                "CROSS-SECTIONAL COLLAPSE or UNMEASURABLE on the SERVED CUT "
+                "(verdict=%s): %s | mask status=%s, date states=%s. The "
+                "promotion veto refuses on this "
+                "(alpha-engine-config-I11106).",
+                _sv, xsec_variance_share_served.get("reason"),
+                served_cut_mask_report.get("status"),
+                served_cut_mask_report.get("date_states"),
+            )
+    except Exception as _e:  # noqa: BLE001 — diagnostic, never fails training
+        log.warning("Served-cut cross-sectional measurement failed: %s", _e)
+        _served_mask = None
+        xsec_variance_share_served = {
+            "status": "error", "verdict": "unmeasurable", "error": str(_e),
+            "xsec_sd": None, "xsec_variance_share": None,
+            "basis": _BASIS_SERVED_CUT,
+        }
+
     # alpha-engine-config-I10185 — the MAGNITUDE leg's like-for-like reference:
     # the SERVING incumbent's frozen coefficients scored on THIS candidate's
-    # panel. `xsec_sd` has units and moves with the vintage, so comparing a
+    # rows. `xsec_sd` has units and moves with the vintage, so comparing a
     # candidate's number against the incumbent's STORED number measures the two
     # panels as much as the two models. Held constant here, it measures the
     # model. Never raises; a null is read as uncomputable by the veto, which
     # still refuses a below-floor candidate (absence is never a pass).
+    #
+    # I11106: computed on BOTH populations, because the ratio leg must be
+    # like-for-like with the candidate figure it divides. The gating reference
+    # is the served-cut one; the fit-panel one stays for the record and for the
+    # bootstrap case where no served cut resolves.
     xsec_incumbent_same_panel: dict = {"status": "not_run"}
+    xsec_incumbent_served_cut: dict = {"status": "not_run"}
     try:
         from training.xsec_magnitude import incumbent_xsec_sd_on_candidate_panel
         import boto3 as _b3_xsec
 
+        _s3_xsec = _b3_xsec.client("s3")
         xsec_incumbent_same_panel = incumbent_xsec_sd_on_candidate_panel(
-            _b3_xsec.client("s3"), bucket,
+            _s3_xsec, bucket,
             meta_X=meta_X,
-            dates=[
-                r.get("date")
-                for r, _m in zip(oos_meta_rows, canonical_finite_mask) if _m
-            ],
+            dates=_xsec_dates,
             train_meta_features=TRAIN_META_FEATURES,
         )
+        if _served_mask is not None:
+            xsec_incumbent_served_cut = incumbent_xsec_sd_on_candidate_panel(
+                _s3_xsec, bucket,
+                meta_X=meta_X[_served_mask],
+                dates=[d for d, _k in zip(_xsec_dates, _served_mask) if _k],
+                train_meta_features=TRAIN_META_FEATURES,
+                # Resolved once above; reusing it keeps both numbers pinned to
+                # the SAME incumbent even if the live pointer moves mid-run.
+                served_version=xsec_incumbent_same_panel.get(
+                    "incumbent_version_id"),
+                basis="incumbent_coefficients_on_candidate_served_cut",
+            )
+        else:
+            xsec_incumbent_served_cut = {
+                "status": "served_cut_unresolvable",
+                "reason": (
+                    "no served-cut rows resolved, so the incumbent has no "
+                    "like-for-like reference on that population; the veto "
+                    "reads this as uncomputable and refuses a below-floor or "
+                    "absent candidate anyway (alpha-engine-config-I11106)"
+                ),
+                "xsec_sd": None,
+                "basis": "incumbent_coefficients_on_candidate_served_cut",
+            }
     except Exception as _e:  # noqa: BLE001 — diagnostic, never fails training
         log.warning("Incumbent same-panel xsec_sd failed: %s", _e)
         xsec_incumbent_same_panel = {
             "status": "error", "reason": str(_e), "xsec_sd": None,
             "basis": "incumbent_coefficients_on_candidate_panel",
         }
+        xsec_incumbent_served_cut = {
+            "status": "error", "reason": str(_e), "xsec_sd": None,
+            "basis": "incumbent_coefficients_on_candidate_served_cut",
+        }
 
     # The scalars the promotion veto reads, assembled once so both manifest
     # emission sites carry the identical block.
-    _cand_xsec_sd = xsec_variance_share_observe.get("xsec_sd")
-    _inc_xsec_sd = xsec_incumbent_same_panel.get("xsec_sd")
+    #
+    # `xsec_sd` / `xsec_variance_share` — the keys the veto's rules read by
+    # name — carry the SERVED-CUT figures (alpha-engine-config-I11106).
+    # `*_fit_panel` carry the whole design matrix. `xsec_basis` names which
+    # population the gating keys came from, so no reader has to assume, and
+    # the two are never mixed inside one block.
+    _fit_xsec_sd = xsec_variance_share_observe.get("xsec_sd")
+    _cand_xsec_sd = xsec_variance_share_served.get("xsec_sd")
+    _inc_xsec_sd = xsec_incumbent_served_cut.get("xsec_sd")
+    _inc_xsec_sd_fit = xsec_incumbent_same_panel.get("xsec_sd")
     xsec_behavioral_metrics: dict = {
-        "xsec_variance_share": xsec_variance_share_observe.get(
+        # ── gating keys: the served cut ──────────────────────────────────────
+        "xsec_variance_share": xsec_variance_share_served.get(
             "xsec_variance_share"),
         "xsec_sd": _cand_xsec_sd,
         "xsec_sd_incumbent_same_panel": _inc_xsec_sd,
@@ -3690,17 +3831,44 @@ def run_meta_training(
             if (_cand_xsec_sd is not None and _inc_xsec_sd not in (None, 0))
             else None
         ),
+        "xsec_basis": _BASIS_SERVED_CUT,
+        "xsec_served_cut_status": xsec_variance_share_served.get("status"),
+        "xsec_served_cut_n_rows": xsec_variance_share_served.get("n_rows"),
+        "xsec_served_cut_n_dates": xsec_variance_share_served.get("n_dates"),
+        # ── recorded, not gated: the whole fitted panel ──────────────────────
+        "xsec_sd_fit_panel": _fit_xsec_sd,
+        "xsec_variance_share_fit_panel": xsec_variance_share_observe.get(
+            "xsec_variance_share"),
+        "xsec_sd_incumbent_fit_panel": _inc_xsec_sd_fit,
+        "xsec_fit_panel_n_rows": xsec_variance_share_observe.get("n_rows"),
+        "xsec_fit_panel_n_dates": xsec_variance_share_observe.get("n_dates"),
+        # The divergence, stated rather than left to be inferred. >1 means the
+        # fitted panel OVERSTATES the dispersion the executor will see; 6.56 on
+        # the 2026-08-14 champion is what I11106 records.
+        "xsec_sd_fit_panel_over_served_cut": (
+            float(_fit_xsec_sd) / float(_cand_xsec_sd)
+            if (_fit_xsec_sd is not None and _cand_xsec_sd not in (None, 0))
+            else None
+        ),
     }
-    if _cand_xsec_sd is not None:
-        log.info(
-            "Cross-sectional MAGNITUDE (alpha-engine-config-I10185): candidate "
-            "xsec_sd=%.6g, incumbent-on-this-panel=%s, ratio=%s. The promotion "
-            "veto refuses a candidate that is BOTH below the %s absolute floor "
-            "and below %sx that reference.",
-            _cand_xsec_sd, _inc_xsec_sd,
-            xsec_behavioral_metrics["xsec_sd_ratio_vs_incumbent_same_panel"],
-            _XSEC_SD_ABSOLUTE_FLOOR, _XSEC_SD_MIN_RATIO,
-        )
+    log.info(
+        "Cross-sectional MAGNITUDE (alpha-engine-config-I10185 / -I11106): "
+        "candidate xsec_sd=%s on the SERVED CUT (%s rows / %s dates), "
+        "incumbent-on-those-rows=%s, ratio=%s. For the record, the same model "
+        "on the whole fitted panel: xsec_sd=%s over %s rows — %sx the served "
+        "figure. The promotion veto refuses a candidate that is BOTH below the "
+        "%s absolute floor and below %sx that reference, and refuses outright "
+        "when the served-cut figure is ABSENT.",
+        _cand_xsec_sd,
+        xsec_behavioral_metrics["xsec_served_cut_n_rows"],
+        xsec_behavioral_metrics["xsec_served_cut_n_dates"],
+        _inc_xsec_sd,
+        xsec_behavioral_metrics["xsec_sd_ratio_vs_incumbent_same_panel"],
+        _fit_xsec_sd,
+        xsec_behavioral_metrics["xsec_fit_panel_n_rows"],
+        xsec_behavioral_metrics["xsec_sd_fit_panel_over_served_cut"],
+        _XSEC_SD_ABSOLUTE_FLOOR, _XSEC_SD_MIN_RATIO,
+    )
 
     # (W3.2×W4.1) the leak-free per-HORIZON IC curve under the NONLINEAR
     # (LightGBM) blender — does a nonlinear meta move the optimal horizon vs the
@@ -5516,10 +5684,23 @@ def run_meta_training(
                 # mirrored into behavioral_metrics below, which is
                 # what the promotion veto reads.
                 "xsec_variance_share": xsec_variance_share_observe,
+                # alpha-engine-config-I11106 — the SAME measurement restricted
+                # to the rows this model would actually serve (each date's
+                # attractiveness_top_20 ∪ held). This is the basis the
+                # promotion veto gates on; the block above is the fit-panel
+                # basis, kept because it is the only one computable before a
+                # served cut exists. Both are persisted so the divergence is
+                # visible rather than inferred.
+                "xsec_variance_share_served_cut": xsec_variance_share_served,
+                # Which panel dates resolved to a served cut and which did not,
+                # by NAMED state. An excluded date never falls back to the full
+                # panel — that fallback is the defect I11106 removes.
+                "served_cut_mask": served_cut_mask_report,
                 # alpha-engine-config-I10185 — the like-for-like magnitude
                 # reference, persisted so a future session reads it instead of
-                # re-deriving a parquet join.
+                # re-deriving a parquet join. Both populations (I11106).
                 "xsec_incumbent_same_panel": xsec_incumbent_same_panel,
+                "xsec_incumbent_served_cut": xsec_incumbent_served_cut,
                 "behavioral_metrics": xsec_behavioral_metrics,
                 "meta_model_oos_ic_cpcv": cpcv_meta_ic,
                 # alpha-engine-config-I9024 §2 — the SERVING incumbent's frozen
@@ -6055,8 +6236,14 @@ def run_meta_training(
         # Fit-time cross-sectional collapse detector (alpha-engine-config,
         # 2026-09-08); the scalar mirror is what arms the promotion veto.
         "xsec_variance_share": xsec_variance_share_observe,
-        # alpha-engine-config-I10185 — the like-for-like magnitude reference.
+        # alpha-engine-config-I11106 — the served-cut basis (the GATED one) and
+        # the per-date resolution report behind it. See the manifest block above.
+        "xsec_variance_share_served_cut": xsec_variance_share_served,
+        "served_cut_mask": served_cut_mask_report,
+        # alpha-engine-config-I10185 — the like-for-like magnitude reference,
+        # on both populations (I11106).
         "xsec_incumbent_same_panel": xsec_incumbent_same_panel,
+        "xsec_incumbent_served_cut": xsec_incumbent_served_cut,
         "behavioral_metrics": xsec_behavioral_metrics,
         # W1.2 (L4469, OBSERVE): combinatorial purged CV distribution of
         # leak-free cross-sectional OOS ICs (mean/std/percentiles/frac_positive
