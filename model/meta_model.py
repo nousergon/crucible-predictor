@@ -644,7 +644,14 @@ class MetaModel:
     # model without it would feed raw (un-standardized) features into a Ridge
     # whose coefficients were fit on standardized ones → garbage predictions.
     # None ⇒ no transform (back-compat with v2/legacy pickles).
-    _PICKLE_SCHEMA = 3
+    # v4 (alpha-engine-config-I11104): `_coefficients` joins the payload.
+    # `training/xsec_magnitude.py`'s relative-leg veto reads `_coefficients`
+    # via the registry loader, which never fetches the `.pkl.meta.json`
+    # sidecar `_coefficients` previously depended on exclusively — so every
+    # registry-loaded bundle reported `status: coefficients_unavailable` and
+    # the relative leg has never once been evaluated. Same travels-with-the-
+    # bytes argument as feature_names (v2) and meta_scaler (v3).
+    _PICKLE_SCHEMA = 4
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -656,6 +663,7 @@ class MetaModel:
                     "model": self._model,
                     "feature_names": list(self._feature_names),
                     "meta_scaler": self._scaler,
+                    "coefficients": dict(self._coefficients),
                 },
                 f,
             )
@@ -680,6 +688,10 @@ class MetaModel:
             # v3 (L4565): load-bearing directional scaler. Absent in v2 pickles
             # → None → identity transform (legacy behaviour preserved).
             mm._scaler = obj.get("meta_scaler")
+            # v4 (alpha-engine-config-I11104): load-bearing coefficients.
+            # Absent in v2/v3 pickles → {} → repaired below via estimator
+            # reconstruction when no sidecar is present either.
+            mm._coefficients = dict(obj.get("coefficients") or {})
         else:
             mm._model = obj
         mm._fitted = True
@@ -721,6 +733,27 @@ class MetaModel:
         # re-saves with the new schema.
         if not mm._feature_names and mm._coefficients:
             mm._feature_names = [k for k in mm._coefficients.keys() if k != "intercept"]
+        # alpha-engine-config-I11104: a pre-v4 pickle with no sidecar (the
+        # registry-load path — `predictor/registry/{version_id}/` stores only
+        # `meta_model.pkl`, no `.pkl.meta.json`) leaves `_coefficients` empty
+        # above. The estimator bytes already carry everything needed to
+        # reconstruct it: `_coefficients` is defined as
+        # `zip(_feature_names, _model.coef_)` plus the rounded intercept
+        # (fit-time arithmetic at :341-345) — reconstructing here is the
+        # IDENTICAL computation, not a new derivation. Guard on length
+        # equality and leave `_coefficients` EMPTY on a mismatch — never
+        # zero-fill (I5949): a fabricated zero coefficient is indistinguishable
+        # from a genuinely-zero fitted one, and would silently pass
+        # `xsec_magnitude`'s relative-leg veto on garbage.
+        if not mm._coefficients:
+            coef_ = getattr(mm._model, "coef_", None)
+            intercept_ = getattr(mm._model, "intercept_", None)
+            if coef_ is not None and intercept_ is not None and len(coef_) == len(mm._feature_names):
+                mm._coefficients = {
+                    name: round(float(coef), 6)
+                    for name, coef in zip(mm._feature_names, coef_)
+                }
+                mm._coefficients["intercept"] = round(float(intercept_), 6)
         log.info(
             "MetaModel loaded from %s (IC=%.4f, n_features=%d, embedded_names=%s)",
             path, mm._val_ic, len(mm._feature_names), embedded_names,

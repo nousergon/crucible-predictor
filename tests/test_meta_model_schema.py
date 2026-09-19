@@ -204,3 +204,82 @@ def test_legacy_raw_model_pickle_falls_back_to_sidecar(tmp_path):
 
     mm2 = MetaModel.load(pkl_path)
     assert mm2._feature_names == legacy_features
+
+
+def test_v3_pickle_with_no_sidecar_reconstructs_coefficients_from_estimator(tmp_path):
+    """alpha-engine-config-I11104: the registry-load path stores ONLY
+    meta_model.pkl (no .pkl.meta.json sidecar), which previously left
+    `_coefficients` permanently empty for every registry-loaded bundle — the
+    magnitude veto's relative leg (`training/xsec_magnitude.py`) has never
+    once been evaluated. A pre-v4 pickle (no embedded `coefficients` key) with
+    no sidecar must reconstruct `_coefficients` from the fitted estimator
+    using the IDENTICAL fit-time arithmetic (meta_model.py:341-345)."""
+    X, y = _synth_training_data(META_FEATURES)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+    expected_coefficients = dict(mm._coefficients)
+
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    # Simulate a v3 (pre-I11104) pickle: strip the "coefficients" key that
+    # save() now embeds, and delete the sidecar entirely (the registry-load
+    # shape: predictor/registry/{version_id}/ stores only the .pkl).
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+    payload["_meta_model_schema"] = 3
+    del payload["coefficients"]
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+    Path(str(pkl_path) + ".meta.json").unlink()
+
+    mm2 = MetaModel.load(pkl_path)
+    assert mm2._coefficients == expected_coefficients
+
+
+def test_reconstructed_coefficients_empty_on_length_mismatch(tmp_path):
+    """alpha-engine-config-I11104 hard check: a length mismatch between
+    coef_ and feature_names must leave `_coefficients` EMPTY, never
+    zero-filled (I5949) — a fabricated zero coefficient is indistinguishable
+    from a genuinely-zero fitted one and would silently pass the relative-leg
+    veto on garbage."""
+    X, y = _synth_training_data(META_FEATURES)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+    payload["_meta_model_schema"] = 3
+    del payload["coefficients"]
+    # Truncate the embedded feature_names so len(coef_) != len(feature_names).
+    payload["feature_names"] = payload["feature_names"][:-1]
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+    Path(str(pkl_path) + ".meta.json").unlink()
+
+    mm2 = MetaModel.load(pkl_path)
+    assert mm2._coefficients == {}
+
+
+def test_schema4_save_load_roundtrip_preserves_coefficients(tmp_path):
+    """alpha-engine-config-I11104: a schema-4 save/load round-trip preserves
+    `_coefficients` exactly, without depending on the sidecar."""
+    X, y = _synth_training_data(META_FEATURES)
+    mm = MetaModel(alpha=1.0).fit(X, y, feature_names=META_FEATURES)
+    expected_coefficients = dict(mm._coefficients)
+
+    pkl_path = tmp_path / "mm.pkl"
+    mm.save(pkl_path)
+
+    with open(pkl_path, "rb") as f:
+        payload = pickle.load(f)
+    assert payload["_meta_model_schema"] == 4
+    assert payload["coefficients"] == expected_coefficients
+
+    # Delete the sidecar to prove the pickle alone is sufficient (I11104's
+    # whole point: coefficients travel with the estimator bytes).
+    Path(str(pkl_path) + ".meta.json").unlink()
+
+    mm2 = MetaModel.load(pkl_path)
+    assert mm2._coefficients == expected_coefficients
