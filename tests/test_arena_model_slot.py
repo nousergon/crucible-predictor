@@ -675,6 +675,157 @@ class TestTheEmittedCycle:
         assert ArmRegister.from_dicts(events).all_arms() == register.all_arms()
 
 
+class TestAnUnservableCycleStillWritesTheArtifact:
+    """alpha-engine-config-I11105 — RED before the fix: ``run_slot`` ran
+    ``assert_servable(cycle)`` BEFORE ``emit_cycle``, so the one week every
+    arm failed a hard serving precondition was the one week the M slot wrote
+    NO ``arena/model/{as_of}.json`` at all. Measured live 2026-09-19:
+    ``arena/model/latest.json`` stayed byte-identical to the 2026-09-11 cycle
+    (17,346 bytes, both stamped 2026-09-12) and there was no
+    ``2026-09-18.json`` — the unservable verdict, the highest-information
+    state this slot can produce, reached nobody.
+    """
+
+    def _run(self, monkeypatch, *, precondition_reasons):
+        s3 = _FakeS3()
+        versions = _versions(
+            ("v-a", "lbl-alpha", "2026-09-11"),
+            ("v-b", "lbl-beta", "2026-09-11"),
+            ("v-c", "v3.0-meta", "2026-09-11"),
+        )
+        monkeypatch.setattr(ams, "_list_registry_versions", lambda _s3, _b: versions)
+
+        # Sound manifests (non-empty, no arm_validity/l1_fit_validity failures,
+        # data_coverage_degraded=False) so training_statuses reports every arm
+        # OK — this test isolates the SERVING gate (assert_servable /
+        # ArenaSlotUnservable), never TrainingIntegrityError (a separate,
+        # already-covered failure mode, TestImproperTrainingFailsTheTask).
+        clean_manifest = json.dumps({
+            "data_coverage_degraded": False,
+            "arm_validity": {"failures": []},
+            "l1_fit_validity": {"failures": []},
+        }).encode()
+        for v in versions:
+            s3.objects[f"predictor/registry/{v['version_id']}/manifest.json"] = clean_manifest
+
+        register, _by_label = ams.build_register(
+            _FakeS3(), "b", as_of="2026-09-18", specs=_SPECS, canonical_horizon=21,
+            versions=versions, register=ArmRegister(),
+        )
+        arms = register.active_arms()
+        dates = [f"2026-08-{d:02d}" for d in (2, 9, 16, 23, 30)]
+        series = {a: ArmSeries(arm_id=a, scores={d: 0.01 for d in dates}) for a in arms}
+        monkeypatch.setattr(ams, "build_series", lambda *a, **k: series)
+
+        # Force EVERY arm to fail a hard serving precondition — the shape
+        # measured live 2026-09-19 (all three M arms failed the xsec_sd
+        # magnitude floor). Bypassing the real gate logic here is deliberate:
+        # this test is about write-vs-assert ORDER in run_slot, and the gate
+        # logic itself is already covered by TestServingPreconditions.
+        def _all_blocked(*, arm_ids, **_kwargs):
+            return {
+                a: (ServingPrecondition(name="behavioral_veto", passed=False,
+                                        reason=precondition_reasons),)
+                for a in arm_ids
+            }
+        monkeypatch.setattr(ams, "serving_preconditions", _all_blocked)
+
+        with pytest.raises(ams.ArenaSlotUnservable):
+            ams.run_slot(
+                s3, "b", as_of="2026-09-18", specs=_SPECS,
+                incumbent_version_id="v-a",
+            )
+        return s3
+
+    def test_the_dated_key_and_latest_mirror_carry_status_unservable(self, monkeypatch):
+        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+
+        doc = s3.puts["arena/model/2026-09-18.json"]
+        assert doc["decision"]["status"] == "unservable"
+        latest = s3.puts["arena/model/latest.json"]
+        assert latest["decision"]["status"] == "unservable"
+        assert latest == doc
+
+    def test_the_register_is_not_persisted_on_an_unservable_cycle(self, monkeypatch):
+        # I11105's stated decision: persist_register stays gated on
+        # assert_servable succeeding, so it is NOT moved ahead of the
+        # assertion the way emit_cycle is — moving it too would drop this
+        # cycle's retirement folding on the one path that most needs it
+        # recorded accurately.
+        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+        assert ams.REGISTER_KEY not in s3.puts
+
+
+class TestKnownInapplicableLabelsCollapseToOneLine:
+    """alpha-engine-config-I11107 — RED before the fix: EVERY prediction file
+    from a permanently-excluded label (a non-canonical horizon, e.g.
+    `spec-60d`/`spec-90d`) fired its own per-file WARNING, ~34x per rotation
+    forever, camouflaging a genuinely unknown label. `version_id=None`
+    (the I8219 family — a different condition) must stay loud."""
+
+    _SPECS_WITH_60D = [
+        {"id": "sixty-day-arm", "model_version_label": "spec-60d",
+         "status": "active", "overrides": {"FORWARD_DAYS": 60}},
+    ]
+
+    def _pairs(self):
+        return [
+            # Known-inapplicable: excluded from the slot by horizon (60d vs
+            # the canonical 21d), permanently and by construction.
+            {"champion_version_id": "v-60d-1", "date": "2026-07-01",
+             "ticker": "AAA", "predicted_alpha": 0.1, "realized_alpha": 0.05},
+            # A genuinely unknown label — not in the spec register at all.
+            {"champion_version_id": "v-unknown-1", "date": "2026-07-02",
+             "ticker": "BBB", "predicted_alpha": 0.2, "realized_alpha": 0.1},
+            # version_id=None (label=None) — the I8219 family, must stay loud.
+            {"champion_version_id": None, "date": "2026-07-03",
+             "ticker": "CCC", "predicted_alpha": 0.3, "realized_alpha": 0.15},
+        ]
+
+    def _version_labels(self):
+        return {"v-60d-1": "spec-60d", "v-unknown-1": "totally-new-label"}
+
+    def test_known_inapplicable_collapses_to_one_info_line(self, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="training.arena_model_slot")
+
+        ams.build_series(
+            "bucket", arm_id_by_label={}, version_labels=self._version_labels(),
+            pairs=self._pairs(), specs=self._SPECS_WITH_60D, canonical_horizon=21,
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+
+        warning_text = " ".join(r.getMessage() for r in warnings)
+        info_text = " ".join(r.getMessage() for r in infos)
+
+        # The known-inapplicable label never produces a per-file WARNING.
+        assert "spec-60d" not in warning_text
+        assert "v-60d-1" not in warning_text
+        # ...and instead is named once in an aggregate INFO line.
+        assert any("spec-60d" in r.getMessage() and "1 prediction" in r.getMessage()
+                   for r in infos), info_text
+
+        # A genuinely unknown label still WARNs.
+        assert any("totally-new-label" in r.getMessage() for r in warnings), warning_text
+        # version_id=None (the I8219 family) still WARNs.
+        assert any("version_id=None" in r.getMessage() for r in warnings), warning_text
+
+    def test_a_synthetic_unknown_label_still_warns(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger="training.arena_model_slot")
+
+        ams.build_series(
+            "bucket", arm_id_by_label={},
+            version_labels={"v-mystery-1": "never-seen-before"},
+            pairs=[{"champion_version_id": "v-mystery-1", "date": "2026-07-04",
+                    "ticker": "DDD", "predicted_alpha": 0.1, "realized_alpha": 0.2}],
+            specs=self._SPECS_WITH_60D, canonical_horizon=21,
+        )
+        assert any("never-seen-before" in r.getMessage() for r in caplog.records)
+
+
 class TestTheSlotDoesNotReimplementTheEngine:
     """policy §10: a slot re-implementing §§3–6 is a defect, not a variation."""
 
