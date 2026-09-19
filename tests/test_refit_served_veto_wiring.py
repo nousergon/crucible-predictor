@@ -32,10 +32,22 @@ Two structural defects, both fixed here:
 from training import arena_model_slot as ams
 
 
-def _manifest(stdev_p_up, *, alpha_stdev=None):
+# Clear of XSEC_SD_ABSOLUTE_FLOOR (0.015). An ABSENT xsec_sd is a veto in its
+# own right since alpha-engine-config-I11106, and these tests are about which
+# MANIFEST the refit is compared against — so every fixture states a healthy
+# magnitude rather than being refused for an unrelated reason.
+HEALTHY_XSEC_SD = 0.030
+
+
+def _manifest(stdev_p_up, *, alpha_stdev=None, xsec_sd=HEALTHY_XSEC_SD):
     m = {"output_distribution_gate": {"metrics": {"stdev_p_up": stdev_p_up}}}
+    behavioral = {}
     if alpha_stdev is not None:
-        m["behavioral_metrics"] = {"alpha_stdev": alpha_stdev}
+        behavioral["alpha_stdev"] = alpha_stdev
+    if xsec_sd is not None:
+        behavioral["xsec_sd"] = xsec_sd
+    if behavioral:
+        m["behavioral_metrics"] = behavioral
     return m
 
 

@@ -90,6 +90,9 @@ def _mk_manifest(forward_days, cpcv_ic, gate_pass, *, dsr=None, registry_dsr=Non
         cpcv["n_backtest_paths"] = n_paths
     return {
         "forward_days": forward_days,
+        # alpha-engine-config-I11106: an ABSENT xsec_sd is a promotion veto in
+        # its own right. No test in this file is about that rule.
+        "behavioral_metrics": {"xsec_sd": 0.030},
         "meta_model_oos_ic_cpcv": cpcv,
         "meta_model_promotion_stats": {
             "downside": {"passes_downside_gate": gate_pass or (registry_dsr is not None)},
