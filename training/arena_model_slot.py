@@ -966,19 +966,37 @@ def run_slot(
     # a well-formed `arena_cycle` built from an empty live record is the
     # "reads as coverage" failure (policy §7.4, §11).
     doc["score_attribution"] = score_attribution
+    # alpha-engine-config-I11105 — write the artifact BEFORE asserting
+    # servability, not after. The one week every arm failed a hard serving
+    # precondition is the one week `assert_servable` raised and the module
+    # returned before `emit_cycle` ever ran, so `arena/model/latest.json`
+    # kept presenting the prior week's cycle as current. Measured live
+    # 2026-09-19: `arena/model/2026-09-11.json` and a byte-identical
+    # `latest.json` (17,346 bytes, both stamped 2026-09-12), no
+    # `2026-09-18.json`, and no `register.json` write — the unservable
+    # verdict, the highest-information state this slot can produce, reached
+    # nobody. `emit_cycle` itself still validates before writing (its own
+    # docstring), so a malformed `unservable` doc still fails loud rather
+    # than being silently written.
+    keys = emit_cycle(s3, bucket, doc, as_of=as_of) if write else []
     assert_servable(cycle)
 
     # The engine's retirement verdicts are appended to the log here — the one
-    # place a cap-with-grace retirement is ever written.
+    # place a cap-with-grace retirement is ever written. This stays AFTER
+    # assert_servable (I11105): moving `persist_register` ahead of the
+    # assertion too would persist the register before this cycle's
+    # retirements are folded in, silently dropping them on an unservable
+    # cycle. The `arena_cycle` artifact (moved above) is the fact that needed
+    # to reach every reader unconditionally; the register is a derived index
+    # that is still correctly rebuilt on the next servable cycle, so it is
+    # left gated on `assert_servable` succeeding.
     for verdict in cycle.retirements:
         if verdict.retire and register.state(verdict.arm_id).retired_date is None:
             register = register.retire(verdict.arm_id, as_of, reason=verdict.reason)
 
     pointer_arm = cycle.decision.champion
     pointer_bundle = bundle_by_arm.get(pointer_arm) if pointer_arm else None
-    keys = []
     if write:
-        keys = emit_cycle(s3, bucket, doc, as_of=as_of)
         persist_register(s3, bucket, register)
     return {
         "cycle": cycle,

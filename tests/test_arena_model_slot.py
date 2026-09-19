@@ -675,6 +675,87 @@ class TestTheEmittedCycle:
         assert ArmRegister.from_dicts(events).all_arms() == register.all_arms()
 
 
+class TestAnUnservableCycleStillWritesTheArtifact:
+    """alpha-engine-config-I11105 — RED before the fix: ``run_slot`` ran
+    ``assert_servable(cycle)`` BEFORE ``emit_cycle``, so the one week every
+    arm failed a hard serving precondition was the one week the M slot wrote
+    NO ``arena/model/{as_of}.json`` at all. Measured live 2026-09-19:
+    ``arena/model/latest.json`` stayed byte-identical to the 2026-09-11 cycle
+    (17,346 bytes, both stamped 2026-09-12) and there was no
+    ``2026-09-18.json`` — the unservable verdict, the highest-information
+    state this slot can produce, reached nobody.
+    """
+
+    def _run(self, monkeypatch, *, precondition_reasons):
+        s3 = _FakeS3()
+        versions = _versions(
+            ("v-a", "lbl-alpha", "2026-09-11"),
+            ("v-b", "lbl-beta", "2026-09-11"),
+            ("v-c", "v3.0-meta", "2026-09-11"),
+        )
+        monkeypatch.setattr(ams, "_list_registry_versions", lambda _s3, _b: versions)
+
+        # Sound manifests (non-empty, no arm_validity/l1_fit_validity failures,
+        # data_coverage_degraded=False) so training_statuses reports every arm
+        # OK — this test isolates the SERVING gate (assert_servable /
+        # ArenaSlotUnservable), never TrainingIntegrityError (a separate,
+        # already-covered failure mode, TestImproperTrainingFailsTheTask).
+        clean_manifest = json.dumps({
+            "data_coverage_degraded": False,
+            "arm_validity": {"failures": []},
+            "l1_fit_validity": {"failures": []},
+        }).encode()
+        for v in versions:
+            s3.objects[f"predictor/registry/{v['version_id']}/manifest.json"] = clean_manifest
+
+        register, _by_label = ams.build_register(
+            _FakeS3(), "b", as_of="2026-09-18", specs=_SPECS, canonical_horizon=21,
+            versions=versions, register=ArmRegister(),
+        )
+        arms = register.active_arms()
+        dates = [f"2026-08-{d:02d}" for d in (2, 9, 16, 23, 30)]
+        series = {a: ArmSeries(arm_id=a, scores={d: 0.01 for d in dates}) for a in arms}
+        monkeypatch.setattr(ams, "build_series", lambda *a, **k: series)
+
+        # Force EVERY arm to fail a hard serving precondition — the shape
+        # measured live 2026-09-19 (all three M arms failed the xsec_sd
+        # magnitude floor). Bypassing the real gate logic here is deliberate:
+        # this test is about write-vs-assert ORDER in run_slot, and the gate
+        # logic itself is already covered by TestServingPreconditions.
+        def _all_blocked(*, arm_ids, **_kwargs):
+            return {
+                a: (ServingPrecondition(name="behavioral_veto", passed=False,
+                                        reason=precondition_reasons),)
+                for a in arm_ids
+            }
+        monkeypatch.setattr(ams, "serving_preconditions", _all_blocked)
+
+        with pytest.raises(ams.ArenaSlotUnservable):
+            ams.run_slot(
+                s3, "b", as_of="2026-09-18", specs=_SPECS,
+                incumbent_version_id="v-a",
+            )
+        return s3
+
+    def test_the_dated_key_and_latest_mirror_carry_status_unservable(self, monkeypatch):
+        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+
+        doc = s3.puts["arena/model/2026-09-18.json"]
+        assert doc["decision"]["status"] == "unservable"
+        latest = s3.puts["arena/model/latest.json"]
+        assert latest["decision"]["status"] == "unservable"
+        assert latest == doc
+
+    def test_the_register_is_not_persisted_on_an_unservable_cycle(self, monkeypatch):
+        # I11105's stated decision: persist_register stays gated on
+        # assert_servable succeeding, so it is NOT moved ahead of the
+        # assertion the way emit_cycle is — moving it too would drop this
+        # cycle's retirement folding on the one path that most needs it
+        # recorded accurately.
+        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+        assert ams.REGISTER_KEY not in s3.puts
+
+
 class TestTheSlotDoesNotReimplementTheEngine:
     """policy §10: a slot re-implementing §§3–6 is a defect, not a variation."""
 
