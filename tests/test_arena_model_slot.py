@@ -529,14 +529,36 @@ class TestServingPreconditions:
         assert veto.passed is False
         assert "stdev_p_up" in veto.reason
 
-    def test_an_uncomputable_veto_is_non_blocking_and_never_a_pass_in_prose(self):
+    def test_an_EMPTY_manifest_is_refused_not_waved_through(self):
+        """alpha-engine-config-I11106 — this assertion is INVERTED.
+
+        An empty manifest used to yield ``insufficient``, which the slot read as
+        non-blocking: nothing measurable, so nothing refused. That is how a
+        manifest carrying no ``behavioral_metrics`` block at all reached
+        serving. ``xsec_sd``'s absence is now a veto in its own right, so the
+        precondition fails and names why.
+        """
         pre = ams.serving_preconditions(
             arm_ids=["M:cand:h"], manifests_by_arm={"M:cand:h": {}},
             incumbent_arm=None,
         )
         veto = [p for p in pre["M:cand:h"] if p.name == "behavioral_veto"][0]
+        assert veto.passed is False
+        assert "xsec_sd" in veto.reason
+
+    def test_a_manifest_with_a_healthy_xsec_sd_and_nothing_else_still_passes(self):
+        """The non-blocking posture survives for metrics whose producers do not
+        write to the training manifest yet — only the one whose producer runs
+        every cycle became blocking."""
+        pre = ams.serving_preconditions(
+            arm_ids=["M:cand:h"],
+            manifests_by_arm={
+                "M:cand:h": {"behavioral_metrics": {"xsec_sd": 0.030}},
+            },
+            incumbent_arm=None,
+        )
+        veto = [p for p in pre["M:cand:h"] if p.name == "behavioral_veto"][0]
         assert veto.passed is True
-        assert "insufficient" in veto.reason
 
     def test_input_completeness_is_its_own_precondition(self):
         pre = ams.serving_preconditions(

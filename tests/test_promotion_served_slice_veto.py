@@ -78,8 +78,16 @@ MANIFEST_INCUMBENT_STDEV_P_UP = 0.113644
 MANIFEST_CANDIDATE_STDEV_P_UP = 0.130132
 
 
+# A healthy served-cut xsec_sd, well clear of XSEC_SD_ABSOLUTE_FLOOR (0.015).
+# Carried by default because an ABSENT xsec_sd is itself a veto since
+# alpha-engine-config-I11106, and these tests are about the served-slice
+# dispersion rules — a manifest with no magnitude number would be refused for a
+# reason none of them is asking about. Pass ``xsec_sd=None`` to test absence.
+HEALTHY_XSEC_SD = 0.030
+
+
 def _manifest(*, mean_ic, stdev_p_up=None, forward_days=21, second_opinion=None,
-              incumbent_rescore=None):
+              incumbent_rescore=None, xsec_sd=HEALTHY_XSEC_SD):
     cpcv = {"mean_ic": mean_ic, "n_combos": 44}
     if second_opinion is not None:
         cpcv["second_opinion"] = second_opinion
@@ -91,6 +99,8 @@ def _manifest(*, mean_ic, stdev_p_up=None, forward_days=21, second_opinion=None,
             "overfit": {"passes_overfit_gate": True, "dsr": 1.0},
         },
     }
+    if xsec_sd is not None:
+        m["behavioral_metrics"] = {"xsec_sd": xsec_sd}
     if stdev_p_up is not None:
         m["output_distribution_gate"] = {"metrics": {"stdev_p_up": stdev_p_up}}
     if incumbent_rescore is not None:
@@ -318,7 +328,7 @@ def test_a_zero_high_confidence_candidate_is_vetoed_without_an_incumbent_value()
     actionable names is refused even on a rotation where the incumbent could not
     be measured."""
     verdict = evaluate_behavioral_veto(
-        None, None,
+        {"behavioral_metrics": {"xsec_sd": HEALTHY_XSEC_SD}}, None,
         candidate_served_metrics={"n_high_confidence": 0},
         incumbent_served_metrics=None,
     )

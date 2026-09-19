@@ -180,10 +180,48 @@ def test_a_healthy_incumbent_reference_below_the_floor_arms_the_absolute_leg_alo
 
 # ── nothing may pass unmeasured ──────────────────────────────────────────────
 
-def test_a_missing_xsec_sd_is_named_uncomputable_not_skipped():
+def test_a_missing_xsec_sd_is_a_VETO_and_is_also_named_uncomputable():
+    """alpha-engine-config-I11106. This assertion is INVERTED from what it was.
+
+    The leg used to file a missing ``xsec_sd`` under ``uncomputable`` and return
+    zero vetoes — a silent pass through the one gate that exists to see a
+    dispersion collapse. That is how the currently-serving champion was
+    promoted: ``predictor/weights/meta/manifest.json`` (v3.0-meta, 2026-08-14)
+    carries no ``behavioral_metrics`` block at all, so this leg never evaluated
+    it. The module's own docstring already said "Absence is never a pass"; the
+    code did not implement it.
+
+    Both facts are still reported, because they need different repairs: the
+    veto says the candidate is not promotable, the ``uncomputable`` entry says
+    the number was never produced.
+    """
     out = evaluate_behavioral_veto(_manifest(), _manifest())
     assert "xsec_sd" in out["uncomputable"]
-    assert not [v for v in out["vetoes"] if v["metric"] == "xsec_sd"]
+    hit = [v for v in out["vetoes"] if v["metric"] == "xsec_sd"]
+    assert len(hit) == 1
+    assert hit[0]["candidate"] is None
+    assert "absent" in hit[0]["reason"].lower()
+    assert out["status"] == "veto"
+
+
+def test_the_2026_08_14_serving_champion_manifest_would_be_REFUSED_today():
+    """The regression this leg failed to catch, as the artifact actually is.
+
+    ``predictor/weights/meta/manifest.json`` for ``v3.0-meta-2026-08-14-119e069b``
+    carries ``output_distribution_gate`` and nothing else — no ``xsec_sd``, no
+    ``xsec_variance_share``, no ``behavioral_metrics`` block. Before I11106 that
+    manifest produced zero vetoes from this module.
+    """
+    champion_manifest_as_it_is = {
+        "output_distribution_gate": {
+            "metrics": {"alpha_stdev": 0.017, "stdev_p_up": 0.113644},
+        },
+    }
+    out = evaluate_behavioral_veto(
+        champion_manifest_as_it_is, champion_manifest_as_it_is,
+    )
+    assert out["status"] == "veto"
+    assert [v for v in out["vetoes"] if v["metric"] == "xsec_sd"]
 
 
 def test_a_below_floor_candidate_with_NO_incumbent_reference_is_refused():
@@ -235,16 +273,24 @@ def test_the_incumbent_reference_is_never_taken_from_the_incumbents_own_panel():
 
 
 def test_a_served_slice_measurement_cannot_arm_this_rule():
-    """``xsec_sd`` is a FIT-TIME property of the training panel. A served-slice
-    measurement has no such quantity, and letting one through the served merge
-    would silently rank a served number against a fitted one."""
+    """``xsec_sd`` is computed AT FIT TIME, from the fitted coefficient vector —
+    over the served-cut rows since alpha-engine-config-I11106, but still by
+    ``training/xsec_variance_share.py`` and not by a served-batch measurement.
+    Letting a served-slice value through the merge would rank a differently
+    derived number against a fitted one.
+
+    The refusal here is the ABSENCE rule (I11106), not the served number: the
+    candidate figure on the veto is ``None``, proving 0.0001 never reached it.
+    """
     out = evaluate_behavioral_veto(
         _manifest(), _manifest(),
         candidate_served_metrics={"xsec_sd": 0.0001},
         incumbent_served_metrics={"xsec_sd": 0.9},
     )
     assert "xsec_sd" in out["uncomputable"]
-    assert not [v for v in out["vetoes"] if v["metric"] == "xsec_sd"]
+    assert "xsec_sd" not in out["measured"]
+    hit = [v for v in out["vetoes"] if v["metric"] == "xsec_sd"]
+    assert len(hit) == 1 and hit[0]["candidate"] is None
 
 
 def test_behavioral_metrics_surfaces_both_numbers_from_the_forward_slot():

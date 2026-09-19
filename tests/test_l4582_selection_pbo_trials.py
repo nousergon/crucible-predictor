@@ -83,6 +83,9 @@ def _manifest(fwd=21, mean_ic=0.15, *, downside=True, dsr=0.97,
         cpcv["ics"] = ics
     return {
         "forward_days": fwd,
+        # alpha-engine-config-I11106: an ABSENT xsec_sd is a promotion veto in
+        # its own right. No test in this file is about that rule.
+        "behavioral_metrics": {"xsec_sd": 0.030},
         "meta_model_oos_ic_cpcv": cpcv,
         "meta_model_promotion_stats": {
             "downside": {"passes_downside_gate": downside},

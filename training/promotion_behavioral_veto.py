@@ -33,6 +33,16 @@ with no code change here.
 ``stdev_p_up`` IS carried today, by both the candidate's manifest and the
 incumbent's registry bundle, under ``output_distribution_gate.metrics``.
 
+``xsec_sd`` is the exception that proves the rule, and it cost a promotion
+(alpha-engine-config-I11106). Its leg read ``cand.get("xsec_sd")``, got ``None``
+on a manifest that carried no ``behavioral_metrics`` block at all, filed it
+under ``uncomputable`` and returned ZERO vetoes — a silent pass through the one
+gate that exists to see a dispersion collapse, on the manifest of the model
+serving today. It is now a refusal. A metric that is merely *not produced yet*
+is reported uncomputable and does not block; a metric whose own producer runs
+every weekly cycle and yielded nothing is a broken measurement, and promoting
+on it is promoting on a number nobody produced.
+
 The SERVED slice (alpha-engine-config-I9061)
 --------------------------------------------
 The manifest metrics are not enough, and the 2026-08-21 rotation is the proof.
@@ -128,9 +138,28 @@ _FLOOR_VETO_REASON_DEFAULT = "{name} {c} is below the {floor} floor"
 #
 # The absolute floor is not a new number. It is the predictor's own absolute
 # serving ``alpha_stdev`` floor (alpha-engine-config-I9267, "derived from the
-# measured healthy population"), applied to the TRAINING panel — where the same
-# quantity is knowable before the model ever serves a batch. On the champion it
-# was already below that floor at fit time and nothing looked.
+# measured healthy population"), applied at fit time — where the same quantity
+# is knowable before the model ever serves a batch. On the champion it was
+# already below that floor at fit time and nothing looked.
+#
+# WHICH POPULATION (alpha-engine-config-I11106). I9267's provenance is verbatim
+# "derived from the healthy population (2026-08-10..08-21 ranged 0.0200-0.0434)"
+# — ``alpha_stdev`` over a SERVED batch of 26-30 names. Until I11106 the number
+# compared against it was pooled over the whole L2 design matrix: ~896 names per
+# date. Measured on the serving champion v3.0-meta-2026-08-14-119e069b, the same
+# model's own cross-sectional output:
+#
+#     served cut (attractiveness_top_20)   0.007408   0.49x floor   FAILS
+#     whole served batch (35 names)        0.016768   1.12x floor
+#     fit-time panel (what the veto read)  0.048588   3.24x floor   passed by 3x
+#
+# 0.048588 / 0.007408 = 6.56x. The gate was 6.6x too LENIENT, not too strict: a
+# model clearing the floor by 3x at fit time had half the required dispersion on
+# the names the executor can actually enter. The number is unchanged; the
+# population it is measured over is now the one it was derived from, which is
+# champion-challenger-policy.md §7.3 — gate on the invariant the actor consumes.
+# ``training/served_cut_mask.py`` supplies the rows; the manifest carries both
+# bases under distinct keys so the divergence is visible rather than inferred.
 XSEC_SD_ABSOLUTE_FLOOR: float = 0.015
 
 # The relative floor is this module's existing dispersion bar (MIN_DISPERSION_
@@ -205,10 +234,19 @@ def _as_float(value):
 
 def _evaluate_xsec_magnitude(cand: dict) -> tuple[list[dict], dict, list[str]]:
     """The MAGNITUDE leg (alpha-engine-config-I10185): is the candidate's
-    cross-sectional dispersion, measured on its OWN training panel, too small in
-    absolute terms AND too small against the incumbent scored on that same panel?
+    cross-sectional dispersion, measured on the rows it would actually SERVE,
+    too small in absolute terms AND too small against the incumbent scored on
+    those same rows?
 
     Returns ``(vetoes, measured, uncomputable)``.
+
+    The population changed with alpha-engine-config-I11106: ``xsec_sd`` and
+    ``xsec_sd_incumbent_same_panel`` are now measured over each date's
+    ``attractiveness_top_20 ∪ held`` (``training/served_cut_mask.py``), which is
+    the population the 0.015 floor was derived from. The fit-panel figures are
+    still on the manifest under their own keys — they are the only basis
+    computable before a model has ever served — but they are not what this leg
+    reads. A ``None`` here is a VETO, not a skip; see the branch below.
 
     Both sub-legs must fire, and that conjunction is measured, not assumed.
     Every registered ``v3.0-meta`` coefficient vector (20, 2026-06-06 ..
@@ -240,7 +278,38 @@ def _evaluate_xsec_magnitude(cand: dict) -> tuple[list[dict], dict, list[str]]:
     if ref is None or ref <= 0:
         uncomputable.append(XSEC_SD_INCUMBENT_SAME_PANEL)
     if c is None:
+        # ABSENCE IS A REFUSAL (alpha-engine-config-I11106). This branch used to
+        # file the metric under ``uncomputable`` and return zero vetoes — a
+        # candidate carrying no ``xsec_sd`` at all sailed through the leg whose
+        # own module docstring says "Absence is never a pass". That is how the
+        # currently-serving champion was promoted: ``predictor/weights/meta/
+        # manifest.json`` (v3.0-meta, 2026-08-14) carries no ``xsec_sd``, no
+        # ``xsec_variance_share`` and no ``behavioral_metrics`` block at all, so
+        # the gate that exists to catch a dispersion collapse never evaluated it.
+        #
+        # Still recorded as uncomputable — it is both — because a reader must be
+        # able to tell a refusal on a MEASURED collapse from a refusal on a
+        # MISSING measurement; they need different repairs
+        # (champion-challenger-policy.md §§7.2, 5.1).
         uncomputable.append("xsec_sd")
+        vetoes.append({
+            "metric": "xsec_sd",
+            "candidate": None,
+            "rule": f">= {XSEC_SD_ABSOLUTE_FLOOR}",
+            "reason": (
+                "xsec_sd is ABSENT from this candidate's behavioral metrics, so "
+                "the cross-sectional dispersion the executor ranks and sizes on "
+                "was never measured for it. An unmeasured model is unobserved, "
+                "not healthy: refusing is the only reading that does not promote "
+                "on a number nobody produced. The producer is "
+                "training/xsec_variance_share.py, masked to the served cut by "
+                "training/served_cut_mask.py, mirrored onto the manifest's "
+                "behavioral_metrics block by training/meta_trainer.py — a null "
+                "here means that chain did not run or could not resolve the "
+                "served cut, and its own status field names which "
+                "(alpha-engine-config-I11106)"
+            ),
+        })
         return vetoes, measured, uncomputable
 
     ratio = (c / ref) if (ref is not None and ref > 0) else None

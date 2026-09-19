@@ -84,6 +84,7 @@ def incumbent_xsec_sd_on_candidate_panel(
     dates,
     train_meta_features,
     served_version: str | None = None,
+    basis: str = "incumbent_coefficients_on_candidate_panel",
 ) -> dict:
     """The incumbent's ``xsec_sd`` over the CANDIDATE's training panel.
 
@@ -101,6 +102,15 @@ def incumbent_xsec_sd_on_candidate_panel(
     ``basis`` is recorded because the whole claim rests on it: this is the
     incumbent's frozen coefficients on THIS vintage's rows, never its own
     stored number and never a refit.
+
+    ``basis`` is also a PARAMETER (alpha-engine-config-I11106), because "this
+    vintage's rows" is now two different populations. The rows passed may be
+    the whole fitted design matrix (``incumbent_coefficients_on_candidate_``
+    ``panel``) or only the rows the model would actually serve — each date's
+    ``attractiveness_top_20 ∪ held`` (``incumbent_coefficients_on_candidate_``
+    ``served_cut``). The two differ by 6.6x on the measured champion, so a
+    reader who cannot tell which one produced a number cannot use it. The
+    caller states which rows it passed; this function never guesses.
     """
     import numpy as np
 
@@ -116,7 +126,7 @@ def incumbent_xsec_sd_on_candidate_panel(
         "xsec_variance_share": None,
         "n_rows": int(X.shape[0]) if X.ndim == 2 else None,
         "n_dates": None,
-        "basis": "incumbent_coefficients_on_candidate_panel",
+        "basis": str(basis),
     }
     try:
         vid = served_version or _resolve_served_version(s3, bucket)
