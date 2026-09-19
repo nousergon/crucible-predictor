@@ -112,7 +112,9 @@ __all__ = [
     "REGISTER_KEY", "CYCLE_PREFIX", "BASE_ARCH_ARM",
     "recipe_spec", "build_register", "build_series", "training_statuses",
     "serving_preconditions", "run_model_slot_cycle", "emit_cycle",
-    "ArenaSlotUnservable",
+    "cycle_outcome", "ArenaSlotUndecidable",
+    "OUTCOME_DECIDED", "OUTCOME_UNSERVABLE",
+    "SERVABLE_STATUSES", "UNSERVABLE_STATUS", "ALARMING_STATUSES",
 ]
 
 SLOT = "M"
@@ -212,13 +214,25 @@ class _LazyConfig:
 ARENA_CONFIG = _LazyConfig()
 
 
-class ArenaSlotUnservable(RuntimeError):
-    """No arm may serve this cycle. Policy §5.3: the slot fails LOUD.
+class ArenaSlotUndecidable(RuntimeError):
+    """The cycle reached NO verdict. Distinct from reaching a refusal.
 
-    Distinct from ``TrainingIntegrityError`` (§3), which is about the training
-    substrate. This one says every arm trained fine and none of them is fit to
-    be consumed — continuing to serve a known-unfit arm is never the safer
-    option, and rendering that as a quiet hold is §7.2's dominant bug class.
+    ``unservable`` — every arm trained fine and none of them is fit to be
+    consumed — is a VERDICT the slot produced by applying its §5.3 serving
+    preconditions, and it is reported as one (see :func:`cycle_outcome`). This
+    exception is the other thing: the cycle came out with NO arm to serve and
+    no stated refusal to explain that, or the engine reported a
+    ``decision.status`` this module does not know. Neither is rendered as a
+    decision (``sf-pipeline-policy.md`` §2.3a rule 2: UNKNOWN is not a pass),
+    so both halt under one distinct name.
+
+    NOT this: ``unmeasurable``. That cycle measured nothing, which alarms, but
+    it leaves the incumbent serving and is the ordinary shape of a one-arm
+    slot — see :func:`cycle_outcome` for why failing there would be a false
+    red rather than a loud one.
+
+    Also distinct from ``TrainingIntegrityError`` (§3), which is about the
+    training substrate rather than the decision.
     """
 
 
@@ -832,15 +846,110 @@ def run_model_slot_cycle(
     return cycle, doc
 
 
-def assert_servable(cycle) -> None:
-    """Policy §5.3: a cycle where no arm may serve fails loud."""
-    if cycle.decision.status == "unservable":
-        raise ArenaSlotUnservable(
-            f"M slot is UNSERVABLE as of {cycle.as_of}: {cycle.decision.reason}. "
-            "Every arm failed a hard serving precondition, so there is no arm "
-            "to point at. Continuing to serve a known-unfit arm is never the "
-            "safer option (champion-challenger-policy §5.3)."
+#: ``MODEL_ZOO_SELECT_OUTCOME`` v1 — the two outcomes a cycle that RAN can
+#: have. The durable source of truth is always
+#: ``arena/model/{date}.json::decision.status``; these names exist so a caller
+#: (and the ``spot-model-zoo-select`` workload above it) can render "the slot
+#: declined to promote" differently from "the stage broke" without re-deriving
+#: the engine's enum.
+OUTCOME_DECIDED = "decided"
+OUTCOME_UNSERVABLE = "unservable"
+
+#: ``PointerDecision.status`` values (``nousergon_lib.arena.engine``) that leave
+#: the slot with an arm it is permitted to serve. ``unmeasurable`` is in this
+#: set ON PURPOSE and with a caveat — see :func:`cycle_outcome`.
+SERVABLE_STATUSES = frozenset({"decided", "held", "bootstrap", "unmeasurable"})
+#: The one status that is a REFUSAL: the preconditions ran and excluded every
+#: arm. A verdict, not a fault.
+UNSERVABLE_STATUS = "unservable"
+#: Statuses that reached no comparison at all. They still leave the incumbent
+#: serving, so they are not a refusal — but they ALARM (policy §7.2, §11).
+ALARMING_STATUSES = frozenset({"unmeasurable"})
+
+
+def cycle_outcome(cycle) -> str:
+    """The completed cycle's outcome: ``"decided"`` or ``"unservable"``.
+
+    alpha-engine-config-I11106. ``unservable`` used to raise here, so the
+    weekly SF could not tell "the M slot correctly declined to promote — no
+    arm passes its §5.3 serving preconditions" from "the ModelZooSelect stage
+    broke". Those are different states and they must render differently: the
+    2026-09-19 weekly run terminated DEGRADED on a stage that had done exactly
+    its job — it evaluated three M arms, applied the preconditions, and
+    concluded that nothing qualifies.
+
+    **The refusal is unchanged.** ``promotion_behavioral_veto`` and every other
+    serving precondition refuse exactly what they refused before, no arm
+    becomes promotable, and the pointer does not move. Only the REPORTING of a
+    correct refusal changes: it is returned as a verdict the caller propagates
+    (and the workload prints as ``MODEL_ZOO_SELECT_OUTCOME: unservable``,
+    exit 0) rather than thrown as a failure.
+
+    The question this answers is exactly one: **does the slot come out of this
+    cycle with an arm it is permitted to serve?** Yes → ``decided``. No, because
+    the preconditions excluded every arm → ``unservable``. Anything else — a
+    cycle with no champion that is not a stated refusal, or a status this
+    module does not know — is not classified at all and raises
+    :class:`ArenaSlotUndecidable`; guessing would be rendering UNKNOWN as a
+    pass (``sf-pipeline-policy.md`` §2.3a rule 2).
+
+    ``unmeasurable`` and the alarm it carries
+    -----------------------------------------
+    ``unmeasurable`` — zero comparisons, or no challenger sharing a usable
+    window — is NOT a failure and is NOT reported as one. It is the ordinary
+    shape of a slot holding ONE eligible arm: the engine keeps the incumbent
+    serving and says why. Measured: three existing rotation tests
+    (``test_model_zoo_digest_email``, ``test_l4582_selection_pbo_trials``) run
+    real one-arm pools and reach it, and the M slot reaches it the first week a
+    single arm clears the veto while the others do not. Failing the weekly
+    pipeline there would be a false red on a slot that is serving correctly,
+    and it is a strictly wider change than "report a refusal as a refusal".
+
+    What it does get is the alarm policy §7.2/§11 requires: an ERROR log naming
+    that the cycle produced no comparison, plus ``decision.status`` in the
+    durable ``arena/model/{date}.json``, which is where a consumer reads the
+    difference between "held against a measured challenger" and "nothing to
+    measure". The stdout marker cannot carry that third state —
+    ``MODEL_ZOO_SELECT_OUTCOME`` v1 is two-valued by cross-repo contract — and
+    the close for that is moving the SF Choice onto a structured read of the
+    artifact (alpha-engine-config-I11101 deliverable 4).
+    """
+    status = cycle.decision.status
+    if status == UNSERVABLE_STATUS:
+        # Loud, and it alarms (policy §5.3, §7.2) — via the artifact, this
+        # WARNING, and the outcome the caller propagates. What it no longer
+        # does is masquerade as a broken stage.
+        log.warning(
+            "arena[M]: the slot is UNSERVABLE as of %s: %s. Every arm failed a "
+            "hard serving precondition, so there is no arm to point at and "
+            "NOTHING is promoted. This is the slot's VERDICT, reported as one "
+            "(champion-challenger-policy §5.3, alpha-engine-config-I11106).",
+            cycle.as_of, cycle.decision.reason,
         )
+        return OUTCOME_UNSERVABLE
+    if status in ALARMING_STATUSES:
+        log.error(
+            "arena[M]: the cycle as of %s reached NO comparison (status=%s): %s. "
+            "The incumbent keeps serving, so the slot is not unservable — but a "
+            "cycle that measured nothing is a defect, not a result "
+            "(champion-challenger-policy §7.2, §11). The artifact at "
+            "%s/%s.json carries the status; this outcome cannot.",
+            cycle.as_of, status, cycle.decision.reason, CYCLE_PREFIX, cycle.as_of,
+        )
+    if status in SERVABLE_STATUSES and cycle.decision.champion is not None:
+        return OUTCOME_DECIDED
+    raise ArenaSlotUndecidable(
+        f"M slot reached NO verdict as of {cycle.as_of}: decision.status="
+        f"{status!r}, champion={cycle.decision.champion!r} — "
+        f"{cycle.decision.reason}. "
+        + (
+            "The cycle names no arm to serve and did not state the refusal that "
+            "would explain it."
+            if status in SERVABLE_STATUSES else
+            "This status is not one this module knows how to report; refusing "
+            "to classify it as either a decision or a refusal."
+        )
+    )
 
 
 def emit_cycle(s3, bucket: str, doc: dict, *, as_of: str) -> list:
@@ -897,7 +1006,12 @@ def run_slot(
     cannot fire (§7.4). This translates version-keyed metrics onto arm ids
     here, where the mapping exists.
 
-    ``TrainingIntegrityError`` and :class:`ArenaSlotUnservable` both propagate.
+    Returns ``outcome`` alongside the cycle: ``"decided"`` when the slot has an
+    arm it may serve, ``"unservable"`` when the §5.3 preconditions excluded
+    every arm. ``TrainingIntegrityError`` and :class:`ArenaSlotUndecidable`
+    both propagate — a cycle that could not RUN, and a cycle that could not
+    DECIDE, are failures; a cycle that decided not to promote is not
+    (alpha-engine-config-I11106).
     """
     versions = _list_registry_versions(s3, bucket)
     register, arm_id_by_label = build_register(
@@ -1000,10 +1114,10 @@ def run_slot(
     # a well-formed `arena_cycle` built from an empty live record is the
     # "reads as coverage" failure (policy §7.4, §11).
     doc["score_attribution"] = score_attribution
-    # alpha-engine-config-I11105 — write the artifact BEFORE asserting
-    # servability, not after. The one week every arm failed a hard serving
-    # precondition is the one week `assert_servable` raised and the module
-    # returned before `emit_cycle` ever ran, so `arena/model/latest.json`
+    # alpha-engine-config-I11105 — write the artifact BEFORE classifying the
+    # cycle, not after. The one week every arm failed a hard serving
+    # precondition is the one week the then-`assert_servable` raised and the
+    # module returned before `emit_cycle` ever ran, so `arena/model/latest.json`
     # kept presenting the prior week's cycle as current. Measured live
     # 2026-09-19: `arena/model/2026-09-11.json` and a byte-identical
     # `latest.json` (17,346 bytes, both stamped 2026-09-12), no
@@ -1013,17 +1127,19 @@ def run_slot(
     # docstring), so a malformed `unservable` doc still fails loud rather
     # than being silently written.
     keys = emit_cycle(s3, bucket, doc, as_of=as_of) if write else []
-    assert_servable(cycle)
+    # alpha-engine-config-I11106 — `unservable` is a VERDICT and is RETURNED;
+    # only an undecidable cycle raises. See `cycle_outcome`.
+    outcome = cycle_outcome(cycle)
 
     # The engine's retirement verdicts are appended to the log here — the one
-    # place a cap-with-grace retirement is ever written. This stays AFTER
-    # assert_servable (I11105): moving `persist_register` ahead of the
-    # assertion too would persist the register before this cycle's
-    # retirements are folded in, silently dropping them on an unservable
-    # cycle. The `arena_cycle` artifact (moved above) is the fact that needed
-    # to reach every reader unconditionally; the register is a derived index
-    # that is still correctly rebuilt on the next servable cycle, so it is
-    # left gated on `assert_servable` succeeding.
+    # place a cap-with-grace retirement is ever written. It runs on an
+    # unservable cycle too (I11106, revisiting I11105's stated decision): a
+    # cycle that HAPPENED is a fact, the retirement verdicts it produced are
+    # the register's only writer, and the reason they were previously gated
+    # was the `assert_servable` raise that no longer stands between here and
+    # the cycle. The ordering constraint I11105 named still holds and is what
+    # this block preserves: retirements are folded in BEFORE
+    # `persist_register` writes, never after.
     for verdict in cycle.retirements:
         if verdict.retire and register.state(verdict.arm_id).retired_date is None:
             register = register.retire(verdict.arm_id, as_of, reason=verdict.reason)
@@ -1042,6 +1158,7 @@ def run_slot(
         "pointer_arm": pointer_arm,
         "pointer_version_id": (pointer_bundle or {}).get("version_id"),
         "keys": keys,
+        "outcome": outcome,
     }
 
 

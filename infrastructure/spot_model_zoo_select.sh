@@ -160,6 +160,10 @@ fi
 # ── Select-only (after Map joins) ────────────────────────────────────────────
 if [ "$MODE" = "select-only" ]; then
   print_banner "MODEL-ZOO SELECT (observe-first by default)"
+  # The SSM output is teed so the launcher can read the workload's outcome
+  # line back out of it (MODEL_ZOO_SELECT_OUTCOME v1, below). `set -o pipefail`
+  # is in force (_spot_common.sh), so a failed run_ssm still fails the stage.
+  _ZOO_SELECT_OUT="$(mktemp -t spot-model-zoo-select.XXXXXX)"
   run_ssm "model-zoo-select" "${_RUN_TOKEN_EXPORT}$(cat <<'ZOOSEL'
 set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1
@@ -194,6 +198,22 @@ except Exception:
     date_str = None
 
 board = run_select_only(bucket, date_str=date_str)
+
+# MODEL_ZOO_SELECT_OUTCOME v1 (alpha-engine-config-I11106) — the M slot's
+# verdict, handed to the launcher on stdout. 'unservable' means the serving
+# preconditions ran and excluded every arm: the slot DECIDED not to promote,
+# which is a successful stage with a negative result. The DURABLE source of
+# truth is arena/model/{date}.json::decision.status; this line is only a
+# cheap transport for the weekly SF's Choice (moving that Choice onto a
+# structured read of the artifact is alpha-engine-config-I11101 deliverable
+# 4). A missing/unknown outcome is NOT defaulted — it exits non-zero.
+_outcome = board.get('arena_outcome')
+if _outcome not in ('decided', 'unservable'):
+    raise SystemExit(
+        'model_zoo select: no usable arena outcome on the leaderboard (%r) — '
+        'refusing to report an outcome-less select as a successful stage '
+        '(alpha-engine-config-I11106)' % (_outcome,)
+    )
 print()
 print('=' * 60)
 print('  MODEL-ZOO SELECT')
@@ -207,10 +227,42 @@ for c in board.get('candidates', []):
 print('  Winner:         %s' % board.get('winner_version_id'))
 print('  Promoted:       %s' % board.get('promoted'))
 print('=' * 60)
+
+# LAST line the workload prints, deliberately: SSM caps inline
+# StandardOutputContent at 24KB and ROTATES the buffer past it, so an outcome
+# line emitted mid-run can be dropped before the launcher reads it back.
+print('MODEL_ZOO_SELECT_OUTCOME_RAW=%s' % _outcome)
 PYEOF
 $PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
 ZOOSEL
-)" "${MAX_RUNTIME_SECONDS}"
+)" "${MAX_RUNTIME_SECONDS}" | tee "$_ZOO_SELECT_OUT"
+
+  # ── MODEL_ZOO_SELECT_OUTCOME v1 (alpha-engine-config-I11106) ───────────────
+  # Three distinguishable states, not two:
+  #   unservable — every M arm failed a hard serving precondition. The stage
+  #                EVALUATED the arms, applied the §5.3 preconditions, and
+  #                correctly concluded that nothing may be promoted. A
+  #                VERDICT, exit 0. Nothing is weakened: no arm becomes
+  #                promotable and the pointer does not move.
+  #   decided    — the slot has an arm it may serve. Exit 0.
+  #   anything else (exception, resource kill, timeout, no outcome line at
+  #                all) — the stage BROKE. Exit non-zero, unchanged.
+  # The weekly SF's Choice matches this exact string on
+  # StandardOutputContent, so it is a single anchored line and must not be
+  # reworded. The durable source of truth stays
+  # arena/model/{date}.json::decision.status — this is a transport only, and
+  # moving the Choice onto a structured read of that artifact is tracked as
+  # alpha-engine-config-I11101 deliverable 4.
+  if grep -qx 'MODEL_ZOO_SELECT_OUTCOME_RAW=unservable' "$_ZOO_SELECT_OUT"; then
+    _ZOO_OUTCOME="unservable"
+  elif grep -qx 'MODEL_ZOO_SELECT_OUTCOME_RAW=decided' "$_ZOO_SELECT_OUT"; then
+    _ZOO_OUTCOME="decided"
+  else
+    rm -f "$_ZOO_SELECT_OUT"
+    echo "ERROR: model-zoo select produced NO MODEL_ZOO_SELECT_OUTCOME_RAW line — the workload exited 0 without reporting an outcome. Refusing to report an outcome-less select as a successful stage (alpha-engine-config-I11106)." >&2
+    exit 1
+  fi
+  rm -f "$_ZOO_SELECT_OUT"
 
   emit_heartbeat
 
@@ -227,5 +279,6 @@ ZOOSEL
 
   echo ""
   echo "==> Model-zoo select complete. Instance will be terminated."
+  echo "MODEL_ZOO_SELECT_OUTCOME: ${_ZOO_OUTCOME}"
   exit 0
 fi
