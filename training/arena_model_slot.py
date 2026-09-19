@@ -476,6 +476,7 @@ def build_series(
     bucket: str, *, arm_id_by_label: dict, version_labels: dict,
     n_days: int = 90, horizon_days: int | None = None, s3_client=None,
     pairs: list | None = None, attribution_out: dict | None = None,
+    specs: list | None = None, canonical_horizon: int | None = None,
 ):
     """One :class:`ArmSeries` per arm — per-date realized market-relative rank-IC.
 
@@ -531,12 +532,36 @@ def build_series(
         attribution_out.clear()
         attribution_out.update(attribution)
 
+    # alpha-engine-config-I11107 — labels the slot register has already
+    # classified `inapplicable` or `retired` (e.g. `spec-60d`, `spec-90d`: the
+    # M slot trains one canonical 21d horizon, so a 60d/90d spec's Jun–Aug
+    # prediction files legitimately map to no registered arm, permanently —
+    # `canonical_horizon=21d policy=refuse_non_canonical`, I9313). A per-file
+    # WARNING over this closed, known set recurs ~34x every rotation forever
+    # and camouflages the first genuinely unknown label the week one appears.
+    # `version_id=None` (label=None, the I8219 family — a different condition:
+    # an unstamped bucket, not a known-inapplicable spec) is NOT in this set
+    # and always falls through to the per-file WARNING below.
+    from training import model_zoo_registry as reg
+    _known_inapplicable_labels = {
+        a.model_version_label
+        for a in reg.resolve_arms(specs, canonical_horizon=canonical_horizon)
+        if a.applicability in ("inapplicable", "retired")
+    }
+    n_known_inapplicable = 0
+
     scores: dict[str, dict[str, float]] = {}
     misses: dict[str, set] = {}
     for version_id, per_date in by_version.items():
         label = version_labels.get(version_id)
         arm_id = arm_id_by_label.get(label)
         if arm_id is None:
+            if label in _known_inapplicable_labels:
+                # Structurally excluded from the slot, not an unknown label —
+                # counted for the single aggregate INFO line below rather than
+                # warned per file.
+                n_known_inapplicable += 1
+                continue
             # An artifact from a version no arm claims. Recorded, never folded
             # into some other arm's series — that is I9313's `thinktank_coverage`
             # defect and the 2026-07-28 false-provenance defect at once (§7.5).
@@ -553,6 +578,14 @@ def build_series(
                 # Two refits of one recipe never both produce on one date (a
                 # single version serves a given day), so this cannot collide.
                 scores.setdefault(arm_id, {})[date] = float(ic)
+
+    if n_known_inapplicable:
+        log.info(
+            "arena[M]: %d prediction file(s) belong to known-inapplicable/"
+            "retired labels %s — not scored, collapsed from per-file WARNINGs "
+            "to this one aggregate line (alpha-engine-config-I11107).",
+            n_known_inapplicable, sorted(_known_inapplicable_labels),
+        )
 
     out = {}
     for arm_id in set(arm_id_by_label.values()):
@@ -896,6 +929,7 @@ def run_slot(
     series_by_arm = build_series(
         bucket, arm_id_by_label=arm_id_by_label, version_labels=version_labels,
         n_days=n_days, s3_client=s3, attribution_out=score_attribution,
+        specs=specs,
     )
     # Every arm the register says is scored this cycle must have a series, even
     # an empty one — the engine refuses a missing series, and rightly: an arm

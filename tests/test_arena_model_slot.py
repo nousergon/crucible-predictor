@@ -756,6 +756,76 @@ class TestAnUnservableCycleStillWritesTheArtifact:
         assert ams.REGISTER_KEY not in s3.puts
 
 
+class TestKnownInapplicableLabelsCollapseToOneLine:
+    """alpha-engine-config-I11107 — RED before the fix: EVERY prediction file
+    from a permanently-excluded label (a non-canonical horizon, e.g.
+    `spec-60d`/`spec-90d`) fired its own per-file WARNING, ~34x per rotation
+    forever, camouflaging a genuinely unknown label. `version_id=None`
+    (the I8219 family — a different condition) must stay loud."""
+
+    _SPECS_WITH_60D = [
+        {"id": "sixty-day-arm", "model_version_label": "spec-60d",
+         "status": "active", "overrides": {"FORWARD_DAYS": 60}},
+    ]
+
+    def _pairs(self):
+        return [
+            # Known-inapplicable: excluded from the slot by horizon (60d vs
+            # the canonical 21d), permanently and by construction.
+            {"champion_version_id": "v-60d-1", "date": "2026-07-01",
+             "ticker": "AAA", "predicted_alpha": 0.1, "realized_alpha": 0.05},
+            # A genuinely unknown label — not in the spec register at all.
+            {"champion_version_id": "v-unknown-1", "date": "2026-07-02",
+             "ticker": "BBB", "predicted_alpha": 0.2, "realized_alpha": 0.1},
+            # version_id=None (label=None) — the I8219 family, must stay loud.
+            {"champion_version_id": None, "date": "2026-07-03",
+             "ticker": "CCC", "predicted_alpha": 0.3, "realized_alpha": 0.15},
+        ]
+
+    def _version_labels(self):
+        return {"v-60d-1": "spec-60d", "v-unknown-1": "totally-new-label"}
+
+    def test_known_inapplicable_collapses_to_one_info_line(self, caplog):
+        import logging
+        caplog.set_level(logging.INFO, logger="training.arena_model_slot")
+
+        ams.build_series(
+            "bucket", arm_id_by_label={}, version_labels=self._version_labels(),
+            pairs=self._pairs(), specs=self._SPECS_WITH_60D, canonical_horizon=21,
+        )
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        infos = [r for r in caplog.records if r.levelno == logging.INFO]
+
+        warning_text = " ".join(r.getMessage() for r in warnings)
+        info_text = " ".join(r.getMessage() for r in infos)
+
+        # The known-inapplicable label never produces a per-file WARNING.
+        assert "spec-60d" not in warning_text
+        assert "v-60d-1" not in warning_text
+        # ...and instead is named once in an aggregate INFO line.
+        assert any("spec-60d" in r.getMessage() and "1 prediction" in r.getMessage()
+                   for r in infos), info_text
+
+        # A genuinely unknown label still WARNs.
+        assert any("totally-new-label" in r.getMessage() for r in warnings), warning_text
+        # version_id=None (the I8219 family) still WARNs.
+        assert any("version_id=None" in r.getMessage() for r in warnings), warning_text
+
+    def test_a_synthetic_unknown_label_still_warns(self, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger="training.arena_model_slot")
+
+        ams.build_series(
+            "bucket", arm_id_by_label={},
+            version_labels={"v-mystery-1": "never-seen-before"},
+            pairs=[{"champion_version_id": "v-mystery-1", "date": "2026-07-04",
+                    "ticker": "DDD", "predicted_alpha": 0.1, "realized_alpha": 0.2}],
+            specs=self._SPECS_WITH_60D, canonical_horizon=21,
+        )
+        assert any("never-seen-before" in r.getMessage() for r in caplog.records)
+
+
 class TestTheSlotDoesNotReimplementTheEngine:
     """policy §10: a slot re-implementing §§3–6 is a defect, not a variation."""
 
