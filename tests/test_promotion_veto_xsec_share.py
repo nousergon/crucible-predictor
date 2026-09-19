@@ -50,13 +50,21 @@ def test_a_degenerate_candidate_is_vetoed():
 
 
 def test_a_cross_sectionally_live_candidate_is_not_vetoed_on_this_rule():
-    out = evaluate_behavioral_veto(_manifest(0.42), _manifest(0.38))
+    # ``xsec_sd`` is supplied because its absence is itself a veto since
+    # alpha-engine-config-I11106; this test is about the SHARE rule, so the
+    # magnitude leg must be given something to measure or it would refuse for
+    # a reason that has nothing to do with the subject.
+    out = evaluate_behavioral_veto(
+        _manifest(0.42, xsec_sd=0.030), _manifest(0.38, xsec_sd=0.030),
+    )
     assert out["status"] == "pass"
     assert out["measured"]["xsec_variance_share"] == {"candidate": 0.42, "floor": 0.10}
 
 
 def test_an_absent_share_is_uncomputable_never_a_pass_of_this_rule():
-    out = evaluate_behavioral_veto(_manifest(None), _manifest(None))
+    out = evaluate_behavioral_veto(
+        _manifest(None, xsec_sd=0.030), _manifest(None, xsec_sd=0.030),
+    )
     assert "xsec_variance_share" in out["uncomputable"]
     assert not [v for v in out["vetoes"] if v["metric"] == "xsec_variance_share"]
 
@@ -70,7 +78,8 @@ def test_the_rule_is_absolute_not_a_ratio_against_the_incumbent():
 
 def test_the_existing_hit_rate_floor_keeps_its_own_reason_text():
     out = evaluate_behavioral_veto(
-        _manifest(0.42, model_hit_rate_30d=0.41), _manifest(0.38),
+        _manifest(0.42, model_hit_rate_30d=0.41, xsec_sd=0.030),
+        _manifest(0.38, xsec_sd=0.030),
     )
     hit = [v for v in out["vetoes"] if v["metric"] == "model_hit_rate_30d"]
     assert len(hit) == 1
