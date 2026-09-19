@@ -968,6 +968,79 @@ def emit_cycle(s3, bucket: str, doc: dict, *, as_of: str) -> list:
         s3.put_object(Bucket=bucket, Key=key, Body=body,
                       ContentType="application/json")
         log.info("arena[M]: cycle written to s3://%s/%s", bucket, key)
+    keys += _emit_verdict_projection(s3, bucket, doc, as_of=as_of)
+    return keys
+
+
+def _verdict_vocabulary() -> frozenset[str]:
+    """The projection's vocabulary, READ FROM THE CONTRACT, never restated.
+
+    ``arena_cycle.schema.json`` already enumerates ``decision.status``
+    (``decided``, ``held``, ``unmeasurable``, ``unservable``, ``bootstrap``).
+    A second hand-maintained copy here would be a fifth place the vocabulary
+    lives and the first one to go stale — the drift class this repo has been
+    bitten by repeatedly. Deriving it means a schema change is picked up
+    automatically, and a status the schema does not know still fails loud.
+    """
+    from nousergon_lib.contracts import load_schema
+
+    enum = (
+        load_schema("arena_cycle")["properties"]["decision"]
+        ["properties"]["status"]["enum"]
+    )
+    return frozenset(enum)
+
+
+def _emit_verdict_projection(s3, bucket: str, doc: dict, *, as_of: str) -> list:
+    """Write ``decision.status`` as a bare word beside the cycle artifact.
+
+    **Why a second key for one field that the cycle artifact already carries.**
+    The weekly SF (``ne-weekly-freshness-pipeline``, branch B) has to know
+    whether the M slot refused to promote, because a correct refusal and a
+    crashed stage are different outcomes and the run must render them
+    differently. Every way of getting that fact out of the cycle JSON *inside
+    Step Functions* is unsafe, measured rather than assumed
+    (alpha-engine-config-I11101):
+
+    * Matching the workload's stdout marker fails on log length — SSM caps
+      ``StandardOutputContent`` at ~24,000 characters and the marker is emitted
+      last, because the verdict is not known until the end. On
+      ``watch-rerun-2026-09-18-1`` the log was 28,759 bytes and the marker fell
+      4.7 KB outside the window.
+    * ``States.StringToJson`` on the cycle body raises ``States.Runtime`` on a
+      malformed artifact, and that error is **not catchable** — proven against
+      live Step Functions on 2026-09-19, including from inside a Parallel whose
+      Catch names ``States.ALL``. A bad artifact would take down the whole
+      weekly run.
+    * String-matching the rendered JSON re-introduces the class being removed:
+      ``decision.comparisons[].status`` is a second ``status`` field in the same
+      document, so a substring match is a false-positive surface rather than a
+      read.
+
+    So the parse happens here, where a malformed value is an ordinary Python
+    exception on the producer, and the SF does a whole-body comparison against a
+    single word. This is a PROJECTION, not a second source of truth: it is
+    derived from the same validated ``doc`` inside the same function, so the two
+    keys cannot disagree about a cycle.
+    """
+    vocabulary = _verdict_vocabulary()
+    status = (doc.get("decision") or {}).get("status")
+    if status not in vocabulary:
+        raise ValueError(
+            f"arena[M]: decision.status {status!r} is outside the verdict "
+            f"vocabulary {sorted(vocabulary)}. The weekly SF's "
+            f"CheckModelZooVerdict has no arm for it and would route the cycle "
+            f"to its UNKNOWN edge. validate() should already have refused this "
+            f"doc, so reaching here means the schema and this projection "
+            f"disagree (alpha-engine-config-I11101)."
+        )
+    keys = [f"{CYCLE_PREFIX}/{as_of}.verdict", f"{CYCLE_PREFIX}/latest.verdict"]
+    for key in keys:
+        # No trailing newline: the SF compares the WHOLE body, so any byte here
+        # is part of the contract.
+        s3.put_object(Bucket=bucket, Key=key, Body=status.encode("utf-8"),
+                      ContentType="text/plain")
+        log.info("arena[M]: verdict %r written to s3://%s/%s", status, bucket, key)
     return keys
 
 

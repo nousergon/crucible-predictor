@@ -64,7 +64,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-I9018: 7 -> 6. The dated-archive write
     # (predictor/weights/meta/archive/{date}/) is GONE — training writes a
     # per-run staging prefix and the immutable registry bundle is the store.
-    "training/arena_model_slot.py": 2,  # arena/model-slot register + arena_cycle artifacts (alpha-engine-config-I9319)
+    "training/arena_model_slot.py": 3,  # arena/model-slot register + arena_cycle artifacts (alpha-engine-config-I9319) + the arena/model/{date|latest}.verdict plain-text projection of decision.status (alpha-engine-config-I11101): registered as arena_model_verdict_latest in ARTIFACT_REGISTRY.yaml, NOT grandfathered — the weekly SF routes on it, and its absence degrades the run at CheckModelZooVerdict rather than reading as a decided cycle. The dated sibling is deliberately unregistered (anchoring ambiguity), same posture as model_zoo_leaderboard/promotions.
     "training/meta_trainer.py": 6,
     # alpha-engine-config-I9018: 4 -> 3. The G2 live-contract RESTORE put is
     # GONE with G2 itself — training can no longer write the live contract, so
