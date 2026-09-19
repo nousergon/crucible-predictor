@@ -64,6 +64,9 @@ def mock_arena_run_slot(
             "pointer_arm": decision.champion,
             "pointer_version_id": pointer_version_id,
             "keys": [f"arena/model/{as_of}.json", "arena/model/latest.json"],
+            # alpha-engine-config-I11106 — classified by the REAL function, so
+            # a mock can never report an outcome the module would not.
+            "outcome": arena_mod.cycle_outcome(cycle),
         }
 
     monkeypatch.setattr(arena_mod, "run_slot", _run_slot)

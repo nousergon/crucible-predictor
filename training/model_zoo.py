@@ -2116,6 +2116,13 @@ def _verify_promotion_marker_noop(s3, bucket: str, date_str: str, marker: dict) 
         "date": date_str,
         "mode": marker.get("mode"),
         "idempotent_noop": True,
+        # alpha-engine-config-I11106 — a promotion marker exists for this date,
+        # which can only have been written by a run that got all the way
+        # through the arena decision and promoted. So the outcome this re-run
+        # reports is the one that run reached: `decided`. An `unservable`
+        # cycle promotes nothing and writes no marker, so it can never land
+        # here.
+        "arena_outcome": "decided",
         "candidates": [],
         "winner_version_id": marker.get("winner_version_id"),
         "promoted": marker.get("promoted"),
@@ -3304,6 +3311,20 @@ def select_and_finalize(
         leaderboard["arena_cycle_keys"] = _arena_run["keys"]
         leaderboard["arena_decision"] = _arena_run["cycle"].decision.to_dict()
         leaderboard["arena_pointer_arm"] = _arena_run["pointer_arm"]
+        # alpha-engine-config-I11106 — the M slot's VERDICT, propagated rather
+        # than thrown. `"unservable"` means the serving preconditions ran and
+        # excluded every arm: the slot correctly declined to promote, which is
+        # a successful stage with a negative result, not a broken one. The
+        # DURABLE source of truth for it stays
+        # `arena/model/{date}.json::decision.status` (written by
+        # `arena.run_slot` above, unconditionally); this key, and the
+        # `MODEL_ZOO_SELECT_OUTCOME` line the spot workload prints from it,
+        # are a cheap transport so the weekly SF's Choice can render a
+        # refusal differently from a failure. Moving that Choice onto a
+        # structured read of the artifact is alpha-engine-config-I11101
+        # deliverable 4. An undecidable cycle never reaches here — it raises
+        # ArenaSlotUndecidable inside run_slot.
+        leaderboard["arena_outcome"] = _arena_run["outcome"]
 
         promote_vid = _arena_run["pointer_version_id"]
         if not promote_vid:
@@ -3599,6 +3620,21 @@ def run_select_only(
         s3, bucket, date_str=date_str, auto_promote_winner=auto_promote_winner,
         trained=None, specs=specs, dry_run=dry_run,
     )
+
+    # alpha-engine-config-I11106 — a real select MUST carry the M slot's
+    # verdict out of this entrypoint: it is what the `spot-model-zoo-select`
+    # workload prints as `MODEL_ZOO_SELECT_OUTCOME` and what the weekly SF's
+    # Choice reads to tell a refusal from a failure. Absent, the stage would
+    # exit 0 having reported no outcome at all, which the SF would render as
+    # a clean success — `no data` rendered as green (`principles.md` §2.7).
+    # Raised, never defaulted.
+    if not dry_run and s3 is not None and not leaderboard.get("arena_outcome"):
+        raise RuntimeError(
+            "model_zoo select: the leaderboard carries no `arena_outcome` — the "
+            "M-slot arena decision did not run, or did not reach this "
+            "entrypoint. Refusing to report an outcome-less select as a "
+            "successful stage (alpha-engine-config-I11106)."
+        )
 
     # config#1051/#1083 (no-silent-fails): an empty pool — zero challenger
     # candidates AND no base champion-arch — means every Map iteration failed /

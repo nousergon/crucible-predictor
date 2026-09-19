@@ -23,6 +23,7 @@ the pre-fix behaviour it was run against.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -583,8 +584,10 @@ class TestServingPreconditions:
             ).TrainingStatus(arm_id=a, ok=True) for a in arms},
         )
         assert cycle.decision.status == "unservable"
-        with pytest.raises(ams.ArenaSlotUnservable):
-            ams.assert_servable(cycle)
+        # alpha-engine-config-I11106 — and that is a VERDICT, reported as one.
+        # It used to raise, which made "the slot correctly declined to
+        # promote" indistinguishable from "the stage broke".
+        assert ams.cycle_outcome(cycle) == ams.OUTCOME_UNSERVABLE
 
 
 # ── the emitted artifact (M0 contract discipline) ──────────────────────────
@@ -675,19 +678,41 @@ class TestTheEmittedCycle:
         assert ArmRegister.from_dicts(events).all_arms() == register.all_arms()
 
 
-class TestAnUnservableCycleStillWritesTheArtifact:
-    """alpha-engine-config-I11105 — RED before the fix: ``run_slot`` ran
-    ``assert_servable(cycle)`` BEFORE ``emit_cycle``, so the one week every
-    arm failed a hard serving precondition was the one week the M slot wrote
-    NO ``arena/model/{as_of}.json`` at all. Measured live 2026-09-19:
+class _StubCycle:
+    """The two fields :func:`cycle_outcome` reads, and nothing else."""
+
+    def __init__(self, *, status, champion, as_of="2026-09-18", reason="stub"):
+        self.as_of = as_of
+        self.decision = type(
+            "_StubDecision", (),
+            {"status": status, "champion": champion, "reason": reason},
+        )()
+
+
+class TestAnUnservableCycleIsAVerdict:
+    """alpha-engine-config-I11105 + -I11106 — two defects on one path.
+
+    I11105, RED before its fix: ``run_slot`` asserted servability BEFORE
+    ``emit_cycle``, so the one week every arm failed a hard serving
+    precondition was the one week the M slot wrote NO
+    ``arena/model/{as_of}.json`` at all. Measured live 2026-09-19:
     ``arena/model/latest.json`` stayed byte-identical to the 2026-09-11 cycle
     (17,346 bytes, both stamped 2026-09-12) and there was no
-    ``2026-09-18.json`` — the unservable verdict, the highest-information
-    state this slot can produce, reached nobody.
+    ``2026-09-18.json``.
+
+    I11106, RED before this fix: the assertion then RAISED, the spot workload
+    exited 1, and the 2026-09-19 weekly SF terminated DEGRADED on a stage
+    that had done exactly its job — it evaluated three M arms, applied the
+    §5.3 serving preconditions, and correctly concluded that nothing may be
+    promoted. "Decided not to promote" and "could not decide" are different
+    states and must render differently. The refusal itself is unchanged: no
+    arm becomes promotable and the pointer does not move.
     """
 
-    def _run(self, monkeypatch, *, precondition_reasons):
-        s3 = _FakeS3()
+    def _run(self, monkeypatch, *, precondition_reasons, blocked_arms=None):
+        # Held on the instance too, so a test whose run RAISES can still
+        # inspect what reached S3 before the raise.
+        s3 = self.s3 = _FakeS3()
         versions = _versions(
             ("v-a", "lbl-alpha", "2026-09-11"),
             ("v-b", "lbl-beta", "2026-09-11"),
@@ -723,22 +748,22 @@ class TestAnUnservableCycleStillWritesTheArtifact:
         # this test is about write-vs-assert ORDER in run_slot, and the gate
         # logic itself is already covered by TestServingPreconditions.
         def _all_blocked(*, arm_ids, **_kwargs):
+            selected = arm_ids if blocked_arms is None else blocked_arms
             return {
                 a: (ServingPrecondition(name="behavioral_veto", passed=False,
                                         reason=precondition_reasons),)
-                for a in arm_ids
+                for a in arm_ids if a in selected
             }
         monkeypatch.setattr(ams, "serving_preconditions", _all_blocked)
 
-        with pytest.raises(ams.ArenaSlotUnservable):
-            ams.run_slot(
-                s3, "b", as_of="2026-09-18", specs=_SPECS,
-                incumbent_version_id="v-a",
-            )
-        return s3
+        return s3, ams.run_slot(
+            s3, "b", as_of="2026-09-18", specs=_SPECS,
+            incumbent_version_id="v-a",
+        )
 
     def test_the_dated_key_and_latest_mirror_carry_status_unservable(self, monkeypatch):
-        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+        s3, _run = self._run(
+            monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
 
         doc = s3.puts["arena/model/2026-09-18.json"]
         assert doc["decision"]["status"] == "unservable"
@@ -746,14 +771,84 @@ class TestAnUnservableCycleStillWritesTheArtifact:
         assert latest["decision"]["status"] == "unservable"
         assert latest == doc
 
-    def test_the_register_is_not_persisted_on_an_unservable_cycle(self, monkeypatch):
-        # I11105's stated decision: persist_register stays gated on
-        # assert_servable succeeding, so it is NOT moved ahead of the
-        # assertion the way emit_cycle is — moving it too would drop this
-        # cycle's retirement folding on the one path that most needs it
-        # recorded accurately.
-        s3 = self._run(monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
-        assert ams.REGISTER_KEY not in s3.puts
+    def test_the_run_returns_the_unservable_verdict_instead_of_raising(self, monkeypatch):
+        # alpha-engine-config-I11106. The spot workload turns this into
+        # `MODEL_ZOO_SELECT_OUTCOME: unservable` + exit 0, so the weekly SF
+        # can render a refusal differently from a broken stage.
+        _s3, run = self._run(
+            monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+        assert run["outcome"] == ams.OUTCOME_UNSERVABLE
+        assert run["cycle"].decision.status == "unservable"
+        # and NOTHING is promoted — the refusal is untouched.
+        assert run["pointer_arm"] is None
+        assert run["pointer_version_id"] is None
+        assert run["cycle"].decision.moved is False
+
+    def test_the_register_is_persisted_on_an_unservable_cycle(self, monkeypatch):
+        # alpha-engine-config-I11106, revisiting I11105's stated decision.
+        # I11105 left persist_register gated on the servability assertion so
+        # the register could not be written before this cycle's retirements
+        # were folded in. With the assertion no longer standing between the
+        # cycle and the fold, both run: a cycle that HAPPENED is a fact, and
+        # the register is where its retirement verdicts are recorded.
+        s3, _run = self._run(
+            monkeypatch, precondition_reasons="every arm failed the xsec_sd floor")
+        assert ams.REGISTER_KEY in s3.puts
+
+    def test_an_unmeasurable_cycle_alarms_but_is_not_reported_as_a_refusal(
+        self, monkeypatch, caplog,
+    ):
+        # alpha-engine-config-I11106 — the third state the two-valued marker
+        # cannot carry. One eligible arm produces ZERO comparisons: the cycle
+        # measured nothing, which ALARMS (policy §7.2, §11), but the incumbent
+        # keeps serving, so it is neither a refusal nor a broken stage.
+        # Measured: this is the ordinary shape of a one-arm pool (three
+        # rotation tests reach it with the real engine), and it is what the M
+        # slot hits the first week a single arm clears the veto.
+        register, _by_label = ams.build_register(
+            _FakeS3(), "b", as_of="2026-09-18", specs=_SPECS, canonical_horizon=21,
+            versions=_versions(
+                ("v-a", "lbl-alpha", "2026-09-11"),
+                ("v-b", "lbl-beta", "2026-09-11"),
+                ("v-c", "v3.0-meta", "2026-09-11"),
+            ),
+            register=ArmRegister(),
+        )
+        incumbent = register.active_arms()[0]
+        with caplog.at_level(logging.ERROR, logger=ams.log.name):
+            s3, run = self._run(
+                monkeypatch,
+                precondition_reasons="dispersion collapsed",
+                blocked_arms={a for a in register.active_arms() if a != incumbent},
+            )
+        assert run["cycle"].decision.status == "unmeasurable"
+        assert run["outcome"] == ams.OUTCOME_DECIDED
+        # it alarms...
+        assert any("reached NO comparison" in r.message for r in caplog.records)
+        # ...and the durable artifact, not the outcome, carries the distinction
+        doc = s3.puts["arena/model/2026-09-18.json"]
+        assert doc["decision"]["status"] == "unmeasurable"
+
+    def test_a_cycle_with_no_arm_and_no_stated_refusal_is_never_classified(self):
+        # No champion and no `unservable` verdict explaining it: the cycle
+        # came out with nothing to serve and did not say why. Never guessed
+        # into a decision.
+        cycle = _StubCycle(status="held", champion=None)
+        with pytest.raises(ams.ArenaSlotUndecidable):
+            ams.cycle_outcome(cycle)
+
+    def test_an_unknown_decision_status_is_never_classified(self):
+        # A status this module does not know is neither a decision nor a
+        # refusal, and is never guessed into one.
+        cycle = _StubCycle(status="brand-new-engine-status", champion="M:x:1")
+        with pytest.raises(ams.ArenaSlotUndecidable):
+            ams.cycle_outcome(cycle)
+
+    @pytest.mark.parametrize("status", ["decided", "held", "bootstrap"])
+    def test_a_servable_cycle_reports_decided(self, status):
+        assert ams.cycle_outcome(
+            _StubCycle(status=status, champion="M:x:1")
+        ) == ams.OUTCOME_DECIDED
 
 
 class TestKnownInapplicableLabelsCollapseToOneLine:
