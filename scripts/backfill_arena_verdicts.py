@@ -72,7 +72,14 @@ def main() -> int:
             if key.endswith(".verdict"):
                 existing.add(key)
             elif key.endswith(".json") and not key.endswith("/register.json"):
-                cycles.append(key)
+                # latest.json is a POINTER, not a dated cycle. Walking it here
+                # would derive as_of="latest" from the filename and write the
+                # same key _backfill_latest writes — right by coincidence of
+                # naming, wrong the moment either side changes, and a
+                # double-write either way. It is handled once, below, from the
+                # document's own as_of.
+                if not key.endswith("/latest.json"):
+                    cycles.append(key)
 
     vocabulary = _verdict_vocabulary()
     planned, skipped = [], []
@@ -97,6 +104,11 @@ def main() -> int:
         print(f"  SKIP   {as_of}: {why}")
     if not planned and not skipped:
         print("  nothing to do — every cycle already has its projection")
+
+    if not args.write and planned:
+        # Named in the plan so the operator sees the full set of writes, not
+        # only the dated ones.
+        print("  would write  latest.verdict (from latest.json)")
 
     if args.write:
         for as_of, doc, _status in planned:
