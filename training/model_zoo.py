@@ -2089,6 +2089,15 @@ def _write_promotion_marker(s3, bucket: str, date_str: str,
              "(promoted=%s)", bucket, key, promoted)
 
 
+def _recorded_arena_outcome(s3, bucket: str, date_str: str) -> str | None:
+    """Local import to match this module's existing arena-slot call convention
+    (see `select_and_finalize`, which imports it inside the function to keep
+    the heavy arena/engine import off this module's import path)."""
+    from training import arena_model_slot as arena
+
+    return arena.recorded_outcome(s3, bucket, as_of=date_str)
+
+
 def _verify_promotion_marker_noop(s3, bucket: str, date_str: str, marker: dict) -> dict:
     """config#2252 — a marker exists for ``date_str``: verify the live champion
     matches what the marker recorded, then return a no-op leaderboard (email +
@@ -2116,13 +2125,18 @@ def _verify_promotion_marker_noop(s3, bucket: str, date_str: str, marker: dict) 
         "date": date_str,
         "mode": marker.get("mode"),
         "idempotent_noop": True,
-        # alpha-engine-config-I11106 — a promotion marker exists for this date,
-        # which can only have been written by a run that got all the way
-        # through the arena decision and promoted. So the outcome this re-run
-        # reports is the one that run reached: `decided`. An `unservable`
-        # cycle promotes nothing and writes no marker, so it can never land
-        # here.
-        "arena_outcome": "decided",
+        # alpha-engine-config-I11101, correcting I11106. This used to be the
+        # literal "decided", on the stated premise that "an unservable cycle
+        # promotes nothing and writes no marker, so it can never land here."
+        # THE PREMISE IS FALSE, disproved by the very cycle it was written for:
+        # the 2026-09-18 rotation concluded UNSERVABLE and still wrote
+        # predictor/model_zoo/promotions/2026-09-18.json with promoted=null, so
+        # re-running that date reported `decided` — this run's verdict invented
+        # from the fact that an earlier run had finished. The outcome now comes
+        # from the earlier run's OWN arena cycle artifact, and is None when
+        # there is no such artifact, which the caller refuses rather than
+        # defaults.
+        "arena_outcome": _recorded_arena_outcome(s3, bucket, date_str),
         "candidates": [],
         "winner_version_id": marker.get("winner_version_id"),
         "promoted": marker.get("promoted"),

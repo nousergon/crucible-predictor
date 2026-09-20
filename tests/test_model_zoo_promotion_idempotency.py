@@ -44,6 +44,19 @@ _SPECS = [
 
 _DATE = "2026-07-11"
 _MARKER_KEY = f"{mz._PROMOTIONS_PREFIX}/{_DATE}.json"
+#: alpha-engine-config-I11101 — the no-op re-run reports the RECORDED verdict
+#: out of the earlier run's own arena cycle, so a no-op fixture must carry one.
+#: It used to answer the literal "decided" with no artifact at all, which is how
+#: a re-run over the genuinely UNSERVABLE 2026-09-18 cycle came to report
+#: `decided`.
+_CYCLE_KEY = f"arena/model/{_DATE}.json"
+
+
+def _mk_cycle(status="decided"):
+    return {"schema_version": 1, "slot": "M", "as_of": _DATE,
+            "decision": {"slot": "M", "as_of": _DATE, "status": status,
+                         "moved": False, "champion": None, "incumbent": None,
+                         "reason": "fixture", "comparisons": [], "ineligible": {}}}
 
 
 class _FakeS3:
@@ -221,15 +234,22 @@ def test_marker_written_on_observe_finalize_with_no_promotion(monkeypatch):
 def test_noop_with_matching_marker_suppresses_email_and_writes(monkeypatch):
     run, promotes, s3, sent, inert = _select_fixture(
         monkeypatch, auto_promote=True, champion_vid="resid-v",
-        objects={_MARKER_KEY: _mk_marker(promoted="resid-v", champion_after="resid-v")},
+        objects={_MARKER_KEY: _mk_marker(promoted="resid-v", champion_after="resid-v"),
+                 _CYCLE_KEY: _mk_cycle("decided")},
     )
     board = run()
     assert board["idempotent_noop"] is True
     assert board["promoted"] == "resid-v"          # reported FROM the marker
+    assert board["arena_outcome"] == "decided"     # reported FROM the cycle
     assert board["digest_email"] == "suppressed_idempotent_noop"
     assert sent == [], "digest email must be suppressed on the idempotent re-run"
     assert promotes == [], "promotion must not be re-applied"
-    assert s3.puts == {}, "no writes (leaderboard/trial-log/marker) on a no-op"
+    assert s3.puts == {}, (
+        "no writes (leaderboard/trial-log/marker/verdict) on a no-op — "
+        "recorded_outcome is READ-ONLY; backfilling the verdict projection for "
+        "old cycles is scripts/backfill_arena_verdicts.py, not a side effect of "
+        "an unrelated re-run (alpha-engine-config-I11101)"
+    )
     assert inert == [], "empty no-op candidates must not fire the inert alert"
 
 
@@ -238,12 +258,65 @@ def test_noop_matching_marker_observe_mode_none_champion(monkeypatch):
     run, _, s3, sent, _ = _select_fixture(
         monkeypatch, auto_promote=False, champion_vid=None,
         objects={_MARKER_KEY: _mk_marker(promoted=None, champion_after=None,
-                                         mode="observe")},
+                                         mode="observe"),
+                 _CYCLE_KEY: _mk_cycle("held")},
     )
     board = run()
     assert board["idempotent_noop"] is True
+    assert board["arena_outcome"] == "held"
     assert sent == []
     assert s3.puts == {}
+
+
+# ── alpha-engine-config-I11101: the no-op reports the RECORDED verdict ───────
+
+
+def test_noop_over_an_unservable_cycle_reports_unservable_not_decided(monkeypatch):
+    """THE REGRESSION THIS EXISTS FOR. An unservable rotation promotes nothing
+    but DOES write a promotion marker (promoted=None) — measured on the live
+    2026-09-18 cycle, which is the exact case the previous code's comment said
+    "can never land here". Re-running that date answered `decided`: a verdict
+    for THIS run invented from the fact that an earlier run had finished."""
+    run, _, s3, sent, _ = _select_fixture(
+        monkeypatch, auto_promote=False, champion_vid=None,
+        objects={_MARKER_KEY: _mk_marker(promoted=None, champion_after=None,
+                                         mode="observe"),
+                 _CYCLE_KEY: _mk_cycle("unservable")},
+    )
+    board = run()
+    assert board["idempotent_noop"] is True
+    assert board["arena_outcome"] == "unservable", (
+        "a re-run over an unservable cycle must report the slot's actual "
+        "standing verdict, never `decided`"
+    )
+    assert sent == []
+    assert s3.puts == {}
+
+
+def test_noop_with_no_recorded_cycle_refuses_rather_than_inventing(monkeypatch):
+    """No cycle artifact for the date means this re-run genuinely cannot say
+    what the slot decided. It must refuse — the caller's outcome-less guard
+    (I11106) fires — rather than default to a passing word."""
+    run, _, _s3, _sent, _ = _select_fixture(
+        monkeypatch, auto_promote=False, champion_vid=None,
+        objects={_MARKER_KEY: _mk_marker(promoted=None, champion_after=None,
+                                         mode="observe")},
+    )
+    with pytest.raises(RuntimeError, match="carries no `arena_outcome`"):
+        run()
+
+
+def test_noop_with_an_out_of_vocabulary_status_refuses(monkeypatch):
+    """A cycle whose status the contract does not know is unroutable by the
+    weekly SF's Choice. Reporting it would hand the SF a word with no arm."""
+    run, _, _s3, _sent, _ = _select_fixture(
+        monkeypatch, auto_promote=False, champion_vid=None,
+        objects={_MARKER_KEY: _mk_marker(promoted=None, champion_after=None,
+                                         mode="observe"),
+                 _CYCLE_KEY: _mk_cycle("probably-fine")},
+    )
+    with pytest.raises(RuntimeError, match="carries no `arena_outcome`"):
+        run()
 
 
 # ── marker/state divergence → fail loud ──────────────────────────────────────
