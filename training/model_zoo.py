@@ -3700,7 +3700,28 @@ def _cli_subcommand(argv: list) -> bool:
 
     if sub == "list-rotation-specs":
         ids = list_rotation_spec_ids(args.bucket, budget=args.budget)
-        print(json.dumps(ids))
+        # alpha-engine-config-I11160 — COMMA-DELIMITED, NOT JSON, and with no
+        # trailing newline. The only consumer is the weekly SF's
+        # ResolveZooSpecs -> ParseZooSpecs pair, and ParseZooSpecs is a Pass:
+        # it used States.StringToJson on this text, which raises
+        # States.Runtime on anything that is not valid JSON. States.Runtime
+        # from an intrinsic is NOT CATCHABLE -- verified against live Step
+        # Functions 2026-09-19, including from inside a Parallel whose Catch
+        # names States.ALL -- and a Pass cannot carry a Catch at all. So one
+        # stray byte on this stream took down the ENTIRE weekly run, with no
+        # mitigation available at that state.
+        #
+        # States.StringSplit is total: it cannot raise on any input. A
+        # truncated or polluted stream now yields wrong spec ids, which fail
+        # inside the Map's own per-spec isolation (catchable, fail-open),
+        # instead of killing the run. SSM caps StandardOutputContent at
+        # ~24,000 characters, so truncation is the concrete way this happens.
+        #
+        # No trailing newline because MEASURED: States.StringSplit('a,b\n', ',')
+        # returns ['a', 'b\n'] -- the newline rides on the last element. The SF
+        # splits on the character SET ',\n' as well, so both halves are
+        # defended; neither alone is enough.
+        sys.stdout.write(",".join(ids))
         return True
     if sub == "train-spec":
         # Trains exactly ONE spec; exits non-zero ONLY on a real training failure

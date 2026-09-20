@@ -158,6 +158,61 @@ def test_list_rotation_spec_ids_empty_when_no_active(monkeypatch):
                                      registered_versions=[]) == []
 
 
+# ── alpha-engine-config-I11160: the stdout CONTRACT, not just the ids ────────
+
+
+def _run_list(monkeypatch, capsys, ids):
+    monkeypatch.setattr(mz, "list_rotation_spec_ids", lambda *a, **k: ids)
+    assert mz._cli_subcommand(["list-rotation-specs", "--bucket", "bkt"]) is True
+    return capsys.readouterr().out
+
+
+def test_the_spec_list_is_comma_delimited_and_never_json(monkeypatch, capsys):
+    """The weekly SF's ParseZooSpecs is a Pass, and it used
+    States.StringToJson on this stream. States.Runtime from an intrinsic is
+    NOT CATCHABLE — verified against live Step Functions on 2026-09-19,
+    including from inside a Parallel whose Catch names States.ALL — and a Pass
+    cannot carry a Catch at all. One stray byte here took down the entire
+    weekly run with no mitigation available at that state.
+
+    States.StringSplit is total and cannot raise, so the contract is a
+    delimited list. A JSON array would silently restore the old hazard."""
+    out = _run_list(monkeypatch, capsys, ["alpha", "beta"])
+    assert out == "alpha,beta"
+    assert not out.startswith("["), "a JSON array reinstates the uncatchable parse"
+    assert '"' not in out
+
+
+def test_the_spec_list_has_no_trailing_newline(monkeypatch, capsys):
+    """MEASURED against live Step Functions: States.StringSplit('a,b\n', ',')
+    returns ['a', 'b\n'] — a trailing newline rides on the LAST element and
+    would corrupt the last spec id. The SF also splits on the character set
+    ',\n', so both halves are defended; this asserts our half."""
+    out = _run_list(monkeypatch, capsys, ["alpha", "beta"])
+    assert out == out.rstrip(), f"trailing whitespace in {out!r}"
+    assert "\n" not in out
+
+
+def test_an_empty_rotation_emits_an_empty_stream(monkeypatch, capsys):
+    """MEASURED: States.StringSplit('', ',') returns [], so the Map runs zero
+    iterations — the documented empty-pool behaviour, preserved."""
+    assert _run_list(monkeypatch, capsys, []) == ""
+
+
+def test_a_single_spec_needs_no_delimiter(monkeypatch, capsys):
+    out = _run_list(monkeypatch, capsys, ["only-one"])
+    assert out == "only-one"
+
+
+def test_no_spec_id_may_contain_the_delimiter(monkeypatch, capsys):
+    """A comma inside an id would split one spec into two, and the Map would
+    dispatch training for names that do not exist. Spec ids are slugs by
+    convention; this pins the convention where it is now load-bearing."""
+    for spec in _SPECS:
+        sid = spec["id"] if isinstance(spec, dict) else getattr(spec, "id", str(spec))
+        assert "," not in sid and "\n" not in sid, sid
+
+
 # ── registry pool resolution (parallel select) ───────────────────────────────
 
 
