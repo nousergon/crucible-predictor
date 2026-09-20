@@ -991,7 +991,66 @@ def _verdict_vocabulary() -> frozenset[str]:
     return frozenset(enum)
 
 
-def _emit_verdict_projection(s3, bucket: str, doc: dict, *, as_of: str) -> list:
+def recorded_outcome(s3, bucket: str, *, as_of: str) -> str | None:
+    """The outcome a PREVIOUS run recorded for ``as_of``, re-read from its own
+    artifact, plus a refresh of the verdict projection beside it.
+
+    For re-runs that legitimately do no work. ``model_zoo``'s config#2252
+    idempotent no-op short-circuits before the arena runs, so it has no cycle
+    of its own to report — and it used to answer ``"decided"`` on the stated
+    premise that "an unservable cycle promotes nothing and writes no marker, so
+    it can never land here." **That premise is false and was disproved by the
+    run it was written for**: the 2026-09-18 rotation concluded UNSERVABLE and
+    still wrote ``predictor/model_zoo/promotions/2026-09-18.json`` with
+    ``promoted: null`` (alpha-engine-config-I11101). Re-running that date then
+    reported ``decided`` — this run's verdict invented from the fact that some
+    earlier run finished, which is the §2.3b sub-status failure in miniature.
+
+    Returns the recorded status, or ``None`` when there is no cycle artifact to
+    read. ``None`` is deliberate and is NOT a default: a re-run that can find no
+    record of what the slot decided must say so and let the caller refuse,
+    because the alternative is manufacturing a verdict for a cycle nobody
+    measured.
+
+    READ-ONLY, on purpose. The obvious convenience would be to write the
+    verdict projection here for cycles that predate it, but config#2252's no-op
+    path is declared write-free and its test asserts ``s3.puts == {}``. A new
+    projection over existing artifacts is a BACKFILL, not something to do lazily
+    from an unrelated re-run path — see ``scripts/backfill_arena_verdicts.py``.
+    """
+    key = f"{CYCLE_PREFIX}/{as_of}.json"
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        doc = json.loads(body)
+    except Exception as exc:  # noqa: BLE001 — absence and unreadability are one answer
+        # Swallowed deliberately, and it is not a silent swallow: (a) the
+        # failure mode is "no recorded cycle for this date", (b) the caller
+        # refuses to report an outcome-less select, so nothing downstream reads
+        # a fabricated value, (c) it is logged here at WARNING with the key.
+        log.warning(
+            "arena[M]: no readable cycle at s3://%s/%s (%s) — this re-run can "
+            "report NO outcome for %s rather than inventing one",
+            bucket, key, exc, as_of,
+        )
+        return None
+    status = (doc.get("decision") or {}).get("status")
+    if status not in _verdict_vocabulary():
+        log.warning(
+            "arena[M]: cycle at s3://%s/%s carries decision.status=%r, outside "
+            "the contract vocabulary — reporting no outcome rather than "
+            "passing an unroutable word to the weekly SF", bucket, key, status,
+        )
+        return None
+    log.info(
+        "arena[M]: re-run over an already-decided %s — reporting the RECORDED "
+        "verdict %r from s3://%s/%s (alpha-engine-config-I11101)",
+        as_of, status, bucket, key,
+    )
+    return status
+
+
+def _emit_verdict_projection(s3, bucket: str, doc: dict, *, as_of: str,
+                             mirror_latest: bool = True) -> list:
     """Write ``decision.status`` as a bare word beside the cycle artifact.
 
     **Why a second key for one field that the cycle artifact already carries.**
@@ -1034,7 +1093,15 @@ def _emit_verdict_projection(s3, bucket: str, doc: dict, *, as_of: str) -> list:
             f"doc, so reaching here means the schema and this projection "
             f"disagree (alpha-engine-config-I11101)."
         )
-    keys = [f"{CYCLE_PREFIX}/{as_of}.verdict", f"{CYCLE_PREFIX}/latest.verdict"]
+    keys = [f"{CYCLE_PREFIX}/{as_of}.verdict"]
+    if mirror_latest:
+        # mirror_latest=False is for the BACKFILL, which walks dates oldest to
+        # newest: mirroring on every iteration would leave latest.verdict as
+        # whichever date happened to be processed last. Correct only by
+        # accident of sort order, and silently wrong the first time someone
+        # backfills a single old date. The backfill sets latest itself, from
+        # latest.json.
+        keys.append(f"{CYCLE_PREFIX}/latest.verdict")
     for key in keys:
         # No trailing newline: the SF compares the WHOLE body, so any byte here
         # is part of the contract.
