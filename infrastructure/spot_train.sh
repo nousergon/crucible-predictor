@@ -343,6 +343,44 @@ if ! git diff --quiet HEAD -- config.py config/predictor.sample.yaml training/tr
   echo ""
 fi
 
+# ── Declared instance-type allow-list (alpha-engine-config-I11227) ───────────
+# Mirrors the single source,
+# nous-ergon-ops/infrastructure/iam/spot-launch-declared-instance-types.json,
+# from which the executor and dashboard roles' ec2:RunInstances
+# `ec2:InstanceType` condition values are asserted. These launchers live in
+# PUBLIC repos and must not read a private file at runtime, so the list is
+# duplicated here and held in lockstep by that repo's
+# tests/test_spot_launch_instance_type_allowlist.py, which reads THIS constant
+# out of the public repo and fails on divergence in either direction.
+# Adding a type is a two-PR change: the declared file first, this constant
+# second. Without this check the operator sees an opaque UnauthorizedOperation
+# from RunInstances and nothing naming the list that refused it.
+ALLOWED_INSTANCE_TYPES="c5.2xlarge,c5.large,c5.xlarge,c5a.large,c6i.2xlarge,c6i.large,c6i.xlarge,m5.large,m5.xlarge,m5a.large,m5a.xlarge,m6i.large,m6i.xlarge,r5.large,r5a.large,r6i.large"
+
+# Refuse, before any AWS call, a type IAM will refuse. Placed at the single
+# krepis.ec2_spot chokepoint rather than at argument parsing so that every
+# later override — a RAM floor, `--instance-type`, a per-stage INSTANCE_TYPES
+# assignment — is covered by construction rather than by remembering to add a
+# second check next to it.
+spot_assert_instance_types_allowed() {
+    local _bad="" _t
+    for _t in $(echo "${1:-}" | tr ',' ' '); do
+        case ",${ALLOWED_INSTANCE_TYPES}," in
+            *",${_t},"*) ;;
+            *) _bad="${_bad} ${_t}" ;;
+        esac
+    done
+    if [ -z "$_bad" ]; then return 0; fi
+    echo "ERROR: instance type(s) not on the spot-launch allow-list:${_bad}" >&2
+    echo "       allow-list: ${ALLOWED_INSTANCE_TYPES}" >&2
+    echo "       declared in: nous-ergon-ops/infrastructure/iam/spot-launch-declared-instance-types.json" >&2
+    echo "       mirrored in: this script's ALLOWED_INSTANCE_TYPES constant" >&2
+    echo "       ec2:RunInstances would refuse this launch with UnauthorizedOperation" >&2
+    echo "       (alpha-engine-config-I11227). Add the type to the declared file and to" >&2
+    echo "       every mirrored constant, or pick one from the list above." >&2
+    return 1
+}
+
 # ── Launch spot instance ──────────────────────────────────────────────────────
 # Capacity-resilient launch via krepis.ec2_spot (lib v0.26.0+ as
 # nousergon_lib.ec2_spot; invoked directly via krepis per config#1649 — the
@@ -351,6 +389,7 @@ fi
 # Rotates (instance_type × subnet) on InsufficientInstanceCapacity etc.
 # Replaces the broken-by-design hardcoded single-subnet + single-instance-type
 # pattern (2026-05-22 incident — Evaluator failed in sibling backtester spot).
+spot_assert_instance_types_allowed "$INSTANCE_TYPES" || exit 2
 echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
 INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
   --types "$INSTANCE_TYPES" \
