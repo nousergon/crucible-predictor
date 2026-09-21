@@ -1,0 +1,107 @@
+name: cost-gate
+
+# alpha-engine-config-I11228 deliverable 2 — pre-merge cost gate.
+#
+# Runs `nousergon-cost-gate` (nousergon_lib.cost_gate, nousergon-lib
+# v0.124.142) over the PR's diff: a change that adds a billable capability,
+# an always-on resource of an unmapped type, or a schedule with no bounded
+# retry policy fails here rather than after it has spent. Exit 1 = findings,
+# exit 2 = could not grade; both fail the job, because "the gate could not
+# run" must never look like "the gate ran clean".
+#
+# Replay over the last 150 commits on origin/main: 0 findings, 0
+# could-not-grade — adopted BLOCKING.
+#
+# Public repo: its Actions crons are free, unlimited minutes, so
+# --repo-visibility public keeps that from being graded as spend.
+#
+# The gate is installed from nousergon-lib in ITS OWN step, pinned to the
+# v0.124.142 tag with --no-deps, deliberately isolated from this repo's own
+# lib pin (held in lockstep by this repo's own guard/tests) — bumping that
+# pin is a separate, guarded change and not part of this PR.
+#
+# Base-SHA resolution is event-aware: `merge_group.base_sha` on merge-queue
+# graduation, `pull_request.base.sha` on a PR, `github.event.before` on a
+# direct push to main. A bare `origin/main` would silently regrade the wrong
+# diff on every event type but the first.
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cost-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cost-gate:
+    name: cost-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve base SHA
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            merge_group)
+              base="$MERGE_GROUP_BASE_SHA"
+              ;;
+            pull_request)
+              base="$PR_BASE_SHA"
+              ;;
+            push)
+              base="$PUSH_BEFORE_SHA"
+              ;;
+            *)
+              echo "::error::unhandled event_name '$EVENT_NAME' — no base SHA rule for it"
+              exit 1
+              ;;
+          esac
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "resolved base: $base ($EVENT_NAME)"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: '3.12'
+
+      - name: Install cost gate (nousergon-lib v0.124.142, isolated from repo's own lib pin)
+        run: |
+          set -euo pipefail
+          pip install --quiet --no-deps "git+https://github.com/nousergon/nousergon-lib@v0.124.142"
+          pip install --quiet pyyaml
+
+      - name: Run cost gate
+        run: |
+          set -euo pipefail
+          nousergon-cost-gate \
+            --base "${{ steps.base.outputs.base }}" \
+            --head HEAD \
+            --root . \
+            --repo-visibility public
+
+  notify-main-failure:
+    needs: [cost-gate]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@62597e550c08c0b7a7fe0af490cb141e344061b3 # main
+    secrets: inherit
