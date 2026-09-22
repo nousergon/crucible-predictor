@@ -350,3 +350,181 @@ class TestResultContract:
             datetime(2026, 8, 12, 16, 0, tzinfo=timezone.utc).isoformat()
         )
         assert a["verdict"] == b["verdict"] == c["verdict"] == "BLOCKED"
+
+
+# ── alpha-engine-config-I11384 — PROCEED_REMEDIATION ────────────────────────
+#
+# The gate refused hardest in the one case Brian's standing rule says must
+# always proceed: a same-day rerun after the morning produced no tradeable
+# book. On 2026-09-22 the optimizer raised, the executor held the whole book,
+# the fix was merged and verified by 11:51 ET, and the rerun was refused at
+# 11:45 ET by a boundary whose stated purpose is to stop a run acting on a
+# STALE plan — while the thing being stopped was installing a CORRECTED one.
+
+import json as _json
+from datetime import date
+from unittest.mock import MagicMock
+
+import pytest
+
+from inference.trading_day_gate import _todays_book_is_unfilled, check_market_hours
+
+_IN_SESSION = "2026-09-22T15:45:00Z"  # 11:45 ET, a Tuesday
+_PREOPEN_CRON = "2026-09-22T12:15:00Z"  # 05:15 PT, the scheduled start
+
+
+def _s3(monkeypatch, *, book=None, shadow=None, book_err=None, shadow_err=None):
+    client = MagicMock()
+
+    def _get(Bucket, Key):  # noqa: N803 — boto3 kwarg names
+        if "order_book" in Key:
+            if book_err:
+                raise book_err
+            return {"Body": MagicMock(read=lambda: _json.dumps(book).encode())}
+        if book_err is None and shadow_err:
+            raise shadow_err
+        return {"Body": MagicMock(read=lambda: _json.dumps(shadow).encode())}
+
+    client.get_object.side_effect = _get
+    import boto3
+
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+    return client
+
+
+_TRADED = {"approved_entries": [{"ticker": "AAPL"}], "urgent_exits": []}
+_OK_SHADOW = {"shadow_status": "ok"}
+
+
+class TestRemediationProbe:
+    """Evidence, not a caller's claim — and every failure returns False."""
+
+    def test_an_absent_order_book_is_an_unfilled_day(self, monkeypatch):
+        _s3(monkeypatch, book_err=RuntimeError("404"))
+        out = _todays_book_is_unfilled(date(2026, 9, 22))
+        assert out["unfilled"] is True
+        assert "absent" in out["evidence"]
+
+    def test_a_book_with_no_entries_and_no_exits_is_unfilled(self, monkeypatch):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        out = _todays_book_is_unfilled(date(2026, 9, 22))
+        assert out["unfilled"] is True
+        assert "0 approved_entries" in out["evidence"]
+
+    def test_a_failed_shadow_log_is_unfilled_even_behind_a_populated_book(
+        self, monkeypatch
+    ):
+        # The 2026-09-22 shape after a partial rerun: orders exist but the
+        # optimizer that should have sized them did not solve.
+        _s3(monkeypatch, book=_TRADED, shadow={"shadow_status": "failed"})
+        out = _todays_book_is_unfilled(date(2026, 9, 22))
+        assert out["unfilled"] is True
+        assert "shadow_status='failed'" in out["evidence"]
+
+    def test_a_traded_day_is_not_unfilled(self, monkeypatch):
+        _s3(monkeypatch, book=_TRADED, shadow=_OK_SHADOW)
+        out = _todays_book_is_unfilled(date(2026, 9, 22))
+        assert out["unfilled"] is False
+        assert out["error"] is None
+
+    @pytest.mark.parametrize(
+        "boom",
+        [ImportError("no boto3"), RuntimeError("no credentials")],
+    )
+    def test_every_probe_failure_returns_false_not_true(self, monkeypatch, boom):
+        """The direction a boundary is allowed to fail in.
+
+        The probe can only GRANT a start the calendar would refuse, so a
+        failure that returned True would loosen the boundary via an S3
+        outage — exactly what the gate's zero-infra design exists to prevent.
+        """
+        import boto3
+
+        monkeypatch.setattr(
+            boto3, "client", MagicMock(side_effect=boom)
+        )
+        out = _todays_book_is_unfilled(date(2026, 9, 22))
+        assert out["unfilled"] is False
+        assert out["error"] is not None, "and it says why, rather than going quiet"
+
+    def test_malformed_json_returns_false(self, monkeypatch):
+        client = MagicMock()
+        client.get_object.return_value = {"Body": MagicMock(read=lambda: b"{{{")}
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", lambda *a, **k: client)
+        assert _todays_book_is_unfilled(date(2026, 9, 22))["unfilled"] is False
+
+
+class TestRemediationVerdict:
+    def test_an_unfilled_day_proceeds_in_session_with_no_override(
+        self, monkeypatch
+    ):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        out = check_market_hours(_IN_SESSION, {}, pipeline="preopen")
+        assert out["is_market_hours"] is True
+        assert out["verdict"] == "PROCEED_REMEDIATION"
+        assert out["remediation"]["probed"] is True
+        assert out["remediation"]["evidence"]
+
+    def test_a_traded_day_is_still_BLOCKED(self, monkeypatch):
+        _s3(monkeypatch, book=_TRADED, shadow=_OK_SHADOW)
+        out = check_market_hours(_IN_SESSION, {}, pipeline="preopen")
+        assert out["verdict"] == "BLOCKED", (
+            "the boundary still refuses an opportunistic in-session start — "
+            "that is the case I7111 exists for and it is unchanged"
+        )
+
+    def test_the_postclose_chain_is_never_eligible(self, monkeypatch):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        out = check_market_hours(_IN_SESSION, {}, pipeline="postclose")
+        assert out["verdict"] == "BLOCKED"
+        assert out["remediation"]["probed"] is False
+
+    def test_an_unknown_pipeline_is_never_eligible(self, monkeypatch):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        assert check_market_hours(_IN_SESSION, {})["verdict"] == "BLOCKED"
+
+    def test_the_scheduled_start_never_probes_s3(self, monkeypatch):
+        """The 05:15 PT path must keep its zero-infra posture.
+
+        A gate that reached S3 on every scheduled run would have taken on the
+        dependency its whole design exists to avoid.
+        """
+        client = _s3(monkeypatch, book=_TRADED, shadow=_OK_SHADOW)
+        out = check_market_hours(_PREOPEN_CRON, {}, pipeline="preopen")
+        assert out["verdict"] == "PROCEED"
+        assert out["remediation"]["probed"] is False
+        client.get_object.assert_not_called()
+
+    def test_a_valid_override_still_wins_over_remediation(self, monkeypatch):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        out = check_market_hours(
+            _IN_SESSION,
+            {"market_hours_override": {
+                "reason": "manual",
+                "authorized_by": "Brian McMahon",
+                "expires_at": "2026-09-22T20:00:00Z",
+            }},
+            pipeline="preopen",
+        )
+        assert out["verdict"] == "PROCEED_OVERRIDE", (
+            "an explicit human authorisation must never be silently "
+            "re-labelled as an automatic one in the record"
+        )
+        assert out["remediation"]["probed"] is False
+
+    def test_a_malformed_override_still_fails_closed_on_an_unfilled_day(
+        self, monkeypatch
+    ):
+        _s3(monkeypatch, book={"approved_entries": [], "urgent_exits": []})
+        out = check_market_hours(
+            _IN_SESSION,
+            {"market_hours_override": {"reason": "", "authorized_by": ""}},
+            pipeline="preopen",
+        )
+        assert out["verdict"] == "OVERRIDE_MALFORMED", (
+            "a half-typed authorisation is a mis-authorisation, and finding "
+            "it on the run where it did not matter is the point"
+        )
+        assert out["remediation"]["probed"] is False

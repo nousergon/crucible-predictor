@@ -13,11 +13,23 @@ pipelines.
 Pure NYSE-calendar math via ``nousergon_lib.trading_calendar`` — no S3, no
 ArcticDB, no models, no GitHub. The gate must never depend on fragile infra, so
 that the gate itself can't be the thing that breaks.
+
+One deliberate exception, alpha-engine-config-I11384: the REMEDIATION probe
+(``_todays_book_is_unfilled``) reads two S3 keys. It is admissible only
+because it can move the verdict in exactly one direction — it can GRANT a
+start the calendar would otherwise refuse, never refuse one the calendar
+would allow — and because every one of its own failure modes returns
+``False``. An S3 outage therefore makes this gate STRICTER, which is the
+direction a boundary is allowed to fail in.
 """
 from __future__ import annotations
 
+import logging
+import os
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 _NYSE = ZoneInfo("America/New_York")
 
@@ -188,8 +200,111 @@ def _evaluate_override(execution_input: dict | None, now: datetime) -> dict:
     return record
 
 
+def _todays_book_is_unfilled(check_date: date) -> dict:
+    """Did today's preopen produce a tradeable book? Evidence, not assertion.
+
+    alpha-engine-config-I11384. Brian's standing rule (2026-09-22): *"when the
+    portfolio optimizer doesn't load correctly during trading hours, we need
+    to FIX IT ASAP AND GET IT RUNNING SAME DAY ... We never wait for a close
+    before implementing fixes that affect intraday trading."* Generalises his
+    2026-08-13 ruling that a failed preopen is ALWAYS relaunched while the
+    session is open.
+
+    The gate cannot take that claim from the CALLER — a self-declared
+    "this is a remediation" flag is an override with extra steps, and the
+    whole point of I7111 is that the boundary binds every principal
+    including the operator. So it is derived from what the morning actually
+    left in S3:
+
+      * the day's order book is absent, OR
+      * it carries zero approved entries AND zero urgent exits, OR
+      * the day's optimizer shadow log is absent or not ``shadow_status: ok``
+
+    Any of those means the session is currently running on a book that did
+    not trade, which is the only state this exemption exists for.
+
+    **Every failure mode returns False.** No credentials, no bucket, S3
+    error, malformed JSON, unexpected shape — all of it means "no evidence of
+    a remediation", so the caller falls through to the normal BLOCKED path.
+    That is what makes an S3 read admissible inside a gate whose whole design
+    premise is that it cannot be taken out by infrastructure: this probe can
+    only ever make the boundary stricter.
+    """
+    out = {"probed": True, "unfilled": False, "evidence": None, "error": None}
+    day = check_date.isoformat()
+    try:
+        import boto3
+
+        bucket = os.environ.get("S3_BUCKET", "alpha-engine-research")
+        s3 = boto3.client("s3")
+
+        try:
+            body = s3.get_object(
+                Bucket=bucket, Key=f"trades/order_book/{day}.json"
+            )["Body"].read()
+        except Exception:
+            out["unfilled"] = True
+            out["evidence"] = f"trades/order_book/{day}.json absent or unreadable"
+            return out
+
+        import json as _json
+
+        book = _json.loads(body)
+        n_entries = len(book.get("approved_entries") or [])
+        n_exits = len(book.get("urgent_exits") or [])
+        if n_entries == 0 and n_exits == 0:
+            out["unfilled"] = True
+            out["evidence"] = (
+                f"trades/order_book/{day}.json carries 0 approved_entries and "
+                f"0 urgent_exits"
+            )
+            return out
+
+        try:
+            shadow = _json.loads(
+                s3.get_object(
+                    Bucket=bucket,
+                    Key=f"predictor/optimizer_shadow/{day}.json",
+                )["Body"].read()
+            )
+        except Exception:
+            out["unfilled"] = True
+            out["evidence"] = (
+                f"predictor/optimizer_shadow/{day}.json absent or unreadable "
+                f"while the book carries {n_entries} entries / {n_exits} exits"
+            )
+            return out
+
+        if shadow.get("shadow_status") != "ok":
+            out["unfilled"] = True
+            out["evidence"] = (
+                f"predictor/optimizer_shadow/{day}.json shadow_status="
+                f"{shadow.get('shadow_status')!r}"
+            )
+            return out
+
+        out["evidence"] = (
+            f"today's book carries {n_entries} approved entries and {n_exits} "
+            f"urgent exits, and the optimizer solved ok"
+        )
+        return out
+    except Exception as exc:  # noqa: BLE001 — see docstring: fails to False
+        logger.warning(
+            "market-hours remediation probe failed (%s) — NOT granting a "
+            "remediation start; falling through to the normal boundary", exc,
+        )
+        return {
+            "probed": True,
+            "unfilled": False,
+            "evidence": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def check_market_hours(
-    now: str | None = None, execution_input: dict | None = None
+    now: str | None = None,
+    execution_input: dict | None = None,
+    pipeline: str | None = None,
 ) -> dict:
     """Return whether a trading pipeline may start at ``now``.
 
@@ -214,13 +329,33 @@ def check_market_hours(
             field so an ABSENT override is representable — an ASL
             ``"override.$": "$.market_hours_override"`` parameter throws
             States.Runtime on every normal run.
+        pipeline: ``"preopen"`` or ``"postclose"``, a LITERAL in each state
+            machine's own ``MarketHoursGate`` payload — never read from
+            ``execution_input``, so no caller can claim to be the preopen
+            chain. Only ``"preopen"`` is eligible for the remediation
+            verdict: the postclose chain stops the box and reconciles the
+            book, and what "the book did not trade" should mean there is a
+            different question that has not been answered
+            (alpha-engine-config-I11384).
 
     Returns a ``verdict`` the pipeline's Choice keys on:
 
       ``PROCEED``             market closed (or override offered but not needed)
-      ``BLOCKED``             market open, no override
+      ``BLOCKED``             market open, no override, book already traded
       ``PROCEED_OVERRIDE``    market open, valid override — recorded, not silent
+      ``PROCEED_REMEDIATION`` market open, no override, and today's book is
+                              demonstrably unfilled — the same-day repair
+                              Brian's 2026-09-22 ruling says must always
+                              proceed. Recorded like an override; granted on
+                              S3 EVIDENCE, never on a caller's claim.
       ``OVERRIDE_MALFORMED``  an override was offered and is not usable
+
+    Precedence is deliberate. A malformed override still fails closed even on
+    a genuinely unfilled day: a half-typed authorisation is a
+    mis-authorisation, and discovering it on the run where it did not matter
+    is the whole reason that check exists. A VALID override still wins over
+    remediation, so an explicit human authorisation is never silently
+    re-labelled as an automatic one in the record.
     """
     from nousergon_lib.trading_calendar import is_trading_day
 
@@ -235,12 +370,28 @@ def check_market_hours(
 
     override = _evaluate_override(execution_input, moment_et)
 
+    # Probed ONLY when it can change the answer: the market is open, no valid
+    # override is carrying the start, and this is the preopen chain. An S3
+    # read on the scheduled 05:15 PT path would be a dependency the gate does
+    # not need and must not have.
+    remediation = {"probed": False, "unfilled": False, "evidence": None,
+                   "error": None}
+    if (
+        open_now
+        and pipeline == "preopen"
+        and not (override["present"] and not override["valid"])
+        and not override["valid"]
+    ):
+        remediation = _todays_book_is_unfilled(check_date)
+
     if override["present"] and not override["valid"]:
         verdict = "OVERRIDE_MALFORMED"
     elif not open_now:
         verdict = "PROCEED"
     elif override["valid"]:
         verdict = "PROCEED_OVERRIDE"
+    elif remediation["unfilled"]:
+        verdict = "PROCEED_REMEDIATION"
     else:
         verdict = "BLOCKED"
 
@@ -267,5 +418,7 @@ def check_market_hours(
         ),
         "reason": why,
         "override": override,
+        "remediation": remediation,
+        "pipeline": pipeline,
         "marker": "MARKET_OPEN" if open_now else "MARKET_CLOSED",
     }

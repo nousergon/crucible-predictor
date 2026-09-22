@@ -262,7 +262,14 @@ def handler(event: dict, context) -> dict:
     # take out the boundary AND the pipeline together.
     if event.get("action") == "check_market_hours":
         from inference.trading_day_gate import check_market_hours
-        _r = check_market_hours(event.get("now"), event.get("execution_input"))
+        # `pipeline` is a literal in each state machine's own gate payload,
+        # never read from execution_input — only the preopen chain is
+        # eligible for PROCEED_REMEDIATION (alpha-engine-config-I11384).
+        _r = check_market_hours(
+            event.get("now"),
+            event.get("execution_input"),
+            pipeline=event.get("pipeline"),
+        )
         log.info(
             "Market-hours gate: %s (%s) -> %s [%s] override=%s%s",
             _r["now_et"], _r["day_name"], _r["verdict"], _r["reason"],
