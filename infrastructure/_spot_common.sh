@@ -194,7 +194,7 @@ spot_launch() {
 # Adding a type is a two-PR change: the declared file first, this constant
 # second. Without this check the operator sees an opaque UnauthorizedOperation
 # from RunInstances and nothing naming the list that refused it.
-ALLOWED_INSTANCE_TYPES="c5.2xlarge,c5.large,c5.xlarge,c5a.large,c6i.2xlarge,c6i.large,c6i.xlarge,m5.large,m5.xlarge,m5a.large,m5a.xlarge,m6i.large,m6i.xlarge,r5.large,r5a.large,r6i.large"
+ALLOWED_INSTANCE_TYPES="c5.2xlarge,c5.large,c5.xlarge,c5a.large,c6a.large,c6i.2xlarge,c6i.large,c6i.xlarge,c7a.large,c7i.large,m5.large,m5.xlarge,m5a.large,m5a.xlarge,m6i.large,m6i.xlarge,r5.large,r5a.large,r6i.large"
 
 # Refuse, before any AWS call, a type IAM will refuse. Placed at the single
 # krepis.ec2_spot chokepoint rather than at argument parsing so that every
