@@ -54,17 +54,27 @@ def load_oos_rows(bucket: str, date: str | None = None, model_version: str | Non
     yet" warning.
 
     ``model_version`` (alpha-engine-config-I9378) scopes the read to the arm
-    that wrote it — pass the champion-arch spec's registered version_id (see
-    ``predictor/registry/{version_id}/manifest.json``). ``None`` falls back
+    that wrote it. Pass the ARM LABEL, ``training.io_spec.oos_rows_arm`` of the
+    arm's training manifest (e.g. ``v3.0-meta``), NOT a registry version_id,
+    which no writer keys by (alpha-engine-config-I11477). ``None`` falls back
     to the pre-fix unscoped prefix, for reading panels written before this
-    fix landed; a fresh read should always name the version.
+    fix landed; a fresh read should always name the arm.
     """
     import boto3
     import io
     import pandas as pd
 
-    prefix = f"{OOS_ROWS_PREFIX}{model_version}/" if model_version else OOS_ROWS_PREFIX
-    key = f"{prefix}{'latest' if date is None else date}.parquet"
+    if model_version:
+        # alpha-engine-config-I11477 — the trainer's own key builder.
+        from training.io_spec import TrainingIOSpec
+
+        _io_spec = TrainingIOSpec.live()
+        key = (
+            _io_spec.oos_rows_latest_key(model_version) if date is None
+            else _io_spec.oos_rows_key(date, model_version)
+        )
+    else:
+        key = f"{OOS_ROWS_PREFIX}{'latest' if date is None else date}.parquet"
     s3 = boto3.client("s3")
     try:
         obj = s3.get_object(Bucket=bucket, Key=key)

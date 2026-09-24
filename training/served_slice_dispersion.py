@@ -196,13 +196,23 @@ def read_oos_panel(
     """
     import pandas as pd
 
-    prefix = (
-        f"{_OOS_ROWS_PREFIX}{model_version}/" if model_version else _OOS_ROWS_PREFIX
-    )
-    keys = []
-    if date_str:
-        keys.append(f"{prefix}{date_str}.parquet")
-    keys.append(f"{prefix}latest.parquet")
+    if model_version:
+        # alpha-engine-config-I11477 — the SAME key builder the trainer writes
+        # through, never a second f-string that can drift from it.
+        from training.io_spec import TrainingIOSpec
+
+        _io_spec = TrainingIOSpec.live()
+        prefix = f"{_io_spec.oos_rows_prefix}{model_version}/"
+        keys = []
+        if date_str:
+            keys.append(_io_spec.oos_rows_key(date_str, model_version))
+        keys.append(_io_spec.oos_rows_latest_key(model_version))
+    else:
+        prefix = _OOS_ROWS_PREFIX
+        keys = []
+        if date_str:
+            keys.append(f"{prefix}{date_str}.parquet")
+        keys.append(f"{prefix}latest.parquet")
     last_exc: Exception | None = None
     for key in keys:
         try:
@@ -571,8 +581,10 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
 
     ``model_version`` (alpha-engine-config-I9378) scopes the ``oos_rows`` key
     read to the champion-arch spec that wrote this rotation's panel — pass
-    the champion-arch's own registered ``version_id``. Ignored when ``panel``
-    is supplied directly.
+    the ARM LABEL, ``training.io_spec.oos_rows_arm`` of the champion-arch's
+    training manifest (e.g. ``v3.0-meta``). NOT its registry ``version_id``:
+    no writer uses that, which is how every rotation read nothing
+    (alpha-engine-config-I11477). Ignored when ``panel`` is supplied directly.
     """
     top_n, min_conf = _top_n(), _min_confidence()
     out: dict = {
