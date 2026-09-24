@@ -166,7 +166,9 @@ INPUT_REGISTER: tuple[InputSpec, ...] = (
     #   TWO / HYOAS / BAA10Y
     #     -> regime_predictor.build_features: yield_curve_10y_2y, hy_oas_level,
     #        hy_oas_change_21d, baa10y_level, baa10y_change_21d
-    #     -> cfg.MACRO_NORM_FEATURES
+    #     -> cfg.MACRO_NORM_FEATURES (TWO and BAA10Y columns only since
+    #        2026-09-24, alpha-engine-config-I11523: the two HYOAS columns
+    #        were dropped, BAA10Y is the credit-spread input)
     #     -> meta_trainer's X_vol_aug -> `prod_vol_macro_aug`
     #
     # `prod_vol_macro_aug` is a PARALLEL-OBSERVATION variant. Inference does
@@ -194,6 +196,10 @@ INPUT_REGISTER: tuple[InputSpec, ...] = (
         features=("yield_curve_10y_2y",),
         max_staleness_days=10,
     ),
+    # HYOAS no longer reaches cfg.MACRO_NORM_FEATURES (I11523). It stays
+    # registered while meta_trainer still loads it: an unregistered macro
+    # load fails test_register_covers_every_load_close_call_in_meta_trainer,
+    # and summarize_universe_rows would count it as a universe symbol.
     InputSpec(
         symbol="HYOAS", severity="optional",
         consumers=("regime_predictor.build_features",),

@@ -971,21 +971,27 @@ MACRO_NORM_FEATURES = [
     # - market_breadth_200d: secular bull-vs-bear regime indicator.
     #   Distinct from market_breadth (50d cyclical breadth).
     # Stage 2c-full (gated on Stage 2.5 + 2.5b data ingestion + backfill):
-    # yield_curve_10y_2y, hy_oas_level, hy_oas_change_21d.
+    # yield_curve_10y_2y and the credit-spread pair below.
     "vix_vix3m_ratio",
     "market_breadth_200d",
     # Stage 2c-full additions (2026-05-10):
     # - yield_curve_10y_2y: recession-canonical curve, distinct from
     #   yield_curve_slope (10Y-3M cyclical). Inverted values precede
     #   recessions historically.
-    # - hy_oas_level / hy_oas_change_21d: HY-specific credit stress
-    #   regime. License-gated to 2023+ on FRED (forward signal).
     # - baa10y_level / baa10y_change_21d: BBB-rated corporate spread,
-    #   full 40y FRED history. Provides credit-regime signal across
-    #   the full predictor training corpus.
+    #   full 40y FRED history. THE credit-spread input: it covers the whole
+    #   predictor training corpus.
+    #
+    # hy_oas_level / hy_oas_change_21d were dropped 2026-09-24 (Brian's
+    # ruling on alpha-engine-config-I11523). FRED's BAMLH0A0HYM2 is
+    # licence-gated to ~3 years, so HYOAS starts 2023-09-05 and
+    # build_features zero-fills ~70% of a 2016+ corpus; the step to real
+    # values then reads as an extreme z-score for about a year. HYOAS is
+    # still collected, and build_features still emits both columns, so a
+    # model trained on the old list can be scored until it is retrained
+    # (inference reads the macro columns from the loaded model, not from
+    # this list). Revisit only if a licensed full-history source is bought.
     "yield_curve_10y_2y",
-    "hy_oas_level",
-    "hy_oas_change_21d",
     "baa10y_level",
     "baa10y_change_21d",
 ]
