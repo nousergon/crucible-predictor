@@ -972,6 +972,64 @@ def declared_absent_features(oos_meta_rows, train_meta_features) -> list[str]:
     ]
 
 
+def _write_feature_drift_reference(
+    s3, bucket: str, reference: "dict | None", *, staging_prefix: str, io,
+) -> list[str]:
+    """Persist the feature-drift reference; return the keys written.
+
+    alpha-engine-config-I11478. Always into this run's own staging prefix,
+    beside ``manifest.json``, so the registry snapshot captures it into the
+    bundle and ``model.registry.promote_to_champion`` copies it to the live
+    key exactly when the model it describes becomes the champion.
+
+    Also to the legacy live key, but ONLY when ``io.write_side_artifacts``:
+    the champion-architecture run, never a model-zoo challenger or a shadow
+    run. Until a promotion carries a bundle that holds the reference, the
+    champion-architecture refresh (same features as the served champion) is
+    the closest honest stand-in; a challenger's reference never is. That live
+    write is the grandfathered second writer tracked by
+    alpha-engine-config-I9029, now bounded to one caller per rotation.
+
+    Fail-soft, like the build above: a failed write never fails training.
+    """
+    if reference is None:
+        return []
+    from monitoring.feature_drift import (
+        FEATURE_DRIFT_REFERENCE_FILENAME,
+        save_training_reference,
+    )
+
+    targets = [f"{staging_prefix}{FEATURE_DRIFT_REFERENCE_FILENAME}"]
+    if io.write_side_artifacts:
+        targets.append(None)  # the module default: the live reference key
+    written: list[str] = []
+    for key in targets:
+        try:
+            kwargs = {"key": key} if key is not None else {}
+            written.append(
+                save_training_reference(reference, bucket=bucket, s3_client=s3, **kwargs)
+            )
+        except Exception as exc:  # noqa: BLE001 — secondary observability
+            log.warning(
+                "[feature_drift] failed to save training reference to %s: %s",
+                key or "the live key", exc,
+            )
+    for key in written:
+        log.info(
+            "[feature_drift] saved training reference: %d features n=%d -> s3://%s/%s",
+            len(reference.get("features", [])), reference.get("n_samples", 0),
+            bucket, key,
+        )
+    if not io.write_side_artifacts:
+        log.info(
+            "[feature_drift] %s run — the live drift reference is NOT written; "
+            "it moves only with a promotion (alpha-engine-config-I11478).",
+            f"challenger spec={io.challenger_spec}" if io.is_challenger_spec
+            else f"shadow basis={io.shadow_basis}",
+        )
+    return written
+
+
 def run_meta_training(
     data_dir: str,
     bucket: str,
@@ -2702,25 +2760,22 @@ def run_meta_training(
     # a reference-write failure must NOT abort training (model + manifest are
     # the primary deliverable); the report card shows feature_drift_ks N/A until
     # a reference lands. Per the feedback_no_silent_fails secondary carve-out.
+    #
+    # alpha-engine-config-I11478 — BUILT here, WRITTEN with the rest of this
+    # run's outputs below. It used to be PUT straight to the live key from here,
+    # by every run of the rotation, so the last model-zoo challenger to finish
+    # owned the champion's drift reference.
+    _drift_ref = None
     try:
         from krepis.dates import now_dual
 
-        from monitoring.feature_drift import (
-            build_training_reference,
-            save_training_reference,
-        )
+        from monitoring.feature_drift import build_training_reference
 
         _drift_ref = build_training_reference(
             meta_X, TRAIN_META_FEATURES, trained_date=now_dual().trading_day,
         )
-        _drift_key = save_training_reference(_drift_ref, bucket=bucket)
-        log.info(
-            "[feature_drift] saved training reference: %d features n=%d -> s3://%s/%s",
-            len(_drift_ref.get("features", [])), _drift_ref.get("n_samples", 0),
-            bucket, _drift_key,
-        )
     except Exception as _drift_err:  # noqa: BLE001 — secondary observability (see comment)
-        log.warning("[feature_drift] failed to save training reference: %s", _drift_err)
+        log.warning("[feature_drift] failed to build training reference: %s", _drift_err)
 
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(
@@ -5895,6 +5950,10 @@ def run_meta_training(
             log.info(
                 "Feature list written to s3://%s/%s",
                 bucket, feature_list_key,
+            )
+
+            _write_feature_drift_reference(
+                s3_up, bucket, _drift_ref, staging_prefix=prefix, io=io,
             )
 
             # Phase 0 model registry (champion/challenger governance): snapshot

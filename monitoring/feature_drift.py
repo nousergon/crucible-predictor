@@ -34,7 +34,12 @@ logger = logging.getLogger(__name__)
 # feature_list.json under the meta-weights prefix). Distinct from the
 # legacy ``predictor/metrics/training_feature_stats.json`` the z-score
 # drift_detector expects, to avoid feature-set entanglement.
-FEATURE_DRIFT_REFERENCE_KEY = "predictor/weights/meta/feature_drift_reference.json"
+# alpha-engine-config-I11478 — training writes this FILENAME into its own
+# per-run staging prefix, so the reference travels inside the registry bundle
+# and ``model.registry.promote_to_champion`` lands it at the live key together
+# with the model it describes.
+FEATURE_DRIFT_REFERENCE_FILENAME = "feature_drift_reference.json"
+FEATURE_DRIFT_REFERENCE_KEY = f"predictor/weights/meta/{FEATURE_DRIFT_REFERENCE_FILENAME}"
 
 # Per-ticker META_FEATURES whose cross-sectional distribution is meaningful to
 # KS-test. Excludes the market-wide macro_* / regime_intensity_z columns.

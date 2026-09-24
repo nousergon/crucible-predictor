@@ -84,14 +84,24 @@ class TrainingIOSpec:
     # When False the run can never overwrite the live champion weights AND is
     # never registered as a model-zoo challenger (so select_winner can never
     # promote it). When False we also skip the live-path side artifacts
-    # (factor-risk-model, triple-barrier cutover gate) that would otherwise
-    # write to shared production keys.
+    # (factor-risk-model, triple-barrier cutover gate, the live feature-drift
+    # reference, the predictor_training health record and data manifest) that
+    # would otherwise write to shared production keys. Off for a shadow run
+    # and for a model-zoo challenger (:meth:`for_challenger_spec`,
+    # alpha-engine-config-I11478).
     allow_live_promote: bool = True
     register_in_zoo: bool = True
     write_side_artifacts: bool = True
 
     # Non-None marks this as a shadow run (e.g. "crsp").
     shadow_basis: str | None = None
+
+    # alpha-engine-config-I11478 — non-None marks this as a model-zoo
+    # CHALLENGER spec run (the spec's namespace slug). Set only by
+    # :meth:`for_challenger_spec`, which also turns ``write_side_artifacts``
+    # off: a challenger trains and registers, but it never writes a key that
+    # the champion's serving or monitoring state is read from.
+    challenger_spec: str | None = None
 
     # alpha-engine-config-I9018 — when True, :meth:`for_run` scopes the output
     # paths by ``{date}/{model_version}/`` so two specs in the same weekly Map
@@ -102,6 +112,37 @@ class TrainingIOSpec:
     @property
     def is_shadow(self) -> bool:
         return self.shadow_basis is not None
+
+    @property
+    def is_challenger_spec(self) -> bool:
+        return self.challenger_spec is not None
+
+    def for_challenger_spec(self, spec: str) -> "TrainingIOSpec":
+        """Return this spec marked as a model-zoo CHALLENGER run.
+
+        alpha-engine-config-I11478. The weekly rotation trains the champion
+        architecture and then every model-zoo spec, each through the same
+        ``train_handler.main``. The weight contract was already per-run
+        (I9018), but every write outside it (the feature-drift reference, the
+        ``predictor_training`` health record and data manifest, the
+        triple-barrier cutover gate, the factor-risk-model) went to ONE shared
+        key, so the last spec to finish decided what the champion's monitors
+        read. Measured on rehearsal 2026-09-23: the live drift reference was
+        the sota challenger's 4-feature one, written 20 minutes after the
+        champion-architecture run wrote its 6-feature one.
+
+        A challenger still trains, registers and writes its own namespaced
+        artifacts (weights under ``for_run``, its spec-namespaced summary, its
+        ``oos_rows/{label}/`` panel). ``write_side_artifacts=False`` is the one
+        switch every shared write is gated on, the same switch a shadow run
+        already used.
+        """
+        if not spec:
+            raise ValueError(
+                "for_challenger_spec requires a non-empty spec namespace "
+                "(alpha-engine-config-I11478)."
+            )
+        return replace(self, challenger_spec=spec, write_side_artifacts=False)
 
     def summary_key(self, date_str: str) -> str:
         return self.summary_key_tmpl.format(date=date_str)
