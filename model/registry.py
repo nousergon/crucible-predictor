@@ -56,6 +56,15 @@ DEFAULT_SOURCE_PREFIX = "predictor/weights/meta_staging/"
 DEFAULT_LIVE_PREFIX = "predictor/weights/meta/"
 DEFAULT_REGISTRY_PREFIX = "predictor/registry/"
 
+# alpha-engine-config-I11479 — where an OPERATOR pointer move (a hand promotion
+# or rollback through this module's CLI) records itself in the champion
+# history. A SUBPREFIX of the rotation markers' ``predictor/model_zoo/promotions/``
+# so ``analysis.observe_leaderboard.load_promotion_history`` (which lists the
+# whole prefix) reads it with no second source, while the rotation's own
+# ``promotions/{date}.json`` key, which its idempotency check and the artifact
+# registry address by date, is never touched.
+OPERATOR_PROMOTIONS_PREFIX = "predictor/model_zoo/promotions/operator/"
+
 # The predictor checkout root (``model/registry.py`` → repo root is two
 # parents up). Used as the trusted ``safe.directory`` for the in-process
 # ``git rev-parse`` below — the same path the package is imported from, so
@@ -553,14 +562,95 @@ def promote_to_champion(
     }
 
 
+def record_operator_promotion(
+    s3,
+    bucket: str,
+    version_id: str,
+    *,
+    run_date: str,
+    reason: str,
+    prior_champion_version_id: str | None = None,
+    now: datetime | None = None,
+    prefix: str = OPERATOR_PROMOTIONS_PREFIX,
+) -> str:
+    """Record an operator pointer move in the champion history; return its key.
+
+    alpha-engine-config-I11479. The rotation records every pointer move it makes
+    in ``predictor/model_zoo/promotions/{run_date}.json``. A move made by hand did
+    not record itself anywhere, so the history went on saying the last rotation's
+    winner was serving. Measured on rehearsal 2026-09-23: the 2026-09-04
+    promotion served 09-08 and 09-09, and the 2026-09-11 promotion served no
+    session at all. Both were rolled back to ``v3.0-meta-2026-08-14-119e069b`` by
+    hand (the live manifest was last written 2026-09-12 15:45Z), and the history
+    kept resolving the rolled-back versions for 09-10 through 09-18. Every
+    prediction stamp was right; the history was the stale record.
+
+    ``run_date`` uses the rotation markers' meaning: the champion serving on
+    date D is the one after the newest marker whose ``run_date`` is strictly
+    earlier than D. For a move made now, that is the last CLOSED trading day
+    (see :func:`_operator_run_date`). Same-date markers are ordered by
+    ``written_at_utc``, so a rollback made after a rotation on the same trading
+    day wins over it.
+    """
+    if not version_id or not run_date:
+        raise RegistryError(
+            "record_operator_promotion needs a version_id and a run_date — a "
+            "history row that cannot be placed is not a record (I11479)."
+        )
+    if not (reason or "").strip():
+        raise RegistryError(
+            "record_operator_promotion needs a reason — an operator pointer move "
+            "with no stated cause cannot be audited later (I11479)."
+        )
+    written = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    marker = {
+        "schema_version": 1,
+        "run_date": str(run_date)[:10],
+        "mode": "operator",
+        "promoted": version_id,
+        "promoted_kind": "operator",
+        "prior_champion_version_id": prior_champion_version_id,
+        "champion_version_id_after": version_id,
+        "reason": reason.strip(),
+        "written_at_utc": written.isoformat(),
+    }
+    key = f"{prefix}{marker['run_date']}T{written.strftime('%H%M%S')}Z.json"
+    s3.put_object(
+        Bucket=bucket, Key=key,
+        Body=json.dumps(marker, indent=2).encode(), ContentType="application/json",
+    )
+    return key
+
+
+def _operator_run_date(now: datetime | None = None) -> str:
+    """The history ``run_date`` for an operator move made at ``now``: the last
+    CLOSED NYSE session, the same knowledge-axis date a rotation stamps its
+    marker with, so the move applies from the next session's predictions on."""
+    from krepis.dates import last_closed_trading_day
+
+    day = last_closed_trading_day(now or datetime.now(timezone.utc))
+    if isinstance(day, datetime):
+        day = day.date()
+    return day.isoformat()
+
+
+def _current_champion_version_id(s3, bucket: str) -> str | None:
+    champs = list_versions(s3, bucket, stage="champion")
+    return champs[0].get("version_id") if champs else None
+
+
 def _cli() -> None:
     """Model registry CLI — snapshot / promote / list (L4469).
 
     Snapshot (backfill) — register a model as a challenger (challenger-first):
         python -m model.registry --bucket B --model-version V --date YYYY-MM-DD \
             --stage challenger [--source-prefix P]
-    Promote a challenger to the live champion (operator step):
-        python -m model.registry --bucket B --promote VERSION_ID
+    Promote a challenger to the live champion (operator step; also records the
+    move in the champion history, alpha-engine-config-I11479):
+        python -m model.registry --bucket B --promote VERSION_ID --reason "..."
+    Backfill a history row for a move made before moves recorded themselves:
+        python -m model.registry --bucket B --record-promotion VERSION_ID \
+            --run-date YYYY-MM-DD --reason "..."
     List registered versions:
         python -m model.registry --bucket B --list [--stage challenger]
 
@@ -583,6 +673,18 @@ def _cli() -> None:
     p.add_argument("--code-sha", default=None)
     p.add_argument("--promote", default=None, metavar="VERSION_ID",
                    help="Promote this registered version to the live champion.")
+    p.add_argument("--reason", default=None,
+                   help="Why the pointer is moving. REQUIRED with --promote and "
+                        "--record-promotion: it is written to the champion history "
+                        "(alpha-engine-config-I11479).")
+    p.add_argument("--record-promotion", default=None, metavar="VERSION_ID",
+                   help="Record, WITHOUT copying anything, that VERSION_ID became the "
+                        "live champion — to backfill a pointer move made before "
+                        "operator moves recorded themselves. Needs --run-date and "
+                        "--reason.")
+    p.add_argument("--run-date", default=None,
+                   help="History run_date for --record-promotion: the last trading "
+                        "day whose predictions were NOT yet served by VERSION_ID.")
     p.add_argument("--list", action="store_true", help="List registered versions.")
     p.add_argument("--stage", default=None, choices=VALID_STAGES,
                    help="Filter --list by stage; OR set the recorded stage when "
@@ -595,10 +697,32 @@ def _cli() -> None:
             print(f"{(v.get('stage') or '?'):10s} {v.get('version_id')}  ({v.get('date')})")
         return
 
+    if args.record_promotion:
+        if not (args.run_date and args.reason):
+            p.error("--record-promotion requires --run-date and --reason")
+        key = record_operator_promotion(
+            s3, args.bucket, args.record_promotion,
+            run_date=args.run_date, reason=args.reason,
+        )
+        print(f"RECORDED {args.record_promotion} as champion from run_date "
+              f"{args.run_date} → s3://{args.bucket}/{key}")
+        return
+
     if args.promote:
+        # alpha-engine-config-I11479 — a hand move records itself in the
+        # champion history, or the history keeps naming the version it replaced.
+        if not (args.reason or "").strip():
+            p.error("--promote requires --reason (it is written to the champion history)")
+        prior = _current_champion_version_id(s3, args.bucket)
         result = promote_to_champion(s3, args.bucket, args.promote)
         print(f"PROMOTED {result['version_id']} → live champion "
               f"({len(result['files_copied'])} files copied to {result['live_prefix']}).")
+        key = record_operator_promotion(
+            s3, args.bucket, result["version_id"],
+            run_date=_operator_run_date(), reason=args.reason,
+            prior_champion_version_id=prior,
+        )
+        print(f"HISTORY: recorded at s3://{args.bucket}/{key}")
         print("NEXT: update MODEL_REGISTRY.yaml — set this version stage: champion, "
               "prior champion → archived (the doc SoT).")
         return

@@ -2165,7 +2165,7 @@ def _alert_promotion(bucket, date_str, leaderboard, winner_vid, prior_vid) -> No
         new_ic = win.get("cpcv_mean_ic")
         spec = win.get("spec_id", "?")
         revert = (
-            f"python -m model.registry --bucket {bucket} --promote {prior_vid}"
+            f"python -m model.registry --bucket {bucket} --promote {prior_vid} --reason \"revert <why>\""
             if prior_vid else "(prior champion version_id unavailable — see predictor/registry/)"
         )
         # config#671/#673/#1052: surface the challenger's DSR (now an OBSERVABILITY
@@ -2485,7 +2485,7 @@ def _alert_observe_recommendation(bucket, date_str, leaderboard, winner_vid) -> 
             f"(spec {win.get('spec_id','?')}) beat the champion "
             f"(CPCV {champ_ic} → {win.get('cpcv_mean_ic')}) but auto-promote is OFF — "
             f"review predictor/model_zoo/leaderboard/{date_str}.json; promote with "
-            f"`python -m model.registry --bucket {bucket} --promote {winner_vid}`."
+            f"`python -m model.registry --bucket {bucket} --promote {winner_vid} --reason \"<why>\"`."
         )
         from ops_alerts import publish_ops_alert
 
