@@ -431,6 +431,28 @@ def evaluate_completeness(
     }
 
 
+def record_degradation(block: dict, *, input: str, status: str, reason: str,
+                       severity: str = "optional", **extra) -> dict:
+    """Append one NAMED degradation to a completeness ``block`` and mark it
+    ``degraded`` (never downgrading a ``fail``). Returns the entry.
+
+    alpha-engine-config-I11481 / -I11482. A condition that was logged once per
+    fold, or once per column, at WARNING never reached the training result, so
+    the model zoo, the leaderboard and the console could not tell a run that
+    trained on its declared inputs from one that silently did not. Recorded
+    here, it rides the manifest's ``data_completeness`` like every other
+    degraded input. It does NOT gate (``assert_trainable`` raises only on
+    ``failures``), and ``arena_model_slot`` refuses only ``status == "fail"``.
+    """
+    entry = {"input": input, "status": status, "severity": severity,
+             "reason": reason, **extra}
+    block.setdefault("degradations", []).append(entry)
+    if block.get("status") in (None, "ok"):
+        block["status"] = "degraded"
+    log.warning("data_completeness: DEGRADED %s (%s) — %s", input, status, reason)
+    return entry
+
+
 def assert_trainable(block: dict) -> None:
     """Raise ``DataCompletenessError`` when a REQUIRED input failed.
 

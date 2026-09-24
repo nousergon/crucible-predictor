@@ -948,6 +948,72 @@ def build_meta_matrix(oos_meta_rows, train_meta_features):
     return matrix
 
 
+def _record_calibrator_leakage(block: dict, leakage_folds: list, *, n_folds: int,
+                               research_score_dates=None) -> "dict | None":
+    """Record the research calibrator's leakage fallback as ONE named
+    degradation on the training result (alpha-engine-config-I11481).
+
+    Measured on rehearsal 2026-09-23: 16 of 16 folds fell back to the
+    full-history ``prod_calibrator`` because ``score_performance`` begins
+    2026-03-04 and every fold's train window ends years earlier. It was one
+    WARNING per fold and nothing on the manifest, so the leaderboard could not
+    tell a leak-free ``research_calibrator_prob`` from a leaky one.
+    """
+    if not leakage_folds:
+        return None
+    from training.data_completeness import record_degradation
+
+    n = len(leakage_folds)
+    dates = research_score_dates if research_score_dates is not None else []
+    span = (
+        f"{str(min(dates))}..{str(max(dates))}" if len(dates) else "no rows"
+    )
+    return record_degradation(
+        block,
+        input="research_calibrator.per_fold",
+        status="leakage_fallback",
+        reason=(
+            f"{n} of {n_folds} walk-forward folds fell back to the full-history "
+            f"prod_calibrator, whose calibration is forward-looking for those "
+            f"folds (score_performance span: {span}; a fold needs >= 10 rows "
+            "dated on or before its train end)."
+        ),
+        n_folds_fallback=n,
+        n_folds=int(n_folds),
+        folds=list(leakage_folds),
+        score_performance_span=span,
+    )
+
+
+def _record_declared_absent(block: dict, absent: list, *, n_rows: int) -> "dict | None":
+    """Record RESEARCH_META_FEATURES absent from EVERY OOS row as ONE named
+    degradation on the training result (alpha-engine-config-I11482).
+
+    The fail-soft contract zero-fills such a column, which is right for a
+    partial lag and wrong to leave unreported at 100%: the column is a
+    constant, its coefficient is exactly zero, and the arm is smaller than
+    its declared feature list. Measured on rehearsal 2026-09-23 for
+    ``guidance_direction``, ``risk_factor_count_delta_raw`` and
+    ``management_tone_zscore`` on 25639/25639 rows, in every run.
+    """
+    if not absent:
+        return None
+    from training.data_completeness import record_degradation
+
+    return record_degradation(
+        block,
+        input="research_meta_features",
+        status="producer_absent",
+        reason=(
+            f"{len(absent)} RESEARCH_META_FEATURES absent from all {n_rows} OOS "
+            f"rows and zero-filled by the fail-soft contract: {list(absent)}. "
+            "The producer has not deployed; these columns carry no information "
+            "and the arm is smaller than its declared feature list."
+        ),
+        features_affected=list(absent),
+    )
+
+
 def declared_absent_features(oos_meta_rows, train_meta_features) -> list[str]:
     """``RESEARCH_META_FEATURES`` absent from EVERY OOS row — the producer has
     not deployed (alpha-engine-config-I5949) and ``build_meta_matrix`` zero-
@@ -2012,6 +2078,10 @@ def run_meta_training(
     macro_dates_defaulted: set[str] = set()
     vol_fold_ics = []
     resid_mom_fold_ics = []  # W2: per-fold raw IC of the residual-momentum L1
+    # alpha-engine-config-I11481 — folds whose research calibrator fell back to
+    # the full-history prod_calibrator (forward-looking leakage). Counted and
+    # recorded on the result after the loop, not only logged per fold.
+    calibrator_leakage_folds: list[int] = []
 
     for i, fold in enumerate(folds):
         fold_start = time.time()
@@ -2043,16 +2113,19 @@ def run_meta_training(
                     i + 1, len(folds), n_train_cal, fold["train_end"],
                 )
             else:
-                log.warning(
+                log.info(
                     "  Fold %d/%d: only %d score_performance rows dated <= %s — "
                     "falling back to prod_calibrator (leakage). Per-row "
                     "research_calibrator_prob may use slightly forward-looking "
-                    "calibration for this fold.",
+                    "calibration for this fold. Counted on the result's "
+                    "data_completeness (alpha-engine-config-I11481).",
                     i + 1, len(folds), n_train_cal, fold["train_end"],
                 )
                 fold_calibrator = prod_calibrator
+                calibrator_leakage_folds.append(i + 1)
         else:
             fold_calibrator = prod_calibrator
+            calibrator_leakage_folds.append(i + 1)
 
         # Momentum L1 component is now the deterministic weighted-blend
         # baseline (was a low-capacity LightGBM). Across 16 weeks of
@@ -2278,6 +2351,10 @@ def run_meta_training(
             _n_capped, _rf_cap,
         )
     peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 6 walk-forward loop"))
+    _record_calibrator_leakage(
+        data_completeness, calibrator_leakage_folds, n_folds=len(folds),
+        research_score_dates=research_score_dates,
+    )
 
     # ── Step 6b: Research-signal join summary (added 2026-04-28) ────────────
     # Before-fix the meta-trainer hardcoded constants for the four research
@@ -2686,6 +2763,7 @@ def run_meta_training(
     )
     meta_X_all = build_meta_matrix(oos_meta_rows, TRAIN_META_FEATURES)
     _declared_absent = declared_absent_features(oos_meta_rows, TRAIN_META_FEATURES)
+    _record_declared_absent(data_completeness, _declared_absent, n_rows=len(oos_meta_rows))
     meta_y_all = np.array([r["actual_fwd"] for r in oos_meta_rows])  # legacy, kept for diagnostics
     canonical_y_full = np.array([
         r.get("actual_fwd_canonical", float("nan")) for r in oos_meta_rows
