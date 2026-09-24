@@ -311,7 +311,7 @@ if [ "$MODE" = "model-zoo-spec" ] && [ -z "$MODEL_ZOO_SPEC_ID" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  GBM Spot Training — $(date +%Y-%m-%d)  (SSM transport)"
+echo "  GBM Spot Training — $(stage_run_date)  (SSM transport)"
 echo "═══════════════════════════════════════════════════════════════"
 if [ -n "$INSTANCE_TYPE" ]; then
   INSTANCE_TYPES="$INSTANCE_TYPE"  # --instance-type X collapses to single value

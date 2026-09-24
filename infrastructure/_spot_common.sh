@@ -541,6 +541,29 @@ print_banner() {
   echo "═══════════════════════════════════════════════════════════════"
 }
 
+# ── Cycle date for banners (alpha-engine-config-I11475) ─────────────────────
+#
+# The date a stage LABELS itself with. Every launcher used to print
+# `$(date +%Y-%m-%d)` in its banner — the box's UTC calendar day — so a run that
+# crossed 00:00 UTC labelled itself a day ahead of its own cycle: on the
+# 2026-09-23 weekly rehearsal (run_date 2026-09-23) the model-zoo-select banner
+# read `MODEL-ZOO SELECT-ONLY — 2026-09-24`, while the stage-coverage assertion
+# at the end of the same launcher filed its verdict under $EXECUTION_RUN_DATE.
+# Mirrors nousergon-data `infrastructure/_stage_window.sh::stage_run_date`.
+#
+# Resolution order:
+#   1. $EXECUTION_RUN_DATE — exported by nousergon-data's step_function.json
+#      from $.run_date (the cycle's trading day after NormalizeRunDates).
+#   2. The exchange's calendar day (America/New_York), for a manual launch with
+#      no SF around it. Never the UTC day.
+stage_run_date() {
+  if [ -n "${EXECUTION_RUN_DATE:-}" ]; then
+    printf '%s' "$EXECUTION_RUN_DATE"
+    return 0
+  fi
+  TZ=America/New_York date +%Y-%m-%d
+}
+
 # ── Preflight checks ─────────────────────────────────────────────────────────
 
 check_config_exists() {
