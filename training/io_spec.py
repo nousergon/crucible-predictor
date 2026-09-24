@@ -42,6 +42,7 @@ PR7-step-7b of epic config#1433 / config#1434. Cross-repo dependency: the
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Mapping
 
 # Supported shadow bases → (universe library, label close column). The only
 # basis today is the CRSP total-return rebuild; adding a basis is a one-line
@@ -304,3 +305,30 @@ class TrainingIOSpec:
         if basis is None:
             return cls.live()
         return cls.shadow(basis)
+
+
+def oos_rows_arm(manifest: "Mapping | None") -> "str | None":
+    """The arm label an ``oos_rows`` key is scoped by, read from a TRAINING
+    MANIFEST's ``version`` field (the spec's ``MODEL_VERSION_LABEL``, e.g.
+    ``v3.0-meta`` or ``spec-sota-combine``).
+
+    alpha-engine-config-I11477. This function alone decides which field
+    names the arm. The trainer wrote under ``manifest['version']``, but
+    model-zoo select read under the registry ``version_id``
+    (``v3.0-meta-2026-09-23-d7f8f864``). No writer has ever used that key, so
+    the I9061 served-slice dispersion was UNCOMPUTABLE on every rotation. The
+    writer's scheme is kept because ``ARTIFACT_REGISTRY.yaml``'s
+    ``predictor_oos_rows_*`` rows also declare it (their ``*`` segment is the
+    model FAMILY), and every panel already in S3 was written under it. A
+    registry ``version_id`` changes on every run, so it is not an arm label;
+    a reader holding one must look up that version's manifest.
+
+    Both sides pass a manifest dict: the trainer passes its in-memory
+    manifest, and select passes the registry bundle's ``manifest.json``, a
+    byte copy of the same manifest. Returns ``None`` when the manifest has no
+    ``version``.
+    """
+    if not manifest:
+        return None
+    value = manifest.get("version")
+    return str(value) if value else None

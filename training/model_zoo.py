@@ -1124,6 +1124,7 @@ def select_winner(
     from training.promotion_behavioral_veto import evaluate_behavioral_veto
     from training.realized_ic_second_opinion import evaluate_second_opinion_gate
     from training.served_slice_dispersion import served_slice_metrics
+    from training.io_spec import oos_rows_arm
 
     # ── SERVING champion (the live model that's trading NOW) ──────────────────
     # alpha-engine-config-I9018 — resolved from the INCUMBENT'S OWN REGISTRY
@@ -1344,15 +1345,36 @@ def select_winner(
     # loss of ranking information — the 2026-08-28 rotation, where the
     # champion-ARCHITECTURE control was vetoed alongside every challenger.
     # They are nested and cannot arm a rule; no threshold moves.
-    served_slice = served_slice_metrics(
-        s3, bucket,
-        list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else []),
-        date_str=date_str,
-        # alpha-engine-config-I9378 — the oos_rows panel this rotation is
-        # scoped by the champion-arch spec that wrote it, never a bare date.
-        model_version=champ_arch_vid,
-        reference_version_id=serving_bundle_vid,
+    # alpha-engine-config-I9378 — the oos_rows panel this rotation is scoped
+    # by the champion-arch spec that wrote it, never a bare date.
+    # alpha-engine-config-I11477 — scoped by its ARM LABEL, resolved from its
+    # training manifest by the same function the trainer wrote the key with.
+    # This used to pass ``champ_arch_vid`` (the registry version_id), a key no
+    # writer has ever produced, so the measurement was uncomputable on every
+    # rotation.
+    champ_arch_oos_arm = oos_rows_arm(manifests.get(champ_arch_vid)) or (
+        (champ_arch_rec or {}).get("model_version")
     )
+    _served_vids = (
+        list(manifests.keys()) + ([serving_bundle_vid] if serving_bundle_vid else [])
+    )
+    if champ_arch_vid and not champ_arch_oos_arm:
+        served_slice = {
+            "status": "uncomputable",
+            "reason": (
+                f"the champion-arch {champ_arch_vid}'s training manifest names "
+                "no arm label, so its oos_rows panel cannot be located "
+                "(alpha-engine-config-I11477)"
+            ),
+            "panel_key": None, "n_panel_rows": None, "metrics": {}, "errors": {},
+        }
+    else:
+        served_slice = served_slice_metrics(
+            s3, bucket, _served_vids,
+            date_str=date_str,
+            model_version=champ_arch_oos_arm,
+            reference_version_id=serving_bundle_vid,
+        )
     served_by_vid = served_slice.get("metrics") or {}
     incumbent_served = served_by_vid.get(serving_bundle_vid)
     if served_slice.get("status") != "measured":

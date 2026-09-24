@@ -6050,7 +6050,11 @@ def run_meta_training(
                 # local above, which is only in scope on the register_in_zoo
                 # path) so this write can never silently fall through to an
                 # unscoped default: that default IS the collision this closes.
-                _oos_model_version = manifest.get("version") or getattr(
+                # alpha-engine-config-I11477 — the arm label comes from the
+                # ONE resolver model-zoo select also reads it through, so the
+                # writer and the reader cannot pick different fields again.
+                from training.io_spec import oos_rows_arm
+                _oos_model_version = oos_rows_arm(manifest) or getattr(
                     cfg, "MODEL_VERSION_LABEL", None,
                 )
                 if not _oos_model_version:
