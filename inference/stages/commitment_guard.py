@@ -276,7 +276,7 @@ def _check(ctx: PipelineContext) -> None:
             f"the bundle being served cannot be identified and cannot be graded "
             f"against the freeze pinning {frozen or '(none declared)'} "
             f"(alpha-engine-config-I10259). Restamp the live manifest with "
-            f"`python -m model.registry --bucket {bucket} --promote <version_id>` for "
+            f"`python -m model.registry --bucket {bucket} --promote <version_id> --reason \"<why>\"` for "
             f"the version that should be serving.",
             severity="warning",
             dedup_key="predictor_commitment_served_version_missing",

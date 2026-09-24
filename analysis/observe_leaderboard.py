@@ -269,7 +269,10 @@ def load_promotion_history(bucket: str, s3_client=None) -> list[dict]:
     alpha-engine-config-I8219. ``predictor/model_zoo/promotions/{run_date}.json``
     is written once per rotation by ``model_zoo._write_promotion_marker`` and is
     never rewritten, so it is the durable record of which registry version held
-    the champion pointer after each rotation. It is what lets a prediction
+    the champion pointer after each rotation. Operator moves made through
+    ``python -m model.registry --promote`` record themselves under
+    ``promotions/operator/`` (alpha-engine-config-I11479); the listing below
+    reads both, ordered by ``run_date`` and then by ``written_at_utc``. It is what lets a prediction
     artifact written BEFORE the ``champion_version_id`` stamp shipped
     (2026-08-25) still be attributed to the arm that actually produced it.
 
@@ -302,7 +305,12 @@ def load_promotion_history(bucket: str, s3_client=None) -> list[dict]:
             run_date = marker.get("run_date")
             champ = marker.get("champion_version_id_after")
             if run_date and champ:
-                out.append({"run_date": str(run_date)[:10], "champion_version_id": champ})
+                out.append({
+                    "run_date": str(run_date)[:10],
+                    "champion_version_id": champ,
+                    "written_at_utc": str(marker.get("written_at_utc") or ""),
+                    "source": marker.get("mode"),
+                })
     except Exception:  # noqa: BLE001 — absence is reported, never invented
         log.warning(
             "promotion history: %s/ unreadable — pre-stamp predictions will be "
@@ -310,7 +318,10 @@ def load_promotion_history(bucket: str, s3_client=None) -> list[dict]:
             _PROMOTIONS_PREFIX, exc_info=True,
         )
         return []
-    out.sort(key=lambda r: r["run_date"])
+    # alpha-engine-config-I11479 — within one run_date, the LATER write wins: an
+    # operator rollback (``promotions/operator/``) recorded after that date's
+    # rotation marker is the pointer that actually served next.
+    out.sort(key=lambda r: (r["run_date"], r["written_at_utc"]))
     return out
 
 
