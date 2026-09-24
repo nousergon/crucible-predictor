@@ -67,7 +67,7 @@ fi
 resolve_or_stage_predictor_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml"
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  MODEL-ZOO $(echo "$MODE" | tr 'a-z' 'A-Z') — $(date +%Y-%m-%d)"
+echo "  MODEL-ZOO $(echo "$MODE" | tr 'a-z' 'A-Z') — $(stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Instance types: $INSTANCE_TYPES"
 echo "  Subnets       : $SUBNETS"

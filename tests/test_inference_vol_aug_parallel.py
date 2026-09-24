@@ -167,3 +167,96 @@ class TestSmokeImport:
         ):
             m = importlib.import_module(mod)
             assert m is not None
+
+
+# ── Train/inference consistency across a MACRO_NORM_FEATURES change ────
+
+
+# The list as it stood before alpha-engine-config-I11523 dropped the HY OAS
+# pair. A model trained the Saturday before a config change merges carries
+# these names until the next weekly retrain.
+_PRE_I11523_MACROS = [
+    "spy_20d_return", "spy_20d_vol", "vix_level", "vix_term_slope",
+    "yield_curve_slope", "market_breadth", "vix_vix3m_ratio",
+    "market_breadth_200d", "yield_curve_10y_2y", "hy_oas_level",
+    "hy_oas_change_21d", "baa10y_level", "baa10y_change_21d",
+]
+
+
+class _StubScorer:
+    def __init__(self, names):
+        self.feature_names = list(names)
+
+
+def _fit_and_reload(tmp_path, macro_names):
+    """A real booster, saved and reloaded the way load_model.py does it."""
+    from model.gbm_scorer import GBMScorer
+
+    names = list(cfg.VOLATILITY_FEATURES) + list(macro_names)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, len(names)))
+    y = np.abs(X[:, 0]) + 0.1 * rng.normal(size=400)
+    scorer = GBMScorer(
+        params={"min_child_samples": 20, "num_leaves": 7, "verbose": -1},
+        n_estimators=5, early_stopping_rounds=5,
+    )
+    scorer.fit(X[:300], y[:300], X[300:], y[300:], feature_names=names)
+    path = tmp_path / "volatility_macro_aug.txt"
+    scorer.save(path)
+    return GBMScorer.load(path)
+
+
+class TestMacroColumnsComeFromTheModel:
+
+    def _all_columns(self):
+        # build_features still emits the HY OAS pair, so both lists resolve.
+        return set(_PRE_I11523_MACROS) | set(cfg.MACRO_NORM_FEATURES)
+
+    def test_model_trained_on_the_old_list_is_scored_on_the_old_list(self, tmp_path):
+        from inference.stages.run_inference import resolve_vol_aug_macro_columns
+
+        scorer = _fit_and_reload(tmp_path, _PRE_I11523_MACROS)
+        cols = resolve_vol_aug_macro_columns(scorer, self._all_columns())
+        assert cols == _PRE_I11523_MACROS
+        # And the vector built from those columns is the width it expects.
+        x = np.zeros((1, len(cfg.VOLATILITY_FEATURES) + len(cols)), np.float32)
+        assert scorer.predict(x).shape == (1,)
+
+    def test_model_trained_on_the_new_list_is_scored_on_the_new_list(self, tmp_path):
+        from inference.stages.run_inference import resolve_vol_aug_macro_columns
+
+        scorer = _fit_and_reload(tmp_path, cfg.MACRO_NORM_FEATURES)
+        cols = resolve_vol_aug_macro_columns(scorer, self._all_columns())
+        assert cols == list(cfg.MACRO_NORM_FEATURES)
+        assert "hy_oas_level" not in cols
+
+    def test_no_model_falls_back_to_config(self):
+        from inference.stages.run_inference import resolve_vol_aug_macro_columns
+
+        assert resolve_vol_aug_macro_columns(None, []) == list(
+            cfg.MACRO_NORM_FEATURES
+        )
+
+    def test_a_trained_macro_the_build_did_not_produce_raises(self):
+        import pytest
+
+        from inference.stages.run_inference import resolve_vol_aug_macro_columns
+
+        scorer = _StubScorer(list(cfg.VOLATILITY_FEATURES) + _PRE_I11523_MACROS)
+        with pytest.raises(ValueError, match="hy_oas_level"):
+            resolve_vol_aug_macro_columns(scorer, cfg.MACRO_NORM_FEATURES)
+
+    def test_a_reordered_volatility_prefix_raises(self):
+        import pytest
+
+        from inference.stages.run_inference import resolve_vol_aug_macro_columns
+
+        vol = list(reversed(cfg.VOLATILITY_FEATURES))
+        scorer = _StubScorer(vol + list(cfg.MACRO_NORM_FEATURES))
+        with pytest.raises(ValueError, match="VOLATILITY_FEATURES"):
+            resolve_vol_aug_macro_columns(scorer, self._all_columns())
+
+    def test_inference_reads_the_macro_list_from_the_loaded_model(self):
+        src = _src("inference/stages/run_inference.py")
+        assert "resolve_vol_aug_macro_columns(" in src
+        assert 'regime_features_df[\n                macro_cols\n            ]' in src

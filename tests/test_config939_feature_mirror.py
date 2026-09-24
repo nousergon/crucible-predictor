@@ -54,7 +54,9 @@ def test_no_collision_with_regime_predictor_hy_oas_level():
     # mirror must use a distinct name so the two are never confused.
     assert "hy_oas_level" not in cfg.FEATURES
     assert "hy_oas_credit_spread_pct" in cfg.FEATURES
-    # The regime-substrate pair still exists, untouched, in its own
-    # namespace — confirms this PR didn't collide with or remove it.
-    assert "hy_oas_level" in cfg.MACRO_NORM_FEATURES
-    assert "hy_oas_change_21d" in cfg.MACRO_NORM_FEATURES
+    # The regime-substrate pair left MACRO_NORM_FEATURES on 2026-09-24
+    # (alpha-engine-config-I11523: BAA10Y is the credit-spread input). The
+    # per-ticker mirror must not have been swapped in for it either.
+    assert "hy_oas_level" not in cfg.MACRO_NORM_FEATURES
+    assert "hy_oas_change_21d" not in cfg.MACRO_NORM_FEATURES
+    assert "hy_oas_credit_spread_pct" not in cfg.MACRO_NORM_FEATURES

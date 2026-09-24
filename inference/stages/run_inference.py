@@ -126,6 +126,49 @@ def compute_momentum_veto(
     return m20, m20 < threshold
 
 
+def resolve_vol_aug_macro_columns(scorer, available) -> list[str]:
+    """Macro columns, in trained order, that the macro-aug vol GBM expects.
+
+    The column list comes from the LOADED model, never from
+    ``cfg.MACRO_NORM_FEATURES``. Training fits the arm on
+    ``VOLATILITY_FEATURES + MACRO_NORM_FEATURES`` and LightGBM records those
+    names in the booster, so the model file is the only thing that knows
+    which macros it was trained on. Reading the list from config would score
+    a model trained on the previous list against the current one for every
+    day between a config change merging and the next weekly retrain
+    (alpha-engine-config-I11523 dropped the two HY OAS columns from the
+    list; the model trained the Saturday before still carries them).
+
+    ``scorer`` is ``None`` when the arm is not loaded; the config list is
+    returned then, and nothing scores against it. Raises ``ValueError`` when
+    the model's leading columns are not ``cfg.VOLATILITY_FEATURES`` (the
+    per-ticker half is built from config and cannot be re-ordered) or when a
+    trained macro column is absent from ``available``. The caller drops the
+    parallel field for the day rather than score a mismatched vector.
+    """
+    if scorer is None:
+        return list(cfg.MACRO_NORM_FEATURES)
+    names = list(getattr(scorer, "feature_names", None) or [])
+    n_vol = len(cfg.VOLATILITY_FEATURES)
+    if names[:n_vol] != list(cfg.VOLATILITY_FEATURES):
+        raise ValueError(
+            "volatility_macro_aug model's leading features "
+            f"{names[:n_vol]} are not cfg.VOLATILITY_FEATURES "
+            f"{list(cfg.VOLATILITY_FEATURES)}"
+        )
+    macro_cols = names[n_vol:]
+    if not macro_cols:
+        raise ValueError("volatility_macro_aug model records no macro columns")
+    available = set(available)
+    missing = [c for c in macro_cols if c not in available]
+    if missing:
+        raise ValueError(
+            f"volatility_macro_aug model was trained on macro columns {missing} "
+            "that build_features did not produce today"
+        )
+    return macro_cols
+
+
 def _emit_nan_feature_tickers_metric(count: int) -> None:
     """Emit ``AlphaEngine/Predictor/nan_feature_tickers_count`` gauge.
 
@@ -455,8 +498,21 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
     if not regime_features_df.empty and len(regime_features_df) >= 60:
         try:
             from data.dataset import time_series_zscore_normalize
+            # The trained model's own macro list, not cfg.MACRO_NORM_FEATURES
+            # (see resolve_vol_aug_macro_columns). The z-score is per
+            # column, so the subset does not change any column's values.
+            macro_cols = resolve_vol_aug_macro_columns(
+                (ctx.meta_models or {}).get("volatility_macro_aug"),
+                regime_features_df.columns,
+            )
+            if list(macro_cols) != list(cfg.MACRO_NORM_FEATURES):
+                log.warning(
+                    "volatility_macro_aug model was trained on a macro list "
+                    "that differs from cfg.MACRO_NORM_FEATURES; scoring it on "
+                    "its own list %s until the next retrain", macro_cols,
+                )
             macro_subset = regime_features_df[
-                list(cfg.MACRO_NORM_FEATURES)
+                macro_cols
             ].to_numpy(dtype=np.float64)
             macro_dates_list = list(pd.DatetimeIndex(regime_features_df.index))
             macro_zscored_full = time_series_zscore_normalize(
@@ -560,9 +616,10 @@ def _run_meta_inference(ctx: PipelineContext) -> None:
 
     # Stage 1c: macro-augmented rank+z-score batch for the parallel
     # vol-aug GBM. Schema must match training feature order:
-    # [VOLATILITY_FEATURES rank-normed, MACRO_NORM_FEATURES z-scored].
-    # Same n_features the aug GBM was trained on (12 = 6 + 6) per
-    # Stage 1b's VOL_AUG_FEATURES list. Today's z-scored macros are
+    # [VOLATILITY_FEATURES rank-normed, the model's macros z-scored].
+    # The macro half follows the loaded model's recorded feature names
+    # (resolve_vol_aug_macro_columns), so it matches whatever
+    # MACRO_NORM_FEATURES was at the model's training time. Today's z-scored macros are
     # broadcast to every ticker because macros are constant cross-
     # sectionally on a given date.
     vol_scorer_aug = ctx.meta_models.get("volatility_macro_aug")
