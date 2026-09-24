@@ -9,8 +9,10 @@ full-set macros in ``RegimePredictor.build_features()``:
 - ``baa10y_change_21d``: 21d change in BAA10Y (full-corpus credit
   regime-shift signal)
 
-All five flow into ``cfg.MACRO_NORM_FEATURES`` so Stage 1b's macro-aug
-volatility GBM consumes them via the time-series z-score pipeline.
+``build_features`` still emits all five. Since 2026-09-24
+(alpha-engine-config-I11523) only the TWO and BAA10Y columns flow into
+``cfg.MACRO_NORM_FEATURES`` for Stage 1b's macro-aug volatility GBM; the HY
+OAS pair was dropped because its FRED history starts in 2023.
 
 Plan doc: ~/Development/alpha-engine-docs/private/regime-conditioning-260510.md
 """
@@ -50,14 +52,21 @@ class TestFullMacroSchema:
     def test_macro_norm_features_includes_full_set(self):
         for name in (
             "yield_curve_10y_2y",
-            "hy_oas_level",
-            "hy_oas_change_21d",
             "baa10y_level",
             "baa10y_change_21d",
         ):
             assert name in cfg.MACRO_NORM_FEATURES, (
                 f"{name} missing from cfg.MACRO_NORM_FEATURES"
             )
+
+    def test_hy_oas_pair_is_not_in_macro_norm_features(self):
+        # alpha-engine-config-I11523: BAA10Y is the credit-spread input.
+        # HYOAS starts 2023-09-05, so ~70% of the 2016+ corpus would be
+        # zero-fill and the step to real values reads as an extreme z-score.
+        assert "hy_oas_level" not in cfg.MACRO_NORM_FEATURES
+        assert "hy_oas_change_21d" not in cfg.MACRO_NORM_FEATURES
+        assert len(cfg.MACRO_NORM_FEATURES) == 11
+        assert len(set(cfg.MACRO_NORM_FEATURES)) == 11
 
     def test_build_features_emits_full_set(self):
         rp = RegimePredictor()
@@ -256,11 +265,10 @@ class TestStage1bIntegrationSanity:
             all_dates, regime_df, list(cfg.MACRO_NORM_FEATURES),
         )
         assert X_macro.shape == (250, len(cfg.MACRO_NORM_FEATURES))
-        # Stage 2c-full additions: indexes for the 5 new macros.
+        # Stage 2c-full additions still in the list (the HY OAS pair left
+        # it under alpha-engine-config-I11523).
         for name in (
             "yield_curve_10y_2y",
-            "hy_oas_level",
-            "hy_oas_change_21d",
             "baa10y_level",
             "baa10y_change_21d",
         ):

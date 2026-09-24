@@ -265,9 +265,11 @@ class RegimePredictor:
             df["yield_curve_10y_2y"] = 0.0
 
         # hy_oas_level: ICE BofA US HY Index OAS. License-gated to 2023+
-        # on FRED — pre-2023 rows fall back to neutral. Forward-going,
-        # the level captures HY-specific stress regimes that BAA10Y
-        # (BBB-rated) misses.
+        # on FRED — pre-2023 rows fall back to neutral. NOT in
+        # cfg.MACRO_NORM_FEATURES since 2026-09-24 (alpha-engine-config-
+        # I11523; BAA10Y is the credit-spread input). Still emitted so a
+        # macro-aug model trained on the older list can be scored until its
+        # retrain: inference reads its macro columns from the model.
         if hyoas_series is not None:
             hyoas_aligned = _record_coverage(
                 hyoas_series.reindex(df.index, method="ffill"), "HYOAS",
