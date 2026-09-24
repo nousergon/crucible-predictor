@@ -105,6 +105,7 @@ __all__ = [
     "L1FitSpec",
     "L1_FIT_REGISTER",
     "measure_output_dispersion",
+    "measure_feature_block",
     "evaluate_l1_fits",
     "assert_l1_fits_valid",
 ]
@@ -126,6 +127,9 @@ class L1FitValidityError(RuntimeError):
 _STATUS_PRECEDENCE = (
     "absent",
     "not_fitted",
+    # alpha-engine-config-I11522: a starved input is the ROOT cause of
+    # whatever the fit then did, so it outranks every fit-quality verdict.
+    "starved_input",
     "underfit_early_stop",
     "no_val_signal",
     "train_val_gap",
@@ -165,6 +169,23 @@ class L1FitSpec:
         panel it was fitted on. ``None`` records the number without gating on
         it — used where no cross-vintage series exists yet to site a floor
         honestly.
+    feature_block_floors : dict
+        ``{block_name: min_finite_pct}`` (fractions in 0..1) for the feature
+        blocks this arm is DECLARED to consume beyond its base features
+        (alpha-engine-config-I11522). ``finite_pct`` is the share of rows on
+        which every column of the block is finite: the same number
+        ``meta_trainer`` logs. A block under its floor, or a declared block
+        the fit record does not report at all, grades the arm
+        ``starved_input`` and names the block. A booster fed an all-NaN
+        block still early-stops on its base features and clears every fit
+        floor, which is exactly how the macro-augmented arm graded ``valid``
+        on ``finite_pct=0.00`` in every weekly run from 2026-07-18 to
+        2026-09-23.
+    starved_input_severity : str or None
+        Severity of a ``starved_input`` finding. ``None`` inherits
+        ``severity``. Declared separately because an observe-only variant
+        that nothing serves from must not stop the weekly run over its own
+        inputs, yet must never read as ``valid`` either.
     """
 
     name: str
@@ -175,6 +196,8 @@ class L1FitSpec:
     min_abs_val_ic: float = 0.05
     max_train_val_ic_ratio: "float | None" = 5.0
     min_output_dispersion: "float | None" = None
+    feature_block_floors: "tuple[tuple[str, float], ...]" = ()
+    starved_input_severity: "str | None" = None
 
 
 # The single list of L1 arms whose fit is gated. An L1 that early-stops and is
@@ -216,6 +239,15 @@ L1_FIT_REGISTER: tuple[L1FitSpec, ...] = (
         min_best_iteration=10,
         min_abs_val_ic=0.05,
         max_train_val_ic_ratio=None,
+        # alpha-engine-config-I11522. 0.50 mirrors META_MACRO_MIN_ROW_COVERAGE:
+        # at least half the rows must carry every declared macro, or the arm
+        # is not the "vol + macros" model its name claims.
+        feature_block_floors=(("macro", 0.50),),
+        # Observe-only: inference emits its output as a parallel field and
+        # nothing serves from it. A starved block therefore DEGRADES the run
+        # by name instead of failing it. Before any cutover of this variant,
+        # raise this to "required".
+        starved_input_severity="optional",
     ),
     L1FitSpec(
         name="volatility_risk_aug",
@@ -254,6 +286,65 @@ class _Finding:
     def as_dict(self) -> dict:
         return {"arm": self.arm, "status": self.status,
                 "severity": self.severity, "reason": self.reason}
+
+
+def measure_feature_block(X, columns) -> dict:
+    """Finite-coverage report for one feature block (alpha-engine-config-I11522).
+
+    ``finite_pct`` is the share of rows on which EVERY column is finite, a
+    fraction in 0..1. ``column_finite_frac`` gives the same per column, so a
+    reader sees which column starved the block without re-running training.
+    """
+    import numpy as np
+
+    arr = np.asarray(X)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return {"finite_pct": None, "n_rows": int(arr.shape[0]) if arr.ndim else 0,
+                "n_cols": int(arr.shape[1]) if arr.ndim == 2 else 0,
+                "column_finite_frac": {}}
+    finite = np.isfinite(arr)
+    per_col = finite.mean(axis=0)
+    names = list(columns) if columns is not None else [f"col{i}" for i in range(arr.shape[1])]
+    return {
+        "finite_pct": round(float(finite.all(axis=1).mean()), 6),
+        "n_rows": int(arr.shape[0]),
+        "n_cols": int(arr.shape[1]),
+        "column_finite_frac": {
+            str(n): round(float(v), 6) for n, v in zip(names, per_col)
+        },
+    }
+
+
+def _starved_block_issues(spec: L1FitSpec, fit: dict) -> "list[tuple[str, str]]":
+    """``starved_input`` issues for every declared block under its floor or
+    missing from the fit record (alpha-engine-config-I11522)."""
+    issues: list[tuple[str, str]] = []
+    reported = (fit or {}).get("feature_blocks") or {}
+    for block, floor in spec.feature_block_floors:
+        rep = reported.get(block)
+        pct = _finite((rep or {}).get("finite_pct"))
+        if pct is None:
+            issues.append(("starved_input", (
+                f"{spec.name}: starved_input — declared feature block {block!r} "
+                "was not reported with a finite_pct, so the arm cannot show it "
+                f"was fed; required >= {floor:.2f}. Reported as starved, not a "
+                "pass: an unmeasured input that reads as green is the defect "
+                "(alpha-engine-config-I11522)."
+            )))
+            continue
+        if pct < floor:
+            cols = (rep or {}).get("column_finite_frac") or {}
+            worst = sorted(cols.items(), key=lambda kv: kv[1])[:5]
+            worst_s = ", ".join(f"{c}={v:.2f}" for c, v in worst) or "none reported"
+            issues.append(("starved_input", (
+                f"{spec.name}: starved_input — feature block {block!r} is finite "
+                f"on {pct:.2%} of rows (every column finite); measured {pct:.4f}, "
+                f"required >= {floor:.2f}. Least-covered columns: {worst_s}. The "
+                "fit floors pass on the base features alone, so this arm is not "
+                f"the model its {block!r} inputs claim "
+                "(alpha-engine-config-I11522)."
+            )))
+    return issues
 
 
 def _finite(value) -> "float | None":
@@ -446,6 +537,9 @@ def evaluate_l1_fits(fits: "dict | None",
                     ),
                 })
 
+        if fit is not None and fit.get("fitted") and spec.feature_block_floors:
+            issues.extend(_starved_block_issues(spec, fit))
+
         by_status = dict(issues)
         status, reason = "valid", ""
         for candidate in _STATUS_PRECEDENCE:
@@ -472,11 +566,13 @@ def evaluate_l1_fits(fits: "dict | None",
             "split": (fit or {}).get("split"),
             "design_matrix": (fit or {}).get("design_matrix"),
             "val_ic_precision": (fit or {}).get("val_ic_precision"),
+            "feature_blocks": (fit or {}).get("feature_blocks"),
             "floors": {
                 "min_best_iteration": spec.min_best_iteration,
                 "min_abs_val_ic": spec.min_abs_val_ic,
                 "max_train_val_ic_ratio": spec.max_train_val_ic_ratio,
                 "min_output_dispersion": spec.min_output_dispersion,
+                "feature_blocks": dict(spec.feature_block_floors) or None,
             },
             "reason": reason or None,
             "issues": [{"status": st, "reason": rs} for st, rs in issues],
@@ -487,7 +583,16 @@ def evaluate_l1_fits(fits: "dict | None",
             # check that cannot be computed is reported insufficient and
             # does not block." A required arm whose val_ic cannot be
             # distinguished from noise is a gap in evidence, not a failure.
-            finding_severity = "optional" if status == "insufficient" else spec.severity
+            # The finding carries the STRICTEST severity among the arm's
+            # issues, so `starved_input` outranking a fit failure for the
+            # headline never demotes that failure to a degradation.
+            issue_statuses = {st for st, _ in issues}
+            if issue_statuses - {"insufficient", "starved_input"}:
+                finding_severity = spec.severity
+            elif "starved_input" in issue_statuses:
+                finding_severity = spec.starved_input_severity or spec.severity
+            else:
+                finding_severity = "optional"
             findings.append(_Finding(spec.name, status, finding_severity, reason))
 
     failures = [f for f in findings if f.severity == "required"]

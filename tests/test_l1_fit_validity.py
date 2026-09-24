@@ -65,6 +65,10 @@ HEALTHY_VOL_FITS = {
         "fitted": True, "best_iteration": 145, "val_ic": 0.331344,
         "train_ic": None, "n_estimators": 2000, "n_samples": 100000,
         "output_dispersion": None,
+        # alpha-engine-config-I11522: "healthy" includes being FED. A
+        # macro-aug arm with no block report now grades starved_input.
+        "feature_blocks": {"macro": {"finite_pct": 0.92, "n_rows": 100000,
+                                     "n_cols": 13, "column_finite_frac": {}}},
     },
     "volatility_risk_aug": {
         "fitted": True, "best_iteration": 150, "val_ic": 0.334690,
