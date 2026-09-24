@@ -50,6 +50,11 @@ def mock_arena_run_slot(
             retirements=(),
             scored_arms=(),
             active_arms=(),
+            # Required fields from nousergon-lib v0.124.153 on
+            # (alpha-engine-config-I11393 lockstep bump). The mock has no arms,
+            # so nothing is promotable; the config is the slot's own.
+            promotable_arms=(),
+            config=arena_mod._arena_config(),
         )
         return {
             "cycle": cycle,
