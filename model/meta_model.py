@@ -58,6 +58,8 @@ from pathlib import Path
 
 import numpy as np
 
+from model.sklearn_pickle import load_checked, sklearn_version
+
 log = logging.getLogger(__name__)
 
 # Meta-model input features (order must match at training and inference)
@@ -664,6 +666,9 @@ class MetaModel:
                     "feature_names": list(self._feature_names),
                     "meta_scaler": self._scaler,
                     "coefficients": dict(self._coefficients),
+                    # alpha-engine-config-I11520: the version that pickled
+                    # the estimator travels with it.
+                    "sklearn_version": sklearn_version(),
                 },
                 f,
             )
@@ -676,7 +681,7 @@ class MetaModel:
         path = Path(path)
         mm = cls()
         with open(path, "rb") as f:
-            obj = pickle.load(f)
+            obj, mm._sklearn_load_report = load_checked(f, artifact=f"MetaModel {path.name}")
         # v2+ payload: feature_names embedded with the estimator (load-bearing,
         # sidecar-independent). Legacy payload: a bare estimator → feature_names
         # come from the sidecar / coefficients fallback below.

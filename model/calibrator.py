@@ -27,6 +27,8 @@ from nousergon_lib.quant.stats.calibration import (
     expected_calibration_error as _lib_expected_calibration_error,
 )
 
+from model.sklearn_pickle import load_checked, sklearn_version
+
 log = logging.getLogger(__name__)
 
 
@@ -397,6 +399,7 @@ class PlattCalibrator:
 
         meta = self.metrics()
         meta["deployed_at"] = datetime.now(timezone.utc).isoformat()
+        meta["sklearn_version"] = sklearn_version()  # I11520
         Path(str(path) + ".meta.json").write_text(json.dumps(meta, indent=2))
         log.info("Calibrator saved to %s (deployed_at=%s)", path, meta["deployed_at"])
 
@@ -416,7 +419,8 @@ class PlattCalibrator:
         cal = cls(method=method)
 
         with open(path, "rb") as f:
-            cal._model = pickle.load(f)
+            cal._model, cal._sklearn_load_report = load_checked(
+                f, artifact=f"PlattCalibrator {path.name}")
 
         cal._fitted = meta.get("fitted", True)
         cal._n_samples = meta.get("n_samples", 0)

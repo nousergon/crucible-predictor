@@ -355,3 +355,35 @@ class TestMalformedParquet:
         )
         assert result["status"] == "ok"
         assert result["n_tickers"] == 40  # garbage skipped, others survived
+
+
+# ── alpha-engine-config-I11520: non-positive closes never reach log() ───────
+
+def test_non_positive_close_is_masked_not_logged_as_inf_or_warning():
+    import warnings
+
+    from training.risk_model_persist import _log_returns
+
+    close = pd.Series(
+        [10.0, 11.0, 0.0, 12.0, -5.0, 13.0, np.inf, 14.0],
+        index=pd.bdate_range("2026-01-01", periods=8),
+    )
+    bad: dict[str, int] = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # the rehearsal's RuntimeWarning fails here
+        out = _log_returns(close, "XYZ", bad)
+    assert bad == {"XYZ": 3}
+    assert not np.isinf(out).any()
+    assert out.iloc[1] == pytest.approx(np.log(11.0 / 10.0))
+    # Every return touching a masked close is NaN, never ±inf.
+    assert out.iloc[2:8].isna().all()
+
+
+def test_clean_close_series_reports_nothing():
+    from training.risk_model_persist import _log_returns
+
+    close = pd.Series([10.0, 11.0, 12.1], index=pd.bdate_range("2026-01-01", periods=3))
+    bad: dict[str, int] = {}
+    out = _log_returns(close, "OK", bad)
+    assert bad == {}
+    assert out.iloc[1:].notna().all()

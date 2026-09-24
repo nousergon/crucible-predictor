@@ -20,6 +20,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from model.sklearn_pickle import load_checked, sklearn_version
+
 log = logging.getLogger(__name__)
 
 # Regime labels derived from subsequent 20-day SPY return
@@ -529,6 +531,7 @@ class RegimePredictor:
             "n_samples": self._n_samples,
             "accuracy": round(self._accuracy, 4) if self._accuracy else None,
             "features": self.FEATURE_NAMES,
+            "sklearn_version": sklearn_version(),  # I11520
             "in_sample": self._train_metrics,
             "oos": self._oos_metrics,
         }
@@ -544,7 +547,8 @@ class RegimePredictor:
         path = Path(path)
         rp = cls()
         with open(path, "rb") as f:
-            rp._model = pickle.load(f)
+            rp._model, rp._sklearn_load_report = load_checked(
+                f, artifact=f"RegimePredictor {path.name}")
         rp._fitted = True
         meta_path = Path(str(path) + ".meta.json")
         if meta_path.exists():

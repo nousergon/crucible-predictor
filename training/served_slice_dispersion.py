@@ -256,11 +256,12 @@ def load_scoring_head(s3, bucket: str, version_id: str) -> tuple[object, object]
     Exactly the pair ``promote_to_champion`` would copy into the live prefix, so
     what is measured is what would serve.
     """
-    import pickle
-
     meta_model = load_meta_model(s3, bucket, version_id)
-    calibrator = pickle.loads(
-        _get_bytes(s3, bucket, f"{_REGISTRY_PREFIX}{version_id}/isotonic_calibrator.pkl")
+    from model.sklearn_pickle import loads_checked
+
+    calibrator, _report = loads_checked(
+        _get_bytes(s3, bucket, f"{_REGISTRY_PREFIX}{version_id}/isotonic_calibrator.pkl"),
+        artifact=f"isotonic_calibrator {version_id}",
     )
     return meta_model, calibrator
 
