@@ -1877,12 +1877,20 @@ def run_meta_training(
     # 2M-row macro array immediately so it doesn't linger through the
     # research-calibrator load + walk-forward loop (Step 4b OOM hotspot).
     del X_macro_raw
+    # alpha-engine-config-I11522: measured once, here, and carried on the
+    # macro-augmented arm's fit record so the L1 gate grades what it was fed.
+    from training.l1_fit_validity import measure_feature_block
+    macro_block_report = measure_feature_block(
+        X_macro_zscored, list(cfg.MACRO_NORM_FEATURES),
+    )
+    _macro_cols = macro_block_report["column_finite_frac"]
     log.info(
         "Macro feature array (Stage 1b): %d rows × %d cols, "
-        "rolling z-score window=%d, finite_pct=%.2f",
+        "rolling z-score window=%d, finite_pct=%.2f; least-covered columns: %s",
         X_macro_zscored.shape[0], X_macro_zscored.shape[1],
         cfg.MACRO_NORM_WINDOW,
-        100.0 * float(np.isfinite(X_macro_zscored).all(axis=1).mean()),
+        100.0 * float(macro_block_report["finite_pct"] or 0.0),
+        ", ".join(f"{c}={v:.2f}" for c, v in sorted(_macro_cols.items(), key=lambda kv: kv[1])[:5]),
     )
     peak_rss_mb = max(peak_rss_mb, _log_rss("after Step 4b macro-array build (OOM hotspot)"))
 
@@ -4862,6 +4870,8 @@ def run_meta_training(
             "n_samples": int(n_train),
             "output_dispersion": None,
             "split": prod_split_block,
+            # alpha-engine-config-I11522: graded against the declared floor.
+            "feature_blocks": {"macro": macro_block_report},
         }
     except Exception as e:
         log.warning(
