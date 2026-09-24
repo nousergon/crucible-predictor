@@ -638,13 +638,34 @@ def _resolve_registered_specs_for_date(
         for mv, v in newest.items() if v.get("version_id")
     ]
     present = sorted(c["spec_id"] for c in pool)
-    absent = sorted(sid for sid in label_to_spec.values() if sid not in present)
+    absent, not_trained = _absent_and_untrainable(specs, label_to_spec.values(), present)
     log.info(
         "model_zoo select: registered-for-%s pool — present=%s absent=%s "
-        "(absent = failed/skipped Map iteration; tolerated)",
-        date_str, present, absent,
+        "(absent = failed/skipped Map iteration of a TRAINABLE arm; tolerated) "
+        "not_trained=%s (inapplicable/retired by the arm register, never "
+        "dispatched — alpha-engine-config-I11489)",
+        date_str, present, absent, not_trained,
     )
     return pool
+
+
+def _absent_and_untrainable(specs, expected_ids, present) -> tuple[list, list]:
+    """Split the specs missing from today's pool into ``absent`` (a TRAINABLE
+    arm whose Map iteration produced nothing: a real failure) and
+    ``not_trained`` (an arm the register classifies inapplicable or retired,
+    which ``train_all_active`` and the Map never train).
+
+    alpha-engine-config-I11489. ``absent`` used to hold both, so every
+    rotation carried ``horizon-60d``/``horizon-90d`` (non-canonical horizons,
+    refused before training by I9313) as tolerated absences, and a genuine Map
+    failure had to be picked out of that noise by hand.
+    """
+    present = set(present)
+    trainable = {a.spec_id: a.trainable for a in resolve_arms(specs)}
+    missing = sorted(sid for sid in set(expected_ids) if sid not in present)
+    absent = [sid for sid in missing if trainable.get(sid, True)]
+    not_trained = [sid for sid in missing if not trainable.get(sid, True)]
+    return absent, not_trained
 
 
 def _resolve_base_champion_version(s3, bucket: str, date_str: str | None) -> dict | None:
