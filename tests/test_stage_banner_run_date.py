@@ -58,7 +58,7 @@ def _run(env_extra: dict[str, str], *, drop: tuple[str, ...] = ()) -> str:
         check=True,
         timeout=30,
     )
-    return proc.stdout
+    return proc.stdout.strip()
 
 
 def test_stage_run_date_is_the_sf_run_date_when_exported():
