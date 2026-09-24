@@ -88,7 +88,10 @@ krepis[flow-doctor]==0.59.53  # pinned per §139 — first-party/fast-moving dep
 # expected next patch after PR398 merges (0.124.114 is current at pin time) --
 # this pin is a placeholder that will 404 until nousergon-lib-PR398 merges and
 # auto-version-bump publishes it; CI on this branch is expected red until then.
-nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115
+# Bumped v0.124.115 -> v0.124.153 (alpha-engine-config-I11393): LOCKSTEP with
+# crucible-backtester, whose producer arena declares ArenaConfig.promote_statistic
+# (first published in v0.124.153). The two are co-installed by spot_backtest.sh.
+nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.23.0
