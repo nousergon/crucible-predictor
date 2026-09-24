@@ -320,7 +320,11 @@ class TestRunResearchFreeInferenceEndToEnd:
             )
 
         assert result["status"] == "ok"
-        assert result["n_written"] == 2
+        # GOOG was evaluated but failed the quant filter. Since
+        # alpha-engine-config-I11483 it is scored too; the quant-pass pool
+        # is still reported separately.
+        assert result["n_written"] == 3
+        assert result["n_scanner_pool"] == 2
         assert result["n_errors"] == 0
         assert result["n_research_features_missing"] == 4
 

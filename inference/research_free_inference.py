@@ -3,9 +3,13 @@ inference over the scanner-passing pool (config#2365, champion-loop epic
 child 1 / config#2364).
 
 Writes ``predictor/predictions_research_free/{date}.json``: one entry per
-ticker where the CURRENT cycle's scanner run (``candidates/{date}/
+ticker the most recent scanner run EVALUATED (``candidates/{date}/
 candidates.json::scanner_eval_log``, produced by crucible-research's
-Scanner Lambda) recorded ``quant_filter_pass=1``. Each entry runs the FULL
+Scanner Lambda, pass and fail alike), plus every member of every cut in that
+run's ``universe_membership/{date}/membership.json``. Each entry carries
+``in_scanner_pool`` (``quant_filter_pass=1``, the only population before
+alpha-engine-config-I11483) and ``cuts``. See :func:`scored_population` for
+why the population is this wide. Each entry runs the FULL
 deployed meta-ensemble (the same ``model/meta_model.py::MetaModel`` the live
 champion inference in ``inference/stages/run_inference.py`` uses) with the 4
 research meta-features (``model/meta_model.py::RESEARCH_META_FEATURES`` —
@@ -141,6 +145,12 @@ PREDICTIONS_RESEARCH_FREE_LATEST_KEY = cfg.PREDICTIONS_RESEARCH_FREE_LATEST_KEY
 
 _CANDIDATES_PREFIX = "candidates"
 
+# The scanner writes this doc in the same invocation as candidates.json
+# (crucible-research ``producers/filling_arms.py::MEMBERSHIP_KEY``), so
+# the two share a run date. Read at the CANDIDATES date, never latest.json
+# (alpha-engine-config-I11483).
+_MEMBERSHIP_KEY = "universe_membership/{date}/membership.json"
+
 # Bounded walk-back for resolving the most-recent scanner-passing pool
 # against a producer that now runs daily while its sole source
 # (candidates/{d}/candidates.json) is written only on the weekly Scanner's
@@ -262,6 +272,104 @@ def _scanner_eval_log_universe(artifact: dict) -> list[str]:
     than what the scanner evaluated)."""
     eval_log = artifact.get("scanner_eval_log") or []
     return sorted({rec["ticker"] for rec in eval_log if rec.get("ticker")})
+
+
+#: What ``predictions`` covers, recorded on the envelope so a reader never has
+#: to infer it from the counts.
+SCORED_POPULATION = "scanner_eval_log+membership_cuts"
+
+
+def scored_population(
+    candidates_artifact: dict, membership_cuts: dict[str, list[str]],
+) -> list[str]:
+    """The tickers this producer scores: every name the scanner EVALUATED
+    (quant pass and fail), plus every member of every cut in the same run's
+    membership doc.
+
+    alpha-engine-config-I11483. This used to be the quant-pass pool alone.
+    The live scanner champion re-marks ``quant_filter_pass``, so that pool is
+    the CHAMPION's cut. The pinned ``attractiveness_top_60`` shared 8 of 60
+    names with it on 2026-09-23, and ``predictor_from_60`` failed its 90%
+    join floor.
+
+    Why the whole evaluated universe and not just "pool ∪ this run's cuts":
+    the weekly SF's ChallengerShadow reads this artifact at the cycle's
+    trading day. The daily preopen writes that file BEFORE Saturday's
+    scanner publishes the cut the arm pins, so the cuts here are always one
+    scanner run older than the one being joined. Week over week,
+    ``attractiveness_top_60`` kept only 42 to 49 of its 60 names from
+    2026-08-28 to 2026-09-23 (measured), which is under the 90% floor.
+    Every cut is drawn from the scanner's evaluated universe (S&P 900), so
+    scoring the universe covers next week's cut too. Cut members the eval
+    log lacks are added so a cut is never scored short.
+    """
+    eval_universe = set(_scanner_eval_log_universe(candidates_artifact))
+    cut_members = {t for tickers in membership_cuts.values() for t in tickers}
+    return sorted(eval_universe | cut_members)
+
+
+def _cuts_by_ticker(membership_cuts: dict[str, list[str]]) -> dict[str, list[str]]:
+    """``{ticker: sorted cut names containing it}``."""
+    out: dict[str, list[str]] = {}
+    for name in sorted(membership_cuts):
+        for t in membership_cuts[name]:
+            out.setdefault(t, []).append(name)
+    return out
+
+
+def load_membership_cuts(
+    bucket: str,
+    membership_date: str,
+    *,
+    s3_client=None,
+) -> tuple[dict[str, list[str]], dict]:
+    """``({cut_name: tickers}, provenance)`` from the universe-membership doc
+    written by the SAME scanner run as ``candidates/{membership_date}``.
+
+    alpha-engine-config-I11483. The membership doc is read at
+    ``universe_membership/{membership_date}/membership.json``, which is the
+    candidates artifact's own date and NOT ``latest.json``. The 2026-09-23
+    artifact paired a 2026-09-18 scanner pool with a 2026-09-23 cut, so it
+    recorded a population no single scanner run produced.
+
+    This read is NOT fail-hard, unlike ``load_candidates_artifact``. The
+    scored population is already the scanner's full evaluated universe,
+    which every cut is drawn from. The cuts contribute only per-entry
+    tagging plus the rare cut member the eval log lacks. A failed read is
+    still never silent: ``provenance["status"]`` says which failure it was,
+    and it rides the envelope.
+    """
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    s3 = s3_client or boto3.client("s3")
+    key = _MEMBERSHIP_KEY.format(date=membership_date)
+    provenance: dict = {"key": key, "run_date": None, "status": "ok"}
+    try:
+        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+    except ClientError as exc:
+        code = str((getattr(exc, "response", {}) or {}).get("Error", {}).get("Code", ""))
+        provenance["status"] = "absent" if code in {"NoSuchKey", "404", "NotFound"} else "unreadable"
+        log.warning("universe membership %s: %s (%s) — cuts untagged", key,
+                    provenance["status"], exc)
+        return {}, provenance
+    except (BotoCoreError, OSError, json.JSONDecodeError, TypeError) as exc:
+        provenance["status"] = "unreadable"
+        log.warning("universe membership %s unreadable (%s) — cuts untagged", key, exc)
+        return {}, provenance
+
+    cuts_raw = doc.get("cuts") if isinstance(doc, dict) else None
+    if not isinstance(cuts_raw, dict) or not cuts_raw:
+        provenance["status"] = "no_cuts"
+        log.warning("universe membership %s carries no cuts — cuts untagged", key)
+        return {}, provenance
+    provenance["run_date"] = doc.get("run_date")
+    cuts = {
+        str(name): sorted({str(t) for t in (body or {}).get("tickers") or [] if t})
+        for name, body in cuts_raw.items()
+        if isinstance(body, dict)
+    }
+    return {name: ts for name, ts in cuts.items() if ts}, provenance
 
 
 # ── Weights (S3-only — never a local checkout path) ─────────────────────────
@@ -508,7 +616,8 @@ def run_research_free_inference(
     dry_run: bool = False,
 ) -> dict:
     """Compute + write research-free ``predicted_alpha`` for every ticker in
-    the current cycle's scanner-passing pool.
+    :func:`scored_population`: the scanner's evaluated universe plus the same
+    run's membership cuts (alpha-engine-config-I11483).
 
     Returns a summary dict (``status``, ``n_written``, ``n_errors``,
     ``feature_names``, ``n_research_features_missing``, ``artifact_key``).
@@ -534,7 +643,13 @@ def run_research_free_inference(
         if rec.get("ticker") and rec.get("quant_filter_pass") == 1
     })
     if not pool_tickers:
-        log.warning("Scanner pool for %s is empty — writing an empty artifact", date_str)
+        log.warning("Scanner pool for %s is empty (quant_filter_pass)", date_str)
+    membership_cuts, membership_provenance = load_membership_cuts(
+        bucket, candidates_date, s3_client=s3_client,
+    )
+    target_tickers = scored_population(candidates_artifact, membership_cuts)
+    pool_set = frozenset(pool_tickers)
+    ticker_cuts = _cuts_by_ticker(membership_cuts)
 
     mm = load_meta_model(bucket, s3_client=s3_client)
     vol_scorer = load_volatility_scorer(bucket, s3_client=s3_client)
@@ -563,7 +678,11 @@ def run_research_free_inference(
     # ran the quant filter against). See module docstring / _scanner_eval_log_
     # universe docstring for the full rationale.
     universe_tickers = _scanner_eval_log_universe(candidates_artifact)
-    all_tickers = sorted(set(universe_tickers) | set(pool_tickers) | {"SPY"})
+    # The cross-sectional base (expected_move rank-norm, macro breadth) stays
+    # exactly the population it was before I11483. A cut member the eval log
+    # lacks is SCORED, but it must not move any other name's normalisation.
+    cross_section = frozenset(universe_tickers) | pool_set | {"SPY"}
+    all_tickers = sorted(cross_section | set(target_tickers))
 
     # Full-column batch read (momentum/volatility precomputed feature columns
     # + Close history in ONE read) via the shared nousergon_lib reader — the
@@ -602,14 +721,22 @@ def run_research_free_inference(
     spy_close_full = close_history.get("SPY")
     d_ts = pd.Timestamp(date_str)
 
-    target_rows = {t: rows_today[t] for t in pool_tickers if t in rows_today}
-    missing = set(pool_tickers) - set(target_rows)
+    target_rows = {t: rows_today[t] for t in target_tickers if t in rows_today}
+    missing = set(target_tickers) - set(target_rows)
     n_errors = len(missing)
-    if missing:
+    missing_pool = missing & pool_set
+    if missing_pool:
         log.warning(
             "%s: %d/%d scanner-passing tickers absent from ArcticDB as-of "
-            "this date — skipped (n_errors)", date_str, len(missing), len(pool_tickers),
+            "this date — skipped (n_errors)", date_str, len(missing_pool), len(pool_tickers),
         )
+    if missing - pool_set:
+        log.info(
+            "%s: %d/%d widened-population tickers (evaluated or cut members, "
+            "not quant-pass) absent from ArcticDB — skipped (n_errors)",
+            date_str, len(missing - pool_set), len(set(target_tickers) - pool_set),
+        )
+    cross_section_rows = {t: r for t, r in rows_today.items() if t in cross_section}
 
     momentum_scores = (
         _compute_momentum_scores(target_rows) if "momentum_score" in feat_names else {}
@@ -620,10 +747,15 @@ def run_research_free_inference(
         )
         if "residual_momentum_score" in feat_names else {}
     )
-    expected_moves = (
-        _compute_expected_move(rows_today, vol_scorer, date_str)
-        if "expected_move" in feat_names else {}
-    )
+    expected_moves: dict[str, float] = {}
+    if "expected_move" in feat_names:
+        expected_moves = _compute_expected_move(cross_section_rows, vol_scorer, date_str)
+        # A cut member outside the cross-section is ranked AGAINST it, one at
+        # a time, so it never shifts another name's rank.
+        for t in [t for t in target_rows if t not in expected_moves]:
+            expected_moves[t] = _compute_expected_move(
+                {**cross_section_rows, t: target_rows[t]}, vol_scorer, date_str,
+            )[t]
 
     macro_row: dict[str, float] = {}
     if any(f.startswith("macro_") or f == "regime_intensity_z" for f in feat_names):
@@ -638,11 +770,14 @@ def run_research_free_inference(
         vix3m_s = _asof_close("VIX3M")
         tnx_s = _asof_close("TNX")
         irx_s = _asof_close("IRX")
-        close_prices = {t: s for t, s in close_history.items() if s is not None and not s.empty}
+        close_prices = {
+            t: s for t, s in close_history.items()
+            if t in cross_section and s is not None and not s.empty
+        }
         macro_row = _compute_macro_row(spy_s, vix_s, vix3m_s, tnx_s, irx_s, close_prices)
 
     entries: list[dict] = []
-    for t in pool_tickers:
+    for t in target_tickers:
         if t not in target_rows:
             continue
         try:
@@ -665,6 +800,12 @@ def run_research_free_inference(
             "prediction_date": date_str,
             "predicted_alpha": alpha,
             "n_research_features_missing": n_research_missing,
+            # Which population this name is in (alpha-engine-config-I11483).
+            # A consumer that wants the pre-I11483 quant-pass pool filters on
+            # in_scanner_pool. A pinned-cut arm joins on its cut and never
+            # needs it.
+            "in_scanner_pool": t in pool_set,
+            "cuts": ticker_cuts.get(t, []),
         })
 
     envelope = {
@@ -675,6 +816,10 @@ def run_research_free_inference(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "n_predictions": len(entries),
         "n_scanner_pool": len(pool_tickers),
+        "scored_population": SCORED_POPULATION,
+        "n_scored_population": len(target_tickers),
+        "n_scanner_universe": len(universe_tickers),
+        "membership": membership_provenance,
         "n_errors": n_errors,
         "feature_names": feat_names,
         "n_research_features_missing": n_research_missing,
@@ -691,6 +836,9 @@ def run_research_free_inference(
     return {
         "status": "ok",
         "n_written": len(entries),
+        "n_scanner_pool": len(pool_tickers),
+        "n_scored_population": len(target_tickers),
+        "membership_status": membership_provenance["status"],
         "n_errors": n_errors,
         "feature_names": feat_names,
         "n_research_features_missing": n_research_missing,
