@@ -1023,6 +1023,84 @@ def _cfg_default_label(_cfg) -> str:
     return "v3.0-meta"
 
 
+def _write_run_health_and_manifest(result: dict, bucket: str, date_str: str, io) -> None:
+    """Write the ``predictor_training`` health record and dated data manifest.
+
+    alpha-engine-config-I11478 — both keys describe THE training run. A
+    model-zoo challenger or a shadow run writing them overwrote the champion
+    architecture's record with its own (last writer wins), so they are skipped
+    whenever ``io.write_side_artifacts`` is off.
+    """
+    if not io.write_side_artifacts:
+        log.info(
+            "%s — skipping the predictor_training health record and data "
+            "manifest (shared keys the champion-architecture run owns).",
+            _side_artifact_skip_reason(io),
+        )
+        return
+    try:
+        from nousergon_lib.health import Deliverable, write_health
+        write_health(
+            module_name="predictor_training",
+            deliverables=[
+                Deliverable(name="training_run", required=True, produced=True),
+            ],
+            run_date=date_str,
+            duration_seconds=result.get("train_time_seconds", 0),
+            summary={
+                "promoted": result.get("promoted", False),
+                "ic_30d": result.get("ic_30d"),
+                "n_train": result.get("n_train"),
+                "slim_cache_tickers": result.get("slim_cache_tickers"),
+                "slim_cache_failed": result.get("slim_cache_failed", 0),
+            },
+            bucket=bucket,
+        )
+    except Exception as _he:
+        log.warning("Health status write failed: %s", _he)
+
+    # Data manifest
+    try:
+        from data_manifest import write_data_manifest
+        write_data_manifest(
+            bucket=bucket,
+            module_name="predictor_training",
+            run_date=date_str,
+            manifest={
+                "promoted": result.get("promoted", False),
+                "promoted_mode": result.get("promoted_mode"),
+                "test_ic": result.get("test_ic"),
+                "n_train": result.get("n_train"),
+                "n_test": result.get("n_test"),
+                "slim_cache_tickers": result.get("slim_cache_tickers"),
+                "slim_cache_failed": result.get("slim_cache_failed", 0),
+            },
+        )
+    except Exception as _me:
+        log.warning("Data manifest write failed: %s", _me)
+
+
+def _io_for_run_role(io, spec_ns: "str | None"):
+    """Mark ``io`` as a model-zoo CHALLENGER run when ``spec_ns`` names one.
+
+    alpha-engine-config-I11478. ``spec_ns`` is :func:`_spec_namespace` — None
+    for the champion-architecture run. A shadow run is left as it is: it is
+    already barred from every shared write, and it is never a zoo spec.
+    """
+    if spec_ns and not io.is_shadow:
+        return io.for_challenger_spec(spec_ns)
+    return io
+
+
+def _side_artifact_skip_reason(io) -> str:
+    """Name WHY a run is not writing shared side artifacts, for its log line."""
+    if io.is_shadow:
+        return f"Shadow run (basis={io.shadow_basis})"
+    if io.is_challenger_spec:
+        return f"Model-zoo challenger run (spec={io.challenger_spec})"
+    return "Side artifacts disabled for this run"
+
+
 def _training_summary_key(
     date_str: str, spec: "str | None", io: "TrainingIOSpec | None" = None,
 ) -> str:
@@ -1409,6 +1487,10 @@ def _main_impl(
     spec_ns = _spec_namespace()
     if spec_ns:
         log.info("model-zoo challenger run: phase markers namespaced under spec=%s", spec_ns)
+    # alpha-engine-config-I11478 — a challenger never writes a key the
+    # champion's serving or monitoring state is read from. One decision, here;
+    # every shared write below is gated on io.write_side_artifacts.
+    io = _io_for_run_role(io, spec_ns)
 
     # Phase registry: markers under predictor/{date}/.phases/ (or, for a zoo
     # challenger, predictor/model_zoo/{spec}/{date}/.phases/) + watchdog +
@@ -1558,9 +1640,9 @@ def _main_impl(
     # touch. It is also irrelevant to the champion-vs-shadow IC comparison.
     if not dry_run and not io.write_side_artifacts:
         log.info(
-            "Shadow run (basis=%s) — skipping risk_model_persist (writes shared "
-            "live risk_model/ keys; out of scope for the IC comparison).",
-            io.shadow_basis,
+            "%s — skipping risk_model_persist (writes shared live risk_model/ "
+            "keys; the champion-architecture run owns them).",
+            _side_artifact_skip_reason(io),
         )
     elif not dry_run:
         try:
@@ -1630,9 +1712,9 @@ def _main_impl(
     # prediction stream; neither applies to an evidence-only basis comparison.
     if not dry_run and not io.write_side_artifacts:
         log.info(
-            "Shadow run (basis=%s) — skipping triple-barrier cutover gate "
-            "(writes shared live variant_gates/ keys).",
-            io.shadow_basis,
+            "%s — skipping triple-barrier cutover gate (writes shared live "
+            "variant_gates/ keys).",
+            _side_artifact_skip_reason(io),
         )
     elif not dry_run:
         try:
@@ -1681,48 +1763,9 @@ def _main_impl(
             date_str,
         )
 
-    # Step 4: Health status
+    # Step 4: Health status + data manifest
     if not dry_run:
-        try:
-            from nousergon_lib.health import Deliverable, write_health
-            write_health(
-                module_name="predictor_training",
-                deliverables=[
-                    Deliverable(name="training_run", required=True, produced=True),
-                ],
-                run_date=date_str,
-                duration_seconds=result.get("train_time_seconds", 0),
-                summary={
-                    "promoted": result.get("promoted", False),
-                    "ic_30d": result.get("ic_30d"),
-                    "n_train": result.get("n_train"),
-                    "slim_cache_tickers": result.get("slim_cache_tickers"),
-                    "slim_cache_failed": result.get("slim_cache_failed", 0),
-                },
-                bucket=bucket,
-            )
-        except Exception as _he:
-            log.warning("Health status write failed: %s", _he)
-
-        # Data manifest
-        try:
-            from data_manifest import write_data_manifest
-            write_data_manifest(
-                bucket=bucket,
-                module_name="predictor_training",
-                run_date=date_str,
-                manifest={
-                    "promoted": result.get("promoted", False),
-                    "promoted_mode": result.get("promoted_mode"),
-                    "test_ic": result.get("test_ic"),
-                    "n_train": result.get("n_train"),
-                    "n_test": result.get("n_test"),
-                    "slim_cache_tickers": result.get("slim_cache_tickers"),
-                    "slim_cache_failed": result.get("slim_cache_failed", 0),
-                },
-            )
-        except Exception as _me:
-            log.warning("Data manifest write failed: %s", _me)
+        _write_run_health_and_manifest(result, bucket, date_str, io)
 
     return result
 
