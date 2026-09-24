@@ -18,7 +18,6 @@
 #   - install_deps() — pip install -r requirements.txt, keeping the log
 #   - emit_heartbeat() — CloudWatch Heartbeat metric
 #   - print_banner() / check_config_exists() — utilities
-#   - stage_run_date() — the cycle date a banner labels itself with
 #   - maybe_run_preflight_only_and_exit() — Friday shell_run dry path: boot +
 #     import/lib-pin + read-only ArcticDB probe, then `exit 0`. Every
 #     per-stage script MUST call this (with PREFLIGHT_ONLY=1 set by its own
