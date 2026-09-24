@@ -38,7 +38,7 @@ krepis[flow-doctor]==0.59.53  # pinned per §139 — first-party/fast-moving dep
 # Bumped v0.124.99 -> v0.124.115 (alpha-engine-config-I10226), kept in lockstep
 # with requirements.txt -- see that file's comment for the swallow-guard lift
 # and the PR398-merge-first caveat.
-nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.115
+nousergon-lib[arcticdb,flow-doctor,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153
 numpy>=2.5.2,<3
 pandas>=2.0.0,<3
 pyarrow>=25.0.1
