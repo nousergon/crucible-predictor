@@ -115,6 +115,7 @@ def _load_universe_panels(
 
     returns_by_ticker: dict[str, pd.Series] = {}
     loadings_rows: list[tuple[pd.Timestamp, str, np.ndarray]] = []
+    bad_close_counts: dict[str, int] = {}
 
     parquets = sorted(data_dir.glob("*.parquet"))
     log.info(
@@ -140,8 +141,7 @@ def _load_universe_panels(
 
         # Close → log returns. NaN on first row by construction.
         close = df["Close"].astype(float)
-        log_ret = np.log(close / close.shift(1))
-        returns_by_ticker[ticker] = log_ret
+        returns_by_ticker[ticker] = _log_returns(close, ticker, bad_close_counts)
 
         # Extract factor-loading columns. If any of the 8 are missing
         # in this ticker's parquet, skip the ticker entirely (rank-
@@ -155,6 +155,14 @@ def _load_universe_panels(
                 continue
             loadings_rows.append((date, ticker, row.values))
 
+    if bad_close_counts:
+        worst = sorted(bad_close_counts.items(), key=lambda kv: -kv[1])[:10]
+        log.warning(
+            "risk_model_persist: %d ticker(s) carry %d non-positive or "
+            "non-finite Close value(s), excluded from log returns as NaN "
+            "(alpha-engine-config-I11520); worst: %s",
+            len(bad_close_counts), sum(bad_close_counts.values()), worst,
+        )
     returns_panel = pd.DataFrame(returns_by_ticker).sort_index()
 
     # Pivot loadings_rows into a per-date dict of N×K DataFrames.
@@ -172,6 +180,25 @@ def _load_universe_panels(
         )
 
     return returns_panel, loadings_by_date
+
+
+def _log_returns(close: pd.Series, ticker: str, bad_counts: dict[str, int]) -> pd.Series:
+    """Close-to-close log returns with every non-positive or non-finite close
+    masked to NaN BEFORE the ratio (alpha-engine-config-I11520).
+
+    ``np.log(close / close.shift(1))`` on raw closes emitted
+    ``RuntimeWarning: invalid value encountered in log`` in the 2026-09-23
+    rehearsal. A negative close makes the ratio negative (NaN plus that
+    warning), and a zero close makes it 0 or inf, so ``-inf``/``inf`` returns
+    reached the panel the factor covariance is estimated from. A price that
+    is not positive is a data defect, not a return, so it is dropped here,
+    counted per ticker, and reported once by the caller.
+    """
+    valid = close.where(np.isfinite(close) & (close > 0))
+    n_bad = int(close.notna().sum() - valid.notna().sum())
+    if n_bad:
+        bad_counts[ticker] = n_bad
+    return np.log(valid / valid.shift(1))
 
 
 def _write_parquet_to_s3(s3_client, bucket: str, key: str, df: pd.DataFrame) -> None:

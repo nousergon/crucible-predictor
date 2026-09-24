@@ -39,6 +39,8 @@ import numpy as np
 
 from model.meta_model import META_FEATURES
 
+from model.sklearn_pickle import load_checked, sklearn_version
+
 log = logging.getLogger(__name__)
 
 # Minimum valid rows before a fit is attempted. Below this, calibrated CV is
@@ -190,6 +192,7 @@ class MetaLabelClassifier:
                     "_meta_label_classifier_schema": self._PICKLE_SCHEMA,
                     "model": self._model,
                     "feature_names": list(self._feature_names),
+                    "sklearn_version": sklearn_version(),  # I11520
                 },
                 f,
             )
@@ -201,7 +204,8 @@ class MetaLabelClassifier:
         path = Path(path)
         clf = cls()
         with open(path, "rb") as f:
-            obj = pickle.load(f)
+            obj, clf._sklearn_load_report = load_checked(
+                f, artifact=f"MetaLabelClassifier {path.name}")
         # v2+ payload: feature_names embedded with the estimator (load-bearing,
         # sidecar-independent). Legacy payload: a bare estimator → feature_names
         # come from the sidecar, exactly as before this fix — old artifacts
