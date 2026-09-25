@@ -94,6 +94,11 @@ SF_EXECUTION_TIMEOUT="${SF_EXECUTION_TIMEOUT:-}"
 # run's output — an existence-only probe cannot tell those apart.
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
+# What the attempt after a spot interruption does differently (demote the
+# reclaimed pool; final attempt on-demand) lives in ONE file beside this one,
+# mirrored from nousergon-data (alpha-engine-config-I11573).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_spot_relaunch.sh"
+
 # Per-stage identity — DECLARED HERE, NEVER DEFAULTED HERE.
 #
 # This block used to carry `predictor-training` / `spot-training` defaults, and
@@ -221,22 +226,39 @@ spot_assert_instance_types_allowed() {
 }
 
   spot_assert_instance_types_allowed "$INSTANCE_TYPES" || exit 2
-  echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
+  # Arm the EXIT handler BEFORE the first billable call (alpha-engine-config-
+  # I11573, the predictor port of I11574). The per-stage launchers used to
+  # arm it on the line AFTER `spot_launch`, so an ec2_spot refusal here (exit
+  # 64 = every pool refused capacity, 65 = spot quota) exited under `set -e`
+  # with no handler: no classification, no relaunch, no on-demand rung.
+  # Armed here, a launch-time refusal goes through cleanup()'s relaunch path,
+  # and cleanup() terminates nothing while _INSTANCE_ID is still empty.
+  trap 'cleanup "$_SSM_SLUG"' EXIT
+  # Demote pools this run already saw reclaimed; the final attempt of a
+  # relaunch chain goes on-demand (alpha-engine-config-I11573, _spot_relaunch.sh).
+  spot_launch_plan
+  echo "==> Requesting ${_SPOT_PLAN_MARKET} instance (lib CLI rotation: types=[$_SPOT_PLAN_TYPES], subnets=[$_SPOT_PLAN_SUBNETS], attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS)..."
 
+  # `|| ec2_spot_rc=$?`: under `set -e` a bare assignment from a failing
+  # command substitution exits before the rc could be read.
+  local ec2_spot_rc=0
   _INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
-    --types "$INSTANCE_TYPES" \
-    --subnets "$SUBNETS" \
+    --types "$_SPOT_PLAN_TYPES" \
+    --subnets "$_SPOT_PLAN_SUBNETS" \
+    "${_SPOT_PLAN_MARKET_ARGS[@]}" \
     --image-id "$AMI_ID" \
     --key-name "$KEY_NAME" \
     --security-group "$SECURITY_GROUP" \
     --iam-profile "$IAM_PROFILE" \
     --name "alpha-engine-${_SPOT_NAME}-$(date +%Y%m%d)" \
-    --region "$AWS_REGION")
-  local ec2_spot_rc=$?
+    --region "$AWS_REGION") || ec2_spot_rc=$?
 
   if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$_INSTANCE_ID" ]; then
     if [ "$ec2_spot_rc" -eq 64 ]; then
       echo "ERROR: capacity exhausted across all instance_type x subnet combinations" >&2
+    fi
+    if [ "$ec2_spot_rc" -eq 65 ]; then
+      echo "ERROR: spot launch refused by the account's spot quota" >&2
     fi
     if [ "$ec2_spot_rc" -eq 0 ]; then
       echo "ERROR: ec2_spot launch exited 0 without an instance id — failing loud (config#1646)" >&2
@@ -246,6 +268,7 @@ spot_assert_instance_types_allowed() {
   fi
 
   echo "  Instance ID: $_INSTANCE_ID"
+  spot_capture_launched_pool "$_INSTANCE_ID"
 
   _RUN_ID="$(date +%Y%m%dT%H%M%SZ)-${_INSTANCE_ID}"
   _S3_STAGING_PREFIX="tmp/spot_train/${_RUN_ID}"
@@ -295,7 +318,8 @@ spot_common_teardown_staging() {
 }
 
 # ── Cleanup + spot-reclaim trap ──────────────────────────────────────────────
-# Installed AFTER spot_launch so _INSTANCE_ID / _S3_STAGING are populated.
+# Installed by spot_launch itself, BEFORE the launch (alpha-engine-config-
+# I11573), so _INSTANCE_ID / _S3_STAGING may still be empty when it runs.
 
 cleanup() {
   local exit_code=$?
@@ -336,9 +360,29 @@ cleanup() {
   echo "    (spot logs above are the FULL workload stdout/stderr — primary diagnostic on RC=-1/OOM)"
   echo ""
 
-  # Spot-reclaim DECISION (lib chokepoint) — run BEFORE terminate-instances
-  local _spot_relaunch=0
-  if [ "$exit_code" -ne 0 ] && [ -n "${_INSTANCE_ID:-}" ] && [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+  # Launch-time refusal (alpha-engine-config-I11573): ec2_spot exited 64
+  # (every pool refused capacity) or 65 (account-wide spot quota) and no
+  # instance exists. Relaunchable within the attempt budget;
+  # _spot_relaunch.sh decides whether the next launch goes on-demand.
+  local _spot_relaunch=0 _relaunch_reason=""
+  if [ -z "${_INSTANCE_ID:-}" ] && { [ "$exit_code" -eq 64 ] || [ "$exit_code" -eq 65 ]; }; then
+    if [ "$exit_code" -eq 64 ]; then
+      _relaunch_reason="launch-capacity-exhausted"
+    else
+      _relaunch_reason="launch-quota-exceeded"
+    fi
+    if [ "$SPOT_ATTEMPT" -lt "$MAX_SPOT_ATTEMPTS" ]; then
+      _spot_relaunch=1
+    else
+      echo "ERROR: spot interruption (reason=$_relaunch_reason) persisted across all $MAX_SPOT_ATTEMPTS attempt(s) — giving up." >&2
+    fi
+  fi
+
+  # Spot-reclaim DECISION (lib chokepoint) — run BEFORE terminate-instances.
+  # Asked on EVERY attempt, including the last: the verdict applies the
+  # budget, but a reclaim on the last attempt must still be RECORDED so a
+  # later launch in this run demotes that pool (I11573).
+  if [ "$exit_code" -ne 0 ] && [ -n "${_INSTANCE_ID:-}" ]; then
     # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
     local _decide_json="" _decide_rc=0
     _decide_json="$("$LIB_PYTHON" -m krepis.ec2_spot relaunch-decision \
@@ -355,11 +399,19 @@ cleanup() {
     if [ "$_decide_rc" -ne 0 ]; then
       echo "    spot relaunch-decision: CLI failed to answer (rc=$_decide_rc) — treating as hold"
     else
-      local _relaunch=""
-      _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+      local _relaunch="" _class=""
+      read -r _relaunch _class <<<"$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; d=json.load(sys.stdin); print("1" if d.get("relaunch") else "0", d.get("classification") or "none")')" || true
       echo "    spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json"
+      # Record EVERY confirmed reclaim, hold verdicts included, so the next
+      # launch in this run (this script's relaunch or an SF re-issue on the
+      # same box) demotes the reclaimed pool (alpha-engine-config-I11573).
+      # stderr/file only.
+      if [ "$_class" = "reclaim" ]; then
+        spot_record_reclaim "$_INSTANCE_ID" "$_SPOT_NAME" || true
+      fi
       if [ "$_relaunch" = "1" ]; then
         _spot_relaunch=1
+        _relaunch_reason="reclaim"
         aws cloudwatch put-metric-data \
           --namespace "AlphaEngine" \
           --metric-name "SpotInterruptionRetry" \
@@ -370,15 +422,27 @@ cleanup() {
     fi
   fi
 
-  echo "==> Terminating spot instance $_INSTANCE_ID..."
-  aws ec2 terminate-instances --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
+  # The trap is armed before launch (I11573): with no instance there is
+  # nothing to terminate.
+  if [ -n "${_INSTANCE_ID:-}" ]; then
+    echo "==> Terminating spot instance $_INSTANCE_ID..."
+    aws ec2 terminate-instances --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION" --output text > /dev/null 2>&1 || true
+  fi
   spot_common_teardown_staging "$exit_code"
-  echo "  Instance terminated."
+  [ -n "${_INSTANCE_ID:-}" ] && echo "  Instance terminated."
 
-  # Relaunch on classified reclaim
+  # Relaunch on classified reclaim or launch-time refusal
   if [ "$_spot_relaunch" = "1" ]; then
-    echo "==> Spot RECLAIMED by AWS mid-run — relaunching on a fresh spot (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+    if [ "$_relaunch_reason" = "reclaim" ]; then
+      echo "==> Spot RECLAIMED by AWS mid-run — relaunching (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+    else
+      echo "==> Spot launch refused (reason=$_relaunch_reason) — relaunching (attempt $((SPOT_ATTEMPT + 1))/$MAX_SPOT_ATTEMPTS)"
+    fi
     trap - EXIT
+    # SPOT_RELAUNCH_CAUSE tells the next attempt it is a relaunch, so it can
+    # go on-demand (_spot_relaunch.sh, rule 2).
+    SPOT_RELAUNCH_CAUSE="$(spot_relaunch_cause "$_relaunch_reason")"
+    export SPOT_RELAUNCH_CAUSE
     SPOT_ATTEMPT=$((SPOT_ATTEMPT + 1)) exec bash "$0" ${_ORIG_ARGS[@]+"${_ORIG_ARGS[@]}"}
   fi
 
