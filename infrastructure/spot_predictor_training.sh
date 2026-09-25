@@ -157,8 +157,7 @@ echo "  Spot attempt  : $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS"
 echo ""
 
 # ── Launch spot + wait + config staging ──────────────────────────────────────
-spot_launch
-trap 'cleanup "$_SSM_SLUG"' EXIT
+spot_launch   # arms the cleanup EXIT trap before it launches (alpha-engine-config-I11573)
 
 aws ec2 wait instance-running --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION"
 stage_config "$(cd "$SCRIPT_DIR/.." && pwd)/config/predictor.yaml" "predictor.yaml"
