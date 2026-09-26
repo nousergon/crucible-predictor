@@ -263,8 +263,62 @@ def test_the_workload_refuses_to_report_an_unknown_outcome():
     assert "_outcome = board.get('arena_outcome')" in source
     assert "if _outcome not in ('decided', 'unservable'):" in source
     assert "raise SystemExit(" in source
-    # and the outcome line is the LAST thing it prints: SSM caps inline
-    # StandardOutputContent at 24KB and rotates the buffer past it.
+    # and the outcome line is the LAST thing it prints, because the SSM body
+    # hands the launcher only the tail of the output (next test).
     assert source.index("MODEL_ZOO_SELECT_OUTCOME_RAW=%s") > source.index(
         "print('  Promoted:       %s' % board.get('promoted'))"
     )
+
+
+def test_the_select_body_hands_ssm_only_a_bounded_tail():
+    """rehearsal-2026-09-25-1: the select log passed SSM's ~24,000-character
+    inline cap, SSM kept the HEAD and dropped the trailing outcome line, and a
+    correct ``unservable`` verdict failed the stage as outcome-less.
+
+    The SSM body must send the workload's output to a file and print only a
+    tail comfortably under that cap, while still exiting with the workload's
+    own status so a genuine failure stays a failure.
+    """
+    block = _select_only_block()
+    body = block[block.index("<<'ZOOSEL'"):block.index("\nZOOSEL\n")]
+    run_line = next(
+        ln for ln in body.splitlines()
+        if "krepis.ssm_log_capture run --slug spot-model-zoo-select" in ln
+    )
+    assert ">/tmp/spot-model-zoo-select.stdout 2>&1 || _ZOO_RC=$?" in run_line
+    tail = re.search(r"^tail -c (\d+) /tmp/spot-model-zoo-select\.stdout$", body, re.M)
+    assert tail, "the select body no longer prints a bounded tail"
+    assert int(tail.group(1)) <= 16000
+    assert body.rstrip().splitlines()[-1] == 'exit "$_ZOO_RC"'
+
+
+def test_the_select_body_keeps_the_outcome_and_the_exit_code(tmp_path):
+    """Run the SSM body's output handling for real, with a stand-in workload
+    that prints far past SSM's inline cap before its outcome line."""
+    block = _select_only_block()
+    body = block[block.index("<<'ZOOSEL'") + len("<<'ZOOSEL'"):block.index("\nZOOSEL\n")]
+    lines = body.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("_ZOO_RC=0"))
+    tail_part = "\n".join(lines[start:])
+    for rc in (0, 3):
+        fake = tmp_path / "fake_py.sh"
+        fake.write_text(
+            "#!/bin/bash\n"
+            "for i in $(seq 1 2000); do echo \"log line $i padding padding padding\"; done\n"
+            "echo MODEL_ZOO_SELECT_OUTCOME_RAW=unservable\n"
+            f"exit {rc}\n"
+        )
+        fake.chmod(0o755)
+        script = tail_part.replace(
+            '$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select '
+            '--log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- '
+            '$PY /tmp/spot-model-zoo-select.py',
+            str(fake),
+        ).replace("/tmp/spot-model-zoo-select.stdout", str(tmp_path / "out.txt"))
+        res = subprocess.run(
+            ["bash", "-c", "set -eo pipefail\n" + script],
+            capture_output=True, text=True,
+        )
+        assert res.returncode == rc
+        assert len(res.stdout) < 24000
+        assert res.stdout.splitlines()[-1] == "MODEL_ZOO_SELECT_OUTCOME_RAW=unservable"
