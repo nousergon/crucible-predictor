@@ -227,12 +227,23 @@ print('  Winner:         %s' % board.get('winner_version_id'))
 print('  Promoted:       %s' % board.get('promoted'))
 print('=' * 60)
 
-# LAST line the workload prints, deliberately: SSM caps inline
-# StandardOutputContent at 24KB and ROTATES the buffer past it, so an outcome
-# line emitted mid-run can be dropped before the launcher reads it back.
+# LAST line the workload prints, deliberately, and the SSM body below hands
+# the launcher only the TAIL of the output, so this line always reaches it.
 print('MODEL_ZOO_SELECT_OUTCOME_RAW=%s' % _outcome)
 PYEOF
-$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py
+# SSM keeps only the FIRST ~24,000 characters of StandardOutputContent and
+# appends "--output truncated--"; it does not rotate. The launcher reads the
+# outcome line out of that inline copy, and the outcome line is the workload's
+# LAST, so once the select log passed 24KB the line was never seen and a
+# correct 'unservable' verdict failed the stage (rehearsal-2026-09-25-1: the
+# spot log ended in MODEL_ZOO_SELECT_OUTCOME_RAW=unservable, the launcher saw
+# none). So the workload's output goes to a file and only its tail reaches
+# stdout. Nothing is lost: ssm_log_capture ships the FULL log to
+# _ssm_logs/spot-model-zoo-select/ in S3 either way.
+_ZOO_RC=0
+$PY -m krepis.ssm_log_capture run --slug spot-model-zoo-select --log /var/log/spot-model-zoo-select.log --bucket "$S3_BUCKET" -- $PY /tmp/spot-model-zoo-select.py >/tmp/spot-model-zoo-select.stdout 2>&1 || _ZOO_RC=$?
+tail -c 12000 /tmp/spot-model-zoo-select.stdout
+exit "$_ZOO_RC"
 ZOOSEL
 )" "${MAX_RUNTIME_SECONDS}" | tee "$_ZOO_SELECT_OUT"
 
