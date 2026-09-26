@@ -268,3 +268,89 @@ def test_the_workload_refuses_to_report_an_unknown_outcome():
     assert source.index("MODEL_ZOO_SELECT_OUTCOME_RAW=%s") > source.index(
         "print('  Promoted:       %s' % board.get('promoted'))"
     )
+
+
+# ── alpha-engine-config-I11605: the outcome line past the inline SSM cap ──────
+
+
+def _run_launcher_block_with_s3_copy(tmp_path: Path, *, inline: str, s3_copy: str | None):
+    """Like ``_run_launcher_block``, plus a stubbed ``aws`` that serves the
+    uncapped S3 copy of the workload's stdout from a local directory."""
+    s3_root = tmp_path / "s3-ssm-output"
+    if s3_copy is not None:
+        leaf = s3_root / "cmd-id" / "i-0abc" / "awsrunShellScript" / "0.awsrunShellScript"
+        leaf.mkdir(parents=True)
+        (leaf / "stdout").write_text(s3_copy)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_aws = bindir / "aws"
+    # `aws s3 cp <src> <dest> --recursive ...` -> copy the fake prefix to dest.
+    fake_aws.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "$1 $2" = "s3 cp" ] || exit 1\n'
+        f'[ -d "{s3_root}" ] && cp -r "{s3_root}/." "$4"\n'
+        "exit 0\n"
+    )
+    fake_aws.chmod(0o755)
+    harness = tmp_path / "harness.sh"
+    out_file = tmp_path / "ssm-stdout.txt"
+    out_file.write_text(inline)
+    harness.write_text(
+        "\n".join(
+            [
+                "set -euo pipefail",
+                'MODE="select-only"',
+                '_RUN_TOKEN_EXPORT=""',
+                "MAX_RUNTIME_SECONDS=1",
+                'LIB_PYTHON="/usr/bin/true"',
+                '_COVERAGE_STAGE="ModelZooSelect"',
+                '_STAGE_WINDOW_START="2026-09-19T00:00:00Z"',
+                'EXECUTION_RUN_DATE="2026-09-19"',
+                '_S3_STAGING="s3://bkt/tmp/spot_train/run"',
+                "_ZOO_S3_RETRY_SLEEP=0",
+                "print_banner() { :; }",
+                "emit_heartbeat() { :; }",
+                'run_ssm() { cat "$FAKE_SSM_STDOUT"; return 0; }',
+                "",
+                _select_only_block(),
+            ]
+        )
+    )
+    env = dict(os.environ)
+    env["FAKE_SSM_STDOUT"] = str(out_file)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    return subprocess.run(
+        ["bash", str(harness)], capture_output=True, text=True, env=env, cwd=tmp_path,
+    )
+
+
+_TRUNCATED_INLINE = "x" * 200 + "\n--output truncated--\n"
+
+
+def test_an_outcome_past_the_inline_cap_is_read_from_the_uncapped_s3_copy(tmp_path):
+    """MEASURED on rehearsal-2026-09-25-1: the workload printed
+    ``MODEL_ZOO_SELECT_OUTCOME_RAW=unservable`` last, the inline copy was
+    truncated before it, and the stage failed as outcome-less."""
+    res = _run_launcher_block_with_s3_copy(
+        tmp_path,
+        inline=_TRUNCATED_INLINE,
+        s3_copy=_WORKLOAD_TAIL + "MODEL_ZOO_SELECT_OUTCOME_RAW=unservable\n",
+    )
+    assert res.returncode == 0, res.stderr
+    assert _MARKER.findall(res.stdout) == ["unservable"]
+    assert "uncapped S3 copy" in res.stderr
+
+
+def test_an_uncapped_copy_without_an_outcome_still_fails(tmp_path):
+    """The fallback reads the workload's own line; it never defaults one."""
+    res = _run_launcher_block_with_s3_copy(
+        tmp_path, inline=_TRUNCATED_INLINE, s3_copy=_WORKLOAD_TAIL,
+    )
+    assert res.returncode != 0
+    assert _MARKER.findall(res.stdout) == []
+
+
+def test_a_missing_s3_copy_still_fails(tmp_path):
+    res = _run_launcher_block_with_s3_copy(tmp_path, inline=_TRUNCATED_INLINE, s3_copy=None)
+    assert res.returncode != 0
+    assert _MARKER.findall(res.stdout) == []

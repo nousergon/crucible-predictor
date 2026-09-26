@@ -252,6 +252,34 @@ ZOOSEL
   # arena/model/{date}.json::decision.status — this is a transport only, and
   # moving the Choice onto a structured read of that artifact is tracked as
   # alpha-engine-config-I11101 deliverable 4.
+  #
+  # The line is printed LAST, and `run_ssm` streams GetCommandInvocation's
+  # StandardOutputContent, which keeps only the HEAD (~24,000 characters) and
+  # appends "--output truncated--". So on a chatty select the tee above never
+  # sees the outcome line at all. MEASURED on rehearsal-2026-09-25-1: the
+  # workload printed `MODEL_ZOO_SELECT_OUTCOME_RAW=unservable` as its last line
+  # (the spot-model-zoo-select log, 26.4 KiB), the inline copy was truncated
+  # before it, and the stage failed as outcome-less (alpha-engine-config-I11605).
+  # SSM's S3 upload of the same stdout (`run_ssm --output-key-prefix`) is NOT
+  # capped and the staging prefix is still alive here (it is torn down in the
+  # EXIT trap), so when the inline copy has no outcome line, the uncapped copy
+  # is read instead. It is the same workload's own line, not a default: if the
+  # uncapped copy has none either, the stage still fails below.
+  if ! grep -qxE 'MODEL_ZOO_SELECT_OUTCOME_RAW=(unservable|decided)' "$_ZOO_SELECT_OUT" \
+     && [ -n "${_S3_STAGING:-}" ]; then
+    _ZOO_S3_OUT="$(mktemp -d -t spot-model-zoo-select-s3.XXXXXX)"
+    for _zoo_try in 1 2 3 4 5 6; do
+      aws s3 cp "${_S3_STAGING}/ssm-output/" "$_ZOO_S3_OUT/" --recursive \
+        --exclude '*' --include '*stdout*' --region "${AWS_REGION:-us-east-1}" --quiet >/dev/null 2>&1 || true
+      if grep -rqxE 'MODEL_ZOO_SELECT_OUTCOME_RAW=(unservable|decided)' "$_ZOO_S3_OUT" 2>/dev/null; then
+        echo "  model-zoo select: outcome line was past the inline SSM output cap — read from the uncapped S3 copy (alpha-engine-config-I11605)" >&2
+        grep -rhxE 'MODEL_ZOO_SELECT_OUTCOME_RAW=(unservable|decided)' "$_ZOO_S3_OUT" | tail -1 >> "$_ZOO_SELECT_OUT"
+        break
+      fi
+      sleep "${_ZOO_S3_RETRY_SLEEP:-5}"
+    done
+    rm -rf "$_ZOO_S3_OUT"
+  fi
   if grep -qx 'MODEL_ZOO_SELECT_OUTCOME_RAW=unservable' "$_ZOO_SELECT_OUT"; then
     _ZOO_OUTCOME="unservable"
   elif grep -qx 'MODEL_ZOO_SELECT_OUTCOME_RAW=decided' "$_ZOO_SELECT_OUT"; then
