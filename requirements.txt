@@ -91,7 +91,9 @@ krepis[flow-doctor]==0.59.53  # pinned per §139 — first-party/fast-moving dep
 # Bumped v0.124.115 -> v0.124.153 (alpha-engine-config-I11393): LOCKSTEP with
 # crucible-backtester, whose producer arena declares ArenaConfig.promote_statistic
 # (first published in v0.124.153). The two are co-installed by spot_backtest.sh.
-nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.153
+# Bumped v0.124.153 -> v0.124.156 (alpha-engine-config-I11660): PhaseRegistry
+# namespaces rehearsal phase markers under .phases/.rehearsal/{RUN_TOKEN}/.
+nousergon-lib[arcticdb,flow-doctor,quant-xs,quant-stats,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.156
 
 # Training dependencies (not needed in Lambda)
 arcticdb>=6.23.0
