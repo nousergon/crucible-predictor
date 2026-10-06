@@ -336,6 +336,7 @@ def _set_feature_drift_ks(ctx, drift_feature_rows: list) -> None:
         from monitoring.feature_drift import (
             compute_feature_drift_ks,
             load_training_reference,
+            research_calibrator_producer,
         )
 
         if not drift_feature_rows:
@@ -349,7 +350,17 @@ def _set_feature_drift_ks(ctx, drift_feature_rows: list) -> None:
             [[row.get(f, _np.nan) for f in META_FEATURES] for row in drift_feature_rows],
             dtype=float,
         )
-        ctx.feature_drift_ks = compute_feature_drift_ks(matrix, META_FEATURES, ref)
+        # alpha-engine-config-I10063 — the same predicate the per-ticker loop
+        # uses to let the GBM override the bucket lookup for
+        # research_calibrator_prob (``research_gbm is not None and fitted``).
+        _research_gbm = (getattr(ctx, "meta_models", None) or {}).get("research_gbm")
+        _gbm_serves = _research_gbm is not None and bool(
+            getattr(_research_gbm, "fitted", False)
+        )
+        ctx.feature_drift_ks = compute_feature_drift_ks(
+            matrix, META_FEATURES, ref,
+            serving_producers=research_calibrator_producer(_gbm_serves),
+        )
     except Exception as e:  # noqa: BLE001 — secondary observability (see docstring)
         log.warning(
             "[feature_drift] KS computation failed (predictions unaffected; "
