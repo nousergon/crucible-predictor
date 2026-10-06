@@ -2484,6 +2484,10 @@ def run_meta_training(
     # non-optional arm is itself a failure — the bucket-lookup fallback below
     # is exactly the silent substitution the gate exists to refuse.
     l1_fits: dict[str, dict] = {}
+    # alpha-engine-config-I10063 — which producer made the
+    # research_calibrator_prob values the meta-Ridge (and the drift reference)
+    # are built from. Flips to the GBM only once every row was recomputed by it.
+    research_calibrator_prob_from_gbm = False
     try:
         finite_mask = np.array([
             np.isfinite(r.get("actual_fwd_10d", float("nan")))
@@ -2666,6 +2670,7 @@ def run_meta_training(
                     })
                 )
                 n_recomputed += 1
+            research_calibrator_prob_from_gbm = True
             log.info(
                 "research_calibrator_prob recomputed via GBM for %d oos_meta_rows "
                 "(in-sample for the purged training block, OOS for the "
@@ -2855,10 +2860,14 @@ def run_meta_training(
     try:
         from krepis.dates import now_dual
 
-        from monitoring.feature_drift import build_training_reference
+        from monitoring.feature_drift import (
+            build_training_reference,
+            research_calibrator_producer,
+        )
 
         _drift_ref = build_training_reference(
             meta_X, TRAIN_META_FEATURES, trained_date=now_dual().trading_day,
+            producers=research_calibrator_producer(research_calibrator_prob_from_gbm),
         )
     except Exception as _drift_err:  # noqa: BLE001 — secondary observability (see comment)
         log.warning("[feature_drift] failed to build training reference: %s", _drift_err)
