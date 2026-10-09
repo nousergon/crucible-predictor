@@ -227,6 +227,15 @@ print('  Winner:         %s' % board.get('winner_version_id'))
 print('  Promoted:       %s' % board.get('promoted'))
 print('=' * 60)
 
+# alpha-engine-config-I11611 (weekly failure class K09). The exactly-once
+# guard (config#2252) found a promotion marker for this trading day: an
+# EARLIER execution already finalized selection and wrote the leaderboard and
+# trial log, so this run suppressed every write by design. Tell the launcher,
+# so the stage-coverage verdict records a declared skip rather than WHOLLY
+# STALE. Printed just before the outcome line so it is inside the tail.
+if board.get('idempotent_noop'):
+    print('MODEL_ZOO_SELECT_IDEMPOTENT_NOOP=%s' % board.get('promotion_marker_key'))
+
 # LAST line the workload prints, deliberately, and the SSM body below hands
 # the launcher only the TAIL of the output, so this line always reaches it.
 print('MODEL_ZOO_SELECT_OUTCOME_RAW=%s' % _outcome)
@@ -272,6 +281,20 @@ ZOOSEL
     echo "ERROR: model-zoo select produced NO MODEL_ZOO_SELECT_OUTCOME_RAW line — the workload exited 0 without reporting an outcome. Refusing to report an outcome-less select as a successful stage (alpha-engine-config-I11106)." >&2
     exit 1
   fi
+  # alpha-engine-config-I11611 (weekly failure class K09): an idempotent re-run
+  # writes nothing, by design (config#2252), so grading it against THIS run's
+  # window reads both declared artifacts WHOLLY STALE. Measured on the
+  # scheduled Saturday f283a70c (cycle 2026-09-25, after Friday's rehearsal
+  # finalized the date) and on watch-rerun-2026-10-02-3 (cycle 2026-10-02):
+  # the select log says "idempotent no-op" and the verdict said WHOLLY STALE.
+  # The workload names the marker; the assertion below passes it as the
+  # stage's own declared skip. That excuses staleness only: a declared
+  # artifact that does not exist is still MISSING.
+  _ZOO_NOOP_REASON=""
+  _ZOO_NOOP_MARKER="$(sed -n 's#^MODEL_ZOO_SELECT_IDEMPOTENT_NOOP=\([A-Za-z0-9/._-]*\)$#\1#p' "$_ZOO_SELECT_OUT" | tail -n 1)"
+  if [ -n "$_ZOO_NOOP_MARKER" ]; then
+    _ZOO_NOOP_REASON="idempotent no-op: an earlier execution already finalized model-zoo selection for this trading day (promotion marker ${_ZOO_NOOP_MARKER}, config#2252), so this run suppressed its writes by design and the leaderboard and trial log carry that execution's timestamps (alpha-engine-config-I11611)"
+  fi
   rm -f "$_ZOO_SELECT_OUT"
 
   emit_heartbeat
@@ -285,7 +308,7 @@ ZOOSEL
 # so it is not a reliable carrier of the execution identity. No fallback:
 # an unset EXECUTION_RUN_DATE must reach the CLI empty so it exits loudly
 # under the observe-mode guard below rather than writing under run_date="".
-  "$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" --run-date "${EXECUTION_RUN_DATE:-}" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+  "$LIB_PYTHON" -m krepis.stage_coverage assert --stage "$_COVERAGE_STAGE" --window-start "$_STAGE_WINDOW_START" --run-date "${EXECUTION_RUN_DATE:-}" --not-applicable-reason "${_ZOO_NOOP_REASON:-}" || echo "WARNING: stage-coverage assertion did not run for $_COVERAGE_STAGE (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
   echo ""
   echo "==> Model-zoo select complete. Instance will be terminated."

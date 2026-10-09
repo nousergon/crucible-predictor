@@ -1871,6 +1871,8 @@ def send_predictor_email(
 
 # ── Stage entry point ────────────────────────────────────────────────────────
 
+_REALIZED_IC_DESCRIPTOR_FIELDS = ("realized_ic", "forward_days", "lookback_days")
+
 # Backtester-owned rolling fields (pipeline_common.push_predictor_rolling_metrics
 # patches these into predictor/metrics/latest.json weekly). The daily inference
 # metrics rebuild must CARRY THEM FORWARD, not reinitialize them — pre-fix it
@@ -1884,7 +1886,33 @@ _ROLLING_METRIC_FIELDS = (
     "ic_ir_30d",
     "rolling_metrics_updated_at",
     "rolling_n",
+) + (
+    # alpha-engine-config-I8701 descriptor fields, added by
+    # crucible-backtester-PR733 beside `ic_30d`. They describe the realized IC
+    # (true window, horizon, graded rows, NON-OVERLAPPING windows and the
+    # standard error against them). Until 2026-10-07 this tuple omitted them,
+    # so every morning's rebuild dropped them: measured on the 21 versions of
+    # predictor/metrics/latest.json from 09-15 to 10-06, only the four
+    # backtester writes carried `realized_ic`; every daily write deleted it.
+    # The brief's honest "IC (60d realized) ... ~N independent window(s)"
+    # label (_build_predictor_email) therefore never rendered, and the report card's
+    # backtest_vs_live_parity read `rolling_n` rows with no way to see that
+    # the producer itself puts n_effective at 1 (alpha-engine-config-I10065).
+    # Carried only where `ic_30d` itself is the carried realized value.
+    *_REALIZED_IC_DESCRIPTOR_FIELDS,
 )
+
+
+def _realized_ic_descriptor(rolling: dict, model_type: str, inference_mode: str) -> dict:
+    """The carried I8701 descriptor fields that belong beside ``ic_30d``.
+
+    They describe the CARRIED realized ``ic_30d``. In legacy single-GBM mode
+    ``ic_30d`` is the training ``test_ic`` instead, so the descriptor would
+    describe a different number and is not carried there.
+    """
+    if model_type == "gbm" and inference_mode != "meta":
+        return {}
+    return {k: rolling[k] for k in _REALIZED_IC_DESCRIPTOR_FIELDS if k in rolling}
 
 
 def intended_scoring_set(ctx, scored: set) -> tuple[int | None, int | None, list[str] | None]:
@@ -1972,6 +2000,7 @@ def run(ctx: PipelineContext) -> None:
             "n_stale": sum(1 for d in ctx.ticker_data_age.values() if d > 1),
         },
     }
+    metrics.update(_realized_ic_descriptor(rolling, ctx.model_type, ctx.inference_mode))
     # Meta-only fields — surface manifest values directly so dashboard / ops
     # can see promotion state and per-component ICs without parsing manifest.
     # The l1_ic / l2_ic / confidence_calibration keys satisfy the

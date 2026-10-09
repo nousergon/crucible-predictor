@@ -251,6 +251,39 @@ class TestRollingMetricsCarryForward:
         }
         assert "model_version" not in out
 
+    def test_carries_realized_ic_descriptor(self):
+        """alpha-engine-config-I10065: the I8701 descriptor written beside
+        `ic_30d` by crucible-backtester-PR733 must survive the daily rebuild.
+        Before this, every morning's write deleted it from latest.json."""
+        descriptor = {"value": 0.1668, "window_days": 60, "horizon_days": 21,
+                      "n_rows": 514, "n_prediction_dates": 20,
+                      "n_effective": 1, "se_effective": 1.0}
+        existing = {"ic_30d": 0.1668, "rolling_n": 514, "realized_ic": descriptor,
+                    "forward_days": 21, "lookback_days": 60}
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {
+            "Body": MagicMock(read=lambda: json.dumps(existing).encode())
+        }
+        with patch("boto3.client", return_value=mock_s3):
+            out = _load_rolling_metrics("bucket")
+        assert out == existing
+
+    def test_descriptor_carried_in_meta_mode(self):
+        rolling = {"ic_30d": 0.1, "realized_ic": {"n_effective": 1},
+                   "forward_days": 21, "lookback_days": 60}
+        assert wo._realized_ic_descriptor(rolling, "gbm", "meta") == {
+            "realized_ic": {"n_effective": 1}, "forward_days": 21, "lookback_days": 60,
+        }
+
+    def test_descriptor_not_carried_in_legacy_gbm_mode(self):
+        """Legacy single-GBM `ic_30d` is the training test_ic, not the
+        realized value the descriptor describes."""
+        rolling = {"realized_ic": {"n_effective": 1}, "forward_days": 21}
+        assert wo._realized_ic_descriptor(rolling, "gbm", "single") == {}
+
+    def test_descriptor_absent_when_producer_predates_it(self):
+        assert wo._realized_ic_descriptor({"ic_30d": 0.05}, "gbm", "meta") == {}
+
     def test_null_fields_not_carried(self):
         mock_s3 = MagicMock()
         mock_s3.get_object.return_value = {
