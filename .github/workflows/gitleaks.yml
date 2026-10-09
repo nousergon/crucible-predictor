@@ -19,5 +19,5 @@ permissions:
 
 jobs:
   gitleaks:
-    uses: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml@440b63a2c51fafa6a4b368752d489718587b6c53  # main — retry the gitleaks download (alpha-engine-config-I7083/I7069)
+    uses: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml@cf43be1630466f8ec6c6b5c0709931fabeda27ad  # main — retry the gitleaks download (alpha-engine-config-I7083/I7069)
     secrets: inherit
