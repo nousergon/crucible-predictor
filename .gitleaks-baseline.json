@@ -1,0 +1,23 @@
+[
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 267,
+  "EndLine": 267,
+  "StartColumn": 32,
+  "EndColumn": 65,
+  "Match": "RUN_TOKEN=\"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "tests/test_spot_reclaim_demotion.py",
+  "SymlinkFile": "",
+  "Commit": "b41b3dae889a4581a1bbc7c29eda2bc90a582a37",
+  "Link": "https://github.com/nousergon/crucible-predictor/blob/b41b3dae889a4581a1bbc7c29eda2bc90a582a37/tests/test_spot_reclaim_demotion.py#L267",
+  "Entropy": 3.5160277,
+  "Author": "Claude",
+  "Email": "noreply@anthropic.com",
+  "Date": "2026-09-25T06:00:59Z",
+  "Message": "fix(spot): demote reclaimed pools, go on-demand on the last attempt, arm the trap before launch\n\nPort of nousergon-data PR1944 (I11565) and PR1958 (I11574) into this repo's\n_spot_common.sh (alpha-engine-config-I11573).\n\n- New infrastructure/_spot_relaunch.sh mirrors nousergon-data's helper: a\n  confirmed reclaim records the box's type and subnet per RUN_TOKEN, later\n  launches in the run move them to the back of the rotation, and the final\n  attempt of a relaunch chain launches with `krepis.ec2_spot launch --no-spot`\n  (LaunchMarket/LaunchReason tagged). A spot-quota refusal goes on-demand on\n  the next attempt.\n- spot_launch arms the cleanup EXIT trap before it launches and captures the\n  launch rc with `|| rc=$?`. The three per-stage scripts no longer arm it\n  afterwards, so an ec2_spot exit 64/65 now reaches cleanup, which relaunches\n  within the budget.\n- cleanup asks relaunch-decision on every attempt so a last-attempt reclaim is\n  still recorded, and it skips terminate-instances when nothing launched.\n\nRefs nousergon/alpha-engine-config#11573\n\nCo-Authored-By: Claude Opus 5.5 (1M context) \u003cnoreply@anthropic.com\u003e\nClaude-Session: https://claude.ai/code/session_01PU9ghbMcx3RDSd8V2om4v1\nSigned-off-by: Claude \u003cnoreply@anthropic.com\u003e",
+  "Tags": [],
+  "Fingerprint": "b41b3dae889a4581a1bbc7c29eda2bc90a582a37:tests/test_spot_reclaim_demotion.py:generic-api-key:267"
+ }
+]
