@@ -3,4 +3,4 @@ repos:
     rev: v8.24.0
     hooks:
       - id: gitleaks
-        args: ['--baseline-path', '.gitleaksbaseline.json']
+        args: ['--baseline-path', '.gitleaks-baseline.json']
