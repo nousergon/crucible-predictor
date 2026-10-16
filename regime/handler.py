@@ -253,6 +253,25 @@ def produce_regime_substrate(
 
 @monitor_handler
 def lambda_handler(event: dict | None, context: Any) -> dict[str, Any]:
+    """AWS Lambda entry point: :func:`_handle` under rehearsal isolation.
+
+    alpha-engine-config-I12351: a weekly-SF REHEARSAL (``execution_arn``'s
+    execution name starts ``rehearsal-``) re-keys every S3 write under
+    ``rehearsal/<name>/``, so it never writes the live ``latest.json`` pointer
+    or a live run artifact. Isolation is activated before ``_handle`` creates
+    its S3 client. A production execution leaves it inert and the response
+    byte-identical to before.
+    """
+    from regime.rehearsal import isolate
+
+    with isolate(event if isinstance(event, dict) else None, stage="RegimeSubstrate") as _rehearsal:
+        response = _handle(event, context)
+        if _rehearsal is not None and isinstance(response, dict):
+            response["rehearsal"] = _rehearsal.summary()
+        return response
+
+
+def _handle(event: dict | None, context: Any) -> dict[str, Any]:
     """AWS Lambda entry point.
 
     Routes ``event["action"]`` to either ``produce`` (default, writes
