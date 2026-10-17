@@ -761,6 +761,19 @@ def _read_live_served_identity(s3, bucket: str, manifest_key: str) -> tuple:
     return (served_version, served_date)
 
 
+def _is_absent_key_error(exc: BaseException) -> bool:
+    """True when ``exc`` is S3 saying the key does not exist (NoSuchKey / 404).
+
+    Anything else — AccessDenied, throttling, a parse error — is a real read
+    failure and must stay loud.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = (response.get("Error") or {}).get("Code")
+    return code in ("NoSuchKey", "404", "NotFound")
+
+
 def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
     """Load every ``signals/{date}/signals.json`` snapshot from S3.
 
@@ -788,6 +801,14 @@ def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
                 date_prefixes.append(date_str)
 
     history: dict[str, dict] = {}
+    # A dated prefix with NO signals.json is not a research snapshot: other
+    # producers share the ``signals/<date>/`` namespace (the executor's
+    # ``order_book_summary.json`` on every trading day). Those are declared
+    # once, below, as a counted INFO line — not one WARNING per date, which
+    # read as 9 "missing" research files per training run when nothing was
+    # lost (alpha-engine-config-I11481, checked on S3 2026-09-26). A key that
+    # exists but cannot be read or parsed is still a WARNING per date.
+    no_snapshot_dates: list[str] = []
     for date_str in sorted(date_prefixes):
         try:
             obj = s3.get_object(
@@ -795,10 +816,21 @@ def _load_signals_history(s3, bucket: str) -> dict[str, dict]:
             )
             history[date_str] = json.loads(obj["Body"].read())
         except Exception as exc:
+            if _is_absent_key_error(exc):
+                no_snapshot_dates.append(date_str)
+                continue
             log.warning(
                 "Could not load signals/%s/signals.json: %s — skipping",
                 date_str, exc,
             )
+
+    if no_snapshot_dates:
+        log.info(
+            "%d signals/<date>/ prefixes hold no signals.json — not research "
+            "snapshots (other producers write under signals/<date>/), so not "
+            "a data gap: %s",
+            len(no_snapshot_dates), ", ".join(no_snapshot_dates),
+        )
 
     if not history:
         raise RuntimeError(

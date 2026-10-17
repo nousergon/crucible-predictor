@@ -259,6 +259,82 @@ class TestLoadSignalsHistory:
         assert "2026-03-05" in history
         assert "2026-03-12" not in history
 
+    @staticmethod
+    def _three_prefix_s3(get_object):
+        mock_s3 = MagicMock()
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {
+                "CommonPrefixes": [
+                    {"Prefix": "signals/2026-03-28/"},
+                    {"Prefix": "signals/2026-03-30/"},
+                    {"Prefix": "signals/2026-03-31/"},
+                ]
+            }
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+        mock_s3.get_object.side_effect = get_object
+        return mock_s3
+
+    def test_prefix_without_signals_json_is_declared_once_not_warned(self, caplog):
+        """alpha-engine-config-I11481: executor-only ``signals/<date>/``
+        prefixes (order_book_summary.json, no signals.json) are not research
+        snapshots. They are declared in ONE counted INFO line, never as a
+        per-date WARNING that reads as a missing research file."""
+        from botocore.exceptions import ClientError
+
+        def _get_object(Bucket, Key):
+            if "2026-03-28" in Key:
+                body = MagicMock()
+                body.read.return_value = b'{"date":"2026-03-28"}'
+                return {"Body": body}
+            raise ClientError(
+                {"Error": {"Code": "NoSuchKey", "Message": "absent"}}, "GetObject"
+            )
+
+        mock_s3 = self._three_prefix_s3(_get_object)
+        with caplog.at_level("INFO", logger="training.meta_trainer"):
+            history = _load_signals_history(mock_s3, "test-bucket")
+
+        assert set(history) == {"2026-03-28"}
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warnings == []
+        declared = [
+            r.getMessage() for r in caplog.records
+            if "hold no signals.json" in r.getMessage()
+        ]
+        assert len(declared) == 1
+        assert declared[0].startswith("2 signals/<date>/ prefixes")
+        assert "2026-03-30, 2026-03-31" in declared[0]
+
+    def test_unreadable_existing_key_still_warns(self, caplog):
+        """A key that exists but cannot be read (AccessDenied) is a real
+        failure and keeps its per-date WARNING."""
+        from botocore.exceptions import ClientError
+
+        def _get_object(Bucket, Key):
+            if "2026-03-28" in Key:
+                body = MagicMock()
+                body.read.return_value = b'{"date":"2026-03-28"}'
+                return {"Body": body}
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "no"}}, "GetObject"
+            )
+
+        mock_s3 = self._three_prefix_s3(_get_object)
+        with caplog.at_level("INFO", logger="training.meta_trainer"):
+            history = _load_signals_history(mock_s3, "test-bucket")
+
+        assert set(history) == {"2026-03-28"}
+        warned = [
+            r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+        ]
+        assert len(warned) == 2
+        assert all("Could not load signals/" in m for m in warned)
+        assert not any(
+            "hold no signals.json" in r.getMessage() for r in caplog.records
+        )
+
 
 # ── Sector-name map invariants ──────────────────────────────────────────────
 class TestSectorCanonicalMap:
