@@ -72,6 +72,26 @@ RESEARCH_CALIBRATOR_PROB = "research_calibrator_prob"
 PRODUCER_RESEARCH_GBM = "research_gbm"
 PRODUCER_BUCKET_LOOKUP = "bucket_lookup"
 
+# alpha-engine-config-I10063 — which reference the KS ran against.
+#
+# The live key is not the served model's reference: the weekly
+# champion-architecture refresh rewrites it (the grandfathered second writer,
+# alpha-engine-config-I9029) whether or not that run is promoted. Measured
+# 2026-10-12: the served champion was ``v3.0-meta-2026-08-14-119e069b`` while
+# the live key held the 2026-10-09 refresh's reference, and its
+# research_calibrator_prob mean moved 0.482 / 0.492 / 0.569 / 0.443 across four
+# weekly rewrites while the served feature stayed at 0.49-0.51. Since
+# alpha-engine-config-I11478 every registry bundle carries the reference its
+# own training run built, so the served champion's bundle is the reference
+# that describes the model actually serving. The live key is the fallback for
+# a champion whose bundle predates I11478, and the block says which was used.
+SERVED_MANIFEST_KEY = "predictor/weights/meta/manifest.json"  # == config.META_MANIFEST_KEY
+REGISTRY_PREFIX = "predictor/registry/"  # == model.registry.DEFAULT_REGISTRY_PREFIX
+REFERENCE_SOURCE_SERVED_BUNDLE = "served_bundle"
+REFERENCE_SOURCE_LIVE_KEY = "live_key"
+
+EXCLUDED_PRODUCER_MISMATCH = "producer_mismatch"
+
 PRODUCER_PARITY_MATCH = "match"            # every declared feature: same producer
 PRODUCER_PARITY_MISMATCH = "mismatch"      # >=1 feature: producers differ
 PRODUCER_PARITY_UNDECLARED = "undeclared"  # a side did not record its producer
@@ -181,9 +201,15 @@ def compute_feature_drift_ks(
 
     ``serving_producers`` (I10063) is which producer made today's values for
     features that have more than one. The block carries both sides'
-    producers plus ``producer_parity`` / ``producer_mismatch``; the KS values
-    themselves are unchanged. A ``mismatch`` means that feature's KS compares
-    two producers, not two periods.
+    producers plus ``producer_parity`` / ``producer_mismatch``.
+
+    A feature whose two sides were made by DIFFERENT producers has no valid
+    reference: its KS compares two producers, not two periods (measured
+    2026-10-12: 0.66-0.99 on every session since 2026-09-14 while the served
+    values held 0.49-0.51). It is therefore moved out of ``per_feature`` and
+    the ``max_ks`` / ``mean_ks`` headline into ``excluded`` — with its KS and
+    the reason, so nothing is hidden — and ``n_features_excluded`` counts it.
+    ``undeclared`` parity cannot be judged and stays in the headline.
     """
     from scipy.stats import ks_2samp
 
@@ -210,28 +236,38 @@ def compute_feature_drift_ks(
 
     if not per_feature:
         return None
-    ks_values = list(per_feature.values())
     ref_producers = dict(reference.get("producers") or {})
     serv_producers = dict(serving_producers or {})
     parity, mismatched = producer_parity(
         ref_producers, serv_producers, list(per_feature),
     )
+    excluded = {
+        f: {"ks": per_feature.pop(f), "reason": EXCLUDED_PRODUCER_MISMATCH}
+        for f in mismatched
+    }
     if parity == PRODUCER_PARITY_MISMATCH:
         logger.warning(
             "[feature_drift] producer mismatch on %s — reference (trained %s) "
             "used %s, serving used %s; those features' KS compares two "
-            "producers, not two periods (alpha-engine-config-I10063).",
+            "producers, not two periods, and is excluded from the headline "
+            "(alpha-engine-config-I10063).",
             mismatched, reference.get("trained_date"),
             {f: ref_producers.get(f) for f in mismatched},
             {f: serv_producers.get(f) for f in mismatched},
         )
+    ks_values = list(per_feature.values())
     return {
-        "max_ks": round(max(ks_values), 4),
-        "mean_ks": round(float(np.mean(ks_values)), 4),
+        "max_ks": round(max(ks_values), 4) if ks_values else None,
+        "mean_ks": round(float(np.mean(ks_values)), 4) if ks_values else None,
         "n_features": len(per_feature),
+        "n_features_excluded": len(excluded),
         "n_samples": n_used,
         "per_feature": dict(sorted(per_feature.items(), key=lambda kv: -kv[1])),
+        "excluded": excluded,
         "reference_trained_date": reference.get("trained_date"),
+        "reference_source": reference.get("reference_source"),
+        "reference_version_id": reference.get("reference_version_id"),
+        "served_version_id": reference.get("served_version_id"),
         "producers": {"reference": ref_producers, "serving": serv_producers},
         "producer_parity": parity,
         "producer_mismatch": mismatched,
@@ -273,3 +309,73 @@ def load_training_reference(
             return None
         raise
     return json.loads(resp["Body"].read())
+
+
+def _read_served_version(client: Any, bucket: str, manifest_key: str) -> Optional[str]:
+    """``served_version`` from the live manifest (restamped by every
+    promotion, ``model.registry.promote_to_champion``), or None."""
+    resp = client.get_object(Bucket=bucket, Key=manifest_key)
+    served = (json.loads(resp["Body"].read()) or {}).get("served_version")
+    return str(served) if served else None
+
+
+def load_served_model_reference(
+    *, bucket: str, region: str = "us-east-1", s3_client: Any | None = None,
+    manifest_key: str = SERVED_MANIFEST_KEY, registry_prefix: str = REGISTRY_PREFIX,
+) -> Optional[dict[str, Any]]:
+    """The drift reference that describes the model actually serving (I10063).
+
+    Prefers ``{registry_prefix}{served_version}/feature_drift_reference.json``
+    — the reference the served champion's own training run built, carried in
+    its registry bundle since alpha-engine-config-I11478. Falls back to the
+    live key only when the served bundle has none (a champion promoted before
+    I11478) or cannot be read; the live key may describe a refresh run that
+    was never promoted, and the returned dict says so.
+
+    The returned reference carries ``reference_source`` (``served_bundle`` |
+    ``live_key``), ``reference_version_id`` (the bundle read, else None) and
+    ``served_version_id``, which ``compute_feature_drift_ks`` copies into the
+    block. None when no reference exists anywhere (caller degrades to N/A).
+    """
+    import boto3
+
+    client = s3_client if s3_client is not None else boto3.client("s3", region_name=region)
+    served: Optional[str] = None
+    try:
+        served = _read_served_version(client, bucket, manifest_key)
+    except Exception as exc:  # noqa: BLE001 — fall back to the live key, recorded below
+        logger.warning(
+            "[feature_drift] could not read served_version from s3://%s/%s (%s); "
+            "using the live reference key (alpha-engine-config-I10063).",
+            bucket, manifest_key, exc,
+        )
+    if served:
+        bundle_key = f"{registry_prefix}{served}/{FEATURE_DRIFT_REFERENCE_FILENAME}"
+        try:
+            ref = load_training_reference(bucket=bucket, key=bundle_key, s3_client=client)
+        except Exception as exc:  # noqa: BLE001 — fall back to the live key, recorded below
+            logger.warning(
+                "[feature_drift] could not read the served champion's reference "
+                "s3://%s/%s (%s); using the live reference key.", bucket, bundle_key, exc,
+            )
+            ref = None
+        if ref is not None:
+            ref.update(
+                reference_source=REFERENCE_SOURCE_SERVED_BUNDLE,
+                reference_version_id=served, served_version_id=served,
+            )
+            return ref
+        logger.info(
+            "[feature_drift] served champion %s carries no %s in its bundle "
+            "(promoted before alpha-engine-config-I11478); using the live key, "
+            "which may describe an unpromoted refresh run.",
+            served, FEATURE_DRIFT_REFERENCE_FILENAME,
+        )
+    ref = load_training_reference(bucket=bucket, s3_client=client)
+    if ref is None:
+        return None
+    ref.update(
+        reference_source=REFERENCE_SOURCE_LIVE_KEY,
+        reference_version_id=None, served_version_id=served,
+    )
+    return ref
