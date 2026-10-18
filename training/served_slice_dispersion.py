@@ -284,25 +284,52 @@ def _calibrate(calibrator, alphas):
     return np.round(np.asarray(p_up, dtype=float), 4)
 
 
+def research_neutral_fills(meta_model, panel) -> list[str]:
+    """The model's features this panel lacks that ``score_panel`` fills with
+    ``RESEARCH_META_NEUTRAL`` — the ``RESEARCH_META_FEATURES`` fail-soft
+    contract, and nothing wider (alpha-engine-config-I11477).
+    """
+    from model.meta_model import RESEARCH_META_FEATURES
+
+    soft = frozenset(RESEARCH_META_FEATURES)
+    names = list(getattr(meta_model, "_feature_names", None) or [])
+    return [f for f in names if f not in panel.columns and f in soft]
+
+
 def score_panel(meta_model, calibrator, panel) -> tuple[object, object]:
     """``(predicted_alpha, p_up)`` for every panel row, under one version's head.
 
-    Raises when the panel does not carry every feature the stored ridge was fit
-    on. Zero-filling a missing META_FEATURE is the ``alpha-engine-config-I5949``
-    defect — a model silently scored on zeros — so it is refused here too.
+    Raises when the panel does not carry every CORE feature the stored ridge
+    was fit on. Zero-filling a missing core META_FEATURE is the
+    ``alpha-engine-config-I5949`` defect — a model silently scored on zeros —
+    so it is refused here too.
+
+    A missing ``RESEARCH_META_FEATURES`` column is filled with
+    ``RESEARCH_META_NEUTRAL`` instead (alpha-engine-config-I11477). That is
+    the value serving feeds (``inference/research_free_inference.py``) and the
+    value training fit on (``meta_trainer.build_meta_matrix``), so the filled
+    panel is scored exactly as it would serve. Refusing it made the served
+    slice UNCOMPUTABLE for every version while a declared research producer
+    is absent (alpha-engine-config-I11482). ``research_neutral_fills`` names
+    the filled columns so the caller can record them.
     """
     import numpy as np
+
+    from model.meta_model import RESEARCH_META_NEUTRAL
 
     names = list(getattr(meta_model, "_feature_names", None) or [])
     if not names:
         raise RuntimeError("meta-model carries no feature_names — cannot score")
-    missing = [f for f in names if f not in panel.columns]
+    filled = research_neutral_fills(meta_model, panel)
+    missing = [f for f in names if f not in panel.columns and f not in filled]
     if missing:
         raise RuntimeError(
             f"OOS panel is missing {len(missing)} of the model's features "
             f"{missing[:6]}{'…' if len(missing) > 6 else ''} — refusing to "
             f"zero-fill (alpha-engine-config-I5949)"
         )
+    if filled:
+        panel = panel.assign(**{f: RESEARCH_META_NEUTRAL for f in filled})
     alpha = np.asarray(
         meta_model.predict(panel[names].to_numpy(dtype=float)), dtype=float
     )
@@ -644,6 +671,11 @@ def served_slice_metrics(s3, bucket: str, version_ids, *,
                 alpha, p_up, dates, top_n=top_n, min_confidence=min_conf,
                 realized=realized)
             metrics["realized"]["column"] = realized_column
+            # alpha-engine-config-I11477 — named, so a slice scored with
+            # neutral-filled research columns is distinguishable from one
+            # scored on a panel that carried them.
+            metrics["research_neutral_filled"] = research_neutral_fills(
+                meta_model, panel)
             out["metrics"][vid] = metrics
             alphas[vid] = alpha
         except Exception as exc:  # noqa: BLE001 — per-version, named, non-blocking

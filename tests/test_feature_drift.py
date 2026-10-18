@@ -152,7 +152,7 @@ class TestProducerProvenance:
         assert research_calibrator_producer(False) == {
             "research_calibrator_prob": "bucket_lookup"}
 
-    def test_mismatch_is_flagged_and_ks_unchanged(self):
+    def test_mismatch_is_flagged_and_excluded_from_headline(self):
         """The 2026-10-05 shape: bucket-lookup reference, GBM at serving."""
         from monitoring.feature_drift import research_calibrator_producer
 
@@ -172,10 +172,23 @@ class TestProducerProvenance:
             "reference": {"research_calibrator_prob": "bucket_lookup"},
             "serving": {"research_calibrator_prob": "research_gbm"},
         }
-        # The KS itself is reported exactly as before — only labelled.
-        assert out["per_feature"] == plain["per_feature"]
-        assert out["max_ks"] == plain["max_ks"]
-        assert out["per_feature"]["research_calibrator_prob"] > 0.9
+        # The two-producer KS is kept, with its reason, but it is not drift:
+        # it leaves per_feature and the max/mean headline.
+        assert out["excluded"]["research_calibrator_prob"]["reason"] == "producer_mismatch"
+        assert out["excluded"]["research_calibrator_prob"]["ks"] == \
+            plain["per_feature"]["research_calibrator_prob"]
+        assert out["excluded"]["research_calibrator_prob"]["ks"] > 0.9
+        assert "research_calibrator_prob" not in out["per_feature"]
+        others = {f: v for f, v in plain["per_feature"].items()
+                  if f != "research_calibrator_prob"}
+        assert out["per_feature"] == others
+        assert out["max_ks"] == max(others.values())
+        assert out["max_ks"] < 0.5
+        assert out["n_features"] == len(others)
+        assert out["n_features_excluded"] == 1
+        # Without declared producers nothing is excluded (undeclared ≠ mismatch).
+        assert plain["max_ks"] > 0.9
+        assert plain["excluded"] == {}
 
     def test_match(self):
         from monitoring.feature_drift import research_calibrator_producer
@@ -232,7 +245,7 @@ class TestProducerCallSites:
             _bucket_like_matrix(1000, seed=1), NAMES,
             producers=fd.research_calibrator_producer(False),
         )
-        monkeypatch.setattr(fd, "load_training_reference", lambda **_: ref)
+        monkeypatch.setattr(fd, "load_served_model_reference", lambda **_: ref)
         rows = [
             {f: float(v) for f, v in zip(META_FEATURES, r)}
             for r in np.random.default_rng(3).normal(0.5, 0.1, (40, len(META_FEATURES)))
@@ -257,6 +270,15 @@ class TestProducerCallSites:
         out = self._run(gbm, monkeypatch)
         assert out["producers"]["serving"] == {"research_calibrator_prob": "bucket_lookup"}
         assert out["producer_parity"] == "match"
+
+    def test_inference_reads_the_served_model_reference(self):
+        import inspect
+
+        from inference.stages import run_inference as ri
+
+        drift = inspect.getsource(ri._set_feature_drift_ks)
+        assert "load_served_model_reference(" in drift
+        assert "load_training_reference(" not in drift
 
     def test_inference_override_predicate_unchanged(self):
         """If the loop's GBM-override predicate changes, the serving producer
@@ -285,3 +307,174 @@ class TestProducerCallSites:
         assert recompute < flip < build
         call = src[build:src.index(")", src.index("trained_date=", build)) + 200]
         assert "producers=research_calibrator_producer(research_calibrator_prob_from_gbm)" in call
+
+
+# ── alpha-engine-config-I10063: a matched reference still detects drift ──────
+
+
+class TestMatchedProducerDetects:
+    """Excluding a two-producer comparison must not blind the monitor: with
+    both sides from one producer the feature is in the headline and a real
+    shift is caught."""
+
+    def _gbm_ref(self):
+        from monitoring.feature_drift import research_calibrator_producer
+
+        m = _matrix(1000, seed=1)
+        m[:, 0] = np.random.default_rng(7).normal(0.50, 0.02, 1000)
+        return build_training_reference(
+            m, NAMES, producers=research_calibrator_producer(True),
+        )
+
+    def _served(self, shift):
+        m = _matrix(500, seed=2)
+        m[:, 0] = np.random.default_rng(8).normal(0.50 + shift, 0.02, 500)
+        return m
+
+    def test_no_shift_stays_low(self):
+        from monitoring.feature_drift import research_calibrator_producer
+
+        out = compute_feature_drift_ks(
+            self._served(0.0), NAMES, self._gbm_ref(),
+            serving_producers=research_calibrator_producer(True),
+        )
+        assert out["producer_parity"] == "match"
+        assert out["excluded"] == {}
+        assert out["per_feature"]["research_calibrator_prob"] < 0.15
+
+    def test_real_shift_is_caught_in_headline(self):
+        from monitoring.feature_drift import research_calibrator_producer
+
+        # One reference sd (0.02) — a modest, real move.
+        out = compute_feature_drift_ks(
+            self._served(0.02), NAMES, self._gbm_ref(),
+            serving_producers=research_calibrator_producer(True),
+        )
+        assert out["per_feature"]["research_calibrator_prob"] > 0.25
+        assert out["max_ks"] == out["per_feature"]["research_calibrator_prob"]
+        assert next(iter(out["per_feature"])) == "research_calibrator_prob"
+
+    def test_every_feature_excluded_leaves_no_headline(self):
+        from monitoring.feature_drift import research_calibrator_producer
+
+        m = _bucket_like_matrix(1000, seed=1)
+        ref = build_training_reference(
+            m, NAMES, producers=research_calibrator_producer(False),
+        )
+        ref["samples"] = {"research_calibrator_prob": ref["samples"]["research_calibrator_prob"]}
+        out = compute_feature_drift_ks(
+            _gbm_like_matrix(40, seed=2), NAMES, ref,
+            serving_producers=research_calibrator_producer(True),
+        )
+        assert out["max_ks"] is None and out["mean_ks"] is None
+        assert out["n_features"] == 0 and out["n_features_excluded"] == 1
+
+
+# ── alpha-engine-config-I10063: the served model's reference, by identity ────
+
+
+class _FakeS3:
+    """get_object over a dict; a value that is an Exception is raised."""
+
+    def __init__(self, objects):
+        self.objects = objects
+        self.reads = []
+
+    def get_object(self, Bucket, Key):  # boto3 keyword names
+        import json
+
+        from botocore.exceptions import ClientError
+
+        self.reads.append(Key)
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        val = self.objects[Key]
+        if isinstance(val, Exception):
+            raise val
+        body = json.dumps(val).encode()
+        return {"Body": type("B", (), {"read": lambda self: body})()}
+
+
+SERVED = "v3.0-meta-2026-08-14-119e069b"
+MANIFEST = "predictor/weights/meta/manifest.json"
+LIVE = "predictor/weights/meta/feature_drift_reference.json"
+BUNDLE = f"predictor/registry/{SERVED}/feature_drift_reference.json"
+
+
+class TestServedModelReference:
+    def _ref(self, trained_date):
+        return build_training_reference(_matrix(100), NAMES, trained_date=trained_date)
+
+    def _load(self, objects):
+        from monitoring.feature_drift import load_served_model_reference
+
+        s3 = _FakeS3(objects)
+        return load_served_model_reference(bucket="b", s3_client=s3), s3
+
+    def test_constants_match_their_owners(self):
+        import config
+        from model.registry import DEFAULT_REGISTRY_PREFIX
+        from monitoring.feature_drift import REGISTRY_PREFIX, SERVED_MANIFEST_KEY
+
+        assert SERVED_MANIFEST_KEY == config.META_MANIFEST_KEY
+        assert REGISTRY_PREFIX == DEFAULT_REGISTRY_PREFIX
+
+    def test_prefers_the_served_bundle_over_a_newer_live_key(self):
+        """The 2026-10-12 shape, after a promotion that carries a reference:
+        a later unpromoted refresh rewrote the live key."""
+        ref, _ = self._load({
+            MANIFEST: {"served_version": SERVED},
+            BUNDLE: self._ref("2026-08-14"),
+            LIVE: self._ref("2026-10-09"),
+        })
+        assert ref["trained_date"] == "2026-08-14"
+        assert ref["reference_source"] == "served_bundle"
+        assert ref["reference_version_id"] == SERVED
+        assert ref["served_version_id"] == SERVED
+
+    def test_falls_back_to_live_key_when_bundle_has_none(self):
+        """The served champion predates I11478 — today's live state."""
+        ref, s3 = self._load({
+            MANIFEST: {"served_version": SERVED},
+            LIVE: self._ref("2026-10-09"),
+        })
+        assert s3.reads == [MANIFEST, BUNDLE, LIVE]
+        assert ref["trained_date"] == "2026-10-09"
+        assert ref["reference_source"] == "live_key"
+        assert ref["reference_version_id"] is None
+        assert ref["served_version_id"] == SERVED
+
+    def test_unreadable_bundle_falls_back(self):
+        from botocore.exceptions import ClientError
+
+        ref, _ = self._load({
+            MANIFEST: {"served_version": SERVED},
+            BUNDLE: ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject"),
+            LIVE: self._ref("2026-10-09"),
+        })
+        assert ref["reference_source"] == "live_key"
+
+    @pytest.mark.parametrize("manifest", [None, {}, {"served_version": None}])
+    def test_no_served_version_uses_live_key(self, manifest):
+        objects = {LIVE: self._ref("2026-10-09")}
+        if manifest is not None:
+            objects[MANIFEST] = manifest
+        ref, s3 = self._load(objects)
+        assert ref["reference_source"] == "live_key"
+        assert ref["served_version_id"] is None
+        assert BUNDLE not in s3.reads
+
+    def test_no_reference_anywhere_is_none(self):
+        ref, _ = self._load({MANIFEST: {"served_version": SERVED}})
+        assert ref is None
+
+    def test_block_says_which_reference_ran(self):
+        ref, _ = self._load({
+            MANIFEST: {"served_version": SERVED},
+            LIVE: self._ref("2026-10-09"),
+        })
+        out = compute_feature_drift_ks(_matrix(500, seed=2), NAMES, ref)
+        assert out["reference_source"] == "live_key"
+        assert out["served_version_id"] == SERVED
+        assert out["reference_version_id"] is None
+
