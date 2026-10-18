@@ -335,13 +335,15 @@ def _set_feature_drift_ks(ctx, drift_feature_rows: list) -> None:
         from model.meta_model import META_FEATURES
         from monitoring.feature_drift import (
             compute_feature_drift_ks,
-            load_training_reference,
+            load_served_model_reference,
             research_calibrator_producer,
         )
 
         if not drift_feature_rows:
             return
-        ref = load_training_reference(
+        # alpha-engine-config-I10063 — the served champion's own reference,
+        # not whatever the latest weekly refresh wrote to the live key.
+        ref = load_served_model_reference(
             bucket=ctx.bucket, region=getattr(ctx, "region", "us-east-1"),
         )
         if not ref:
