@@ -264,3 +264,55 @@ def test_the_mirrored_verdict_prefix_matches_krepis() -> None:
     """A mirrored constant is legitimate only while a test proves it matches."""
     krepis_stage_coverage = pytest.importorskip("krepis.stage_coverage")
     assert VERDICT_KEY_PREFIX == f"{krepis_stage_coverage.VERDICT_PREFIX}/"
+
+
+# ── Rehearsal isolation (alpha-engine-config-I12351) ─────────────────────────
+
+_REHEARSAL_ARN = (
+    "arn:aws:states:us-east-1:711398986525:execution:"
+    "ne-weekly-freshness-pipeline:rehearsal-2026-10-16-2"
+)
+
+
+@pytest.mark.parametrize(
+    "event, expected",
+    [
+        ({"run_date": "2026-10-15", "execution_arn": _REHEARSAL_ARN}, _REHEARSAL_ARN),
+        ({"run_date": "2026-10-16", "execution_arn": _EXEC_ARN}, _EXEC_ARN),
+        ({"run_date": "2026-10-16"}, None),
+    ],
+)
+def test_the_execution_identity_reaches_krepis(monkeypatch, event, expected) -> None:
+    """rehearsal-2026-10-16-2 wrote LibPinDriftCheck's and PipelineContractCheck's
+    verdicts at the live `_stage_coverage/<run_date>/` key. krepis can route a
+    rehearsal's verdict only when it is told the execution."""
+    seen: dict = {}
+
+    def _fake_assert(stage, **kwargs):
+        seen.update(kwargs)
+        return {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+
+    fake_module = types.ModuleType("krepis.stage_coverage")
+    fake_module.assert_stage_coverage = _fake_assert
+    fake_module.StageCoverageContractError = RuntimeError
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake_module)
+
+    safe_assert_stage_coverage(
+        "LibPinDriftCheck",
+        event=event,
+        window_start=None,
+        log=logging.getLogger("test.attribution.rehearsal"),
+    )
+    assert seen["execution_name"] == expected
+
+
+def test_the_pinned_krepis_namespaces_a_rehearsal_verdict() -> None:
+    """The pin carries the contract: krepis >= 0.59.78 keys a rehearsal ARN's
+    verdict under `.rehearsal/<exec>/` and a production ARN's at the live key."""
+    sc = pytest.importorskip("krepis.stage_coverage")
+    rehearsal = pytest.importorskip("krepis.rehearsal")
+    verdict = sc.StageVerdict(stage="LibPinDriftCheck", status="COVERED_NO_OUTPUT", run_date="2026-10-15")
+    assert sc.verdict_key(verdict, rehearsal=rehearsal.rehearsal_token(_REHEARSAL_ARN)) == (
+        "_stage_coverage/.rehearsal/rehearsal-2026-10-16-2/2026-10-15/LibPinDriftCheck.json"
+    )
+    assert rehearsal.rehearsal_token(_EXEC_ARN) is None

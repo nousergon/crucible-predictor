@@ -510,6 +510,14 @@ def safe_assert_stage_coverage(
             run_date=run_date,
             window_start=window_start,
             s3_client=_attributing_s3_client(attribution, log),
+            # alpha-engine-config-I12351: the execution ARN tells krepis
+            # (>= 0.59.78) whether this is a weekly-SF rehearsal. A
+            # rehearsal's verdict is recorded under
+            # `_stage_coverage/.rehearsal/<exec>/` with no StageCoverage
+            # metric; rehearsal-2026-10-16-2 wrote LibPinDriftCheck's and
+            # PipelineContractCheck's at the live key. A production ARN, or
+            # none, leaves the key and the metric unchanged.
+            execution_name=attribution[EXECUTION_ARN_KEY],
         )
     except _ContractError as exc:
         log.error(
