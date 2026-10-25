@@ -1023,6 +1023,34 @@ def _cfg_default_label(_cfg) -> str:
     return "v3.0-meta"
 
 
+def _training_health_measurements(result: dict) -> tuple[float, float | None, list[str]]:
+    """Duration, IC and warnings for the ``predictor_training`` health record.
+
+    alpha-engine-config-I12629. The record read ``train_time_seconds`` and
+    ``ic_30d``, keys the meta trainer's result never carries (it reports
+    ``elapsed_s`` and ``test_ic``). So the 10-23 weekly wrote
+    ``duration_seconds 0`` and ``ic_30d null`` under ``status ok``, for a
+    1.46M-row fit that took 896s and measured test IC 0.083.
+
+    The trainer's own keys are preferred. The legacy keys are still honoured
+    if a trainer supplies them. An IC that was not measured is never left
+    silent under an ``ok`` status: it becomes a warning, so the health status
+    the lib derives is not ``ok``.
+    """
+    duration = result.get("train_time_seconds")
+    if duration is None:
+        duration = result.get("elapsed_s")
+    ic = result.get("ic_30d")
+    if ic is None:
+        ic = result.get("test_ic")
+    warnings: list[str] = []
+    if ic is None:
+        warnings.append("ic not measured this run (result carries neither ic_30d nor test_ic)")
+    if not duration:
+        warnings.append("training duration not measured (result carries neither train_time_seconds nor elapsed_s)")
+    return float(duration or 0), ic, warnings
+
+
 def _write_run_health_and_manifest(result: dict, bucket: str, date_str: str, io) -> None:
     """Write the ``predictor_training`` health record and dated data manifest.
 
@@ -1040,20 +1068,23 @@ def _write_run_health_and_manifest(result: dict, bucket: str, date_str: str, io)
         return
     try:
         from nousergon_lib.health import Deliverable, write_health
+        duration, ic, health_warnings = _training_health_measurements(result)
         write_health(
             module_name="predictor_training",
             deliverables=[
                 Deliverable(name="training_run", required=True, produced=True),
             ],
             run_date=date_str,
-            duration_seconds=result.get("train_time_seconds", 0),
+            duration_seconds=duration,
             summary={
                 "promoted": result.get("promoted", False),
-                "ic_30d": result.get("ic_30d"),
+                "ic_30d": ic,
+                "test_ic": result.get("test_ic"),
                 "n_train": result.get("n_train"),
                 "slim_cache_tickers": result.get("slim_cache_tickers"),
                 "slim_cache_failed": result.get("slim_cache_failed", 0),
             },
+            warnings=health_warnings or None,
             bucket=bucket,
         )
     except Exception as _he:
