@@ -611,6 +611,45 @@ def test_a_healthy_credential_leaves_no_rejection_key(
     assert "github_credential_status" not in result
 
 
+def _run_clean_drift_check():
+    with patch.object(dd, "_read_live_definition",
+                      return_value=_stamped(_DEFINITION, _UPSTREAM[:12])), \
+         patch.object(dd, "_read_stack_tag", return_value=_UPSTREAM), \
+         patch.object(dd, "_fetch_origin_main_sha", return_value=_UPSTREAM) as fetch, \
+         patch.object(dd, "_fetch_repo_definition", return_value=_DEFINITION):
+        result = dd.check_deploy_drift(region="us-east-1", account_id="123")
+    return result, fetch
+
+
+def test_the_payload_says_no_credential_was_presented(monkeypatch):
+    """alpha-engine-config-I8021: ambient pickup is off, so the consumer sends
+    nothing — and says so, even with a token sitting in the environment. The
+    probe must be able to tell this from "sent one and it was accepted"."""
+    monkeypatch.setenv("GH_TOKEN", "stub-ambient-token")
+    result, fetch = _run_clean_drift_check()
+
+    assert result["github_credential_presented"] is False
+    assert "github_credential_rejected" not in result
+    # The fetch is given the SAME literal the field is computed from.
+    assert fetch.call_args.kwargs["allow_ambient_auth"] is False
+
+
+def test_a_reintroduced_ambient_credential_flips_presented(monkeypatch):
+    """I8021 closes-when: deliberately re-enabling ambient pickup must flip the
+    field, not leave it unchanged."""
+    monkeypatch.setenv("GH_TOKEN", "stub-ambient-token")
+    monkeypatch.setattr(dd, "_GITHUB_ALLOW_AMBIENT_AUTH", True)
+    monkeypatch.setattr(
+        dd, "_github_auth_headers",
+        lambda *, allow_ambient=False: (
+            {"Authorization": "Bearer stub"} if allow_ambient else {}),
+    )
+    result, fetch = _run_clean_drift_check()
+
+    assert result["github_credential_presented"] is True
+    assert fetch.call_args.kwargs["allow_ambient_auth"] is True
+
+
 # ── alpha-engine-config-I7927: S3 is the expected definition, GitHub is not ──
 # The halting verdict must not depend on a live api.github.com call. The deploy
 # is the sole writer (sf-pipeline-policy 2.4) and already uploads the exact
