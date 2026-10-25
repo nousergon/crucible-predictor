@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 6,
+    "account_files": 5,
+    "bucket_hits": 139,
+    "bucket_files": 69,
+    "files": 71
+  },
+  "files": {
+    ".github/workflows/alert-class-pr-guard.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/deploy.yml": {
+      "account": 1
+    },
+    "Dockerfile": {
+      "bucket": 2
+    },
+    "analysis/observe_leaderboard.py": {
+      "bucket": 2
+    },
+    "analysis/triple_barrier_cutover_runner.py": {
+      "bucket": 2
+    },
+    "config.py": {
+      "bucket": 1
+    },
+    "config/predictor.sample.yaml": {
+      "bucket": 1
+    },
+    "flow-doctor-model-zoo.yaml": {
+      "bucket": 1
+    },
+    "flow-doctor-regime.yaml": {
+      "bucket": 1
+    },
+    "flow-doctor-training.yaml": {
+      "bucket": 1
+    },
+    "flow-doctor.yaml": {
+      "bucket": 1
+    },
+    "inference/daily_predict.py": {
+      "bucket": 1
+    },
+    "inference/deploy_drift.py": {
+      "bucket": 2
+    },
+    "inference/handler.py": {
+      "bucket": 6
+    },
+    "inference/pipeline_contract_check.py": {
+      "bucket": 1
+    },
+    "inference/self_test.py": {
+      "bucket": 1
+    },
+    "inference/stages/commitment_guard.py": {
+      "bucket": 1
+    },
+    "inference/stages/load_universe.py": {
+      "bucket": 1
+    },
+    "infrastructure/_spot_common.sh": {
+      "bucket": 2
+    },
+    "infrastructure/deploy.sh": {
+      "bucket": 1
+    },
+    "infrastructure/retrain.sh": {
+      "bucket": 1
+    },
+    "infrastructure/setup-regime-lambda.sh": {
+      "bucket": 2
+    },
+    "infrastructure/setup-regime-retrospective-eval-lambda.sh": {
+      "bucket": 1
+    },
+    "infrastructure/spot_model_zoo_select.sh": {
+      "bucket": 6
+    },
+    "infrastructure/spot_predictor_training.sh": {
+      "bucket": 6
+    },
+    "infrastructure/spot_train.sh": {
+      "bucket": 17
+    },
+    "infrastructure/spot_train_spec_dispatch.sh": {
+      "bucket": 3
+    },
+    "monitoring/drift_detector.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "regime/features.py": {
+      "bucket": 2
+    },
+    "regime/handler.py": {
+      "bucket": 2
+    },
+    "regime/rehearsal.py": {
+      "bucket": 1
+    },
+    "regime/retrospective_eval_handler.py": {
+      "bucket": 1
+    },
+    "regime/substrate.py": {
+      "bucket": 2
+    },
+    "scripts/backfill_arena_verdicts.py": {
+      "bucket": 1
+    },
+    "scripts/backfill_regime_fast_signal.py": {
+      "bucket": 2
+    },
+    "scripts/backfill_xsec_sd.py": {
+      "bucket": 1
+    },
+    "scripts/dry_run_meta_training.py": {
+      "bucket": 2
+    },
+    "scripts/momentum_ic_study_21d.py": {
+      "bucket": 2
+    },
+    "scripts/smoke_meta_model_load.py": {
+      "bucket": 1
+    },
+    "stage_coverage_safety.py": {
+      "bucket": 1
+    },
+    "store/arctic_reader.py": {
+      "bucket": 1
+    },
+    "tests/_spot_bootstrap_render_support.py": {
+      "bucket": 1
+    },
+    "tests/test_alpha_uncertainty_decomposition.py": {
+      "bucket": 2
+    },
+    "tests/test_champion_chasing_noise_alert.py": {
+      "bucket": 1
+    },
+    "tests/test_commitment_window_gate_and_detector.py": {
+      "bucket": 1
+    },
+    "tests/test_deploy_drift.py": {
+      "bucket": 1
+    },
+    "tests/test_deploy_drift_github_off_critical_path.py": {
+      "account": 2
+    },
+    "tests/test_drift_detector.py": {
+      "bucket": 1
+    },
+    "tests/test_failure_staging_is_retained.py": {
+      "bucket": 1
+    },
+    "tests/test_flow_doctor_wiring.py": {
+      "bucket": 2
+    },
+    "tests/test_l1_fit_validity.py": {
+      "bucket": 2
+    },
+    "tests/test_pipeline_contract_check.py": {
+      "bucket": 2
+    },
+    "tests/test_predictor_heartbeat_wiring.py": {
+      "bucket": 3
+    },
+    "tests/test_predictor_params_staleness.py": {
+      "bucket": 1
+    },
+    "tests/test_promotion_gate_honesty.py": {
+      "bucket": 1
+    },
+    "tests/test_promotion_served_slice_veto.py": {
+      "bucket": 1
+    },
+    "tests/test_promotion_veto_xsec_magnitude.py": {
+      "bucket": 1
+    },
+    "tests/test_purged_split.py": {
+      "bucket": 1
+    },
+    "tests/test_regime_drawdown.py": {
+      "bucket": 2
+    },
+    "tests/test_regime_fast_signal.py": {
+      "bucket": 1
+    },
+    "tests/test_regime_rehearsal_isolation.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "tests/test_research_free_stage_dry_run.py": {
+      "bucket": 1
+    },
+    "tests/test_risk_model_persist.py": {
+      "bucket": 3
+    },
+    "tests/test_self_test.py": {
+      "bucket": 1
+    },
+    "tests/test_shadow_artifact_records_degradation.py": {
+      "bucket": 1
+    },
+    "tests/test_stage_coverage_attribution.py": {
+      "account": 1,
+      "bucket": 3
+    },
+    "tests/test_train_handler_phase_registry.py": {
+      "bucket": 8
+    },
+    "tests/test_train_handler_subsample_noise_floor.py": {
+      "bucket": 7
+    },
+    "tests/test_write_output.py": {
+      "bucket": 2
+    },
+    "training/commitment.py": {
+      "bucket": 1
+    },
+    "training/purged_split.py": {
+      "bucket": 1
+    }
+  }
+}
