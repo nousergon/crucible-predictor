@@ -23,6 +23,17 @@ from typing import Optional, Union
 # `patch.object(deploy_drift, "_fetch_origin_main_sha", ...)` keeps
 # working in tests.
 from nousergon_lib.preflight import _fetch_origin_main_sha  # noqa: F401
+# `_github_auth_headers` answers "would this call site send a credential?"
+# from the same literal the fetch is given — alpha-engine-config-I8021.
+from nousergon_lib.preflight import _github_auth_headers  # noqa: F401
+
+#: Whether the upstream-SHA fetch may pick up an ambient GitHub credential.
+#: A literal, never an env read: the predictor's repos are public, and an
+#: ambient token frozen in the Lambda environment is what halted preopen on
+#: 2026-08-21 (alpha-engine-config-I7925). The fetch and the
+#: `github_credential_presented` field below both read THIS constant, so the
+#: payload can never claim a different credential posture than the call had.
+_GITHUB_ALLOW_AMBIENT_AUTH = False
 
 log = logging.getLogger(__name__)
 
@@ -488,7 +499,10 @@ def check_deploy_drift(
     # operator. Carried in the payload so the SF's degrade alert can NAME it,
     # rather than surviving silently on the anonymous fallback.
     github_stats: dict = {}
-    upstream = _fetch_origin_main_sha(repo, branch=branch, stats=github_stats)
+    upstream = _fetch_origin_main_sha(
+        repo, branch=branch, stats=github_stats,
+        allow_ambient_auth=_GITHUB_ALLOW_AMBIENT_AUTH,
+    )
 
     # sf_drift is UNMEASURED (omitted below) when there IS a local stamp to
     # compare and upstream could not be fetched, OR when the live machine could
@@ -882,6 +896,16 @@ def check_deploy_drift(
     # never mistaken for a describe call that succeeded.
     if live_read_error is not None:
         result["live_definition_error"] = live_read_error.to_dict()
+    # alpha-engine-config-I8021: ALWAYS present, because only this call site
+    # knows whether it offered a credential. Without it, the absence of
+    # `github_credential_rejected` is ambiguous between "sent one, accepted"
+    # and "sent nothing", and the credential-health probe read both as
+    # acceptance. A NEW key on purpose: emitting `github_credential_rejected:
+    # false` instead would re-create the present-False-reads-as-verified
+    # defect I7924 removed.
+    result["github_credential_presented"] = bool(
+        _github_auth_headers(allow_ambient=_GITHUB_ALLOW_AMBIENT_AUTH),
+    )
     # Present ONLY when the credential was actually rejected, so its absence
     # is never mistaken for a token that was checked and found healthy.
     if github_stats.get("github_credential_rejected"):
