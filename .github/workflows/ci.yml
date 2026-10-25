@@ -80,6 +80,21 @@ jobs:
       - name: Lint dependency extras (no underscores)
         run: python3 scripts/lint_extras.py .
 
+      # Shrink-only guard against hard-coded account / bucket literals (plan
+      # S-04, alpha-engine-config-I12492; clause ENV-NO-LITERALS). The shared
+      # check lives in nousergon-lib and is fetched unpinned, as
+      # provider-linkage-guard.yml fetches its script. OBSERVE mode: it reports
+      # NEW hits and STALE entries against .hardcoded-env-refs-baseline.json and
+      # never blocks; continue-on-error also covers a fetch outage. S-16
+      # (alpha-engine-config-I12504) makes it enforcing. Stdlib only, ~1-2 s.
+      # Removed a literal? Lower the ceiling: python3 hardcoded_env_refs.py --update
+      - name: Hard-coded environment references (observe, S-04)
+        continue-on-error: true
+        run: |
+          curl -fsSL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/hardcoded_env_refs.py" \
+            https://raw.githubusercontent.com/nousergon/nousergon-lib/main/scripts/hardcoded_env_refs.py
+          python3 "$RUNNER_TEMP/hardcoded_env_refs.py" --repo .
+
       - name: Resolve requirements.txt into a clean venv
         run: |
           python -m venv /tmp/venv-root
