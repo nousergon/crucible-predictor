@@ -903,7 +903,7 @@ class TestEmailGating:
     @patch.object(wo, "get_veto_threshold", return_value=0.65)
     @patch.object(wo, "_load_gbm_meta", return_value={})
     @patch.object(wo, "write_predictions")
-    @patch.object(wo, "_read_existing_predictions", return_value=[])
+    @patch.object(wo, "_read_existing_day", return_value={})
     @patch.object(wo, "send_predictor_email", return_value=True)
     @patch("inference.coverage_check.compute_coverage_delta")
     def test_supplemental_invocation_always_sends(
