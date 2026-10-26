@@ -840,6 +840,17 @@ def _read_existing_predictions(s3_bucket: str, date_str: str) -> list[dict]:
     Used by supplemental-scoring mode to merge new predictions into the
     existing day's output without overwriting prior tickers.
     """
+    return list(_read_existing_day(s3_bucket, date_str).get("predictions") or [])
+
+
+def _read_existing_day(s3_bucket: str, date_str: str) -> dict:
+    """Read the whole existing predictions/{date}.json payload from S3.
+
+    Returns {} if the object is absent or unreadable (same 404/403 handling as
+    `_read_existing_predictions`). The supplemental merge needs more than the
+    rows: the first run's `calibration_degradation` verdict must survive the
+    re-invocation (alpha-engine-config-I10489).
+    """
     import boto3
     from botocore.exceptions import ClientError
     dated_key = cfg.PREDICTIONS_KEY.format(date=date_str)
@@ -847,7 +858,7 @@ def _read_existing_predictions(s3_bucket: str, date_str: str) -> list[dict]:
         s3 = boto3.client("s3")
         obj = s3.get_object(Bucket=s3_bucket, Key=dated_key)
         payload = json.loads(obj["Body"].read())
-        return list(payload.get("predictions") or [])
+        return payload if isinstance(payload, dict) else {}
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in ("NoSuchKey", "AccessDenied", "404", "403"):
@@ -856,8 +867,34 @@ def _read_existing_predictions(s3_bucket: str, date_str: str) -> list[dict]:
                 "merge is a no-op union with empty",
                 s3_bucket, dated_key, code,
             )
-            return []
+            return {}
         raise
+
+
+def _merge_calibration_degradation(
+    new: dict | None,
+    existing: dict | None,
+) -> dict | None:
+    """The day's calibration verdict across a supplemental re-invocation.
+
+    alpha-engine-config-I10489 (Brian ruling 2026-10-25, option (b)): whenever
+    the variance fallback engages, `predictions/{date}.json` must carry
+    `calibration_degradation.degraded: true`. The coverage-gap re-invocation
+    scores only the handful of missing tickers — usually below
+    `_MIN_BATCH_SIZE_FOR_VARIANCE_GATE`, so its own verdict is
+    `degraded: false` by construction — and it rewrites the dated artifact. Before
+    this merge it replaced the first run's block wholesale, so a full-batch
+    fallback was erased from the record by a five-ticker top-up, while the
+    first run's rows still carried the fallback's output.
+
+    Degradation is STICKY for the day: once a run on this date recorded
+    `degraded: true`, that block stays the day's verdict and the supplemental
+    run's own block rides along under `supplemental_run`. Otherwise the new
+    block stands, exactly as before.
+    """
+    if isinstance(existing, dict) and existing.get("degraded") is True:
+        return {**existing, "supplemental_run": new}
+    return new
 
 
 def _merge_predictions(
@@ -2042,8 +2079,15 @@ def run(ctx: PipelineContext) -> None:
     # overwritten. combined_rank is recomputed across the merged union; veto
     # compute (below) then runs on the merged set.
     if ctx.explicit_tickers and not ctx.dry_run:
-        existing = _read_existing_predictions(ctx.bucket, ctx.date_str)
+        existing_day = _read_existing_day(ctx.bucket, ctx.date_str)
+        existing = list(existing_day.get("predictions") or [])
         ctx.predictions = _merge_predictions(ctx.predictions, existing)
+        # alpha-engine-config-I10489: a first-run variance fallback must not be
+        # erased from the day's artifact by the supplemental top-up.
+        ctx.calibration_degradation = _merge_calibration_degradation(
+            getattr(ctx, "calibration_degradation", None),
+            existing_day.get("calibration_degradation"),
+        )
 
     # ── Coverage hard-fail (buy_candidates ⊆ predictions) ────────────────────
     # Defense in depth: the Step Function's coverage-gap Choice state is the
