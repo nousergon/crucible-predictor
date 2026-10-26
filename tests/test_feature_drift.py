@@ -301,7 +301,7 @@ class TestProducerCallSites:
         src = inspect.getsource(meta_trainer)
         recompute = src.index('row["research_calibrator_prob"] = float(')
         flip = src.index("research_calibrator_prob_from_gbm = True")
-        build = src.index("_drift_ref = build_training_reference(")
+        build = src.index("_drift_ref = build_served_population_reference(")
         # Flipped only after the recompute loop, and read when the reference
         # is built from meta_X.
         assert recompute < flip < build
@@ -478,3 +478,150 @@ class TestServedModelReference:
         assert out["served_version_id"] == SERVED
         assert out["reference_version_id"] is None
 
+
+
+# ── alpha-engine-config-I10063 option (a): reference = the served population ──
+
+
+def _ranked_panel(n_dates, n_names, *, seed):
+    """A synthetic training panel with NO drift: every date draws its names
+    from one fixed distribution. ``research_composite_score`` is the ranking
+    input; ``momentum_score`` is correlated with it, the way real momentum
+    correlates with the research ranking. Returns ``(matrix, dates)``."""
+    rng = np.random.default_rng(seed)
+    rows, dates = [], []
+    for d in range(n_dates):
+        score = rng.uniform(0.0, 1.0, n_names)
+        block = rng.normal(0.0, 1.0, (n_names, len(NAMES)))
+        block[:, NAMES.index("research_composite_score")] = score
+        block[:, NAMES.index("momentum_score")] = (
+            0.8 * (score - 0.5) / 0.29 + 0.6 * rng.normal(0.0, 1.0, n_names)
+        )
+        rows.append(block)
+        dates.extend([d] * n_names)
+    return np.vstack(rows), np.asarray(dates)
+
+
+def _top_n_mask(matrix, dates, n):
+    """Per date, the top ``n`` rows by ``research_composite_score`` — the
+    shape of ``training.served_cut_mask`` over an ``attractiveness_top_N`` cut."""
+    score = matrix[:, NAMES.index("research_composite_score")]
+    mask = np.zeros(len(dates), dtype=bool)
+    for d in np.unique(dates):
+        idx = np.flatnonzero(dates == d)
+        mask[idx[np.argsort(-score[idx], kind="stable")[:n]]] = True
+    return mask
+
+
+class TestServedPopulationReference:
+    """The reference must describe the rows inference scores (the top-N cut),
+    so an undrifted top-N sample reads near-zero KS rather than RED."""
+
+    TOP_N = 35  # >= _MIN_KS_SAMPLES, ~ the served batch width
+    N_DAYS = 40
+
+    def _inference_sample(self, seed):
+        m, d = _ranked_panel(1, 900, seed=seed)
+        return m[_top_n_mask(m, d, self.TOP_N)]
+
+    def _median_ks(self, ref, feature):
+        """Median KS over ``N_DAYS`` independent undrifted inference days. One
+        n=35 day is noisy by nature (iid null p95 ~0.22), so the property is
+        pinned on the median, not on a single draw."""
+        m, d = _ranked_panel(self.N_DAYS, 900, seed=500)
+        mask = _top_n_mask(m, d, self.TOP_N)
+        ks = [
+            compute_feature_drift_ks(m[(d == k) & mask], NAMES, ref)["per_feature"][feature]
+            for k in range(self.N_DAYS)
+        ]
+        return float(np.median(ks))
+
+    def _served_ref(self):
+        from monitoring.feature_drift import build_served_population_reference
+
+        panel, dates = _ranked_panel(120, 900, seed=11)
+        return build_served_population_reference(
+            panel, NAMES, _top_n_mask(panel, dates, self.TOP_N),
+            trained_date="2026-10-23",
+            mask_report={"n_dates_resolved": 120, "cut_names": ["attractiveness_top_35"]},
+        )
+
+    def test_reference_records_its_population(self):
+        ref = self._served_ref()
+        assert ref["population"] == "served_cut"
+        assert ref["population_detail"]["n_rows"] == 120 * self.TOP_N
+        assert ref["population_detail"]["n_rows_panel"] == 120 * 900
+        assert ref["population_detail"]["n_dates"] == 120
+        out = compute_feature_drift_ks(self._inference_sample(seed=99), NAMES, ref)
+        assert out["reference_population"] == "served_cut"
+
+    @pytest.mark.parametrize("feature", ["research_composite_score", "momentum_score"])
+    def test_undrifted_top_n_reads_near_zero_against_served_reference(self, feature):
+        # Measured: 0.178 / 0.131. Against the whole panel: 0.971 / 0.639.
+        assert self._median_ks(self._served_ref(), feature) < 0.2
+
+    @pytest.mark.parametrize("feature", ["research_composite_score", "momentum_score"])
+    def test_the_whole_panel_reference_reads_red_on_the_same_days(self, feature):
+        """The defect option (a) fixes, pinned so the contrast stays visible:
+        same undrifted top-N days, whole-panel reference, RED by construction."""
+        panel, _ = _ranked_panel(120, 900, seed=11)
+        ref = build_training_reference(panel, NAMES)
+        assert self._median_ks(ref, feature) > 0.6
+        out = compute_feature_drift_ks(self._inference_sample(seed=99), NAMES, ref)
+        assert out["reference_population"] is None  # legacy: undeclared
+
+    def test_served_reference_still_catches_a_real_shift(self):
+        ref = self._served_ref()
+        sample = self._inference_sample(seed=99).copy()
+        j = NAMES.index("momentum_score")
+        sample[:, j] += 1.0 * float(np.std(ref["samples"]["momentum_score"]))
+        out = compute_feature_drift_ks(sample, NAMES, ref)
+        assert out["per_feature"]["momentum_score"] > 0.3
+
+    @pytest.mark.parametrize("mask", [None, "empty", "misaligned"])
+    def test_unresolved_mask_falls_back_to_the_panel_and_says_so(self, mask):
+        from monitoring.feature_drift import build_served_population_reference
+
+        panel, _ = _ranked_panel(5, 100, seed=3)
+        served_mask = {
+            None: None,
+            "empty": np.zeros(len(panel), dtype=bool),
+            "misaligned": np.ones(len(panel) - 1, dtype=bool),
+        }[mask]
+        ref = build_served_population_reference(
+            panel, NAMES, served_mask,
+            mask_report={"status": "unresolvable", "reason": "no membership"}
+            if mask == "empty" else None,
+        )
+        assert ref["population"] == "fit_panel"
+        assert ref["population_detail"]["n_rows"] == len(panel)
+        assert ref["population_detail"]["reason"]
+        if mask == "empty":
+            assert ref["population_detail"]["reason"] == "no membership"
+
+    def test_population_labels_match_the_served_cut_mask_basis(self):
+        from monitoring.feature_drift import (
+            REFERENCE_POPULATION_FIT_PANEL,
+            REFERENCE_POPULATION_SERVED_CUT,
+        )
+        from training.served_cut_mask import BASIS_FIT_PANEL, BASIS_SERVED_CUT
+
+        assert REFERENCE_POPULATION_SERVED_CUT == BASIS_SERVED_CUT
+        assert REFERENCE_POPULATION_FIT_PANEL == BASIS_FIT_PANEL
+
+    def test_training_builds_the_reference_from_the_served_cut_mask(self):
+        """RED pre-fix: meta_trainer built the reference from the whole of
+        meta_X before the served-cut mask existed."""
+        import inspect
+
+        from training import meta_trainer
+
+        src = inspect.getsource(meta_trainer)
+        mask = src.index("_served_mask, served_cut_mask_report = resolve_served_cut_mask(")
+        build = src.index("_drift_ref = build_served_population_reference(")
+        write = src.index("_write_feature_drift_reference(\n                s3_up, bucket, _drift_ref")
+        assert mask < build < write
+        call = src[build:build + 400]
+        assert "meta_X, TRAIN_META_FEATURES, _served_mask," in call
+        assert "mask_report=served_cut_mask_report" in call
+        assert "_drift_ref = build_training_reference(" not in src

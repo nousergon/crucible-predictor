@@ -2875,34 +2875,10 @@ def run_meta_training(
                 float(getattr(cfg, "IC_NOISE_THRESHOLD", 0.005)),
             )
 
-    # config#859: persist the training feature-drift reference (cross-sectional
-    # META_FEATURES subsample) so daily inference can KS-test its feature
-    # distribution against the distribution the model was trained on. meta_X is
-    # the same raw-feature representation the model fits + inference feeds, so
-    # the comparison is apples-to-apples by the model's own contract. Fail-soft:
-    # a reference-write failure must NOT abort training (model + manifest are
-    # the primary deliverable); the report card shows feature_drift_ks N/A until
-    # a reference lands. Per the feedback_no_silent_fails secondary carve-out.
-    #
-    # alpha-engine-config-I11478 — BUILT here, WRITTEN with the rest of this
-    # run's outputs below. It used to be PUT straight to the live key from here,
-    # by every run of the rotation, so the last model-zoo challenger to finish
-    # owned the champion's drift reference.
+    # config#859 feature-drift reference: built further down, after the
+    # served-cut mask resolves (alpha-engine-config-I10063 option (a)), so it
+    # describes the rows inference actually scores.
     _drift_ref = None
-    try:
-        from krepis.dates import now_dual
-
-        from monitoring.feature_drift import (
-            build_training_reference,
-            research_calibrator_producer,
-        )
-
-        _drift_ref = build_training_reference(
-            meta_X, TRAIN_META_FEATURES, trained_date=now_dual().trading_day,
-            producers=research_calibrator_producer(research_calibrator_prob_from_gbm),
-        )
-    except Exception as _drift_err:  # noqa: BLE001 — secondary observability (see comment)
-        log.warning("[feature_drift] failed to build training reference: %s", _drift_err)
 
     meta_model = MetaModel(alpha=1.0)
     meta_model.fit(
@@ -3929,6 +3905,44 @@ def run_meta_training(
             "xsec_sd": None, "xsec_variance_share": None,
             "basis": _BASIS_SERVED_CUT,
         }
+
+    # config#859: persist the training feature-drift reference (cross-sectional
+    # META_FEATURES subsample) so daily inference can KS-test its feature
+    # distribution against the distribution the model was trained on. meta_X is
+    # the same raw-feature representation the model fits + inference feeds.
+    # Fail-soft: a reference-build failure must NOT abort training (model +
+    # manifest are the primary deliverable); the report card shows
+    # feature_drift_ks N/A until a reference lands. Per the
+    # feedback_no_silent_fails secondary carve-out.
+    #
+    # alpha-engine-config-I10063 option (a) — built from the SERVED-CUT rows
+    # (`_served_mask` above: each date's predictor cut ∪ held), not the whole
+    # panel. Inference tests only the ~30 names it scores, so a whole-panel
+    # reference made every ranking input read RED with no drift (10-23:
+    # research_composite_score KS 0.81, served median 0.983 vs a near-uniform
+    # panel). An unresolved mask falls back to the panel, labelled
+    # `population: fit_panel` in the reference and the inference block.
+    #
+    # alpha-engine-config-I11478 — BUILT here, WRITTEN with the rest of this
+    # run's outputs below. It used to be PUT straight to the live key, by every
+    # run of the rotation, so the last model-zoo challenger to finish owned the
+    # champion's drift reference.
+    try:
+        from krepis.dates import now_dual
+
+        from monitoring.feature_drift import (
+            build_served_population_reference,
+            research_calibrator_producer,
+        )
+
+        _drift_ref = build_served_population_reference(
+            meta_X, TRAIN_META_FEATURES, _served_mask,
+            trained_date=now_dual().trading_day,
+            producers=research_calibrator_producer(research_calibrator_prob_from_gbm),
+            mask_report=served_cut_mask_report,
+        )
+    except Exception as _drift_err:  # noqa: BLE001 — secondary observability (see comment)
+        log.warning("[feature_drift] failed to build training reference: %s", _drift_err)
 
     # alpha-engine-config-I10185 — the MAGNITUDE leg's like-for-like reference:
     # the SERVING incumbent's frozen coefficients scored on THIS candidate's
