@@ -92,6 +92,23 @@ REFERENCE_SOURCE_LIVE_KEY = "live_key"
 
 EXCLUDED_PRODUCER_MISMATCH = "producer_mismatch"
 
+# alpha-engine-config-I10063 option (a) — WHICH ROWS the reference describes.
+#
+# Inference KS-tests the ~30 names it scores: each date's predictor cut
+# (``attractiveness_top_20``) plus the book (``load_universe``). The reference
+# used to be a thinned sample of the WHOLE training panel, ~900 names per date.
+# Those are different populations by construction: measured 2026-10-25,
+# ``research_composite_score`` on the 10-23 served names had median 0.983 (26 of
+# 29 at or above 0.90) against a near-uniform panel reference, KS 0.81 with no
+# drift at all. A ranking input reads RED every day under that design, and the
+# other features correlated with the ranking (``momentum_score``) inherit part
+# of it. The reference is therefore built from the panel rows the per-date
+# population rule would have served (``training/served_cut_mask.py``), so the
+# KS compares like with like. The labels equal that module's ``BASIS_*``
+# constants (asserted by tests), so one word names one population everywhere.
+REFERENCE_POPULATION_SERVED_CUT = "served_cut"  # == served_cut_mask.BASIS_SERVED_CUT
+REFERENCE_POPULATION_FIT_PANEL = "fit_panel"    # == served_cut_mask.BASIS_FIT_PANEL
+
 PRODUCER_PARITY_MATCH = "match"            # every declared feature: same producer
 PRODUCER_PARITY_MISMATCH = "mismatch"      # >=1 feature: producers differ
 PRODUCER_PARITY_UNDECLARED = "undeclared"  # a side did not record its producer
@@ -163,6 +180,77 @@ def build_training_reference(
     }
     if producers:
         reference["producers"] = dict(producers)
+    return reference
+
+
+def build_served_population_reference(
+    matrix: np.ndarray, feature_names: Sequence[str], served_mask: Any, *,
+    trained_date: Optional[str] = None,
+    producers: Optional[Mapping[str, str]] = None,
+    mask_report: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """The training reference over the rows inference would have SCORED.
+
+    alpha-engine-config-I10063 option (a). ``served_mask`` is the boolean row
+    mask from ``training.served_cut_mask.resolve_served_cut_mask`` (positionally
+    aligned with ``matrix``): per panel date, that date's predictor cut plus the
+    held book — the population ``inference/stages/load_universe.py`` scores and
+    ``_set_feature_drift_ks`` therefore tests. The reference is built from those
+    rows only, and records ``population`` = ``served_cut``.
+
+    When the mask is missing, misaligned or selects nothing, the reference falls
+    back to the whole panel and SAYS so: ``population`` = ``fit_panel`` plus the
+    mask's own reason, logged at ERROR. The fallback is labelled rather than
+    dropped because a bundle with no reference sends inference to the live key
+    (another run's reference), which is the identity defect I10063 already
+    closed; a labelled panel reference keeps the block honest about what it
+    compared. ``compute_feature_drift_ks`` carries the label into the block as
+    ``reference_population``.
+    """
+    m = np.asarray(matrix, dtype=float)
+    report = dict(mask_report or {})
+    mask = None
+    if served_mask is not None:
+        mask = np.asarray(served_mask, dtype=bool)
+        if mask.shape != (m.shape[0],):
+            report["reason"] = (
+                f"served-cut mask has shape {mask.shape}, the panel has "
+                f"{m.shape[0]} rows — not aligned"
+            )
+            mask = None
+    if mask is not None and bool(mask.any()):
+        reference = build_training_reference(
+            m[mask], feature_names, trained_date=trained_date, producers=producers,
+        )
+        reference["population"] = REFERENCE_POPULATION_SERVED_CUT
+        reference["population_detail"] = {
+            "n_rows": int(mask.sum()),
+            "n_rows_panel": int(m.shape[0]),
+            "n_dates": report.get("n_dates_resolved"),
+            "cut_names": report.get("cut_names"),
+        }
+        return reference
+
+    reason = report.get("reason") or (
+        "served-cut mask selected no rows" if mask is not None
+        else "no served-cut mask was resolved"
+    )
+    logger.error(
+        "[feature_drift] reference built from the WHOLE training panel, not the "
+        "served cut (%s). Inference tests only the served names, so this "
+        "reference's KS mixes population selection with drift; the block says "
+        "reference_population=%s (alpha-engine-config-I10063).",
+        reason, REFERENCE_POPULATION_FIT_PANEL,
+    )
+    reference = build_training_reference(
+        m, feature_names, trained_date=trained_date, producers=producers,
+    )
+    reference["population"] = REFERENCE_POPULATION_FIT_PANEL
+    reference["population_detail"] = {
+        "n_rows": int(m.shape[0]),
+        "n_rows_panel": int(m.shape[0]),
+        "reason": reason,
+    }
     return reference
 
 
@@ -265,6 +353,9 @@ def compute_feature_drift_ks(
         "per_feature": dict(sorted(per_feature.items(), key=lambda kv: -kv[1])),
         "excluded": excluded,
         "reference_trained_date": reference.get("trained_date"),
+        # I10063 option (a): which rows the reference describes. ``None`` for
+        # a reference written before the key existed (the whole panel).
+        "reference_population": reference.get("population"),
         "reference_source": reference.get("reference_source"),
         "reference_version_id": reference.get("reference_version_id"),
         "served_version_id": reference.get("served_version_id"),
