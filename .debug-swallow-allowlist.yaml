@@ -38,7 +38,7 @@ schema_version: 1
 entries:
   # ── OFFLINE dev-mode stub (daily_predict.py) ─────────────────────────────
   - path: inference/daily_predict.py
-    line: 321
+    line: 337
     reason: >-
       nousergon_lib.health import failure while stubbing write_health for
       the local --offline CLI dev harness. No recording surface --

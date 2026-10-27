@@ -68,6 +68,27 @@ from inference.s3_io import _s3_put_json, _s3_put_bytes  # noqa: E402, F401
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
+def _warn_if_email_unconfigured() -> bool:
+    """Warn early when the morning-briefing email cannot be sent.
+
+    Returns True when the warning fired. The log line reports only WHETHER
+    each setting is present, never its value: ``EMAIL_SENDER`` is read via
+    ``get_secret`` and is an e-mail address, so echoing it put a secret-sourced
+    address in clear text in CloudWatch (CodeQL
+    py/clear-text-logging-sensitive-data, alert #16; alpha-engine-config#10561).
+    """
+    sender_state = "set" if cfg.EMAIL_SENDER else "empty"
+    n_recipients = len(cfg.EMAIL_RECIPIENTS or [])
+    if sender_state == "set" and n_recipients:
+        return False
+    log.warning(
+        "Email not configured (EMAIL_SENDER is %s, EMAIL_RECIPIENTS has %d entries) "
+        "— morning briefing will be skipped",
+        sender_state, n_recipients,
+    )
+    return True
+
+
 def main(
     date_str: Optional[str] = None,
     dry_run: bool = False,
@@ -122,12 +143,7 @@ def main(
     )
 
     # Validate email config (warn early so operator knows before pipeline finishes)
-    if not cfg.EMAIL_SENDER or not cfg.EMAIL_RECIPIENTS:
-        log.warning(
-            "Email not configured (EMAIL_SENDER=%r, EMAIL_RECIPIENTS has %d entries) "
-            "— morning briefing will be skipped",
-            cfg.EMAIL_SENDER or "(empty)", len(cfg.EMAIL_RECIPIENTS),
-        )
+    _warn_if_email_unconfigured()
 
     # ── Delegate to staged pipeline ──────────────────────────────────────────
     from inference.pipeline import PipelineContext, run_pipeline

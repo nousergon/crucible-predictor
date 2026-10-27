@@ -392,3 +392,46 @@ class TestOfflineVetoStubTracksConfig:
         assert 0.0 < cfg.MIN_CONFIDENCE < 0.5, (
             f"MIN_CONFIDENCE={cfg.MIN_CONFIDENCE} is not on the |p_up-0.5|*2 axis"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: _warn_if_email_unconfigured — no clear-text sender address in logs
+# ---------------------------------------------------------------------------
+
+class TestWarnIfEmailUnconfigured:
+    """Regression for CodeQL py/clear-text-logging-sensitive-data alert #16
+    (alpha-engine-config#10561): EMAIL_SENDER comes from ``get_secret`` and is
+    an e-mail address, so the early config warning must report only whether it
+    is set, never its value."""
+
+    SENDER = "sender-under-test@example.invalid"
+
+    def _run(self, caplog, sender, recipients):
+        import logging
+        import inference.daily_predict as dp
+
+        with patch.object(dp.cfg, "EMAIL_SENDER", sender), \
+                patch.object(dp.cfg, "EMAIL_RECIPIENTS", recipients), \
+                caplog.at_level(logging.WARNING, logger=dp.log.name):
+            fired = dp._warn_if_email_unconfigured()
+        return fired, caplog.text
+
+    def test_sender_set_recipients_empty_never_logs_the_address(self, caplog):
+        fired, text = self._run(caplog, self.SENDER, [])
+        assert fired is True
+        assert "Email not configured" in text
+        assert "EMAIL_SENDER is set" in text
+        assert self.SENDER not in text
+        assert "example.invalid" not in text
+
+    def test_sender_empty_reports_empty(self, caplog):
+        fired, text = self._run(caplog, "", ["someone@example.invalid"])
+        assert fired is True
+        assert "EMAIL_SENDER is empty" in text
+        assert "EMAIL_RECIPIENTS has 1 entries" in text
+        assert "someone@example.invalid" not in text
+
+    def test_fully_configured_is_silent(self, caplog):
+        fired, text = self._run(caplog, self.SENDER, ["someone@example.invalid"])
+        assert fired is False
+        assert text == ""
