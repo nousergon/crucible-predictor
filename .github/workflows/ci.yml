@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # So the required context `test` reports on a merge-queue entry; the fleet
+  # merge-group required-check guard accepts only this shape
+  # (alpha-engine-config-I12747). Without it a queue entry waits forever on `test`.
+  merge_group:
+    types: [checks_requested]
 
 permissions: {}
 
