@@ -145,16 +145,112 @@ def test_planted_control_passes_when_fresh_best_wins_is_fooled():
     assert result["kill_gate"] == "PASS"
 
 
-def test_planted_control_is_falsified_when_the_baseline_is_not_fooled():
-    """The ruled rule is binary: if fresh-best-wins never promotes the planted
-    overfit at the shallowest depth, the estimator has shown nothing → FALSIFIED."""
+def test_planted_control_is_inconclusive_when_the_baseline_is_not_fooled():
+    """Ruling 1b (2026-10-28): if fresh-best-wins never promotes the planted
+    overfit at the shallowest depth, the control has no contrast and cannot
+    falsify the estimator → INCONCLUSIVE, which never exits like a PASS."""
     strong = [6.0, 6.2, 5.8, 6.1]
-    result = kg.run_real(
-        _spaced_records({"a": [1.0, -1.0, 1.0, -1.0], "s": strong}), source="t"
-    )
+    records = _spaced_records({"a": [1.0, -1.0, 1.0, -1.0], "s": strong})
+    result = kg.run_real(records, source="t")
     assert result["control"]["checks"]["fdr_controlled_all_measured_depths"]
+    assert not result["control"]["checks"]["contrast_at_shallowest_measured_depth"]
     assert not result["control"]["checks"]["separates_at_shallowest_measured_depth"]
+    assert result["kill_gate"] == "INCONCLUSIVE"
+    assert result["kill_gate_label"] == "INCONCLUSIVE"
+
+
+def test_an_fdr_failure_falsifies_even_without_contrast(monkeypatch):
+    """INCONCLUSIVE covers only a control with no contrast. An estimator that
+    promotes the planted overfit above alpha has failed the safety leg, and
+    that is FALSIFIED whatever the baseline did."""
+    from analysis.low_n_selection_estimator import fresh_best_wins_promote
+
+    class _Promotes:
+        def __init__(self, cid):
+            self.blocked, self.promoted_id = False, cid
+            self.rejected_ids, self.e_values = (), {}
+
+    def always_planted(fam, *, alpha):
+        ids = [c.challenger_id for c in fam]
+        return _Promotes(kg.PLANTED_ID if kg.PLANTED_ID in ids else ids[0])
+
+    def never_planted(fam):
+        res = fresh_best_wins_promote([c for c in fam if c.challenger_id != kg.PLANTED_ID])
+        return res
+
+    monkeypatch.setattr(kg, "estimator_promote", always_planted)
+    monkeypatch.setattr(kg, "fresh_best_wins_promote", never_planted)
+    result = kg.run_real(
+        _spaced_records({"a": [1.0, -1.0, 1.0, -1.0]}), source="t"
+    )
+    assert not result["control"]["checks"]["contrast_at_shallowest_measured_depth"]
+    assert not result["control"]["checks"]["fdr_controlled_all_measured_depths"]
     assert result["kill_gate"] == "FALSIFIED"
+
+
+def test_inconclusive_exits_non_zero_and_distinct(tmp_path, monkeypatch):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps(
+        _spaced_records({"a": [1.0, -1.0, 1.0, -1.0], "s": [6.0, 6.2, 5.8, 6.1]})
+    ))
+    logged = []
+    monkeypatch.setattr(kg, "_append_experiments_log", lambda *a: logged.append(a))
+    code = kg.main(["--cohorts", str(path), "--log"])
+    assert code == kg.EXIT_INCONCLUSIVE
+    assert code not in (kg.EXIT_PASS, kg.EXIT_FALSIFIED, kg.EXIT_REFUSED)
+    assert logged and logged[0][0]["kill_gate"] == "INCONCLUSIVE"
+
+
+def test_power_leg_is_reported_and_never_gates(monkeypatch):
+    """Ruling 3b: power is reported at every measured depth; a PASS with power
+    under the floor is labelled 'PASS (safety only)' and still exits 0."""
+    null = [1.0, -1.0, 1.0, -1.0, 0.5, -0.5]
+    records = _spaced_records({"a": null[:4], "b": null[:6]})
+    result = kg.run_real(records, source="t")
+    power = result["control"]["power"]
+    assert power["gates_verdict"] is False
+    assert power["effect_sd"] == kg.CONTROL_POWER_EFFECT_SD
+    assert [r["n_cohorts"] for r in power["sweep"]] == [4, 6]
+    assert result["kill_gate"] == "PASS"
+
+    def no_power(cohorts, *, depths, **kw):
+        return {
+            "effect_sd": 1.0, "report_floor": 0.2, "gates_verdict": False,
+            "sweep": [{"n_cohorts": n, "estimator_true_edge_rate": 0.0} for n in depths],
+            "meets_report_floor_all_measured_depths": False,
+        }
+
+    monkeypatch.setattr(kg, "power_leg", no_power)
+    weak = kg.run_real(records, source="t")
+    assert weak["kill_gate"] == "PASS"
+    assert weak["kill_gate_label"] == kg.SAFETY_ONLY_LABEL
+    # The safety legs are untouched by the power leg's presence.
+    assert weak["control"]["sweep"] == result["control"]["sweep"]
+
+
+def test_power_leg_does_not_disturb_the_safety_draws(monkeypatch):
+    """The power leg has its own seed stream: removing it leaves the planted
+    overfit sweep byte-identical, so the 10-26 safety rule draws what it drew."""
+    records = _spaced_records({"a": [0.3, -0.8, 1.1, -0.2], "b": [0.5, -1.2, 0.9, 0.4, -0.6]})
+    with_power = kg.run_real(records, source="t")["control"]["sweep"]
+    monkeypatch.setattr(
+        kg, "power_leg",
+        lambda cohorts, *, depths, **kw: {"sweep": [], "gates_verdict": False,
+                                          "meets_report_floor_all_measured_depths": True},
+    )
+    without = kg.run_real(records, source="t")["control"]["sweep"]
+    assert with_power == without
+
+
+def test_gate_covers_the_whole_leaderboard():
+    """Ruling 2a: an arm with no common dates stays in the record set at depth
+    0 and refuses the whole board; it never leaves the e-BH family."""
+    records, depths = records_from_leaderboard(_fixture_leaderboard())
+    assert depths["orphan"] == 0 and "orphan" in records
+    result = kg.run_real(records, source="fixture")
+    assert result["refused"] is True
+    assert any(r.startswith("orphan:") for r in result["gate"]["reasons"])
+    assert kg.CONTROL_GATE_SCOPE == "whole_leaderboard"
 
 
 def test_verdict_is_scale_invariant_and_deterministic():
@@ -180,3 +276,15 @@ def test_control_parameters_are_the_preregistered_ones():
     assert (kg.CONTROL_ALPHA, kg.CONTROL_TRIALS, kg.CONTROL_K_FORKS,
             kg.CONTROL_SHALLOW_BASELINE_FLOOR, kg.CONTROL_SEED) == (
         0.10, 2000, 8, 0.15, 12662)
+
+
+def test_amended_parameters_are_the_preregistered_ones():
+    """The 2026-10-28 amendment (rulings 1b/2a/3b), pinned like the original."""
+    assert (kg.CONTROL_NO_CONTRAST_VERDICT, kg.CONTROL_GATE_SCOPE,
+            kg.CONTROL_POWER_EFFECT_SD, kg.CONTROL_POWER_REPORT_FLOOR,
+            kg.CONTROL_POWER_GATES_VERDICT, kg.CONTROL_POWER_SEED_OFFSET,
+            kg.SAFETY_ONLY_LABEL) == (
+        "INCONCLUSIVE", "whole_leaderboard", 1.0, 0.20, False, 100_000,
+        "PASS (safety only)")
+    assert (kg.EXIT_PASS, kg.EXIT_FALSIFIED, kg.EXIT_REFUSED,
+            kg.EXIT_INCONCLUSIVE) == (0, 1, 2, 3)

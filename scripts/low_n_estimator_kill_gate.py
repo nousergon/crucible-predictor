@@ -46,11 +46,22 @@ Two modes
      pooled within-challenger SD; then, per trial, a known-overfit challenger
      (best-sample-mean of ``K`` null streams, unit SD = the real noise) is
      injected into the real family. Run at every distinct measured depth.
-     PASS iff (i) the estimator promotes the planted overfit at a rate <= alpha
-     at EVERY measured depth, and (ii) at the shallowest measured depth
-     fresh-best-wins promotes it at >= the shallow floor while the estimator
-     promotes it strictly less. Otherwise FALSIFIED. The parameters are the
-     ``CONTROL_*`` constants below, pre-registered in the PR and in
+     Three outcomes (amended 2026-10-28, rulings 1b/2a/3b):
+       - FALSIFIED if the estimator promotes the planted overfit at a rate
+         > alpha at ANY measured depth (the safety leg failed);
+       - else INCONCLUSIVE if fresh-best-wins promotes it at < the shallow
+         floor at the shallowest measured depth: the control has no contrast,
+         so it cannot falsify the estimator (1b). Never read as PASS;
+       - else PASS iff the estimator promotes it strictly less than
+         fresh-best-wins there, otherwise FALSIFIED.
+     The data gate stays over the WHOLE leaderboard: an arm below depth
+     stays in the record set and refuses the run, so the e-BH family is never
+     shrunk to the arms that have data (2a). A power leg (a planted true-edge
+     arm at +``CONTROL_POWER_EFFECT_SD`` pooled SD) is REPORTED at every
+     measured depth and never gates the verdict; a PASS whose power is below
+     ``CONTROL_POWER_REPORT_FLOOR`` at any measured depth is labelled
+     ``PASS (safety only)`` (3b). The parameters are the ``CONTROL_*``
+     constants below, pre-registered in the PR and in
      ``alpha-engine-config/private-docs/EXPERIMENTS.md`` before any run, and
      not overridable from the CLI.
 
@@ -88,7 +99,8 @@ OVERFIT_ID = "overfit"
 PLANTED_ID = "__planted_overfit__"
 
 # Pre-registered verdict rule for the REAL run (alpha-engine-config-I12662 Q2,
-# ruled 2026-10-25). Changing any of these after the first real run voids the
+# ruled 2026-10-25; amended 2026-10-28 by rulings 1b/2a/3b, before any real
+# run). Changing any of these after the first real run voids the
 # pre-registration; a change needs a new EXPERIMENTS.md entry first.
 CONTROL_ALPHA = 0.10
 CONTROL_TRIALS = 2000
@@ -96,7 +108,20 @@ CONTROL_K_FORKS = 8
 CONTROL_SHALLOW_BASELINE_FLOOR = 0.15
 CONTROL_SEED = 12662
 
-EXIT_PASS, EXIT_FALSIFIED, EXIT_REFUSED = 0, 1, 2
+#: 1b: what a control with no contrast reports. FDR failure still FALSIFIES.
+CONTROL_NO_CONTRAST_VERDICT = "INCONCLUSIVE"
+#: 2a: the data gate covers every live challenger on the leaderboard.
+CONTROL_GATE_SCOPE = "whole_leaderboard"
+#: 3b: the power leg — planted true edge, in pooled-SD units; reported only.
+CONTROL_POWER_EFFECT_SD = 1.0
+CONTROL_POWER_REPORT_FLOOR = 0.20
+CONTROL_POWER_GATES_VERDICT = False
+CONTROL_POWER_SEED_OFFSET = 100_000
+
+PLANTED_EDGE_ID = "__planted_true_edge__"
+SAFETY_ONLY_LABEL = "PASS (safety only)"
+
+EXIT_PASS, EXIT_FALSIFIED, EXIT_REFUSED, EXIT_INCONCLUSIVE = 0, 1, 2, 3
 
 
 def _forking_paths_overfit(
@@ -280,11 +305,24 @@ def planted_overfit_control(
         r["estimator_planted_rate"] <= alpha for r in rows
     )
     shallow = rows[0] if rows else None
+    has_contrast = bool(
+        shallow and shallow["baseline_planted_rate"] >= shallow_baseline_floor
+    )
     separates = bool(
-        shallow
-        and shallow["baseline_planted_rate"] >= shallow_baseline_floor
+        has_contrast
         and shallow["estimator_planted_rate"] < shallow["baseline_planted_rate"]
     )
+    if not fdr_controlled:
+        verdict = "FALSIFIED"
+    elif not has_contrast:
+        verdict = CONTROL_NO_CONTRAST_VERDICT
+    else:
+        verdict = "PASS" if separates else "FALSIFIED"
+
+    power = power_leg(cohorts, depths=depths, alpha=alpha, trials=trials, seed=seed)
+    label = verdict
+    if verdict == "PASS" and not power["meets_report_floor_all_measured_depths"]:
+        label = SAFETY_ONLY_LABEL
     return {
         "params": {
             "alpha": alpha,
@@ -292,13 +330,58 @@ def planted_overfit_control(
             "k_forks": k_forks,
             "shallow_baseline_floor": shallow_baseline_floor,
             "seed": seed,
+            "no_contrast_verdict": CONTROL_NO_CONTRAST_VERDICT,
+            "gate_scope": CONTROL_GATE_SCOPE,
         },
         "sweep": rows,
         "checks": {
             "fdr_controlled_all_measured_depths": fdr_controlled,
+            "contrast_at_shallowest_measured_depth": has_contrast,
             "separates_at_shallowest_measured_depth": separates,
         },
-        "kill_gate": "PASS" if (fdr_controlled and separates) else "FALSIFIED",
+        "power": power,
+        "kill_gate": verdict,
+        "kill_gate_label": label,
+    }
+
+
+def power_leg(
+    cohorts: list[ChallengerCohorts],
+    *,
+    depths: list[int],
+    alpha: float = CONTROL_ALPHA,
+    trials: int = CONTROL_TRIALS,
+    effect_sd: float = CONTROL_POWER_EFFECT_SD,
+    report_floor: float = CONTROL_POWER_REPORT_FLOOR,
+    seed: int = CONTROL_SEED,
+) -> dict:
+    """The pre-registered power leg (I12662 ruling 3b): REPORTED, never gating.
+
+    At each measured depth, plant a true-edge arm (``effect_sd`` pooled SDs,
+    unit noise) into the real family and count how often the estimator
+    promotes it. Its own seed stream, so the safety legs above draw exactly
+    what they drew before this leg existed."""
+    rows = []
+    for n in depths:
+        rng = np.random.default_rng(seed + CONTROL_POWER_SEED_OFFSET + n)
+        promoted = 0
+        for _ in range(trials):
+            planted = ChallengerCohorts(
+                PLANTED_EDGE_ID, rng.normal(effect_sd, 1.0, size=n)
+            )
+            est = estimator_promote([*cohorts, planted], alpha=alpha)
+            if not est.blocked and est.promoted_id == PLANTED_EDGE_ID:
+                promoted += 1
+        rows.append(
+            {"n_cohorts": n, "estimator_true_edge_rate": round(promoted / trials, 4)}
+        )
+    return {
+        "effect_sd": effect_sd,
+        "report_floor": report_floor,
+        "gates_verdict": CONTROL_POWER_GATES_VERDICT,
+        "sweep": rows,
+        "meets_report_floor_all_measured_depths": bool(rows)
+        and all(r["estimator_true_edge_rate"] >= report_floor for r in rows),
     }
 
 
@@ -354,6 +437,7 @@ def run_real(
         },
         "control": control,
         "kill_gate": control["kill_gate"],
+        "kill_gate_label": control["kill_gate_label"],
     }
 
 
@@ -375,7 +459,7 @@ def _append_experiments_log(result: dict, run_date: str) -> None:
     entry = (
         f"\n## {run_date} — config#1524 low-n selection-bias estimator kill-gate "
         f"({result['mode']})\n\n"
-        f"- Verdict: **{verdict}**\n"
+        f"- Verdict: **{result.get('kill_gate_label') or verdict}**\n"
         f"- Result: `{json.dumps(result, sort_keys=True)}`\n"
     )
     if not log.exists():
@@ -423,8 +507,14 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_REFUSED
     if args.log:
         _append_experiments_log(result, date.today().isoformat())
-    # Non-zero exit on a falsified gate so CI/operators notice.
-    return EXIT_FALSIFIED if result.get("kill_gate") == "FALSIFIED" else EXIT_PASS
+    # Non-zero exit on anything but a PASS so CI/operators notice; INCONCLUSIVE
+    # never exits like a PASS (I12662 ruling 1b). The power leg never changes it.
+    verdict = result.get("kill_gate")
+    if verdict == "FALSIFIED":
+        return EXIT_FALSIFIED
+    if verdict == CONTROL_NO_CONTRAST_VERDICT:
+        return EXIT_INCONCLUSIVE
+    return EXIT_PASS
 
 
 if __name__ == "__main__":
