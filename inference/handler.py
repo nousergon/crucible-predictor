@@ -659,14 +659,45 @@ def handler(event: dict, context) -> dict:
     # predictions — the exact silent-failure mode that hit production on
     # 2026-04-13.
     from inference.daily_predict import main
-    main(
-        date_str=date_str,
-        dry_run=dry_run,
-        local=False,
-        model_type="gbm",
-        watchlist_path="auto",
-        explicit_tickers=explicit_tickers,
-    )
+    from inference.stages.load_universe import UniverseMembershipStaleError
+    try:
+        main(
+            date_str=date_str,
+            dry_run=dry_run,
+            local=False,
+            model_type="gbm",
+            watchlist_path="auto",
+            explicit_tickers=explicit_tickers,
+        )
+    except UniverseMembershipStaleError as exc:
+        # The deploy-time canary probes a freshly published VERSION. When the
+        # weekly producer has not published a fresh universe-membership cycle,
+        # the probe cannot get past load_universe — a domain outcome about
+        # upstream data, not about this image (same rule as canary_accept's
+        # "whether the probe could reach its upstream is never a deploy gate").
+        # Answer it with the deploy.sh contract's reserved no-op status so
+        # promotion is not frozen on a weekly SF's data. ONLY for an event
+        # stamped synthetic by run_canary_action, and ONLY for the stale
+        # subclass (an artifact was read, parsed and rejected for age): every
+        # real or hand-invoked run, and every unreadable/malformed artifact,
+        # still raises exactly as before.
+        if not is_synthetic_invocation(event):
+            raise
+        log.warning(
+            "Canary predict skipped at load_universe: upstream universe "
+            "membership is stale (newest run_date %s, %d days old). The image "
+            "loaded its models and dispatched; the scoring stages were not "
+            "exercised by this canary.",
+            exc.newest_run_date, exc.age_days,
+        )
+        return {
+            "statusCode": "skipped",
+            "reason": "upstream_universe_membership_stale",
+            "body": (
+                f"Canary predict skipped: universe membership newest run_date "
+                f"{exc.newest_run_date} is {exc.age_days} days old"
+            ),
+        }
     log.info("Predictor Lambda completed successfully")
 
     # ── Flow-doctor end-of-run heartbeat (config#646) ───────────────────────

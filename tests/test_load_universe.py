@@ -10,6 +10,7 @@ import pytest
 
 from inference.stages.load_universe import (
     MEMBERSHIP_MAX_AGE_DAYS,
+    UniverseMembershipStaleError,
     UniverseResolutionError,
     get_universe_tickers,
     load_watchlist,
@@ -380,6 +381,61 @@ class TestLoadWatchlistFailsOnStaleOrMissingMembership:
         with patch("boto3.client", return_value=s3):
             with pytest.raises(UniverseResolutionError, match="no universe membership"):
                 load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+
+    def test_stale_membership_carries_the_evidence_it_was_read(self):
+        # The 2026-11-03 deploy-canary case: latest.json resolved, parsed, and
+        # was rejected only for age. The subclass carries what was read so the
+        # canary can say so; it is still a UniverseResolutionError (fatal).
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(["AAPL"], run_date="2026-10-23"),
+        })
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(UniverseMembershipStaleError) as ei:
+                load_watchlist("auto", s3_bucket="b", date_str="2026-11-03")
+        assert isinstance(ei.value, UniverseResolutionError)
+        assert ei.value.newest_run_date == "2026-10-23"
+        assert ei.value.age_days == 11
+        assert "no universe membership" in str(ei.value)
+        assert "universe_membership/latest.json" in str(ei.value)
+
+    def test_newest_of_several_stale_candidates_is_reported(self):
+        s3 = _mock_s3_with_keys({
+            "universe_membership/latest.json": _membership(["AAPL"], run_date="2026-07-01"),
+            "universe_membership/2026-07-17/membership.json": _membership(
+                ["AAPL"], run_date="2026-07-12"
+            ),
+        })
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(UniverseMembershipStaleError) as ei:
+                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert ei.value.newest_run_date == "2026-07-12"
+        assert ei.value.age_days == 15
+
+    def test_absent_membership_is_not_the_stale_subclass(self):
+        # Nothing was read: that can be a code defect in this image (a broken
+        # key or reader), so it must never qualify for the canary's skip.
+        s3 = _mock_s3_with_keys({})
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(UniverseResolutionError) as ei:
+                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert not isinstance(ei.value, UniverseMembershipStaleError)
+
+    def test_undated_artifact_is_not_the_stale_subclass(self):
+        undated = _membership(["AAPL"])
+        undated["run_date"] = None
+        s3 = _mock_s3_with_keys({"universe_membership/latest.json": undated})
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(UniverseResolutionError) as ei:
+                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert not isinstance(ei.value, UniverseMembershipStaleError)
+
+    def test_malformed_cut_is_not_the_stale_subclass(self):
+        empty = _membership([])
+        s3 = _mock_s3_with_keys({"universe_membership/latest.json": empty})
+        with patch("boto3.client", return_value=s3):
+            with pytest.raises(UniverseResolutionError) as ei:
+                load_watchlist("auto", s3_bucket="b", date_str="2026-07-27")
+        assert not isinstance(ei.value, UniverseMembershipStaleError)
 
     def test_empty_named_cut_raises_rather_than_scoring_nothing(self):
         empty = _membership([])

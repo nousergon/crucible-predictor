@@ -79,8 +79,14 @@ DRY_RUN=false
 #   skipped      — NO-OP success (allowlisted, defensive). String form of the
 #                  same no-op contract, mirroring nousergon-data #295's
 #                  status='SKIPPED' allowlist. Matched against the payload's
-#                  `statusCode` field (a future handler may set
-#                  statusCode="skipped" on a no-op). No handler emits this yet.
+#                  `statusCode` field. Emitted by inference/handler.py ONLY
+#                  for a canary-stamped predict whose upstream universe
+#                  membership was read and is too old
+#                  (UniverseMembershipStaleError, 2026-11-03): the image loaded
+#                  and dispatched, the
+#                  probe could not reach fresh upstream data. The success line
+#                  below prints the payload body so the log says what the
+#                  canary did NOT exercise.
 #
 #   400 / 500 / any other value — REAL ERROR. 400 = bad request (e.g. the
 #                  deprecated `action=train` route, unknown regime action);
@@ -267,7 +273,9 @@ print(json.dumps(obj))
     return 1
   fi
 
-  if [ "$expect" = "statusCode" ]; then
+  if [ "$expect" = "statusCode" ] && [ "$status" = "skipped" ]; then
+    echo "  ${action}: OK (status=skipped — ${err_msg:-no reason given})"
+  elif [ "$expect" = "statusCode" ]; then
     echo "  ${action}: OK (status=$status)"
   else
     echo "  ${action}: OK (${expect} present)"

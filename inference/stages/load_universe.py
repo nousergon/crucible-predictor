@@ -128,7 +128,34 @@ class UniverseResolutionError(RuntimeError):
     """
 
 
-def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
+class UniverseMembershipStaleError(UniverseResolutionError):
+    """The membership artifact WAS read and parsed, and is too old to use.
+
+    A narrower case than ``UniverseResolutionError``, and still fatal for every
+    real run. It exists so that ONE caller can tell "the upstream producer has
+    not published a fresh cycle" (a domain outcome, carried with positive
+    evidence: the newest ``run_date`` actually read and its age) apart from
+    "nothing could be read" or "the artifact is malformed" — both of which can
+    be a code defect in this image and stay plain ``UniverseResolutionError``.
+
+    That caller is the deploy-time canary (``inference/handler.py``): a
+    synthetic probe of a freshly published Lambda version whose upstream data
+    is stale cannot run past this stage, and refusing to promote the image for
+    it gates a code deploy on a weekly SF's data. Measured 2026-11-03: the v1
+    weekly trigger was disabled 2026-10-28, ``universe_membership/latest.json``
+    stopped at run_date 2026-10-23, and the 05:02Z deploy of a dependency-only
+    change was refused promotion at 11 days old.
+    """
+
+    def __init__(self, message: str, *, newest_run_date: str, age_days: int):
+        super().__init__(message)
+        self.newest_run_date = newest_run_date
+        self.age_days = age_days
+
+
+def _read_membership(
+    s3, bucket: str, date_str: str, rejected_stale: list[dict] | None = None,
+) -> dict | None:
     """Resolve the freshest membership artifact, or None.
 
     Chain: ``latest.json`` first (the producer's own pointer), then dated keys
@@ -145,6 +172,10 @@ def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
     -I6786) — the exact S3 key that answered. Underscore-prefixed because it is
     resolution metadata, not part of the producer's schema; only the explicitly
     named fields are copied onto the predictions payload.
+
+    ``rejected_stale``, when given, receives ``{"run_date", "age_days",
+    "key"}`` for every candidate that parsed and was rejected ONLY for age —
+    the evidence ``UniverseMembershipStaleError`` carries.
 
     Why the key matters and ``run_date`` alone does not: BOTH keys in the chain
     are POINTERS, and a single run_date can have more than one write. The
@@ -192,6 +223,12 @@ def _read_membership(s3, bucket: str, date_str: str) -> dict | None:
                 "Universe membership %s is %d days old (limit %d) — rejecting",
                 run_date, age, MEMBERSHIP_MAX_AGE_DAYS,
             )
+            if rejected_stale is not None:
+                rejected_stale.append({
+                    "run_date": run_date,
+                    "age_days": age,
+                    "key": payload.get("_resolved_key"),
+                })
             continue
         if fresh is None or run_date > fresh.get("run_date", ""):
             fresh = payload
@@ -322,15 +359,26 @@ def resolve_universe_from_membership(
 
     Raises ``UniverseResolutionError`` when no membership artifact within
     ``MEMBERSHIP_MAX_AGE_DAYS`` resolves, or when the artifact names a cut it
-    does not contain.
+    does not contain — as the ``UniverseMembershipStaleError`` subclass when an
+    artifact was read and rejected only for age.
     """
-    membership = _read_membership(s3, bucket, date_str)
+    rejected_stale: list[dict] = []
+    membership = _read_membership(s3, bucket, date_str, rejected_stale)
     if not membership:
-        raise UniverseResolutionError(
+        message = (
             f"no universe membership artifact within {MEMBERSHIP_MAX_AGE_DAYS} "
             f"days of {date_str} (looked at {_MEMBERSHIP_LATEST_KEY} and dated "
             "keys). The weekly Scanner publishes it — check the weekly SF."
         )
+        if rejected_stale:
+            newest = max(rejected_stale, key=lambda r: r["run_date"])
+            raise UniverseMembershipStaleError(
+                f"{message} Newest read: run_date {newest['run_date']} at "
+                f"{newest['key']} ({newest['age_days']} days old).",
+                newest_run_date=newest["run_date"],
+                age_days=newest["age_days"],
+            )
+        raise UniverseResolutionError(message)
 
     cut_name = membership.get("predictor_universe_cut")
     cut = (membership.get("cuts") or {}).get(cut_name) or {}
