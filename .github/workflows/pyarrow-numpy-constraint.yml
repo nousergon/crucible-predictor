@@ -1,0 +1,52 @@
+# pyarrow/numpy lockstep check for THIS repo's pull requests
+# (alpha-engine-config-I13002; mechanism record nous-ergon-ops#2041).
+#
+# pyarrow >= 26 refuses to import under NumPy 1.x, and the pair broke the
+# fleet three times in October through a surface the previous fix had not
+# touched. nousergon-data `constraints/pyarrow-numpy.toml` is the ONE
+# declaration of the pair, and registers every surface in this repo that
+# installs it (requirements files, locks, bootstraps, Dependabot config).
+# This job runs nousergon-data's checker against this PR's head:
+#
+#   check_pyarrow_numpy_constraint.py --repo <this repo> --root <this checkout>
+#
+# so a Dependabot pyarrow bump (or any edit) that disagrees with the
+# declaration goes red HERE, on its own PR, instead of reaching a box. It also
+# fails on a new file here that declares or pip-installs the pair without
+# being registered.
+#
+# A red run is a finding. Fix it by changing the declaration in nousergon-data
+# FIRST (this job reads it from nousergon-data main), then the surface here;
+# never by editing this job. The daily cross-repo run is alpha-engine-config's
+# pyarrow-numpy-constraint.yml.
+name: pyarrow-numpy-constraint
+
+on:
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          path: this-repo
+      - name: Checkout nousergon-data (the declaration and its checker)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/nousergon-data
+          path: nousergon-data
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
+        with:
+          python-version: "3.12"
+      - name: Install the checker's dependencies
+        run: python3 -m pip install --quiet packaging pyyaml
+      - name: Check this repo's pyarrow/numpy surfaces against the shared constraint
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: python3 nousergon-data/scripts/check_pyarrow_numpy_constraint.py --repo "$REPO_NAME" --root this-repo
