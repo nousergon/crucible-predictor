@@ -116,3 +116,46 @@ class TestCanaryPredictOnStaleMembership:
         deploy_sh = (Path(__file__).resolve().parents[1]
                      / "infrastructure" / "deploy.sh").read_text()
         assert 'CANARY_NOOP_STATUSES=("200" "204" "skipped")' in deploy_sh
+
+
+# ── alpha-engine-config-I13255: the canary's stale-membership stop must not log ERROR
+
+import logging  # noqa: E402
+
+from inference import pipeline as _pipeline  # noqa: E402
+
+
+class _Ctx:
+    def __init__(self, dry_run):
+        self.dry_run = dry_run
+        self.date_str = "2026-11-04"
+
+
+def _run_with_raising_stage(dry_run, exc, caplog):
+    def _boom(_ctx):
+        raise exc
+
+    fake = type("M", (), {"run": staticmethod(_boom)})
+    with patch.object(_pipeline, "STAGES", [("load_universe", "x", True)]), \
+            patch("importlib.import_module", return_value=fake), \
+            caplog.at_level(logging.WARNING, logger=_pipeline.log.name):
+        with pytest.raises(type(exc)):
+            _pipeline.run_pipeline(_Ctx(dry_run))
+    return [r.levelno for r in caplog.records if r.name == _pipeline.log.name]
+
+
+def _stale():
+    return UniverseMembershipStaleError.__new__(UniverseMembershipStaleError)
+
+
+def test_dry_run_stale_membership_logs_warning_not_error(caplog):
+    levels = _run_with_raising_stage(True, _stale(), caplog)
+    assert logging.ERROR not in levels and logging.WARNING in levels
+
+
+def test_real_run_stale_membership_still_logs_error(caplog):
+    assert logging.ERROR in _run_with_raising_stage(False, _stale(), caplog)
+
+
+def test_dry_run_other_failures_still_log_error(caplog):
+    assert logging.ERROR in _run_with_raising_stage(True, RuntimeError("x"), caplog)

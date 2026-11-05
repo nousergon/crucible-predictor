@@ -236,6 +236,20 @@ def run_pipeline(ctx: PipelineContext) -> None:
             log.error("HARD FAIL from %s: %s", stage_name, hf, exc_info=True)
             raise
         except Exception as exc:
+            if critical and ctx.dry_run and type(exc).__name__ == "UniverseMembershipStaleError":
+                # alpha-engine-config-I13255: the deploy canary is a dry run, and
+                # handler.py answers a canary's stale-membership raise with
+                # statusCode "skipped" (PR #682). Logging it at ERROR here made
+                # flow-doctor's ERROR handler page anyway (11-04 06:32Z) before
+                # the handler could decide. WARNING leaves that decision to the
+                # caller: a non-canary dry run is re-raised by the handler and
+                # reported by krepis monitor_handler, and a real run (dry_run
+                # False) still logs ERROR below.
+                log.warning(
+                    "CRITICAL stage %s stopped a dry run on stale upstream data: %s",
+                    stage_name, exc,
+                )
+                raise
             if critical:
                 log.error("CRITICAL stage %s failed: %s", stage_name, exc, exc_info=True)
                 raise
