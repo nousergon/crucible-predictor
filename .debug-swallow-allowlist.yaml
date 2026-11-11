@@ -99,7 +99,7 @@ entries:
 
   # ── Documented literal fallback (training/train_handler.py) ──────────────
   - path: training/train_handler.py
-    line: 1021
+    line: 1025
     reason: >-
       Reading the base champion's model_version_label via `_cfg._cfg`
       failed (attr absent, not a dict, or malformed). No recording surface
