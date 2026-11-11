@@ -30,6 +30,8 @@ from __future__ import annotations
 # Priming a dummy Arctic instance here guarantees arcticdb's S3 client
 # initializes cleanly before any downstream pandas/pyarrow imports run.
 import os as _os  # noqa: E402
+# Before arcticdb. The S3 I/O pool is fixed at import.
+_os.environ.setdefault("ARCTICDB_VersionStore_NumIOThreads_int", "32")
 import arcticdb as _adb  # noqa: E402
 _adb.Arctic(
     f"s3s://s3.{_os.environ.get('AWS_REGION', 'us-east-1')}.amazonaws.com:"
@@ -70,6 +72,7 @@ def pull_from_arcticdb(local_dir: Path) -> int:
     import pandas as pd
     import boto3
 
+    from store.arctic_batch import iter_symbol_reads
     from nousergon_lib.arcticdb import open_universe_lib, open_macro_lib
     universe = open_universe_lib(BUCKET)
     macro_lib = open_macro_lib(BUCKET)
@@ -83,27 +86,25 @@ def pull_from_arcticdb(local_dir: Path) -> int:
 
     n_written = 0
     t0 = time.time()
-    for ticker in chosen:
-        try:
-            df = universe.read(str(ticker)).data
-            if df.empty:
-                continue
-            df.to_parquet(local_dir / f"{ticker}.parquet", engine="pyarrow", compression="snappy")
-            n_written += 1
-        except Exception as e:
-            log.warning("Failed universe %s: %s", ticker, e)
+    for ticker, df, err in iter_symbol_reads(universe, [str(t) for t in chosen]):
+        if err is not None:
+            log.warning("Failed universe %s: %s", ticker, err)
+            continue
+        if df is None or df.empty:
+            continue
+        df.to_parquet(local_dir / f"{ticker}.parquet", engine="pyarrow", compression="snappy")
+        n_written += 1
 
-    # Macro series — all five
-    for key in MACRO_KEYS:
-        try:
-            df = macro_lib.read(key).data
-            if df.empty:
-                log.warning("Macro %s empty", key)
-                continue
-            df.to_parquet(local_dir / f"{key}.parquet", engine="pyarrow", compression="snappy")
-            n_written += 1
-        except Exception as e:
-            log.warning("Failed macro %s: %s", key, e)
+    # Macro series — all five. Full history: the dry run trains on it.
+    for key, df, err in iter_symbol_reads(macro_lib, MACRO_KEYS):
+        if err is not None:
+            log.warning("Failed macro %s: %s", key, err)
+            continue
+        if df is None or df.empty:
+            log.warning("Macro %s empty", key)
+            continue
+        df.to_parquet(local_dir / f"{key}.parquet", engine="pyarrow", compression="snappy")
+        n_written += 1
 
     # sector_map.json from S3 (not in ArcticDB per arctic_reader.py)
     try:

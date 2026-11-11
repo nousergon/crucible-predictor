@@ -630,6 +630,10 @@ def run_research_free_inference(
     fail-hard rationale.
     """
     from model.meta_model import META_FEATURES, RESEARCH_META_FEATURES
+    # Before the lib imports arcticdb. load_universe_ohlcv is already a
+    # date-windowed read_batch; this only sizes the I/O pool.
+    from store.arctic_batch import configure_arcticdb_io_threads
+    configure_arcticdb_io_threads()
     from nousergon_lib.arcticdb import load_universe_ohlcv, load_macro_series
 
     bucket = bucket or cfg.S3_BUCKET

@@ -10,8 +10,9 @@ WHAT IT PROTECTS
 ----------------
 The predictor reads a per-ticker feature row from the ArcticDB ``universe``
 library — ``inference/stages/run_inference.py::
-_load_precomputed_features_from_arcticdb`` does ``universe.read(ticker).data``
-then ``df.iloc[-1]`` — and feeds ``config.FEATURES`` (plus the direct
+_load_precomputed_features_from_arcticdb`` reads the last stored row
+(``row_range=(-1, None)``, the same row as ``df.iloc[-1]`` of a full read)
+— and feeds ``config.FEATURES`` (plus the direct
 ``momentum_20d`` / ``vix_level`` reads, all ⊆ ``config.FEATURES``) into the
 GBM/MLP models. If the feature-store PRODUCER
 (``nousergon-data/features/feature_engineer.py::FEATURES``, locked there by

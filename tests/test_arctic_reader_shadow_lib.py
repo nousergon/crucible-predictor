@@ -8,6 +8,7 @@ the named scratch library directly. The macro library is always ``macro``.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -40,7 +41,18 @@ def _mock_library(symbols):
         item.data = _df()
         return item
 
+    def read_batch(requests):
+        out = []
+        for req in requests:
+            sym = getattr(req, "symbol", req)
+            try:
+                out.append(read(sym))
+            except Exception as exc:  # noqa: BLE001
+                out.append(SimpleNamespace(symbol=sym, exception_string=str(exc)))
+        return out
+
     lib.read.side_effect = read
+    lib.read_batch.side_effect = read_batch
     return lib
 
 

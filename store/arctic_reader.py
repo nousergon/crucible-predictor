@@ -46,6 +46,7 @@ rendering identically.
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
@@ -120,6 +121,11 @@ def download_from_arctic(
     local_dir = str(local_dir)
     os.makedirs(local_dir, exist_ok=True)
 
+    # Before the lib's lazy arcticdb import. Training reads every row (the
+    # model is fit on the history); only the transport is batched.
+    from store.arctic_batch import configure_arcticdb_io_threads, iter_symbol_reads
+    configure_arcticdb_io_threads()
+
     from nousergon_lib.arcticdb import (
         open_universe_lib, open_macro_lib, open_arctic,
     )
@@ -149,15 +155,29 @@ def download_from_arctic(
     from training.data_completeness import measure_symbol_coverage
 
     # Write stock tickers from universe library
-    symbols = universe.list_symbols()
+    symbols = list(universe.list_symbols())
     log.info(
         "[data_source=arcticdb] Reading %d symbols from library '%s'...",
         len(symbols), universe_lib,
     )
 
-    for i, ticker in enumerate(symbols):
-        try:
-            df = universe.read(ticker).data
+    for i, (ticker, df, err) in enumerate(iter_symbol_reads(
+        universe, symbols, after_chunk=gc.collect,
+    )):
+        if err is not None:
+            # config#2882 — WARN (not DEBUG): a partial read-failure episode
+            # (throttling/connectivity/corrupted symbol) must be visible at
+            # default INFO-level logging, not require a DEBUG-level re-run to
+            # even notice data was silently dropped.
+            failed_universe.append(ticker)
+            log.warning("Failed to read ticker %s from ArcticDB: %s", ticker, err)
+        elif df is None:
+            failed_universe.append(ticker)
+            log.warning(
+                "Failed to read ticker %s from ArcticDB: read returned no frame",
+                ticker,
+            )
+        else:
             per_symbol[ticker] = measure_symbol_coverage(df)
             if df.empty:
                 # I9290 — NOT a silent skip. An empty symbol is a distinct
@@ -169,42 +189,43 @@ def download_from_arctic(
                     "ArcticDB universe symbol %s read OK but holds ZERO rows "
                     "— recorded as empty, not skipped silently.", ticker,
                 )
-                continue
-            out_path = os.path.join(local_dir, f"{ticker}.parquet")
-            df.to_parquet(out_path, engine="pyarrow", compression="snappy")
-            n_written += 1
-        except Exception as exc:
-            # config#2882 — WARN (not DEBUG): a partial read-failure episode
-            # (throttling/connectivity/corrupted symbol) must be visible at
-            # default INFO-level logging, not require a DEBUG-level re-run to
-            # even notice data was silently dropped.
-            failed_universe.append(ticker)
-            log.warning("Failed to read ticker %s from ArcticDB: %s", ticker, exc)
+            else:
+                out_path = os.path.join(local_dir, f"{ticker}.parquet")
+                df.to_parquet(out_path, engine="pyarrow", compression="snappy")
+                n_written += 1
 
         if (i + 1) % 200 == 0:
             log.info("  Written %d/%d symbols", i + 1, len(symbols))
 
     # Write macro series from macro library
-    macro_symbols = macro_lib.list_symbols()
-    for key in macro_symbols:
-        try:
-            df = macro_lib.read(key).data
-            per_symbol[key] = measure_symbol_coverage(df)
-            if df.empty:
-                # I9290 — see the universe branch above.
-                empty_macro.append(key)
-                log.warning(
-                    "ArcticDB macro series %s read OK but holds ZERO rows — "
-                    "recorded as empty, not skipped silently.", key,
-                )
-                continue
-            out_path = os.path.join(local_dir, f"{key}.parquet")
-            df.to_parquet(out_path, engine="pyarrow", compression="snappy")
-            n_written += 1
-        except Exception as exc:
+    macro_symbols = list(macro_lib.list_symbols())
+    for key, df, err in iter_symbol_reads(
+        macro_lib, macro_symbols, after_chunk=gc.collect,
+    ):
+        if err is not None:
             # config#2882 — WARN, see above.
             failed_macro.append(key)
-            log.warning("Failed to read macro series %s from ArcticDB: %s", key, exc)
+            log.warning("Failed to read macro series %s from ArcticDB: %s", key, err)
+            continue
+        if df is None:
+            failed_macro.append(key)
+            log.warning(
+                "Failed to read macro series %s from ArcticDB: read returned no frame",
+                key,
+            )
+            continue
+        per_symbol[key] = measure_symbol_coverage(df)
+        if df.empty:
+            # I9290 — see the universe branch above.
+            empty_macro.append(key)
+            log.warning(
+                "ArcticDB macro series %s read OK but holds ZERO rows — "
+                "recorded as empty, not skipped silently.", key,
+            )
+            continue
+        out_path = os.path.join(local_dir, f"{key}.parquet")
+        df.to_parquet(out_path, engine="pyarrow", compression="snappy")
+        n_written += 1
 
     # Write sector_map.json from S3 (not stored in ArcticDB)
     try:

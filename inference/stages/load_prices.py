@@ -15,6 +15,13 @@ from __future__ import annotations
 import logging
 import os
 
+# ArcticDB reads ARCTICDB_* once, at import, and otherwise sizes its S3 I/O
+# pool from the CPU count. This import setdefaults that pool and does not
+# import arcticdb. See store.arctic_batch.
+import store.arctic_batch as _arctic_batch
+
+_arctic_batch.configure_arcticdb_io_threads()
+
 import arcticdb as adb  # Hard dep: matches run_inference.py pattern. No try/except
                         # ImportError — if the Lambda image lacks arcticdb, fail
                         # loud at cold start rather than silently degrading.
@@ -185,36 +192,34 @@ def load_price_data_from_arctic(
     start_ts = end_ts - pd.Timedelta(days=lookback_days)
 
     universe_lib, macro_lib = _connect_arctic(bucket)
+    window = (start_ts, end_ts)
 
-    def _read_ohlcv(lib, sym: str) -> pd.DataFrame:
-        res = lib.read(sym, date_range=(start_ts, end_ts), columns=_ARCTIC_OHLCV_COLS)
-        df = res.data
+    def _sorted(df: pd.DataFrame) -> pd.DataFrame:
+        # No defensive dedup. Duplicates are structurally impossible after the
+        # 2026-04-15 write-path fix; sorting is the only post-read touch, and
+        # a values-differ duplicate must still surface downstream.
         if df.empty:
             return df
         return df.sort_index()
 
-    def _read_close(lib, sym: str) -> pd.DataFrame:
-        res = lib.read(sym, date_range=(start_ts, end_ts), columns=["Close"])
-        df = res.data
-        if df.empty:
-            return df
-        return df.sort_index()
-
-    # ── Stocks: universe library only ────────────────────────────────────────
+    # ── Stocks: universe library only, one read_batch per 150 symbols ────────
     price_data: dict[str, pd.DataFrame] = {}
     n_err = 0
-    for ticker in tickers:
-        try:
-            df = _read_ohlcv(universe_lib, ticker)
-        except Exception as exc:
-            log.warning("ArcticDB universe read failed for %s: %s", ticker, exc)
+    for ticker, df, err in _arctic_batch.iter_symbol_reads(
+        universe_lib,
+        tickers,
+        date_range=window,
+        columns=_ARCTIC_OHLCV_COLS,
+    ):
+        if err is not None:
+            log.warning("ArcticDB universe read failed for %s: %s", ticker, err)
             n_err += 1
             continue
-        if df.empty:
+        if df is None or df.empty:
             log.warning("ArcticDB universe returned empty frame for %s", ticker)
             n_err += 1
             continue
-        price_data[ticker] = df
+        price_data[ticker] = _sorted(df)
 
     err_rate = n_err / max(len(tickers), 1)
     if err_rate > 0.05:
@@ -226,25 +231,39 @@ def load_price_data_from_arctic(
     # ── Macros + sector ETFs: try universe first (full OHLCV from backfill),
     #     fall back to macro library (Close only from daily_append) ───────────
     all_macro_syms = _ARCTIC_MACRO_STEMS + _ARCTIC_SECTOR_ETFS
-    for sym in all_macro_syms:
-        df: pd.DataFrame | None = None
-        try:
-            df = _read_ohlcv(universe_lib, sym)
-        except Exception:
-            df = None  # sym not in universe library — expected for post-backfill-only macros
+    from_universe: dict[str, pd.DataFrame] = {}
+    for sym, df, err in _arctic_batch.iter_symbol_reads(
+        universe_lib,
+        all_macro_syms,
+        date_range=window,
+        columns=_ARCTIC_OHLCV_COLS,
+    ):
+        if err is None and df is not None and not df.empty:
+            from_universe[sym] = _sorted(df)
 
-        if df is None or df.empty:
-            try:
-                df = _read_close(macro_lib, sym)
-            except Exception as exc:
-                log.warning("ArcticDB macro read failed for %s: %s", sym, exc)
+    need_macro = [sym for sym in all_macro_syms if sym not in from_universe]
+    from_macro: dict[str, pd.DataFrame] = {}
+    if need_macro:
+        for sym, df, err in _arctic_batch.iter_symbol_reads(
+            macro_lib,
+            need_macro,
+            date_range=window,
+            columns=["Close"],
+        ):
+            if err is not None:
+                log.warning("ArcticDB macro read failed for %s: %s", sym, err)
                 continue
+            if df is None or df.empty:
+                log.warning("ArcticDB: %s not found in universe or macro libraries", sym)
+                continue
+            from_macro[sym] = _sorted(df)
 
-        if df is None or df.empty:
-            log.warning("ArcticDB: %s not found in universe or macro libraries", sym)
-            continue
-
-        price_data[sym] = df
+    for sym in all_macro_syms:
+        frame = from_universe.get(sym)
+        if frame is None:
+            frame = from_macro.get(sym)
+        if frame is not None:
+            price_data[sym] = frame
 
     # ── Build macro dict (key → Close Series) from what we loaded ────────────
     macro: dict[str, pd.Series] = {}

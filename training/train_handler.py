@@ -52,6 +52,10 @@ import json
 import logging
 import os
 import re
+
+# Before krepis / numpy. The training cache read goes through arcticdb, which
+# sizes its S3 I/O pool at import. Same value the inference handler sets.
+os.environ.setdefault("ARCTICDB_VersionStore_NumIOThreads_int", "32")
 import smtplib
 import tempfile
 import time

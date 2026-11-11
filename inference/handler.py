@@ -81,6 +81,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Before krepis or any stage import. ArcticDB reads this once, at import.
+# 32 is the pool crucible-research measured at 5-6 s per 150 symbols on this
+# library (45-47 s at 3 threads). setdefault: a function environment value wins.
+os.environ.setdefault("ARCTICDB_VersionStore_NumIOThreads_int", "32")
+
 # Ensure the project root is on sys.path so sibling modules can be
 # imported below. Cheap; safe at module-top.
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))

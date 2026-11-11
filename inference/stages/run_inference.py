@@ -7,6 +7,11 @@ import logging
 import os
 from typing import Optional
 
+# Before arcticdb: the S3 I/O pool is sized at import. See store.arctic_batch.
+import store.arctic_batch as _arctic_batch
+
+_arctic_batch.configure_arcticdb_io_threads()
+
 import arcticdb as adb  # Hard dep: PR #5 removed the try/except ImportError
                         # fallback that masked a missing Lambda layer for a
                         # week before detection. If arcticdb isn't in the
@@ -246,16 +251,23 @@ def _load_precomputed_features_from_arcticdb(
     from nousergon_lib.arcticdb import open_universe_lib
     universe = open_universe_lib(ctx.bucket)
 
+    # The model consumes one row per ticker: the last stored row, which the
+    # previous loop took with ``df.iloc[-1]`` after reading the whole symbol.
+    # ``row_range=(-1, None)`` is that same row (ArcticDB matches iloc).
+    # A date window would drop a symbol whose last row is older than the
+    # window and change the prediction; this does not.
     precomputed: dict[str, pd.Series] = {}
     n_err = 0
-    for ticker in ctx.tickers:
-        try:
-            df = universe.read(ticker).data
-        except Exception as exc:
-            log.warning("ArcticDB read failed for %s: %s", ticker, exc)
+    for ticker, df, err in _arctic_batch.iter_symbol_reads(
+        universe,
+        ctx.tickers,
+        row_range=_arctic_batch.LAST_ROW_RANGE,
+    ):
+        if err is not None:
+            log.warning("ArcticDB read failed for %s: %s", ticker, err)
             n_err += 1
             continue
-        if df.empty:
+        if df is None or df.empty:
             log.warning("ArcticDB returned empty frame for %s", ticker)
             n_err += 1
             continue

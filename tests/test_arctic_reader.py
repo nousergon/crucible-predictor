@@ -2,6 +2,7 @@
 
 import json
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -43,7 +44,20 @@ def _mock_library(symbols, get_df=lambda s: _df(), raise_on=None):
         item.data = get_df(symbol)
         return item
 
+    def read_batch(requests):
+        # Production reads through read_batch. Failures stay per-symbol:
+        # ArcticDB returns a DataError rather than raising the batch call.
+        out = []
+        for req in requests:
+            sym = getattr(req, "symbol", req)
+            try:
+                out.append(read(sym))
+            except Exception as exc:  # noqa: BLE001 — the batch API returns this
+                out.append(SimpleNamespace(symbol=sym, exception_string=str(exc)))
+        return out
+
     lib.read.side_effect = read
+    lib.read_batch.side_effect = read_batch
     return lib
 
 
