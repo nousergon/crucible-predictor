@@ -27,4 +27,4 @@ permissions:
 
 jobs:
   guard:
-    uses: nousergon/nousergon-lib/.github/workflows/merge-group-required-check-guard.yml@ddb5efc0dcc3e505cad18af5e2194fa21e2b71fa
+    uses: nousergon/nousergon-lib/.github/workflows/merge-group-required-check-guard.yml@4193735c2417b4f5c2f7b73694b6da250e41fa0d
