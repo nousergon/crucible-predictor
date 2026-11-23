@@ -60,5 +60,5 @@ scikit-learn>=1.9.0
 # discipline).
 hmmlearn>=0.3.3
 pyyaml>=6.0.3
-arcticdb>=6.23.0
+arcticdb>=6.23.0,<7  # alpha-engine-config-I14262: 7.0.0 changed the static-schema mismatch error that daily_append keys on
 # ci-trigger-check
